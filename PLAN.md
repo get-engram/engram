@@ -1,8 +1,8 @@
-# MaaS — Memory as a Service
+# Engram — Memory as a Service
 
 ## Context
 
-Every existing agent memory product (Mem0, Zep, Supermemory, etc.) compresses and summarizes conversations into extracted "memories." None store full, verbatim conversation transcripts. MaaS fills this gap — an MCP-native SaaS where every message, tool call, and response is stored without compaction. The conversation IS the knowledge base.
+Every existing agent memory product (Mem0, Zep, Supermemory, etc.) compresses and summarizes conversations into extracted "memories." None store full, verbatim conversation transcripts. Engram fills this gap — an MCP-native SaaS where every message, tool call, and response is stored without compaction. The conversation IS the knowledge base.
 
 ## Tech Stack
 
@@ -22,13 +22,13 @@ MCP server with 6 tools, D1 storage, Vectorize search, API key auth. No dashboar
 ## Project Structure
 
 ```
-maas/
+engram/
 ├── package.json
 ├── pnpm-workspace.yaml
 ├── turbo.json
 ├── tsconfig.base.json
 ├── packages/
-│   ├── shared/                        # @maas/shared
+│   ├── shared/                        # @engram/shared
 │   │   └── src/
 │   │       ├── types/                 # Conversation, Message, Org, ApiKey types
 │   │       ├── schemas/               # Zod schemas for MCP tool inputs
@@ -37,7 +37,7 @@ maas/
 │   │       │   ├── chunk.ts           # Sliding-window conversation chunking
 │   │       │   └── auth.ts            # SHA-256 key hashing
 │   │       └── constants.ts
-│   └── db/                            # @maas/db
+│   └── db/                            # @engram/db
 │       ├── migrations/
 │       │   ├── 0001_initial_schema.sql
 │       │   └── 0002_add_indexes.sql
@@ -95,8 +95,8 @@ Key design decisions:
 
 ## Auth Flow (Phase 1)
 
-- Key format: `maas_sk_live_` + 32 random chars
-- Passed via `Authorization: Bearer maas_sk_live_...` header on MCP HTTP transport
+- Key format: `engram_sk_live_` + 32 random chars
+- Passed via `Authorization: Bearer engram_sk_live_...` header on MCP HTTP transport
 - Validated by hashing and looking up in `api_keys` table
 - Returns `organization_id` for tenant scoping
 - `last_used_at` updated via `waitUntil` (non-blocking)
@@ -115,7 +115,7 @@ Key design decisions:
 ## Verification
 
 1. `pnpm install && pnpm build` — monorepo builds without errors
-2. `wrangler d1 migrations apply maas-db --local` — migrations apply
+2. `wrangler d1 migrations apply engram-db --local` — migrations apply
 3. `wrangler dev` — server starts, `/health` returns 200
 4. Connect an MCP client (Claude Desktop or `npx @anthropic-ai/mcp-inspector`) to `http://localhost:8787/mcp` with API key
 5. Call `create_conversation` → get back a conversation_id

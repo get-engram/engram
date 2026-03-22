@@ -16,7 +16,7 @@ import {
   insertChunks,
   getChunksByVectorizeIds,
   getVectorizeIdsByConversation,
-} from "@maas/db";
+} from "@engram/db";
 
 let db: D1Database;
 
@@ -50,7 +50,7 @@ describe("API key queries", () => {
       "key_1",
       "org_keys",
       "hash_abc",
-      "maas_sk_live_xxxx",
+      "engram_sk_live_xxxx",
       "test key"
     );
     const key = (await getApiKeyByHash(db, "hash_abc")) as Record<

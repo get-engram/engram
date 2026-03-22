@@ -1,8 +1,8 @@
 import type { Env } from "../types.js";
-import type { SearchResult, Message } from "@maas/shared";
+import type { SearchResult, Message } from "@engram/shared";
 import { generateEmbedding } from "./embedding.js";
-import { getChunksByVectorizeIds } from "@maas/db";
-import { getMessagesBySequenceRange } from "@maas/db";
+import { getChunksByVectorizeIds } from "@engram/db";
+import { getMessagesBySequenceRange } from "@engram/db";
 
 interface VectorizeMatch {
   id: string;

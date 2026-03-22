@@ -1,6 +1,6 @@
 export const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
 export const EMBEDDING_DIMENSIONS = 768;
-export const VECTORIZE_INDEX_NAME = "maas-vectors";
+export const VECTORIZE_INDEX_NAME = "engram-vectors";
 export const CHUNK_WINDOW_SIZE = 5;
 export const CHUNK_STRIDE = 3;
 export const MAX_MESSAGES_PER_APPEND = 200;

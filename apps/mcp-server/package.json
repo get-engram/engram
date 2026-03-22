@@ -1,5 +1,5 @@
 {
-  "name": "@maas/mcp-server",
+  "name": "@engram/mcp-server",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -9,13 +9,13 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "db:migrate:local": "wrangler d1 migrations apply maas-db --local",
-    "db:migrate:remote": "wrangler d1 migrations apply maas-db --remote",
+    "db:migrate:local": "wrangler d1 migrations apply engram-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply engram-db --remote",
     "seed": "node --loader tsx scripts/seed.ts"
   },
   "dependencies": {
-    "@maas/shared": "workspace:*",
-    "@maas/db": "workspace:*",
+    "@engram/shared": "workspace:*",
+    "@engram/db": "workspace:*",
     "hono": "^4.6.0",
     "zod": "^3.24.0",
     "@modelcontextprotocol/sdk": "^1.6.0",

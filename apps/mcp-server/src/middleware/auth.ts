@@ -1,6 +1,6 @@
 import type { Context, Next } from "hono";
-import { hashApiKey } from "@maas/shared";
-import { getApiKeyByHash, updateApiKeyLastUsed } from "@maas/db";
+import { hashApiKey } from "@engram/shared";
+import { getApiKeyByHash, updateApiKeyLastUsed } from "@engram/db";
 import type { Env, AuthContext } from "../types.js";
 
 export async function authMiddleware(
@@ -13,7 +13,7 @@ export async function authMiddleware(
   }
 
   const token = authHeader.slice(7);
-  if (!token.startsWith("maas_sk_live_")) {
+  if (!token.startsWith("engram_sk_live_")) {
     return c.json({ error: "Invalid API key format" }, 401);
   }
 

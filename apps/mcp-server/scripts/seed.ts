@@ -1,5 +1,5 @@
 /**
- * Seed script — run with: npx wrangler d1 execute maas-db --local --command "..."
+ * Seed script — run with: npx wrangler d1 execute engram-db --local --command "..."
  * Or use this script to generate seed SQL.
  *
  * Usage: npx tsx scripts/seed.ts
@@ -19,12 +19,12 @@ async function main() {
   const orgId = `org_${nanoid(21)}`;
   const orgName = "Test Organization";
 
-  const apiKeyRaw = `maas_sk_live_${nanoid(32)}`;
+  const apiKeyRaw = `engram_sk_live_${nanoid(32)}`;
   const apiKeyId = `key_${nanoid(21)}`;
   const keyHash = await hashKey(apiKeyRaw);
   const keyPrefix = apiKeyRaw.slice(0, 20);
 
-  console.log("=== MaaS Seed Data ===\n");
+  console.log("=== Engram Seed Data ===\n");
   console.log(`Organization ID: ${orgId}`);
   console.log(`Organization Name: ${orgName}`);
   console.log(`API Key (save this — shown once): ${apiKeyRaw}`);
@@ -42,7 +42,7 @@ INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, name) VALUES ('
   console.log("");
   console.log("Run with:");
   console.log(`  cd apps/mcp-server`);
-  console.log(`  npx wrangler d1 execute maas-db --local --command "${sql.replace(/\n/g, " ")}"`);
+  console.log(`  npx wrangler d1 execute engram-db --local --command "${sql.replace(/\n/g, " ")}"`);
 }
 
 main().catch(console.error);

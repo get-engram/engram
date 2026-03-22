@@ -11,7 +11,7 @@ describe("Health endpoint", () => {
     const body = await response.json();
     expect(body).toEqual({
       status: "ok",
-      service: "maas-mcp-server",
+      service: "engram-mcp-server",
       version: "0.1.0",
     });
   });

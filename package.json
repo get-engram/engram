@@ -1,5 +1,5 @@
 {
-  "name": "maas",
+  "name": "engram",
   "private": true,
   "scripts": {
     "build": "turbo build",

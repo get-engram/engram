@@ -1,17 +1,17 @@
-name = "maas-mcp-server"
+name = "engram-mcp-server"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
 
 [[d1_databases]]
 binding = "DB"
-database_name = "maas-db"
+database_name = "engram-db"
 database_id = "placeholder-replace-after-creation"
 migrations_dir = "../../packages/db/migrations"
 
 [[vectorize]]
 binding = "VECTORIZE"
-index_name = "maas-vectors"
+index_name = "engram-vectors"
 
 [ai]
 binding = "AI"

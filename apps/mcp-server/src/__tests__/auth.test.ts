@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import app from "../index.js";
-import { hashApiKey, generateApiKeyRaw, generateId } from "@maas/shared";
+import { hashApiKey, generateApiKeyRaw, generateId } from "@engram/shared";
 import { createMockD1, createMockEnv } from "./helpers.js";
 
 let testApiKey: string;
@@ -64,7 +64,7 @@ describe("Auth middleware", () => {
         method: "POST",
         headers: {
           Authorization:
-            "Bearer maas_sk_live_00000000000000000000000000000000",
+            "Bearer engram_sk_live_00000000000000000000000000000000",
         },
       }),
       mockEnv

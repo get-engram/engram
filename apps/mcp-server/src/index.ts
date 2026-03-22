@@ -14,7 +14,7 @@ const app = new Hono<HonoEnv>();
 
 // Health check
 app.get("/health", (c) => {
-  return c.json({ status: "ok", service: "maas-mcp-server", version: "0.1.0" });
+  return c.json({ status: "ok", service: "engram-mcp-server", version: "0.1.0" });
 });
 
 // MCP endpoint — all methods

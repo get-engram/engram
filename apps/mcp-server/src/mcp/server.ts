@@ -9,7 +9,7 @@ import type { Env, AuthContext } from "../types.js";
 
 export function createMcpServer(env: Env, auth: AuthContext): McpServer {
   const server = new McpServer({
-    name: "MaaS",
+    name: "Engram",
     version: "0.1.0",
   });
 

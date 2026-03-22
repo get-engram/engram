@@ -43,10 +43,10 @@ describe("generateId", () => {
 });
 
 describe("generateApiKeyRaw", () => {
-  it("returns raw key with maas_sk_live_ prefix", () => {
+  it("returns raw key with engram_sk_live_ prefix", () => {
     const { raw, prefix } = generateApiKeyRaw();
-    expect(raw).toMatch(/^maas_sk_live_/);
-    expect(raw.length).toBe(13 + 32); // "maas_sk_live_" + 32 chars
+    expect(raw).toMatch(/^engram_sk_live_/);
+    expect(raw.length).toBe(15 + 32); // "engram_sk_live_" + 32 chars
   });
 
   it("returns first 20 chars as prefix", () => {

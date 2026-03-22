@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { createMockD1, createMockEnv } from "./helpers.js";
 import { createConversation, getConversation } from "../services/conversation.js";
-import { insertOrganization, insertConversation as dbInsertConversation } from "@maas/db";
+import { insertOrganization, insertConversation as dbInsertConversation } from "@engram/db";
 
 describe("Conversation service", () => {
   let db: D1Database;

@@ -17,10 +17,10 @@ importers:
 
   apps/mcp-server:
     dependencies:
-      '@maas/db':
+      '@engram/db':
         specifier: workspace:*
         version: link:../../packages/db
-      '@maas/shared':
+      '@engram/shared':
         specifier: workspace:*
         version: link:../../packages/shared
       '@modelcontextprotocol/sdk':

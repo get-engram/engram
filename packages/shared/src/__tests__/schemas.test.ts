@@ -73,7 +73,7 @@ describe("CreateConversationSchema", () => {
       title: "My Conversation",
       agent_id: "agent_123",
       tags: ["dev", "test"],
-      metadata: { project: "maas" },
+      metadata: { project: "engram" },
     });
     expect(result.success).toBe(true);
   });

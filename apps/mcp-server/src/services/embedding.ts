@@ -1,4 +1,4 @@
-import { EMBEDDING_MODEL } from "@maas/shared";
+import { EMBEDDING_MODEL } from "@engram/shared";
 import type { Env } from "../types.js";
 
 export async function generateEmbeddings(

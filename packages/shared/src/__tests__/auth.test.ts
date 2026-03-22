@@ -8,8 +8,8 @@ describe("hashApiKey", () => {
   });
 
   it("produces deterministic output", async () => {
-    const hash1 = await hashApiKey("maas_sk_live_abc123");
-    const hash2 = await hashApiKey("maas_sk_live_abc123");
+    const hash1 = await hashApiKey("engram_sk_live_abc123");
+    const hash2 = await hashApiKey("engram_sk_live_abc123");
     expect(hash1).toBe(hash2);
   });
 

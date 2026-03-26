@@ -1,6 +1,5 @@
 import { Hono } from "hono";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { authMiddleware } from "./middleware/auth.js";
 import { createMcpServer } from "./mcp/server.js";
 import type { Env, AuthContext } from "./types.js";
@@ -22,21 +21,13 @@ app.all("/mcp", authMiddleware, async (c) => {
   const auth = c.get("auth");
   const server = createMcpServer(c.env, auth);
 
-  const transport = new StreamableHTTPServerTransport({
+  const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined, // stateless
   });
 
   await server.connect(transport);
 
-  const request = c.req.raw;
-  const response = await transport.handleRequest(request);
-
-  // StreamableHTTPServerTransport.handleRequest returns a Response or undefined
-  if (response) {
-    return response;
-  }
-
-  return c.json({ error: "No response from MCP transport" }, 500);
+  return transport.handleRequest(c.req.raw);
 });
 
 export default app;

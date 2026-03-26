@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "engram-db"
-database_id = "placeholder-replace-after-creation"
+database_id = "fcf57f81-8d26-4288-aee5-11c42d6ca0d5"
 migrations_dir = "../../packages/db/migrations"
 
 [[vectorize]]
@@ -15,3 +15,8 @@ index_name = "engram-vectors"
 
 [ai]
 binding = "AI"
+
+# Custom domain — serves MCP at mcp.getengram.app
+[[routes]]
+pattern = "mcp.getengram.app/*"
+zone_name = "getengram.app"

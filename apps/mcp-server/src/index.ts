@@ -1,7 +1,9 @@
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { authMiddleware } from "./middleware/auth.js";
 import { createMcpServer } from "./mcp/server.js";
+import { signup } from "./routes/signup.js";
 import type { Env, AuthContext } from "./types.js";
 
 type HonoEnv = {
@@ -11,10 +13,23 @@ type HonoEnv = {
 
 const app = new Hono<HonoEnv>();
 
+// CORS for frontend
+app.use(
+  "/signup",
+  cors({
+    origin: ["https://getengram.app", "http://localhost:3000"],
+    allowMethods: ["POST", "OPTIONS"],
+    allowHeaders: ["Content-Type"],
+  }),
+);
+
 // Health check
 app.get("/health", (c) => {
   return c.json({ status: "ok", service: "engram-mcp-server", version: "0.1.0" });
 });
+
+// Signup (no auth required)
+app.route("/", signup);
 
 // MCP endpoint — all methods
 app.all("/mcp", authMiddleware, async (c) => {

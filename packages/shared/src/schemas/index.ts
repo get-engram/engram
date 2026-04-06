@@ -45,3 +45,8 @@ export const ListConversationsSchema = z.object({
 export const DeleteConversationSchema = z.object({
   conversation_id: z.string(),
 });
+
+export const SignupSchema = z.object({
+  email: z.string().email(),
+  plan: z.enum(["free", "pro"]).optional().default("free"),
+});

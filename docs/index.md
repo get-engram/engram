@@ -1,6 +1,6 @@
 # Engram Documentation
 
-Memory for every conversation. Engram stores complete, uncompressed AI conversation transcripts and makes them instantly searchable.
+Memory infrastructure for AI agents. Engram stores complete, uncompressed conversation transcripts and makes them instantly searchable.
 
 ## Quick Links
 
@@ -35,7 +35,6 @@ Memory for every conversation. Engram stores complete, uncompressed AI conversat
 
 | | |
 |---|---|
-| **[Self-Hosting](./self-hosting.md)** | Deploy your own instance on Cloudflare |
 | **[Troubleshooting](./troubleshooting.md)** | Common issues and fixes |
 | **[FAQ](./faq.md)** | Frequently asked questions |
 
@@ -45,8 +44,7 @@ Memory for every conversation. Engram stores complete, uncompressed AI conversat
 |---|---|
 | **[Roadmap](./roadmap.md)** | What's built, what's next |
 | **[Changelog](./changelog.md)** | Release history |
-| **[Contributing](./contributing.md)** | How to contribute to Engram |
 
-## Source Code
+## Get Started
 
-[github.com/27Club/engram](https://github.com/27Club/engram)
+[getengram.app](https://getengram.app)

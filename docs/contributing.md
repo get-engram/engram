@@ -2,7 +2,7 @@
 
 ## Getting Started
 
-1. Fork the repository: [github.com/27Club/engram](https://github.com/27Club/engram)
+1. Fork the repository: [github.com/get-engram/engram](https://github.com/get-engram/engram)
 2. Clone your fork:
    ```bash
    git clone https://github.com/YOUR_USERNAME/engram.git
@@ -108,7 +108,7 @@ engram/
 Turborepo handles this automatically, but for reference:
 
 ```
-@engram/shared → @engram/db → @engram/mcp-server
+@getengram/shared → @getengram/db → @getengram/mcp-server
 ```
 
 Changes to `shared` require rebuilding `db` and `mcp-server`. Changes to `db` require rebuilding `mcp-server`. Changes to `mcp-server` are self-contained.

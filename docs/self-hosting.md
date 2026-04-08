@@ -14,7 +14,7 @@ Engram runs entirely on Cloudflare's developer platform. You can deploy your own
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/27Club/engram.git
+git clone https://github.com/get-engram/engram.git
 cd engram
 pnpm install
 ```

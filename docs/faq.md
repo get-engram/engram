@@ -18,7 +18,7 @@ The [Model Context Protocol](https://modelcontextprotocol.io) is an open standar
 
 ### Is Engram open source?
 
-Yes. The source code is available at [github.com/27Club/engram](https://github.com/27Club/engram).
+No. Engram is a proprietary product. See [getengram.app](https://getengram.app) for pricing and plans.
 
 ## Data and Privacy
 

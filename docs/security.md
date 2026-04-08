@@ -129,4 +129,4 @@ The MCP server runs on Cloudflare Workers, which provides:
 
 ## Reporting Vulnerabilities
 
-If you discover a security vulnerability in Engram, please report it by opening a private issue at [github.com/27Club/engram](https://github.com/27Club/engram) or contacting the maintainers directly. Do not disclose vulnerabilities publicly before they are fixed.
+If you discover a security vulnerability in Engram, please report it by emailing security@getengram.app. Do not disclose vulnerabilities publicly before they are fixed.

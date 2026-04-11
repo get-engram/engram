@@ -648,19 +648,19 @@ There's no global state, no shared context between requests, and no way to acces
 ### Package dependency graph
 
 ```
-@engram/shared (no dependencies on Cloudflare)
+@getengram/shared (no dependencies on Cloudflare)
     │
     │  Types, Zod schemas, chunking algorithm,
     │  ID generation, API key hashing
     │
     ▼
-@engram/db (depends on shared for types)
+@getengram/db (depends on shared for types)
     │
     │  SQL migrations, typed query helpers
     │  (insert, select, update, delete for each table)
     │
     ▼
-@engram/mcp-server (depends on shared + db)
+@getengram/mcp-server (depends on shared + db)
     │
     │  Hono app, auth middleware, MCP server,
     │  tool handlers, services (conversation, embedding, search)
@@ -681,9 +681,9 @@ Turborepo builds packages in dependency order:
 ```bash
 pnpm build
   → turbo build
-    → @engram/shared (builds first — no deps)
-    → @engram/db (builds after shared)
-    → @engram/mcp-server (builds last — depends on both)
+    → @getengram/shared (builds first — no deps)
+    → @getengram/db (builds after shared)
+    → @getengram/mcp-server (builds last — depends on both)
 ```
 
 ---

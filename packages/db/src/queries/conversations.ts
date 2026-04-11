@@ -75,6 +75,13 @@ export function updateConversationMessageCount(
     .run();
 }
 
+export function getConversationCount(db: D1Database, organizationId: string) {
+  return db
+    .prepare("SELECT COUNT(*) as count FROM conversations WHERE organization_id = ?")
+    .bind(organizationId)
+    .first<{ count: number }>();
+}
+
 export function deleteConversationById(db: D1Database, id: string, organizationId: string) {
   return db.batch([
     db.prepare("DELETE FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),

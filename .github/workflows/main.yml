@@ -1,0 +1,82 @@
+name: Main
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: main
+  cancel-in-progress: false
+
+jobs:
+  # Fast gate — same checks as PR, runs first.
+  check:
+    name: Lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+  # Worker deploy dry-run — catches wrangler config errors, missing bindings,
+  # bundle size limits, and compatibility issues that only surface at deploy
+  # time. Runs after the main gate.
+  worker-deploy-check:
+    name: Worker deploy dry-run
+    runs-on: ubuntu-latest
+    needs: check
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build worker (wrangler deploy --dry-run)
+        working-directory: apps/mcp-server
+        run: pnpm build
+
+      - name: Upload worker bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-server-bundle
+          path: apps/mcp-server/dist
+          retention-days: 7

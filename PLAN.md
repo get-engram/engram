@@ -28,7 +28,7 @@ engram/
 ├── turbo.json
 ├── tsconfig.base.json
 ├── packages/
-│   ├── shared/                        # @engram/shared
+│   ├── shared/                        # @getengram/shared
 │   │   └── src/
 │   │       ├── types/                 # Conversation, Message, Org, ApiKey types
 │   │       ├── schemas/               # Zod schemas for MCP tool inputs
@@ -37,7 +37,7 @@ engram/
 │   │       │   ├── chunk.ts           # Sliding-window conversation chunking
 │   │       │   └── auth.ts            # SHA-256 key hashing
 │   │       └── constants.ts
-│   └── db/                            # @engram/db
+│   └── db/                            # @getengram/db
 │       ├── migrations/
 │       │   ├── 0001_initial_schema.sql
 │       │   └── 0002_add_indexes.sql

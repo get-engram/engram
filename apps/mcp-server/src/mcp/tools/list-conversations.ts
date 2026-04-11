@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { listConversations as dbListConversations } from "@engram/db";
+import { listConversations as dbListConversations } from "@getengram/db";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerListConversations(

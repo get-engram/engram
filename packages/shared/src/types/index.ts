@@ -1,6 +1,9 @@
 export interface Organization {
   id: string;
   name: string;
+  tier: "free" | "pro" | "team" | "enterprise";
+  stripe_customer_id: string | null;
+  stripe_subscription_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -52,6 +55,46 @@ export interface ConversationChunk {
   start_sequence: number;
   end_sequence: number;
   vectorize_id: string;
+  created_at: string;
+}
+
+export interface Usage {
+  id: string;
+  organization_id: string;
+  period: string;
+  messages_stored: number;
+  searches_run: number;
+  updated_at: string;
+}
+
+export interface Seat {
+  id: string;
+  organization_id: string;
+  email: string;
+  role: "owner" | "admin" | "member";
+  invited_at: string;
+  accepted_at: string | null;
+}
+
+export interface WebhookEndpoint {
+  id: string;
+  organization_id: string;
+  url: string;
+  events: string[];
+  secret: string;
+  active: boolean;
+  created_at: string;
+}
+
+export interface WebhookDelivery {
+  id: string;
+  webhook_endpoint_id: string;
+  event: string;
+  payload: string;
+  status_code: number | null;
+  attempts: number;
+  last_attempted_at: string | null;
+  delivered_at: string | null;
   created_at: string;
 }
 

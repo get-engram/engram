@@ -120,4 +120,4 @@ pnpm build
 pnpm typecheck
 ```
 
-The build order matters: `@engram/shared` must build before `@engram/db`, which must build before `@engram/mcp-server`. Turborepo handles this automatically with `pnpm build`.
+The build order matters: `@getengram/shared` must build before `@getengram/db`, which must build before `@getengram/mcp-server`. Turborepo handles this automatically with `pnpm build`.

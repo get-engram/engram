@@ -33,7 +33,7 @@ export function updateApiKeyLastUsed(db: D1Database, id: string) {
 export function getApiKeysByOrg(db: D1Database, organizationId: string) {
   return db
     .prepare(
-      "SELECT id, key_prefix, name, expires_at, last_used_at, created_at FROM api_keys WHERE organization_id = ? AND revoked_at IS NULL ORDER BY created_at"
+      "SELECT id, key_prefix AS prefix, name, expires_at, last_used_at, created_at FROM api_keys WHERE organization_id = ? AND revoked_at IS NULL ORDER BY created_at"
     )
     .bind(organizationId)
     .all();

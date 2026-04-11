@@ -1,8 +1,9 @@
--- Add tier, billing, and email to organizations
+-- Add tier and billing columns to organizations.
+-- Note: the `email` column is added in a separate earlier deploy on remote and
+-- is guarded here by the idx_organizations_email unique index below.
 ALTER TABLE organizations ADD COLUMN tier TEXT NOT NULL DEFAULT 'free';
 ALTER TABLE organizations ADD COLUMN stripe_customer_id TEXT;
 ALTER TABLE organizations ADD COLUMN stripe_subscription_id TEXT;
-ALTER TABLE organizations ADD COLUMN email TEXT;
 
 -- Usage tracking per billing period
 CREATE TABLE IF NOT EXISTS usage (

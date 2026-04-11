@@ -37,15 +37,19 @@ app.all("/mcp", authMiddleware, async (c) => {
   return transport.handleRequest(c.req.raw);
 });
 
-// Public signup endpoint (CORS for the marketing site)
+// CORS for browser-originated calls from the marketing site + dashboard.
+// /signup and /api/* both need this; the Stripe webhook does not (it's
+// called by Stripe's servers, not a browser).
+const BROWSER_ORIGINS = [
+  "https://getengram.app",
+  "https://www.getengram.app",
+  "http://localhost:3000",
+];
+
 app.use(
   "/signup",
   cors({
-    origin: [
-      "https://getengram.app",
-      "https://www.getengram.app",
-      "http://localhost:3000",
-    ],
+    origin: BROWSER_ORIGINS,
     allowMethods: ["POST", "OPTIONS"],
     allowHeaders: ["Content-Type"],
   }),
@@ -56,7 +60,17 @@ app.route("/signup", signup);
 // Mounted BEFORE the /api/* auth middleware so it isn't gated.
 app.route("/billing/webhook", billingWebhook);
 
-// REST API routes (all require auth)
+// REST API routes (all require auth). CORS runs before the auth middleware
+// so preflight OPTIONS requests succeed without a bearer token.
+app.use(
+  "/api/*",
+  cors({
+    origin: BROWSER_ORIGINS,
+    allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization"],
+    maxAge: 86400,
+  }),
+);
 app.use("/api/*", authMiddleware);
 app.route("/api/keys", keys);
 app.route("/api/seats", seats);

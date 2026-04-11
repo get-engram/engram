@@ -27,9 +27,9 @@ Initial MVP release.
 - **Tenant Isolation** — Organization-scoped data at every layer (D1, Vectorize, application)
 
 - **Monorepo** — pnpm workspaces + Turborepo with 3 packages:
-  - `@engram/shared` — Types, Zod schemas, utilities
-  - `@engram/db` — D1 migrations and typed query helpers
-  - `@engram/mcp-server` — Deployable Cloudflare Worker
+  - `@getengram/shared` — Types, Zod schemas, utilities
+  - `@getengram/db` — D1 migrations and typed query helpers
+  - `@getengram/mcp-server` — Deployable Cloudflare Worker
 
 - **Test Suite** — ~95 tests covering schemas, chunking, ID generation, auth, DB queries, conversation service, and HTTP endpoints
 

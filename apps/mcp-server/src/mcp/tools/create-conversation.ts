@@ -1,6 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { createConversation } from "../../services/conversation.js";
+import { getConversationCount } from "@getengram/db";
+import { checkConversationLimit } from "../../services/tier.js";
+import { fireWebhooks } from "../../services/webhooks.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerCreateConversation(
@@ -18,6 +21,29 @@ export function registerCreateConversation(
       metadata: z.record(z.unknown()).optional().describe("Arbitrary metadata"),
     },
     async (params) => {
+      // Check conversation limit
+      const countResult = await getConversationCount(env.DB, auth.organizationId);
+      const currentCount = countResult?.count ?? 0;
+      const tierCheck = checkConversationLimit(auth.tier, currentCount);
+
+      if (!tierCheck.allowed) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                error: tierCheck.error,
+                message: `Conversation limit exceeded. Your ${tierCheck.tier} plan allows ${tierCheck.limit} conversations. Upgrade at https://getengram.app/pricing`,
+                limit: tierCheck.limit,
+                used: tierCheck.used,
+                tier: tierCheck.tier,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+
       const id = await createConversation(
         env.DB,
         auth.organizationId,
@@ -26,6 +52,12 @@ export function registerCreateConversation(
         params.tags,
         params.metadata as Record<string, unknown>
       );
+
+      // Fire webhooks (non-blocking)
+      fireWebhooks(env.DB, auth.organizationId, "conversation.created", {
+        conversation_id: id,
+        title: params.title ?? null,
+      }).catch(() => {});
 
       return {
         content: [

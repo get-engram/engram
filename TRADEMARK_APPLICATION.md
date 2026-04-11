@@ -28,7 +28,7 @@
 > Downloadable computer software for storing, managing, searching, and retrieving conversation data and message transcripts for artificial intelligence agents; downloadable command-line interface (CLI) software for managing cloud-based memory storage services for AI applications; downloadable software development kits (SDKs) for integrating conversation memory and storage services into software applications.
 
 **Specimens to submit (when ready):**
-- Screenshot of CLI tool showing "engram" branding (`pnpm add -g @engram/cli`)
+- Screenshot of CLI tool showing "engram" branding (`pnpm add -g @getengram/cli`)
 - Screenshot of npm/package registry listing
 - App store listing or download page
 

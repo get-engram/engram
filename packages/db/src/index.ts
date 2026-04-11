@@ -3,3 +3,6 @@ export * from "./queries/api-keys.js";
 export * from "./queries/conversations.js";
 export * from "./queries/messages.js";
 export * from "./queries/chunks.js";
+export * from "./queries/usage.js";
+export * from "./queries/seats.js";
+export * from "./queries/webhooks.js";

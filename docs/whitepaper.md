@@ -1,237 +1,188 @@
-# The Memory Problem: Why AI Agents Forget and How to Fix It
+# Agent-Authored Project Tracking
 
-**A technical white paper from Engram**
+**An Engram whitepaper on seven use cases for persistent agent memory**
 
----
-
-## Abstract
-
-Most agent runtimes do not provide portable, transcript-level persistent memory by default. Every conversation starts from zero — no memory of prior sessions, no recall of decisions made, no awareness of context established yesterday. This paper examines why persistent memory is the missing infrastructure layer for AI, why existing approaches (memory extraction, RAG, fine-tuning) fail to preserve the richness of conversational knowledge, and how verbatim transcript storage with semantic search offers a fundamentally better architecture. We present Engram, an open-source memory service built on this principle, and argue that the future of AI lies not in larger context windows but in smarter memory.
+*Published April 11, 2026 · Get Engram LLC*
 
 ---
 
-## 1. The Problem: No Portable, Persistent Memory
+## Your agents already have the conversations
 
-Every AI conversation begins with amnesia.
+Somewhere in your terminal today, an agent debugged an incident. An hour of back-and-forth — error messages, hypotheses, a failed fix, the real root cause, and the commit that finally landed. When the session ended, that conversation was discarded. The pull request remains. The Slack thread remains. The issue on GitHub remains. But the thousand words of reasoning that produced them? Gone.
 
-You spend an hour with an AI agent debugging a complex authentication flow. You trace the issue through three microservices, identify a race condition in the token refresh logic, and land on a fix. The agent understands your codebase, your naming conventions, your architectural preferences. It knows that you chose Postgres over MongoDB last month because of JSONB GIN index performance, and it knows not to suggest mocking the database in tests because of the incident that burned you in Q4.
+Engram's thesis is that this is backwards. The *conversation* is the richest artifact an AI interaction produces. Pull requests and issues are downstream — they're the output, not the input. The input is the working session: the chat where the problem is understood, the options are weighed, and the decision is made. If that working session were stored verbatim and made searchable, the rest of the tracking stack — issues, changelogs, standups, ADRs — becomes something an agent can write for you, from a primary source, on demand.
 
-Then you close the terminal.
+We call this pattern **agent-authored project tracking**, and it's the headline use case in this paper. It's one of seven patterns that came up naturally during a single dogfooding session on 2026-04-11, where the author was working inside Claude Code with Engram mounted as an MCP server. Every example below is a real moment from that session, not a hypothetical.
 
-The next morning, you open a new session. The agent knows nothing. Not the bug you fixed. Not the decision you made. Not the preferences you expressed across dozens of prior conversations. You are starting from zero, again, with an agent that has no idea who you are.
+The seven patterns this paper covers:
 
-Some products have begun addressing this — session memory, profile memory, app-level persistence. But these are proprietary, siloed within individual products, and rarely preserve the full transcript. Most agent runtimes do not provide portable, transcript-level persistent memory by default. Despite models with 200K+ token context windows, despite tool use and function calling, despite agent frameworks that can browse the web and execute code — the fundamental problem remains: **most AI agents do not remember across sessions in a way that is portable and complete.**
+1. **Agent-authored project tracking** — chat in, structured project state out.
+2. **Cross-session decision memory** — recover the *why* behind a choice made weeks ago.
+3. **Incident post-mortems from chat** — the real root cause is in the conversation, not the commit message.
+4. **Agent onboarding** — a fresh session picks up the full project context in one search.
+5. **Pricing and positioning continuity** — the numbers are easy to store; the reasoning isn't.
+6. **Customer support history** — past resolutions as a semantically searchable corpus.
+7. **Sales call and team-chat archive** — treat every long-form conversation as a future query target.
 
-The cost of this amnesia is measured in wasted time, repeated explanations, lost decisions, and a persistent inability for AI to compound its usefulness over time. A human colleague who forgot every conversation overnight would be considered impaired. We accept this behavior from AI agents only because we haven't built the infrastructure to fix it.
-
----
-
-## 2. Current Approaches and Their Limitations
-
-The industry has recognized the memory problem. Several approaches have emerged, each with significant trade-offs.
-
-### Retrieval-Augmented Generation (RAG)
-
-RAG systems retrieve relevant documents and inject them into the prompt. This works well for static knowledge — documentation, manuals, research papers. But conversations are not documents. A conversation has temporal structure, speaker roles, implicit context, and reasoning that unfolds across multiple turns. Naive document-style RAG over transcripts loses this conversational structure. Chunking a conversation the same way you chunk a PDF throws away the speaker turns, the back-and-forth reasoning, and the implicit context that makes it meaningful.
-
-### Memory Extraction
-
-Products like Mem0, Zep, and Supermemory take a different approach: they extract structured "memories" from conversations. A conversation about database preferences becomes a fact: _"user prefers Postgres over MongoDB."_ A debugging session becomes: _"auth service has a race condition in token refresh."_
-
-Fact extraction is useful for compact personalization — quick lookups of user preferences, entity relationships, and simple state. But it is lossy for decision provenance and reasoning history. Consider this exchange:
-
-> **User:** "I tried switching to Postgres 16 but the JSONB GIN indexes were 30% slower than our MongoDB queries for the nested document lookups. We might revisit when Postgres 17 ships with the new JSONB path optimizations. For now, keep MongoDB for the catalog service but use Postgres for everything else."
-
-An extraction system produces: _"User prefers MongoDB for catalog service, Postgres for other services."_
-
-What's lost? The specific version tested (Postgres 16). The benchmark data (30% slower). The specific use case where it failed (nested document lookups with GIN indexes). The forward-looking plan (revisit with Postgres 17). The nuance that this isn't a preference — it's a performance-driven constraint with an expiration date.
-
-When an agent retrieves the extracted memory six months later, it knows _what_ was decided but not _why_. It can't evaluate whether the reasoning still holds. It can't tell the user "Postgres 17 shipped last month with those JSONB optimizations — should we revisit the catalog service?" because that context was destroyed at extraction time.
-
-### Fine-Tuning
-
-Fine-tuning embeds knowledge directly into model weights. But it's expensive, slow (hours to days), doesn't work for per-user or per-session memory, and produces a model that's difficult to update incrementally. You can't fine-tune a model every time a user makes a decision.
-
-### Larger Context Windows
-
-Context windows have grown from 4K to 200K+ tokens in two years. But larger windows are not memory — they're temporary working space. You can fit more into a single session, but it all vanishes when the session ends. And even 200K tokens is insufficient for an agent that should recall information from hundreds of prior conversations.
+The unifying shape is the same in all seven: a long-form conversation happens, gets dropped into Engram verbatim, and is later queried by a different agent (or the same agent in a different session) to produce something structured. Traditional databases, issue trackers, and CRMs are the consumers of that structure. Engram sits in between.
 
 ---
 
-## 3. The Verbatim Approach: Conversations as Knowledge
+## The headline pattern: agent-authored project tracking
 
-Engram is built on a single insight: **the conversation itself is the richest form of knowledge an AI interaction produces.**
+Project management has always been about turning conversations into structure. Two engineers discuss a bug at lunch; one of them opens a Jira ticket. A designer and a PM argue about a feature on Slack; someone writes the spec. A support call reveals a regression; a ticket gets filed. In every case, a human is the sync layer — listening to the unstructured conversation and transcribing the relevant parts into a structured tracker.
 
-A conversation contains not just decisions but reasoning. Not just answers but the questions that prompted them. Not just solutions but the failed attempts that preceded them. This context — the full texture of an interaction — is exactly what makes memory useful. An agent that remembers the conversation can re-evaluate decisions, understand constraints, and build on prior work in ways that an agent holding extracted facts cannot.
+Humans are a bad sync layer. We forget the details. We flatten the nuance. We skip the edge cases because they're inconvenient. Worse, we do this work in proportion to our patience, which is finite. Most of what's said in a working conversation never becomes structured state, because nobody had the time to write it up.
 
-### How Verbatim Storage Works
-
-When messages are sent to Engram, they are stored exactly as written. No summarization, no extraction, no transformation. Every word, every tool call, every response is preserved in its original form.
-
-But storing full conversations is only half the problem. The other half is making them searchable. You can't scan through thousands of conversations linearly — you need a way to find the relevant fragments quickly, by meaning rather than by keyword.
-
-### Chunking: Searchable Without Losing Context
-
-Engram solves retrieval through a sliding window chunking algorithm. Conversations are divided into overlapping groups of messages — windows of 5 messages with a stride of 3. This creates chunks that overlap by 2 messages, ensuring no conversational context is lost at chunk boundaries.
+Agent-authored project tracking flips this. The agent has the conversation with you, and a second agent — in a different session, maybe hours or days later — queries Engram for the relevant fragments and emits the structure. Issues. Changelogs. Release notes. Standups. ADRs. Post-mortems. The writer and the reader don't need to be the same process, or even the same model. They just need to share a memory.
 
 ```
-Messages:  [1] [2] [3] [4] [5] [6] [7] [8] [9] [10]
-
-Chunk 1:   [1] [2] [3] [4] [5]
-                        ─── overlap ───
-Chunk 2:            [3] [4] [5] [6] [7]
-                                 ─── overlap ───
-Chunk 3:                     [6] [7] [8] [9] [10]
+  [ long-form conversation ]
+             │
+             ▼
+     ┌───────────────┐
+     │    Engram     │   verbatim messages
+     │  (MCP server) │   + chunked embeddings
+     └───────────────┘
+             │
+    search("why X?")
+             │
+             ▼
+  [ different agent, later session ]
+             │
+             ▼
+  ┌──────────────────────────────┐
+  │  GitHub issue  │  changelog  │
+  │  standup notes │  ADR / RFC  │
+  │  release notes │  post-mortem│
+  └──────────────────────────────┘
 ```
 
-Each chunk preserves enough conversational context to be meaningful on its own — a question and its answer, a tool call and the discussion around its results, a decision and the reasoning that led to it.
+The example this whitepaper was written from is itself an instance of the pattern. During the 2026-04-11 session, the author discussed seven use cases informally in chat. Those observations were stored to Engram. Later in the same day, a different Claude Code session queried Engram for `"agent memory use cases"`, pulled the relevant chunks back, and opened GitHub issue #11 on `get-engram/engram` containing the structured acceptance criteria that became the outline for this document. The issue was authored by an agent, from a primary source, with zero re-explanation.
 
-**An implementation caveat:** the bge-base-en-v1.5 model on Workers AI has a maximum input of 512 tokens. A 5-message sliding window can exceed that in real conversations with long messages, which means chunks may be truncated at the embedding stage. This doesn't break the system — the stored messages remain verbatim regardless — but it means the search embedding may not capture the full text of very long chunks. Explicit preprocessing or adaptive window sizing can mitigate this, and is an area of active improvement.
-
-### Embeddings: Meaning, Not Keywords
-
-Each chunk is converted into a 768-dimensional vector using the bge-base-en-v1.5 embedding model. These vectors capture semantic meaning: a search for "database performance issues" will find a conversation about "JSONB GIN indexes being 30% slower" even though no keywords overlap.
-
-When an agent searches Engram, the query is embedded with the same model and compared against all stored chunks using cosine similarity. The most relevant chunks are returned — along with the original, verbatim messages. The agent gets back the actual conversation, not a summary of it.
+This is already useful for a solo developer. It's transformative for a team. Every working conversation across the team becomes a candidate source for every structured artifact the team produces. "Write up the changelog for this week" stops being an hour of digging through Slack and commit messages; it becomes `search("what landed this week")` followed by a structured emit. The agent can cite its sources because the sources are stored verbatim.
 
 ---
 
-## 4. Architecture for the Edge
+## Pattern 2: Cross-session decision memory
 
-Engram runs entirely on Cloudflare's edge network. This is an architectural choice with significant implications for performance, cost, and operational complexity.
+Eighteen days before this whitepaper was written, the author decided that Engram, Inc. should be structured as a Delaware LLC rather than a C-Corp. That decision had consequences — for how stock options would work, for fundraising posture, for tax treatment, for the paperwork at incorporation time. It was made in a chat, debated back and forth for about fifteen minutes, and then the terminal closed.
 
-### Why Edge Computing
+Eighteen days later, another agent session was working on the billing architecture and needed to answer a question about ownership structure. A search on Engram for `"LLC vs C-Corp"` returned the original conversation with full fidelity: the options considered, the tax implications, the reasoning that tipped the decision one way. The new session didn't have to re-derive the answer. It inherited the prior agent's work.
 
-Traditional memory services require provisioning servers, managing databases, configuring connection pools, and handling scaling. Engram requires none of this. The entire system — compute, database, vector search, and embedding generation — runs on Cloudflare's infrastructure with zero servers to manage.
-
-**Cloudflare Workers** provide the compute layer. Workers are V8 isolates — the same JavaScript engine that runs in Chrome, but without a browser. They avoid traditional container-style cold starts, which can materially reduce startup latency compared to the 100ms–5s boot times typical of containerized deployments. There are no idle costs and no connection pools to manage.
-
-**D1** provides structured storage. D1 is SQLite running as a service on Cloudflare's network — the same embedded database that runs on your phone, but managed with replication support. With D1 read replication enabled via the Sessions API, read queries can be served from nearby replicas. Writes go to a single primary for consistency.
-
-**Vectorize** provides semantic search. It stores the embedding vectors and performs approximate nearest neighbor (ANN) search, filtered by tenant metadata. Cloudflare Vectorize's free tier includes 5 million stored vector dimensions. With bge-base-en-v1.5 producing 768-dimensional embeddings, this accommodates roughly 6,500 vectors — sufficient for small-scale prototyping but not large production memory corpora. Paid plans increase this significantly.
-
-**Workers AI** generates embeddings. The bge-base-en-v1.5 model runs at the edge, co-located with the Worker that calls it. There is no external API call — it's an internal RPC to a co-located inference node. Workers AI includes a free allocation; usage beyond that is billed per request.
-
-### The Binding Model
-
-The critical architectural detail is how these services communicate. Workers don't make HTTP requests to D1 or Vectorize — they use **bindings**, which are internal RPC calls routed within Cloudflare's network. There's no DNS lookup, no TLS handshake, no HTTP parsing. This significantly reduces per-call overhead compared to traditional API-based architectures.
-
-In our testing, the full write path — authenticate, store messages, chunk, embed, index — completed in 200–500ms. The search path — authenticate, embed query, vector search, fetch messages — completed in 50–150ms. These numbers will vary by region, payload size, and Cloudflare infrastructure load, but they illustrate the performance profile achievable with zero self-managed infrastructure.
-
-### Cost
-
-At small scale, Engram can run entirely within Cloudflare's free tiers. Workers, D1, Vectorize, and Workers AI all offer free allocations that are sufficient for individual developers and small teams getting started. Beyond those free tiers, Cloudflare's usage-based pricing applies — but the serverless model means you pay only for what you use, with no baseline infrastructure cost.
+This is the second pattern: **cross-session decision memory**. Without it, every decision lives in one of three places — a Markdown file someone remembered to write, a human brain, or nowhere. With it, decisions are queryable by meaning, and the *reasoning* is recoverable, not just the conclusion. That matters because in six months, when the context has changed and someone asks "should we revisit this?", the agent can evaluate whether the original reasoning still holds — which is a completely different question from "what did we decide?"
 
 ---
 
-## 5. The Protocol Layer: MCP as Universal Memory Interface
+## Pattern 3: Incident post-mortems from chat
 
-Engram is built on the Model Context Protocol (MCP), an open standard for communication between AI agents and tools. This choice has consequences that extend beyond technical convenience.
+Most incidents leave behind two artifacts: a commit that fixes the bug, and a commit message that is uselessly terse. Neither of those is a post-mortem. The post-mortem is in the conversation that preceded the commit — the one where the symptoms were described, the suspects were eliminated, and the real cause was finally understood.
 
-### Why MCP Over REST
+A concrete example from the same session: the Engram docs site, built on Nextra, was failing to prerender because Nextra's Zod schema rejected an empty string for `docsRepositoryBase`. Debugging took half an hour. The commit message read `fix: docs build`. Nobody reading that commit would know what happened. But the conversation — stored in Engram — contained the symptom, the Nextra version, the Zod error, the reproduction, and the minimal fix. A post-mortem agent can query `"docs prerender failure"` and get the full story, including the false leads.
 
-Most memory services expose REST APIs. This means every client needs custom integration code — HTTP client setup, authentication handling, request/response serialization, error handling, and a tool wrapper to expose the API as something an agent can use. Each integration is bespoke.
-
-MCP inverts this. An MCP server declares its tools — their names, parameters, and descriptions — and clients that support the relevant MCP transport can discover and use them with minimal configuration. Adding Engram to Claude Code, Cursor, Windsurf, or Codex requires a single configuration block: a URL and an API key. No adapter code. No SDK installation. No custom integration.
-
-This is the difference between a memory service that's technically available and one that's practically used. The lower the integration barrier, the more likely developers are to actually give their agents memory.
-
-### Six Tools Is All You Need
-
-Engram exposes exactly six MCP tools: `create_conversation`, `append_messages`, `search`, `get_conversation`, `list_conversations`, and `delete_conversation`. This is deliberately minimal.
-
-The temptation in building a memory service is to add complexity — entity extraction, relationship graphs, memory consolidation, importance scoring, forgetting curves. Each addition makes the system harder to understand, harder to debug, and harder to trust. Engram's position is that the hard work should be done by the agent (deciding what to store and when to search), not by the memory layer (transforming what was stored).
-
-A simple memory layer that stores exactly what you give it and returns exactly what matches is easier to reason about, easier to debug, and produces more predictable results than a complex system that transforms your data in opaque ways.
-
-### Auto-Memory: Agents That Remember Without Being Asked
-
-The most powerful pattern enabled by MCP integration is **auto-memory** — agents that store and recall context automatically, without explicit user instructions.
-
-The setup is simple. A project configuration file (like `CLAUDE.md` for Claude Code or `.cursorrules` for Cursor) instructs the agent:
-
-1. At the start of every session, search Engram for context relevant to the user's first message
-2. During the session, store important decisions, investigations, and context
-3. Use descriptive titles and tags so future searches find the right conversations
-
-From the user's perspective, the agent simply remembers. It recalls Monday's architecture decision during Thursday's implementation. It knows the user's coding preferences without being told again. It picks up debugging where the last session left off.
+The general shape: **the real root cause is in the conversation, not the commit.** Git records what changed. Chat records why. Engram is what turns the why into a primary source that future agents can cite.
 
 ---
 
-## 6. Security and Isolation
+## Pattern 4: Onboarding a fresh agent session
 
-A memory service that stores verbatim conversations must take security seriously. Conversations contain sensitive information — architecture details, API configurations, business logic, customer data.
+A fresh Claude Code session starts every morning. It has a CLAUDE.md, it has the repository, and it has whatever the user types into the first message. What it does not have is the context of yesterday — the bug that was half-fixed, the preference the user expressed about test coverage, the architectural direction that was being considered, the conversation where the user ruled out option B and the reasoning behind that.
 
-### Multi-Tenant Isolation
+With Engram configured as an auto-memory MCP server (the pattern documented in `CLAUDE.md` for Claude Code), the agent does one `search` at the start of every session using the user's first message as the query. The top five results come back — verbatim chunks of the most relevant conversations from any prior session — and the agent enters the working session already oriented. No re-explaining. No re-doing investigation that was already done. No rediscovering the same dead ends.
 
-Engram is multi-tenant by design. Multiple organizations share the same infrastructure, but data is isolated at every layer. The `organization_id` is derived from the API key during authentication — it cannot be specified or overridden by the client. Every database query includes an organization filter. Every vector search is scoped by organization metadata. The organization ID is denormalized onto every record (messages, chunks) so that no JOIN can accidentally leak data across tenants.
-
-### API Key Security
-
-API keys are never stored. When a key is created, its SHA-256 hash is stored in the database and the raw key is shown to the user once. Authentication works by hashing the provided key and comparing it to stored hashes. Even with full database access, an attacker cannot recover usable API keys. This is the same approach used by Stripe, GitHub, and most modern API providers.
-
-### Self-Hosting
-
-For organizations that cannot send conversation data to a third party, Engram is fully self-hostable on Cloudflare. The deployment requires a single `wrangler deploy` command and uses only Cloudflare services — no external dependencies, no data leaving the Cloudflare network.
+This is the pattern that makes persistent memory feel like magic to the user: the agent just remembers. It recalls Monday's architecture decision during Thursday's implementation. It knows the user's coding preferences without being told again. It picks up debugging where the last session left off — and because the memory is stored as a conversation and retrieved as a conversation, the agent understands not just the fact but the reasoning behind it.
 
 ---
 
-## 7. The Future of AI Memory
+## Pattern 5: Pricing and positioning continuity
 
-Memory is not a feature of AI products. It is an infrastructure layer — as fundamental as compute, storage, and networking. The trajectory of AI development makes this increasingly clear.
+Spreadsheets store pricing numbers. Engram stores the *reasoning* behind those numbers — and that's the part that actually has to survive across sessions and across team members.
 
-### Memory That Compounds
+Example: Engram's Pro tier is $39/month. The obvious price, in the age of ChatGPT Plus and Claude Pro, would have been $20. Why $39? The answer is in a conversation, not a doc. It involves unit economics on Cloudflare Workers AI invocations, pricing anchoring relative to Mem0 and Zep, a revenue floor target for getting to ramen-profitable quickly, and an opinion about what developer tools are worth when they replace 15 minutes of engineer time per session. An agent working on pricing six months from now can recover all of that from a single Engram search. A spreadsheet would only recover the $39.
 
-Today, each AI session is independent. The value of an AI agent is roughly constant — it's as helpful in session 100 as it was in session 1. With persistent memory, value compounds. Session 100 benefits from the context of the 99 sessions that preceded it. The agent understands not just the codebase (which it can read) but the history of decisions, the reasoning behind the architecture, the user's preferences and constraints, the bugs that were investigated and the solutions that were tried.
-
-This compounding effect transforms AI from a tool you use to a collaborator that grows with you.
-
-### Cross-Agent Memory
-
-Most developers use multiple AI tools — a CLI agent for coding, a desktop app for research, an IDE agent for code review. Today, these are isolated islands. Knowledge gained in one tool is invisible to the others.
-
-With a shared memory layer, all agents contribute to and draw from the same organizational knowledge. A bug investigated in Claude Code is recalled by Cursor. An architecture decision discussed in Claude Desktop informs Codex. The memory doesn't belong to any single tool — it belongs to the organization.
-
-### Cross-Tool, Cross-Device Memory
-
-Memory should follow you, not your tool. The same Engram organization can be connected to every AI tool you use — CLI, desktop, IDE, mobile. A preference expressed to your phone assistant is recalled by your coding agent. A decision made in a desktop conversation informs a CI/CD agent running in a pipeline.
-
-This is the "personal AI memory" that the industry has been promising — not a feature of one product, but an open infrastructure layer that any MCP-compatible agent can use.
-
-### From Personal to Organizational
-
-Individual memory is the starting point, but organizational memory is the destination. When every AI interaction across a team flows into a shared memory layer, the organization develops a collective intelligence that persists across employee turnover, project transitions, and tool migrations.
-
-A new engineer's AI agent can search the organization's memory for "why did we choose this architecture?" and find the actual conversation — with all the reasoning, constraints, and alternatives discussed — from six months ago. The knowledge isn't locked in someone's head or buried in a Confluence page that's already outdated. It's in the conversations, verbatim, searchable by meaning.
-
-### What Becomes Possible
-
-When agents truly remember, entirely new capabilities emerge:
-
-**Onboarding agents** that know every architectural decision, every bug investigation, every coding convention discussion from the team's history. A new developer asks "how does the auth flow work?" and the agent answers not from documentation but from the actual conversations where the auth flow was designed, debugged, and refactored.
-
-**Support agents** that know every customer interaction verbatim. When a customer calls back about an issue from three months ago, the agent has the full context — not a summary that says "customer had billing issue" but the exact conversation including tool call results, specific error messages, and the resolution that was applied.
-
-**Research agents** that build on their own prior investigations. Instead of starting each research task from scratch, the agent searches its memory for related prior work and extends it. Research becomes cumulative rather than repetitive.
-
-**Personal assistants** that understand your decision-making patterns, your communication preferences, and the full context of your work — not because they were explicitly told, but because they remember every conversation where these patterns were demonstrated.
+The same pattern applies to positioning language. Why do we say "verbatim" and not "raw"? Why is it "memory infrastructure" and not "memory service"? These are decisions that are easy to make, hard to remember, and catastrophic to litigate every time someone writes a tweet. Engram lets the positioning reasoning live next to the positioning output, with one query away.
 
 ---
 
-## 8. Conclusion
+## Pattern 6: Customer support history
 
-The AI industry has spent enormous resources on making models smarter — more parameters, longer context windows, better reasoning. These advances matter. But a brilliant agent that forgets everything between sessions is fundamentally limited in a way that no amount of model improvement can fix.
+When Engram has real customers, every support interaction becomes a conversation stored in Engram. A support agent resolving a new ticket can semantically search past resolutions across the entire history of the product — not just keyword matches on error strings, but matches on the shape of the problem.
 
-Memory is the missing layer. Not memory as a feature bolted onto individual products, but memory as infrastructure — open, standardized, self-hostable, and accessible to any agent through a common protocol.
+Consider a customer who writes in: "My search results are slow and I'm seeing 504s." The support agent queries Engram for `"search latency 504"` and gets back three prior resolutions: one where the root cause was a cold Vectorize index, one where it was a rate limit, and one where it was a client-side timeout misconfigured at 2 seconds. The agent now has three candidate hypotheses, each with the full prior diagnostic conversation, each with the fix that worked. It starts the new investigation with real prior art.
 
-Engram's thesis is simple: **the conversation is the knowledge base.** Don't extract from it. Don't summarize it. Don't compress it. Store it verbatim, chunk it for searchability, embed it for semantic retrieval, and let the agent access the full richness of what was actually said.
-
-The technology to build this exists today. MCP provides the protocol. Edge platforms like Cloudflare provide the infrastructure. Embedding models are accessible and increasingly affordable. Vector databases are mature. What's been missing is the conviction that memory deserves to be its own layer — not a feature of ChatGPT or Claude or Cursor, but a service that sits beneath all of them, accumulating knowledge, compounding value, and making every AI interaction better than the last.
-
-The agents of the future will remember. The question is whether that memory will be proprietary and siloed inside each product, or open and portable across every tool you use. Engram exists to make sure it's the latter.
+Compare this to the status quo of customer support: ticket histories in Zendesk, rendered as opaque threads, keyword-only search, and a tribal-knowledge layer that lives in whoever was on call last quarter. Engram replaces that tribal layer with a semantic index.
 
 ---
 
-*Last updated: March 2026*
+## Pattern 7: Sales calls and team-chat archive
+
+The last pattern generalizes the previous six: **any long-form conversation your organization produces is a future query target.** Sales calls get transcribed and stored, so a rep can search "who asked about SOC 2 in the last 30 days" and get the full context of each conversation — not a CRM note, not a one-line summary, the actual words. Team chat from Slack or Discord gets dumped nightly into Engram, so an agent answering "what did we decide about onboarding last sprint?" can find the specific thread, with tone, dissent, and reasoning intact.
+
+This pattern is where Engram starts to compound into organizational memory. Every conversation the team has becomes a searchable artifact. Employee turnover stops erasing context. Slack retention limits stop being a data-loss event. A new engineer's agent can search the organization's memory for "why did we choose this architecture" and find the actual conversation — with the reasoning, the alternatives, and the constraints that shaped the choice — from six months ago.
+
+---
+
+## Why verbatim storage matters
+
+All seven patterns depend on a design choice that separates Engram from every other memory service: Engram stores full message text, not extracted facts.
+
+Products like Mem0, MemGPT, and many earlier research systems extract structured "memories" from conversations and discard the original text. A conversation about database performance becomes the fact `user_prefers_postgres_for_nested_docs`. Fact extraction is useful for compact personalization, but it is *lossy* for decision provenance. Consider this exchange:
+
+> "I tried switching to Postgres 16 but the JSONB GIN indexes were 30% slower than our MongoDB queries for nested document lookups. We might revisit when Postgres 17 ships with the new JSONB path optimizations. For now, keep MongoDB for the catalog service but use Postgres for everything else."
+
+An extraction system produces: *"user prefers MongoDB for catalog service, Postgres for other services."* What's lost? The version tested, the benchmark numbers, the specific failing use case, the forward-looking plan to revisit, the fact that this isn't a preference at all but a performance-driven constraint with an expiration date. When a future agent retrieves the extracted memory six months later, it knows *what* was decided but not *why*. It cannot evaluate whether the reasoning still holds. It cannot prompt the user with "Postgres 17 shipped last month — want to revisit?" because the triggering context was destroyed at extraction time.
+
+Verbatim storage is the opposite bet: store everything, let retrieval be the smart layer. Engram chunks each conversation into overlapping 5-message windows, embeds each chunk with Cloudflare's `bge-base-en-v1.5` model (768 dimensions), and indexes the vectors in Cloudflare Vectorize. When an agent searches, the query is embedded with the same model, the nearest chunks are retrieved, and the full verbatim messages are returned. No summary. No extraction. The agent gets exactly what was said.
+
+This design choice is why all seven patterns in this paper work. Agent-authored project tracking needs the reasoning, not the conclusion. Cross-session decision memory needs the debate, not the outcome. Post-mortems need the false leads, not just the fix. Onboarding needs the *feel* of how the team discusses things, not a flattened fact sheet. Verbatim storage is the only storage model that makes all of this possible with a single retrieval pipeline.
+
+---
+
+## Why MCP-native matters
+
+The other half of Engram's design is that it's MCP-native. Memory is not accessed through a REST SDK that every client has to integrate. It's accessed through the Model Context Protocol, the open standard from Anthropic that every major agent runtime already speaks.
+
+This matters for a mundane reason and a deep one. The mundane reason: adding Engram to Claude Desktop, Claude Code, Cursor, Windsurf, Zed, or Codex requires a single block of configuration — a URL and an API key. No SDK to install. No adapter code. No "here's how to hook up your vector store to your prompt template." The integration is a copy-paste from the docs.
+
+The deep reason: because Engram is MCP-native, the *same* memory is available to every agent the user runs. A bug investigated in Claude Code this morning is recalled by Cursor this afternoon. A pricing decision discussed in Claude Desktop informs a Codex agent running in CI. The memory doesn't belong to any single tool; it belongs to the organization. This is what makes agent-authored project tracking work across a team — it's not one agent writing issues for itself, it's any agent writing issues from any prior conversation, regardless of which client held the original session.
+
+Memory services that expose REST APIs are technically available but practically underused, because the cost of integrating each client is borne by the developer. MCP-native services are free to integrate and are the reason Engram sees real usage across the five major agent clients on day one.
+
+---
+
+## Getting started
+
+Engram is live at [getengram.app](https://getengram.app). The free tier gives you 1,000 messages per month and unlimited conversations — enough to evaluate all seven patterns in this paper on a real project without paying for anything. Pro is $39/month for 100,000 messages and is the tier most solo developers and small teams will land on. Team is $49 per seat per month for 500,000 messages, webhooks, and a usage dashboard.
+
+To wire Engram into your agent, add one block to your client configuration:
+
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "url": "https://mcp.getengram.app/mcp",
+      "headers": {
+        "Authorization": "Bearer engram_sk_live_..."
+      }
+    }
+  }
+}
+```
+
+That's the whole setup. The [getting started guide](https://getengram.app/docs/getting-started) walks through Claude Desktop, Cursor, Windsurf, Zed, and Claude Code line-by-line. The [API reference](https://getengram.app/docs/api-reference) documents the six MCP tools Engram exposes. The [architecture page](https://getengram.app/docs/architecture) explains how verbatim storage, chunking, and semantic search are wired together on Cloudflare Workers, D1, Vectorize, and Workers AI.
+
+If you're deciding whether Engram is the right memory layer for your agent, the fastest evaluation is to set up the auto-memory pattern documented in `CLAUDE.md` on the Engram repo, point a fresh Claude Code session at it, and work on a real project for a day. The seven patterns in this paper will surface on their own.
+
+---
+
+## Closing
+
+The agents of the future will remember. The question every builder has to answer this year is where that memory lives: locked inside a single chat product, or portable across every agent the user runs. Engram's bet is that portable wins, that verbatim beats extraction, that MCP beats bespoke SDKs, and that agent-authored project tracking is the pattern that finally closes the loop between working conversations and structured project state.
+
+If any of the seven patterns in this paper describe a gap on your own team, the memory layer to close that gap already exists. It's free to start, it takes two minutes to set up, and it gets better every time an agent uses it.
+
+---
+
+*Written by an agent, for agents. Published April 11, 2026 by Get Engram LLC, Delaware. Comments and corrections: [hello@getengram.app](mailto:hello@getengram.app).*
 
 *Visit [getengram.app](https://getengram.app) to get started.*

@@ -1,0 +1,19 @@
+Copyright (c) 2026 Get Engram LLC. All rights reserved.
+
+This repository contains proprietary source code for Engram, a commercial
+memory service operated by Get Engram LLC.
+
+Exceptions: The following subdirectories are licensed under the MIT License,
+as indicated by a LICENSE file within each directory:
+
+  - packages/sdk  (@getengram/sdk, published to npm)
+  - apps/cli      (@getengram/cli, published to npm)
+
+All other code in this repository is proprietary. No license is granted to
+copy, modify, distribute, or create derivative works of the proprietary
+portions of this repository without express written permission from
+Get Engram LLC.
+
+Use of the hosted Engram service at getengram.app is governed by the Terms
+of Service at https://getengram.app/terms and the Privacy Policy at
+https://getengram.app/privacy.

@@ -1,13 +1,26 @@
 import type { Env } from "../types.js";
-import type { SearchResult, Message } from "@getengram/shared";
+import type { SearchResult } from "@getengram/shared";
 import { generateEmbedding } from "./embedding.js";
 import { getChunksByVectorizeIds } from "@getengram/db";
-import { getMessagesBySequenceRange } from "@getengram/db";
 
 interface VectorizeMatch {
   id: string;
   score: number;
   metadata?: Record<string, unknown>;
+}
+
+// Default cap per chunk_text in the search response. Full message bodies
+// can run 1–5k tokens each when tool-call output is included; clipping to
+// ~1500 chars keeps a 10-result search response under ~3k tokens total
+// without destroying the ranking signal. Callers that need the full
+// window should call get_conversation with start_sequence / end_sequence.
+export const DEFAULT_SNIPPET_CHARS = 1500;
+export const MAX_SNIPPET_CHARS = 5000;
+const TRUNCATION_MARKER = "\n...[truncated]";
+
+function truncateSnippet(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return text.slice(0, maxChars) + TRUNCATION_MARKER;
 }
 
 export async function searchConversations(
@@ -16,8 +29,14 @@ export async function searchConversations(
   query: string,
   limit: number,
   conversationId?: string,
-  tags?: string[]
+  tags?: string[],
+  snippetChars: number = DEFAULT_SNIPPET_CHARS
 ): Promise<SearchResult[]> {
+  const cappedSnippet = Math.min(
+    Math.max(snippetChars, 0),
+    MAX_SNIPPET_CHARS
+  );
+
   const queryEmbedding = await generateEmbedding(env.AI, query);
 
   const filter: VectorizeVectorMetadataFilter = { organization_id: organizationId };
@@ -51,30 +70,19 @@ export async function searchConversations(
     vectorize_id: string;
   }>;
 
-  const results: SearchResult[] = [];
-
-  for (const chunk of chunks) {
-    // If tags filter specified, we'd need to check the conversation's tags
-    // For now, tag filtering happens at the Vectorize metadata level or post-filter
-
-    const messagesResult = await getMessagesBySequenceRange(
-      env.DB,
-      chunk.conversation_id,
-      chunk.organization_id,
-      chunk.start_sequence,
-      chunk.end_sequence
-    );
-
-    results.push({
-      chunk_id: chunk.id,
-      conversation_id: chunk.conversation_id,
-      chunk_text: chunk.chunk_text,
-      score: scoreMap.get(chunk.vectorize_id) ?? 0,
-      start_sequence: chunk.start_sequence,
-      end_sequence: chunk.end_sequence,
-      messages: messagesResult.results as unknown as Message[],
-    });
-  }
+  // Note: we intentionally do NOT hydrate full Message rows here. chunk_text
+  // already contains the same window in a model-friendly `[role]: content`
+  // format, and returning both duplicated the payload (see issue #8). If a
+  // caller needs the structured messages they can call get_conversation with
+  // start_sequence / end_sequence.
+  const results: SearchResult[] = chunks.map((chunk) => ({
+    chunk_id: chunk.id,
+    conversation_id: chunk.conversation_id,
+    chunk_text: truncateSnippet(chunk.chunk_text, cappedSnippet),
+    score: scoreMap.get(chunk.vectorize_id) ?? 0,
+    start_sequence: chunk.start_sequence,
+    end_sequence: chunk.end_sequence,
+  }));
 
   // Sort by score descending
   results.sort((a, b) => b.score - a.score);

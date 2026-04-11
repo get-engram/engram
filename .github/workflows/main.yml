@@ -70,6 +70,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build workspace packages
+        run: pnpm -F @getengram/shared -F @getengram/db build
+
       - name: Build worker (wrangler deploy --dry-run)
         working-directory: apps/mcp-server
         run: pnpm build

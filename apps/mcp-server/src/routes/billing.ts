@@ -20,11 +20,34 @@ const billing = new Hono<HonoEnv>();
 // POST /api/billing/checkout
 // Authed. Creates a Checkout Session and returns its URL. The caller is
 // expected to redirect the user to the returned URL.
+//
+// Body:
+//   plan        — "pro" (default) or "team"
+//   quantity    — only meaningful for team; defaults to 1 seat. Customers
+//                 can also edit this inside Stripe Checkout via the
+//                 adjustable_quantity toggle.
+//   success_url — override redirect on success
+//   cancel_url  — override redirect on cancel
 billing.post("/checkout", async (c) => {
   const auth = c.get("auth");
   const body = await c.req
-    .json<{ success_url?: string; cancel_url?: string; plan?: string }>()
-    .catch(() => ({}) as Record<string, string>);
+    .json<{
+      success_url?: string;
+      cancel_url?: string;
+      plan?: "pro" | "team";
+      quantity?: number;
+    }>()
+    .catch(() => ({}) as Record<string, never>);
+
+  const plan = body.plan === "team" ? "team" : "pro";
+  const priceId =
+    plan === "team" ? c.env.STRIPE_PRICE_ID_TEAM : c.env.STRIPE_PRICE_ID_PRO;
+  if (!priceId) {
+    return c.json(
+      { error: "price_not_configured", message: `No Stripe price configured for plan="${plan}"` },
+      500,
+    );
+  }
 
   const org = (await getOrganizationById(c.env.DB, auth.organizationId)) as
     | { id: string; email: string | null; stripe_customer_id: string | null }
@@ -58,15 +81,19 @@ billing.post("/checkout", async (c) => {
     `${c.env.APP_URL}/dashboard?upgrade=success&session_id={CHECKOUT_SESSION_ID}`;
   const cancelUrl = body.cancel_url || `${c.env.APP_URL}/pricing?upgrade=cancelled`;
 
+  const quantity = plan === "team" ? Math.max(1, body.quantity ?? 1) : 1;
+
   const session = await createCheckoutSession(c.env.STRIPE_SECRET_KEY, {
     customerId,
-    priceId: c.env.STRIPE_PRICE_ID_PRO,
+    priceId,
+    quantity,
+    adjustableQuantity: plan === "team",
     successUrl,
     cancelUrl,
     organizationId: org.id,
   });
 
-  return c.json({ url: session.url, session_id: session.id });
+  return c.json({ url: session.url, session_id: session.id, plan });
 });
 
 // POST /api/billing/portal
@@ -120,6 +147,7 @@ function priceToTier(
 ): "free" | "pro" | "team" | "enterprise" | null {
   if (!priceId) return null;
   if (priceId === env.STRIPE_PRICE_ID_PRO) return "pro";
+  if (priceId === env.STRIPE_PRICE_ID_TEAM) return "team";
   return null;
 }
 

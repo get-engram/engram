@@ -21,7 +21,7 @@ export const TIER_LIMITS: Record<Tier, {
 }> = {
   free: {
     messages_per_month: 1_000,
-    conversations: 5,
+    conversations: -1, // unlimited — messages/month is the only binding cap on free
     seats: 1,
     api_keys: 1,
     webhooks: false,

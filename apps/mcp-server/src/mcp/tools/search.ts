@@ -1,6 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { searchConversations } from "../../services/search.js";
+import {
+  searchConversations,
+  DEFAULT_SNIPPET_CHARS,
+  MAX_SNIPPET_CHARS,
+} from "../../services/search.js";
 import { trackSearchRun } from "../../services/tier.js";
 import type { Env, AuthContext } from "../../types.js";
 
@@ -11,7 +15,7 @@ export function registerSearch(
 ) {
   server.tool(
     "search",
-    "Semantic search across stored conversations. Returns matching conversation chunks with relevance scores and surrounding messages.",
+    "Semantic search across stored conversations. Returns the matching chunk_text snippets with relevance scores. For the full structured messages of a chunk, call get_conversation with the returned conversation_id + start_sequence / end_sequence.",
     {
       query: z.string().describe("Search query text"),
       limit: z
@@ -20,8 +24,8 @@ export function registerSearch(
         .min(1)
         .max(50)
         .optional()
-        .default(10)
-        .describe("Max results to return"),
+        .default(5)
+        .describe("Max results to return (default 5)"),
       conversation_id: z
         .string()
         .optional()
@@ -30,6 +34,16 @@ export function registerSearch(
         .array(z.string())
         .optional()
         .describe("Filter by conversation tags"),
+      snippet_chars: z
+        .number()
+        .int()
+        .min(0)
+        .max(MAX_SNIPPET_CHARS)
+        .optional()
+        .default(DEFAULT_SNIPPET_CHARS)
+        .describe(
+          `Max characters of chunk_text to return per result (default ${DEFAULT_SNIPPET_CHARS}, max ${MAX_SNIPPET_CHARS}). Longer snippets = larger responses.`
+        ),
     },
     async (params) => {
       const results = await searchConversations(
@@ -38,7 +52,8 @@ export function registerSearch(
         params.query,
         params.limit,
         params.conversation_id,
-        params.tags
+        params.tags,
+        params.snippet_chars
       );
 
       // Track usage (non-blocking)

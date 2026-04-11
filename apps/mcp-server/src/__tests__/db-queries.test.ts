@@ -16,7 +16,7 @@ import {
   insertChunks,
   getChunksByVectorizeIds,
   getVectorizeIdsByConversation,
-} from "@engram/db";
+} from "@getengram/db";
 
 let db: D1Database;
 

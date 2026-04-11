@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 500" width="500" height="500">
+  <defs>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="2.5" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- Outer circle -->
+  <circle cx="250" cy="250" r="190" fill="none" stroke="#e0e0e0" stroke-width="0.8" opacity="0.25"/>
+
+  <!-- Inner pentagon -->
+  <polygon
+    points="292.7,191.3 319.0,272.4 250,322.6 181.0,272.4 207.3,191.3"
+    fill="none" stroke="#e0e0e0" stroke-width="0.5" opacity="0.15"/>
+
+  <!-- The pentagram star -->
+  <polygon
+    points="250,60 361.7,403.7 69.3,191.3 430.7,191.3 138.3,403.7"
+    fill="none" stroke="#e0e0e0" stroke-width="1.2"
+    stroke-linejoin="miter"/>
+
+  <!-- Outer vertex nodes -->
+  <circle cx="250" cy="60" r="3" fill="#e0e0e0"/>
+  <circle cx="430.7" cy="191.3" r="3" fill="#e0e0e0"/>
+  <circle cx="361.7" cy="403.7" r="3" fill="#e0e0e0"/>
+  <circle cx="138.3" cy="403.7" r="3" fill="#e0e0e0"/>
+  <circle cx="69.3" cy="191.3" r="3" fill="#e0e0e0"/>
+
+  <!-- Inner vertex nodes -->
+  <circle cx="292.7" cy="191.3" r="1.5" fill="#e0e0e0" opacity="0.5"/>
+  <circle cx="319.0" cy="272.4" r="1.5" fill="#e0e0e0" opacity="0.5"/>
+  <circle cx="250" cy="322.6" r="1.5" fill="#e0e0e0" opacity="0.5"/>
+  <circle cx="181.0" cy="272.4" r="1.5" fill="#e0e0e0" opacity="0.5"/>
+  <circle cx="207.3" cy="191.3" r="1.5" fill="#e0e0e0" opacity="0.5"/>
+
+  <!-- Greek letters - Hygieia -->
+  <text x="250" y="40" text-anchor="middle" fill="#e0e0e0" font-family="'Georgia', serif" font-size="13" opacity="0.4">Y</text>
+  <text x="455" y="196" text-anchor="middle" fill="#e0e0e0" font-family="'Georgia', serif" font-size="13" opacity="0.4">&#x0393;</text>
+  <text x="381" y="427" text-anchor="middle" fill="#e0e0e0" font-family="'Georgia', serif" font-size="13" opacity="0.4">I</text>
+  <text x="119" y="427" text-anchor="middle" fill="#e0e0e0" font-family="'Georgia', serif" font-size="13" opacity="0.4">&#x0398;</text>
+  <text x="45" y="196" text-anchor="middle" fill="#e0e0e0" font-family="'Georgia', serif" font-size="13" opacity="0.4">A</text>
+</svg>

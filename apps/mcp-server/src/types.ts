@@ -7,4 +7,5 @@ export interface Env {
 export interface AuthContext {
   organizationId: string;
   apiKeyId: string;
+  tier: "free" | "pro" | "team" | "enterprise";
 }

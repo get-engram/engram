@@ -1,6 +1,6 @@
 import type { Context, Next } from "hono";
-import { hashApiKey } from "@engram/shared";
-import { getApiKeyByHash, updateApiKeyLastUsed } from "@engram/db";
+import { hashApiKey } from "@getengram/shared";
+import { getApiKeyByHash, updateApiKeyLastUsed, getOrganizationById } from "@getengram/db";
 import type { Env, AuthContext } from "../types.js";
 
 export async function authMiddleware(
@@ -26,9 +26,20 @@ export async function authMiddleware(
 
   const key = apiKey as { id: string; organization_id: string };
 
+  // Fetch org to get tier
+  const org = await getOrganizationById(c.env.DB, key.organization_id) as {
+    id: string;
+    tier: "free" | "pro" | "team" | "enterprise";
+  } | null;
+
+  if (!org) {
+    return c.json({ error: "Organization not found" }, 401);
+  }
+
   c.set("auth", {
     organizationId: key.organization_id,
     apiKeyId: key.id,
+    tier: org.tier ?? "free",
   });
 
   // Update last_used_at non-blocking

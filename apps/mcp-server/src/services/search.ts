@@ -1,8 +1,8 @@
 import type { Env } from "../types.js";
-import type { SearchResult, Message } from "@engram/shared";
+import type { SearchResult, Message } from "@getengram/shared";
 import { generateEmbedding } from "./embedding.js";
-import { getChunksByVectorizeIds } from "@engram/db";
-import { getMessagesBySequenceRange } from "@engram/db";
+import { getChunksByVectorizeIds } from "@getengram/db";
+import { getMessagesBySequenceRange } from "@getengram/db";
 
 interface VectorizeMatch {
   id: string;
@@ -20,7 +20,7 @@ export async function searchConversations(
 ): Promise<SearchResult[]> {
   const queryEmbedding = await generateEmbedding(env.AI, query);
 
-  const filter: Record<string, unknown> = { organization_id: organizationId };
+  const filter: VectorizeVectorMetadataFilter = { organization_id: organizationId };
   if (conversationId) {
     filter.conversation_id = conversationId;
   }
@@ -72,7 +72,7 @@ export async function searchConversations(
       score: scoreMap.get(chunk.vectorize_id) ?? 0,
       start_sequence: chunk.start_sequence,
       end_sequence: chunk.end_sequence,
-      messages: messagesResult.results as Message[],
+      messages: messagesResult.results as unknown as Message[],
     });
   }
 

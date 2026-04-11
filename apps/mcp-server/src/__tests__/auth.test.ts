@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import app from "../index.js";
-import { hashApiKey, generateApiKeyRaw, generateId } from "@engram/shared";
+import { hashApiKey, generateApiKeyRaw, generateId } from "@getengram/shared";
 import { createMockD1, createMockEnv } from "./helpers.js";
 
 let testApiKey: string;
@@ -94,7 +94,7 @@ describe("Auth middleware", () => {
         }),
       }),
       mockEnv,
-      { waitUntil: () => {}, passThroughOnException: () => {} }
+      { waitUntil: () => {}, passThroughOnException: () => {}, props: {} } as unknown as ExecutionContext
     );
     // Should not be 401 — auth passed
     expect(response.status).not.toBe(401);

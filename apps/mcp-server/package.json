@@ -1,6 +1,6 @@
 {
-  "name": "@engram/mcp-server",
-  "version": "0.1.0",
+  "name": "@getengram/mcp-server",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -14,8 +14,8 @@
     "seed": "node --loader tsx scripts/seed.ts"
   },
   "dependencies": {
-    "@engram/db": "workspace:*",
-    "@engram/shared": "workspace:*",
+    "@getengram/db": "workspace:*",
+    "@getengram/shared": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.6.0",
     "agents": "^0.0.74",
     "hono": "^4.6.0",

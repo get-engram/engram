@@ -29,3 +29,26 @@ export function updateApiKeyLastUsed(db: D1Database, id: string) {
     .bind(id)
     .run();
 }
+
+export function getApiKeysByOrg(db: D1Database, organizationId: string) {
+  return db
+    .prepare(
+      "SELECT id, key_prefix, name, expires_at, last_used_at, created_at FROM api_keys WHERE organization_id = ? AND revoked_at IS NULL ORDER BY created_at"
+    )
+    .bind(organizationId)
+    .all();
+}
+
+export function getApiKeyCount(db: D1Database, organizationId: string) {
+  return db
+    .prepare("SELECT COUNT(*) as count FROM api_keys WHERE organization_id = ? AND revoked_at IS NULL")
+    .bind(organizationId)
+    .first<{ count: number }>();
+}
+
+export function revokeApiKey(db: D1Database, id: string, organizationId: string) {
+  return db
+    .prepare("UPDATE api_keys SET revoked_at = datetime('now') WHERE id = ? AND organization_id = ?")
+    .bind(id, organizationId)
+    .run();
+}

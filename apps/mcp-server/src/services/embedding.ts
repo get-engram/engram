@@ -1,11 +1,11 @@
-import { EMBEDDING_MODEL } from "@engram/shared";
+import { EMBEDDING_MODEL } from "@getengram/shared";
 import type { Env } from "../types.js";
 
 export async function generateEmbeddings(
   ai: Env["AI"],
   texts: string[]
 ): Promise<number[][]> {
-  const response = await ai.run(EMBEDDING_MODEL as BaseAiTextClassificationModels, {
+  const response = await ai.run(EMBEDDING_MODEL as keyof AiModels, {
     text: texts,
   }) as { data: number[][] };
 

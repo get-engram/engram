@@ -4,7 +4,7 @@ import {
   type MessageInput,
   type Message,
   type Conversation,
-} from "@engram/shared";
+} from "@getengram/shared";
 import {
   insertConversation,
   getConversationById,
@@ -16,7 +16,7 @@ import {
   getMaxSequence,
   insertChunks,
   getVectorizeIdsByConversation,
-} from "@engram/db";
+} from "@getengram/db";
 import { generateEmbeddings } from "./embedding.js";
 import type { Env } from "../types.js";
 

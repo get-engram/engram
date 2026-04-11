@@ -71,23 +71,33 @@ export async function createCheckoutSession(
   params: {
     customerId: string;
     priceId: string;
+    quantity?: number;
+    // If true, we let the customer tweak the quantity inside the Checkout
+    // session itself (e.g. change the seat count before paying).
+    adjustableQuantity?: boolean;
     successUrl: string;
     cancelUrl: string;
     organizationId: string;
   },
 ): Promise<CheckoutSession> {
-  return stripeFetch<CheckoutSession>(secretKey, `/checkout/sessions`, {
+  const body: Record<string, string | number> = {
     customer: params.customerId,
     mode: "subscription",
     "line_items[0][price]": params.priceId,
-    "line_items[0][quantity]": 1,
+    "line_items[0][quantity]": params.quantity ?? 1,
     success_url: params.successUrl,
     cancel_url: params.cancelUrl,
     "metadata[organization_id]": params.organizationId,
     "subscription_data[metadata][organization_id]": params.organizationId,
     allow_promotion_codes: "true",
     billing_address_collection: "auto",
-  });
+  };
+  if (params.adjustableQuantity) {
+    body["line_items[0][adjustable_quantity][enabled]"] = "true";
+    body["line_items[0][adjustable_quantity][minimum]"] = 1;
+    body["line_items[0][adjustable_quantity][maximum]"] = 999;
+  }
+  return stripeFetch<CheckoutSession>(secretKey, `/checkout/sessions`, body);
 }
 
 export interface PortalSession {

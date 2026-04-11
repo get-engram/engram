@@ -58,6 +58,9 @@ importers:
       '@cloudflare/workers-types':
         specifier: ^4.20250313.0
         version: 4.20260317.1
+      '@getengram/sdk':
+        specifier: workspace:*
+        version: link:../../packages/sdk
       tsx:
         specifier: ^4.19.0
         version: 4.21.0

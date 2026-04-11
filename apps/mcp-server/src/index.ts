@@ -8,6 +8,7 @@ import { seats } from "./routes/seats.js";
 import { webhooks } from "./routes/webhooks.js";
 import { usage } from "./routes/usage.js";
 import { signup } from "./routes/signup.js";
+import { billing, billingWebhook } from "./routes/billing.js";
 import type { Env, AuthContext } from "./types.js";
 
 type HonoEnv = {
@@ -51,11 +52,16 @@ app.use(
 );
 app.route("/signup", signup);
 
+// Stripe webhook — public, verified by HMAC signature instead of API key.
+// Mounted BEFORE the /api/* auth middleware so it isn't gated.
+app.route("/billing/webhook", billingWebhook);
+
 // REST API routes (all require auth)
 app.use("/api/*", authMiddleware);
 app.route("/api/keys", keys);
 app.route("/api/seats", seats);
 app.route("/api/webhooks", webhooks);
 app.route("/api/usage", usage);
+app.route("/api/billing", billing);
 
 export default app;

@@ -159,20 +159,6 @@ describe("Engram SDK", () => {
               score: 0.95,
               start_sequence: 1,
               end_sequence: 3,
-              messages: [
-                {
-                  id: "msg_1",
-                  conversation_id: "conv_1",
-                  organization_id: "org_1",
-                  role: "user",
-                  content: "hello",
-                  tool_call_id: null,
-                  tool_name: null,
-                  sequence: 1,
-                  metadata: {},
-                  created_at: "2026-04-06",
-                },
-              ],
             },
           ],
           total: 1,
@@ -185,8 +171,22 @@ describe("Engram SDK", () => {
       expect(result.results[0].chunkId).toBe("chk_1");
       expect(result.results[0].conversationId).toBe("conv_1");
       expect(result.results[0].score).toBe(0.95);
-      expect(result.results[0].messages[0].id).toBe("msg_1");
-      expect(result.results[0].messages[0].conversationId).toBe("conv_1");
+      expect(result.results[0].chunkText).toBe("[user]: hello");
+      expect(result.results[0].startSequence).toBe(1);
+      expect(result.results[0].endSequence).toBe(3);
+    });
+
+    it("forwards snippetChars to the tool call", async () => {
+      let capturedArgs: Record<string, unknown> | undefined;
+      mockFetch.mockImplementationOnce(async (_url, init) => {
+        const body = JSON.parse((init as RequestInit).body as string);
+        capturedArgs = body.params.arguments as Record<string, unknown>;
+        return sseResponse({ results: [], total: 0 });
+      });
+
+      await engram.search({ query: "hello", snippetChars: 800 });
+
+      expect(capturedArgs?.snippet_chars).toBe(800);
     });
   });
 

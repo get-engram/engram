@@ -108,6 +108,8 @@ export class Engram {
     if (params.conversationId !== undefined)
       args.conversation_id = params.conversationId;
     if (params.tags !== undefined) args.tags = params.tags;
+    if (params.snippetChars !== undefined)
+      args.snippet_chars = params.snippetChars;
 
     const raw = await this.transport.callTool("search", args);
     const data = JSON.parse(raw);
@@ -214,8 +216,5 @@ function mapSearchResult(raw: Record<string, unknown>): SearchResult {
     score: raw.score as number,
     startSequence: raw.start_sequence as number,
     endSequence: raw.end_sequence as number,
-    messages: ((raw.messages as Record<string, unknown>[]) ?? []).map(
-      mapMessage,
-    ),
   };
 }

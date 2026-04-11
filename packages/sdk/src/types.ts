@@ -53,11 +53,17 @@ export interface Conversation {
 export interface SearchResult {
   chunkId: string;
   conversationId: string;
+  /**
+   * The chunked window of the conversation in `[role]: content\n`
+   * form. Truncated per the request's `snippetChars` (default 1500,
+   * max 5000). To fetch the full structured messages of this chunk,
+   * call `getConversation()` with `messageLimit` / `messageOffset`
+   * (or use `startSequence` / `endSequence` to compute the range).
+   */
   chunkText: string;
   score: number;
   startSequence: number;
   endSequence: number;
-  messages: Message[];
 }
 
 // ── Method Parameters ──
@@ -76,9 +82,12 @@ export interface StoreParams {
 
 export interface SearchParams {
   query: string;
+  /** Max results. Default 5, max 50. */
   limit?: number;
   conversationId?: string;
   tags?: string[];
+  /** Max characters of chunkText per result. Default 1500, max 5000. */
+  snippetChars?: number;
 }
 
 export interface GetConversationParams {

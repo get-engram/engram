@@ -109,9 +109,15 @@ export interface MessageInput {
 export interface SearchResult {
   chunk_id: string;
   conversation_id: string;
+  /**
+   * The chunked window of the original conversation in
+   * `[role]: content\n` form. Truncated to the request's `snippet_chars`
+   * (default 1500) with a `...[truncated]` marker if exceeded. Call
+   * `get_conversation` with `start_sequence` / `end_sequence` to fetch
+   * the full structured messages.
+   */
   chunk_text: string;
   score: number;
   start_sequence: number;
   end_sequence: number;
-  messages: Message[];
 }

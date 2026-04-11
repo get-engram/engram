@@ -101,16 +101,17 @@ append_messages
 
 ## search
 
-Semantic search across all stored conversations. Returns matching chunks with relevance scores and the original messages.
+Semantic search across all stored conversations. Returns matching chunk snippets with relevance scores. Each result contains the `chunk_text` window that Vectorize matched on, clipped to `snippet_chars` characters — call `get_conversation` with the returned `start_sequence` / `end_sequence` if you need the full structured messages.
 
 ### Parameters
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
 | `query` | string | Yes | — | Natural language search query |
-| `limit` | integer | No | 10 | Max results (1–50) |
+| `limit` | integer | No | 5 | Max results (1–50) |
 | `conversation_id` | string | No | — | Limit search to a specific conversation |
 | `tags` | string[] | No | — | Filter by conversation tags |
+| `snippet_chars` | integer | No | 1500 | Max characters of `chunk_text` per result (max 5000). Responses over the cap are suffixed with `...[truncated]`. |
 
 ### Response
 
@@ -123,16 +124,7 @@ Semantic search across all stored conversations. Returns matching chunks with re
       "chunk_text": "[user]: Can you look up the billing?\n[assistant]: I'll check that now.\n...",
       "score": 0.89,
       "start_sequence": 1,
-      "end_sequence": 5,
-      "messages": [
-        {
-          "id": "msg_xyz",
-          "role": "user",
-          "content": "Can you look up the billing?",
-          "sequence": 1,
-          ...
-        }
-      ]
+      "end_sequence": 5
     }
   ],
   "total": 1

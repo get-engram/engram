@@ -11,7 +11,7 @@ import {
 } from "./commands/conversations.js";
 import { store } from "./commands/store.js";
 import { search } from "./commands/search.js";
-import { daemonStart, daemonStop, daemonStatus } from "./daemon/index.js";
+import { daemonStart, daemonStop, daemonStatus, daemonInstall, daemonUninstall } from "./daemon/index.js";
 import { bold, dim } from "./output.js";
 
 const VERSION = "0.2.0";
@@ -19,7 +19,7 @@ const VERSION = "0.2.0";
 // Commands that take 1 word
 const TOP_COMMANDS = new Set([
   "help", "version", "store", "append", "search", "find", "convs",
-  "start", "stop", "status",
+  "start", "stop", "status", "install", "uninstall",
 ]);
 // Commands that take 2 words (group + subcommand)
 const GROUP_COMMANDS = new Set(["auth", "conversations", "conv", "daemon"]);
@@ -126,6 +126,8 @@ ${bold("COMMANDS")}
   ${bold("start")}                    Start background daemon (auto-capture)
   ${bold("stop")}                     Stop the daemon
   ${bold("status")}                   Show daemon status and sync info
+  ${bold("install")}                  Auto-start daemon on login (launchd)
+  ${bold("uninstall")}                Remove auto-start
 
   ${bold("version")}                  Show version
   ${bold("help")}                     Show this help
@@ -233,6 +235,16 @@ async function main(): Promise<void> {
       case "status":
       case "daemon status":
         await daemonStatus();
+        break;
+
+      case "install":
+      case "daemon install":
+        await daemonInstall();
+        break;
+
+      case "uninstall":
+      case "daemon uninstall":
+        await daemonUninstall();
         break;
 
       default:

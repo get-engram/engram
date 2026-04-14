@@ -2,8 +2,9 @@ import type { Engram } from "@getengram/sdk";
 import { DaemonDb } from "./db.js";
 import type { ParsedMessage, SessionMeta, PendingRow } from "./types.js";
 
-const BATCH_SIZE = 50;
-const FLUSH_INTERVAL_MS = 5_000;
+const BATCH_SIZE = 200;
+const FLUSH_INTERVAL_MS = 2_000;
+const CONCURRENCY = 5;
 
 /**
  * Batches parsed messages and sends them to the Engram API.
@@ -15,6 +16,13 @@ export class Syncer {
   private client: Engram;
   private timer: ReturnType<typeof setInterval> | null = null;
   private flushing = false;
+  private authFailed = false;
+
+  /** Sessions awaiting conversation creation (deferred from parse time). */
+  private pendingSessions = new Map<
+    string,
+    SessionMeta
+  >();
 
   constructor(db: DaemonDb, client: Engram) {
     this.db = db;
@@ -23,25 +31,25 @@ export class Syncer {
 
   /**
    * Called by the parser when new messages are ready for a session.
-   * Creates the Engram conversation if needed, then queues messages.
+   * Queues messages locally; conversation creation is deferred to flush time
+   * to avoid blocking the parser on network calls.
    */
   async onMessages(
     sessionId: string,
     meta: SessionMeta,
     messages: ParsedMessage[],
   ): Promise<void> {
-    try {
-      let conversationId = this.db.getConversationId(sessionId);
+    // Check if we already have a mapping
+    let conversationId = this.db.getConversationId(sessionId);
 
-      if (!conversationId) {
-        conversationId = await this.createConversation(sessionId, meta);
-      }
-
-      this.db.enqueue(conversationId, messages);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[engram] queue error: ${msg}`);
+    if (!conversationId) {
+      // Defer creation — store messages under the sessionId temporarily.
+      // The flush loop will create the conversation and re-map them.
+      this.pendingSessions.set(sessionId, meta);
+      conversationId = `pending:${sessionId}`;
     }
+
+    this.db.enqueue(conversationId, messages);
   }
 
   startFlushLoop(): void {
@@ -55,16 +63,30 @@ export class Syncer {
     }
   }
 
-  /** Flush all pending messages to the API, batched per conversation. */
+  /** Flush all pending messages to the API. */
   async flush(): Promise<void> {
-    if (this.flushing) return;
+    if (this.flushing || this.authFailed) return;
     this.flushing = true;
 
     try {
-      const convIds = this.db.getPendingConversationIds();
+      // Step 1: Create any pending conversations
+      await this.createPendingConversations();
 
-      for (const convId of convIds) {
-        await this.flushConversation(convId);
+      // Step 2: Flush messages for all conversations (with concurrency)
+      const convIds = this.db.getPendingConversationIds().filter(
+        (id) => !id.startsWith("pending:"),
+      );
+
+      // Process conversations in parallel, up to CONCURRENCY at a time
+      const chunks = [];
+      for (let i = 0; i < convIds.length; i += CONCURRENCY) {
+        chunks.push(convIds.slice(i, i + CONCURRENCY));
+      }
+
+      for (const chunk of chunks) {
+        await Promise.allSettled(
+          chunk.map((id) => this.flushConversation(id)),
+        );
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -74,8 +96,47 @@ export class Syncer {
     }
   }
 
+  /** Create conversations for sessions that were deferred during parsing. */
+  private async createPendingConversations(): Promise<void> {
+    if (this.pendingSessions.size === 0) return;
+
+    const entries = [...this.pendingSessions.entries()];
+    this.pendingSessions.clear();
+
+    // Create conversations in parallel batches
+    const batches = [];
+    for (let i = 0; i < entries.length; i += CONCURRENCY) {
+      batches.push(entries.slice(i, i + CONCURRENCY));
+    }
+
+    for (const batch of batches) {
+      const results = await Promise.allSettled(
+        batch.map(async ([sessionId, meta]) => {
+          // Double-check (another flush may have created it)
+          if (this.db.getConversationId(sessionId)) return;
+
+          const conversationId = await this.createConversation(sessionId, meta);
+
+          // Migrate pending messages from pending:sessionId → real conversationId
+          this.db.remapPending(`pending:${sessionId}`, conversationId);
+        }),
+      );
+
+      for (const r of results) {
+        if (r.status === "rejected") {
+          const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
+          if (msg.includes("401") || msg.includes("403")) {
+            this.authFailed = true;
+            console.error(`[engram] auth error, stopping: ${msg}`);
+            return;
+          }
+          console.error(`[engram] create error (will retry): ${msg}`);
+        }
+      }
+    }
+  }
+
   private async flushConversation(conversationId: string): Promise<void> {
-    // Process in batches
     while (true) {
       const rows = this.db.dequeue(conversationId, BATCH_SIZE);
       if (rows.length === 0) break;
@@ -88,8 +149,8 @@ export class Syncer {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
 
-        // Auth errors — stop retrying, user needs to fix their key
         if (msg.includes("401") || msg.includes("403") || msg.includes("Authentication")) {
+          this.authFailed = true;
           console.error(`[engram] auth error, stopping flush: ${msg}`);
           this.stopFlushLoop();
           return;

@@ -3,6 +3,7 @@ import { createMockD1, createMockEnv } from "./helpers.js";
 import {
   searchConversations,
   DEFAULT_SNIPPET_CHARS,
+  DEFAULT_MIN_SCORE,
   MAX_SNIPPET_CHARS,
 } from "../services/search.js";
 
@@ -63,7 +64,12 @@ describe("search service", () => {
       env as unknown as Parameters<typeof searchConversations>[0],
       organizationId,
       "greeting",
-      5
+      5,
+      undefined,
+      undefined,
+      undefined,
+      0,     // minScore — allow all
+      false  // dedupe off — both chunks from conv_1 should return
     );
 
     expect(results.length).toBeGreaterThan(0);
@@ -80,7 +86,12 @@ describe("search service", () => {
       env as unknown as Parameters<typeof searchConversations>[0],
       organizationId,
       "greeting",
-      5
+      5,
+      undefined,
+      undefined,
+      undefined,
+      0,     // minScore
+      false  // dedupe off
     );
 
     const long = results.find((r) => r.chunk_id === "chk_long");
@@ -103,7 +114,9 @@ describe("search service", () => {
       5,
       undefined,
       undefined,
-      200
+      200,
+      0,     // minScore
+      false  // dedupe off
     );
 
     const long = results.find((r) => r.chunk_id === "chk_long");
@@ -120,13 +133,70 @@ describe("search service", () => {
       5,
       undefined,
       undefined,
-      999_999
+      999_999,
+      0,     // minScore
+      false  // dedupe off
     );
 
     const long = results.find((r) => r.chunk_id === "chk_long");
-    // The seed longText is 3× the default, which is 4500 chars < 5000,
+    // The seed longText is 3× the default, which is 2400 chars < 5000,
     // so with the cap at MAX the long chunk should NOT be truncated.
     expect(long!.chunk_text).not.toContain("[truncated]");
     expect(long!.chunk_text.length).toBeLessThanOrEqual(MAX_SNIPPET_CHARS);
+  });
+
+  it("filters out results below min_score", async () => {
+    // vec_short has score 0.99, vec_long has score 0.88
+    const results = await searchConversations(
+      env as unknown as Parameters<typeof searchConversations>[0],
+      organizationId,
+      "greeting",
+      5,
+      undefined,
+      undefined,
+      undefined,
+      0.95,  // only the 0.99 result should pass
+      false  // dedupe off
+    );
+
+    expect(results.length).toBe(1);
+    expect(results[0].chunk_id).toBe("chk_short");
+    expect(results[0].score).toBe(0.99);
+  });
+
+  it("deduplicates chunks from the same conversation by default", async () => {
+    // Both chunks are from conv_1. With dedupe on, only the top-scoring one returns.
+    const results = await searchConversations(
+      env as unknown as Parameters<typeof searchConversations>[0],
+      organizationId,
+      "greeting",
+      5,
+      undefined,
+      undefined,
+      undefined,
+      0  // minScore — allow all
+      // dedupe defaults to true
+    );
+
+    expect(results.length).toBe(1);
+    // Highest score wins
+    expect(results[0].chunk_id).toBe("chk_short");
+    expect(results[0].score).toBe(0.99);
+  });
+
+  it("returns all chunks when dedupe is false", async () => {
+    const results = await searchConversations(
+      env as unknown as Parameters<typeof searchConversations>[0],
+      organizationId,
+      "greeting",
+      5,
+      undefined,
+      undefined,
+      undefined,
+      0,
+      false
+    );
+
+    expect(results.length).toBe(2);
   });
 });

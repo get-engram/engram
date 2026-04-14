@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   searchConversations,
   DEFAULT_SNIPPET_CHARS,
+  DEFAULT_MIN_SCORE,
   MAX_SNIPPET_CHARS,
 } from "../../services/search.js";
 import { trackSearchRun } from "../../services/tier.js";
@@ -44,6 +45,22 @@ export function registerSearch(
         .describe(
           `Max characters of chunk_text to return per result (default ${DEFAULT_SNIPPET_CHARS}, max ${MAX_SNIPPET_CHARS}). Longer snippets = larger responses.`
         ),
+      min_score: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .default(DEFAULT_MIN_SCORE)
+        .describe(
+          `Minimum similarity score (0-1) to include a result (default ${DEFAULT_MIN_SCORE}). Filters out low-relevance noise.`
+        ),
+      dedupe: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe(
+          "Deduplicate overlapping chunks from the same conversation (default true). Set false to see all matching chunks."
+        ),
     },
     async (params) => {
       const results = await searchConversations(
@@ -53,7 +70,9 @@ export function registerSearch(
         params.limit,
         params.conversation_id,
         params.tags,
-        params.snippet_chars
+        params.snippet_chars,
+        params.min_score,
+        params.dedupe
       );
 
       // Track usage (non-blocking)

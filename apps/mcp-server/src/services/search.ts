@@ -11,11 +11,12 @@ interface VectorizeMatch {
 
 // Default cap per chunk_text in the search response. Full message bodies
 // can run 1–5k tokens each when tool-call output is included; clipping to
-// ~1500 chars keeps a 10-result search response under ~3k tokens total
+// ~800 chars keeps a 5-result search response under ~1.5k tokens total
 // without destroying the ranking signal. Callers that need the full
 // window should call get_conversation with start_sequence / end_sequence.
-export const DEFAULT_SNIPPET_CHARS = 1500;
+export const DEFAULT_SNIPPET_CHARS = 800;
 export const MAX_SNIPPET_CHARS = 5000;
+export const DEFAULT_MIN_SCORE = 0.5;
 const TRUNCATION_MARKER = "\n...[truncated]";
 
 function truncateSnippet(text: string, maxChars: number): string {
@@ -30,7 +31,9 @@ export async function searchConversations(
   limit: number,
   conversationId?: string,
   tags?: string[],
-  snippetChars: number = DEFAULT_SNIPPET_CHARS
+  snippetChars: number = DEFAULT_SNIPPET_CHARS,
+  minScore: number = DEFAULT_MIN_SCORE,
+  dedupe: boolean = true
 ): Promise<SearchResult[]> {
   const cappedSnippet = Math.min(
     Math.max(snippetChars, 0),
@@ -75,7 +78,7 @@ export async function searchConversations(
   // format, and returning both duplicated the payload (see issue #8). If a
   // caller needs the structured messages they can call get_conversation with
   // start_sequence / end_sequence.
-  const results: SearchResult[] = chunks.map((chunk) => ({
+  let results: SearchResult[] = chunks.map((chunk) => ({
     chunk_id: chunk.id,
     conversation_id: chunk.conversation_id,
     chunk_text: truncateSnippet(chunk.chunk_text, cappedSnippet),
@@ -86,6 +89,23 @@ export async function searchConversations(
 
   // Sort by score descending
   results.sort((a, b) => b.score - a.score);
+
+  // Drop results below the minimum relevance threshold
+  if (minScore > 0) {
+    results = results.filter((r) => r.score >= minScore);
+  }
+
+  // Deduplicate: keep only the highest-scoring chunk per conversation.
+  // Overlapping chunks (window=5, stride=3) cause the same content to
+  // appear multiple times; dedup prevents wasting the caller's tokens.
+  if (dedupe) {
+    const seen = new Set<string>();
+    results = results.filter((r) => {
+      if (seen.has(r.conversation_id)) return false;
+      seen.add(r.conversation_id);
+      return true;
+    });
+  }
 
   return results;
 }

@@ -140,6 +140,15 @@ export class DaemonDb {
       .all(conversationId, limit) as PendingRow[];
   }
 
+  /** Re-map pending messages from a temporary ID to a real conversation ID. */
+  remapPending(fromId: string, toId: string): void {
+    this.db
+      .prepare(
+        "UPDATE pending_messages SET conversation_id = ? WHERE conversation_id = ? AND sent_at IS NULL",
+      )
+      .run(toId, fromId);
+  }
+
   markSent(ids: number[]): void {
     if (ids.length === 0) return;
     const placeholders = ids.map(() => "?").join(",");

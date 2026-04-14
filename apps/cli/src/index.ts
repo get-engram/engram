@@ -11,6 +11,7 @@ import {
 } from "./commands/conversations.js";
 import { store } from "./commands/store.js";
 import { search } from "./commands/search.js";
+import { log as showLog } from "./commands/log.js";
 import { daemonStart, daemonStop, daemonStatus, daemonInstall, daemonUninstall } from "./daemon/index.js";
 import { bold, dim } from "./output.js";
 
@@ -19,7 +20,7 @@ const VERSION = "0.2.0";
 // Commands that take 1 word
 const TOP_COMMANDS = new Set([
   "help", "version", "store", "append", "search", "find", "convs",
-  "start", "stop", "status", "install", "uninstall",
+  "start", "stop", "status", "install", "uninstall", "log",
 ]);
 // Commands that take 2 words (group + subcommand)
 const GROUP_COMMANDS = new Set(["auth", "conversations", "conv", "daemon"]);
@@ -122,6 +123,7 @@ ${bold("COMMANDS")}
 
   ${bold("store")} -c <id> <message>  Store a message
   ${bold("search")} <query>           Semantic search across memory
+  ${bold("log")}                      Show recent AI conversation activity
 
   ${bold("start")}                    Start background daemon (auto-capture)
   ${bold("stop")}                     Stop the daemon
@@ -219,6 +221,10 @@ async function main(): Promise<void> {
       case "search":
       case "find":
         await search(await getClient(), args, flags);
+        break;
+
+      case "log":
+        await showLog(await getClient(), args, flags);
         break;
 
       // Daemon commands — short aliases + namespaced

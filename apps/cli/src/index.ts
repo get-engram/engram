@@ -11,16 +11,18 @@ import {
 } from "./commands/conversations.js";
 import { store } from "./commands/store.js";
 import { search } from "./commands/search.js";
+import { daemonStart, daemonStop, daemonStatus } from "./daemon/index.js";
 import { bold, dim } from "./output.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 // Commands that take 1 word
 const TOP_COMMANDS = new Set([
   "help", "version", "store", "append", "search", "find", "convs",
+  "start", "stop", "status",
 ]);
 // Commands that take 2 words (group + subcommand)
-const GROUP_COMMANDS = new Set(["auth", "conversations", "conv"]);
+const GROUP_COMMANDS = new Set(["auth", "conversations", "conv", "daemon"]);
 
 function parseArgs(argv: string[]): {
   command: string[];
@@ -121,6 +123,10 @@ ${bold("COMMANDS")}
   ${bold("store")} -c <id> <message>  Store a message
   ${bold("search")} <query>           Semantic search across memory
 
+  ${bold("start")}                    Start background daemon (auto-capture)
+  ${bold("stop")}                     Stop the daemon
+  ${bold("status")}                   Show daemon status and sync info
+
   ${bold("version")}                  Show version
   ${bold("help")}                     Show this help
 
@@ -211,6 +217,22 @@ async function main(): Promise<void> {
       case "search":
       case "find":
         await search(await getClient(), args, flags);
+        break;
+
+      // Daemon commands — short aliases + namespaced
+      case "start":
+      case "daemon start":
+        await daemonStart(args, flags);
+        break;
+
+      case "stop":
+      case "daemon stop":
+        await daemonStop();
+        break;
+
+      case "status":
+      case "daemon status":
+        await daemonStatus();
         break;
 
       default:

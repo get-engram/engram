@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import {
   readFileSync,
   writeFileSync,
@@ -16,6 +16,9 @@ const ENGRAM_DIR = join(homedir(), ".engram");
 const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
 const DB_FILE = join(ENGRAM_DIR, "daemon.db");
 const LOG_FILE = join(ENGRAM_DIR, "daemon.log");
+const PLIST_NAME = "app.getengram.daemon";
+const PLIST_DIR = join(homedir(), "Library", "LaunchAgents");
+const PLIST_PATH = join(PLIST_DIR, `${PLIST_NAME}.plist`);
 
 // Resolve the worker script path relative to this file's compiled location
 function getWorkerPath(): string {
@@ -25,21 +28,47 @@ function getWorkerPath(): string {
 }
 
 function readPid(): number | null {
+  // First check PID file
   try {
     const pid = parseInt(readFileSync(PID_FILE, "utf-8").trim(), 10);
-    if (isNaN(pid)) return null;
-    // Check if process is alive
-    try {
-      process.kill(pid, 0);
-      return pid;
-    } catch {
-      // Process is dead, clean up stale PID file
-      try { unlinkSync(PID_FILE); } catch { /* ignore */ }
-      return null;
+    if (!isNaN(pid)) {
+      try {
+        process.kill(pid, 0);
+        return pid;
+      } catch {
+        try { unlinkSync(PID_FILE); } catch { /* ignore */ }
+      }
     }
   } catch {
-    return null;
+    // no PID file
   }
+
+  // Fall back to launchctl (launchd-managed process may not have PID file)
+  return readLaunchdPid();
+}
+
+function readLaunchdPid(): number | null {
+  if (!isLaunchdInstalled()) return null;
+  try {
+    const output = execSync(`launchctl list ${PLIST_NAME} 2>/dev/null`, {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const match = output.match(/"PID"\s*=\s*(\d+)/);
+    if (match) return parseInt(match[1], 10);
+    // Also check the tabular format: PID\tStatus\tLabel
+    const lines = output.trim().split("\n");
+    for (const line of lines) {
+      const parts = line.split("\t");
+      if (parts.length >= 1) {
+        const pid = parseInt(parts[0], 10);
+        if (!isNaN(pid) && pid > 0) return pid;
+      }
+    }
+  } catch {
+    // not loaded
+  }
+  return null;
 }
 
 export async function daemonStart(
@@ -83,6 +112,11 @@ export async function daemonStart(
     console.log(`${bold("Engram daemon started")} (pid ${pid})`);
     console.log(`${dim("Log:")} ${LOG_FILE}`);
     console.log(`${dim("DB:")}  ${DB_FILE}`);
+
+    // Auto-install launchd if --install flag
+    if ("install" in flags) {
+      installLaunchd();
+    }
   } else {
     console.error("Daemon may have failed to start. Check logs:");
     console.error(`  cat ${LOG_FILE}`);
@@ -138,4 +172,94 @@ export async function daemonStatus(): Promise<void> {
   }
 
   console.log(`${dim("Log:")} ${LOG_FILE}`);
+
+  if (isLaunchdInstalled()) {
+    console.log(`${dim("Auto-start:")} enabled (launchd)`);
+  }
+}
+
+// ── Launchd integration ──
+
+function generatePlist(): string {
+  const workerPath = getWorkerPath();
+  const nodePath = process.execPath;
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${PLIST_NAME}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${nodePath}</string>
+    <string>${workerPath}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>${LOG_FILE}</string>
+  <key>StandardErrorPath</key>
+  <string>${LOG_FILE}</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>${homedir()}</string>
+  </dict>
+</dict>
+</plist>`;
+}
+
+function isLaunchdInstalled(): boolean {
+  return existsSync(PLIST_PATH);
+}
+
+function installLaunchd(): void {
+  mkdirSync(PLIST_DIR, { recursive: true });
+  writeFileSync(PLIST_PATH, generatePlist());
+
+  try {
+    execSync(`launchctl load -w "${PLIST_PATH}"`, { stdio: "pipe" });
+    console.log(`${bold("Auto-start enabled")} — daemon will start on login`);
+    console.log(`${dim("Plist:")} ${PLIST_PATH}`);
+  } catch {
+    console.log(`Plist written to ${PLIST_PATH}`);
+    console.log("Run manually: launchctl load -w " + PLIST_PATH);
+  }
+}
+
+function uninstallLaunchd(): void {
+  if (!isLaunchdInstalled()) {
+    console.log("Launchd agent not installed.");
+    return;
+  }
+
+  try {
+    execSync(`launchctl unload "${PLIST_PATH}"`, { stdio: "pipe" });
+  } catch {
+    // may already be unloaded
+  }
+
+  try {
+    unlinkSync(PLIST_PATH);
+  } catch {
+    // ignore
+  }
+
+  console.log(`${bold("Auto-start disabled")} — launchd agent removed`);
+}
+
+export async function daemonInstall(): Promise<void> {
+  installLaunchd();
+}
+
+export async function daemonUninstall(): Promise<void> {
+  uninstallLaunchd();
 }

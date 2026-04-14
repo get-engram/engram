@@ -1,1 +1,1 @@
-export { daemonStart, daemonStop, daemonStatus } from "./commands.js";
+export { daemonStart, daemonStop, daemonStatus, daemonInstall, daemonUninstall } from "./commands.js";

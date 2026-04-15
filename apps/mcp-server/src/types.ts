@@ -8,11 +8,11 @@ export interface Env {
   STRIPE_PRICE_ID_PRO: string;
   STRIPE_PRICE_ID_TEAM: string;
   APP_URL: string; // e.g. "https://getengram.app"
-  // Shared secret between engram-web and the worker. engram-web's
-  // Next.js server action sends this as a Bearer on /signup so random
-  // internet traffic can't mint API keys against arbitrary emails.
-  // Temporary until stage 2 (worker verifies Supabase JWTs via JWKS).
-  WORKER_SIGNUP_SECRET: string;
+  // Supabase JWT secret — used to verify access tokens from engram-web.
+  // The dashboard sends the user's Supabase access token as a Bearer on
+  // /signup; the worker verifies the HS256 signature and extracts the
+  // user's email from the claims.
+  SUPABASE_JWT_SECRET: string;
 }
 
 export interface AuthContext {

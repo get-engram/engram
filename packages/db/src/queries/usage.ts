@@ -35,6 +35,31 @@ export function incrementMessagesStored(db: D1Database, organizationId: string, 
     .run();
 }
 
+/**
+ * Atomically increment messages_stored only if the new total stays within
+ * the given limit. Returns the updated row if successful, null if the
+ * limit would be exceeded. Prevents race conditions between concurrent
+ * append requests.
+ */
+export function atomicIncrementMessages(
+  db: D1Database,
+  organizationId: string,
+  count: number,
+  limit: number,
+) {
+  const period = getCurrentPeriod();
+  return db
+    .prepare(
+      `UPDATE usage
+       SET messages_stored = messages_stored + ?, updated_at = datetime('now')
+       WHERE organization_id = ? AND period = ?
+         AND messages_stored + ? <= ?
+       RETURNING messages_stored`
+    )
+    .bind(count, organizationId, period, count, limit)
+    .first<{ messages_stored: number }>();
+}
+
 export function incrementSearchesRun(db: D1Database, organizationId: string) {
   const period = getCurrentPeriod();
   return db

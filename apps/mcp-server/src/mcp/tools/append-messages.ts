@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { appendMessages } from "../../services/conversation.js";
-import { checkMessageLimit, trackMessagesStored } from "../../services/tier.js";
+import { checkAndTrackMessages } from "../../services/tier.js";
 import { fireWebhooks } from "../../services/webhooks.js";
 import type { Env, AuthContext } from "../../types.js";
 
@@ -29,8 +29,10 @@ export function registerAppendMessages(
         .describe("Messages to append"),
     },
     async (params) => {
-      // Check tier limit before appending
-      const tierCheck = await checkMessageLimit(
+      // Atomically check tier limit AND increment usage in one operation.
+      // Prevents race conditions where concurrent requests both pass the
+      // check but together exceed the limit.
+      const tierCheck = await checkAndTrackMessages(
         env.DB,
         auth.organizationId,
         auth.tier,
@@ -64,9 +66,6 @@ export function registerAppendMessages(
           metadata: m.metadata as Record<string, unknown>,
         }))
       );
-
-      // Track usage (non-blocking)
-      trackMessagesStored(env.DB, auth.organizationId, messages.length).catch(() => {});
 
       // Fire webhooks (non-blocking)
       fireWebhooks(env.DB, auth.organizationId, "messages.appended", {

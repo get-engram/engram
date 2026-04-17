@@ -1,6 +1,6 @@
 import type { Context, Next } from "hono";
 import { hashApiKey } from "@getengram/shared";
-import { getApiKeyByHash, updateApiKeyLastUsed, getOrganizationById } from "@getengram/db";
+import { getApiKeyWithOrg, updateApiKeyLastUsed } from "@getengram/db";
 import type { Env, AuthContext } from "../types.js";
 
 export async function authMiddleware(
@@ -18,32 +18,20 @@ export async function authMiddleware(
   }
 
   const keyHash = await hashApiKey(token);
-  const apiKey = await getApiKeyByHash(c.env.DB, keyHash);
+  const row = await getApiKeyWithOrg(c.env.DB, keyHash);
 
-  if (!apiKey) {
+  if (!row) {
     return c.json({ error: "Invalid API key" }, 401);
   }
 
-  const key = apiKey as { id: string; organization_id: string };
-
-  // Fetch org to get tier
-  const org = await getOrganizationById(c.env.DB, key.organization_id) as {
-    id: string;
-    tier: "free" | "pro" | "team" | "enterprise";
-  } | null;
-
-  if (!org) {
-    return c.json({ error: "Organization not found" }, 401);
-  }
-
   c.set("auth", {
-    organizationId: key.organization_id,
-    apiKeyId: key.id,
-    tier: org.tier ?? "free",
+    organizationId: row.organization_id,
+    apiKeyId: row.key_id,
+    tier: (row.tier ?? "free") as AuthContext["tier"],
   });
 
   // Update last_used_at non-blocking
-  c.executionCtx.waitUntil(updateApiKeyLastUsed(c.env.DB, key.id));
+  c.executionCtx.waitUntil(updateApiKeyLastUsed(c.env.DB, row.key_id));
 
   await next();
 }

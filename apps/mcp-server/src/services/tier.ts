@@ -1,5 +1,5 @@
 import { TIER_LIMITS, type Tier } from "@getengram/shared";
-import { getOrCreateUsage, incrementMessagesStored, incrementSearchesRun } from "@getengram/db";
+import { getOrCreateUsage, atomicIncrementMessages, incrementMessagesStored, incrementSearchesRun } from "@getengram/db";
 import { generateId } from "@getengram/shared";
 
 export interface TierCheckResult {
@@ -19,6 +19,54 @@ async function ensureUsage(db: D1Database, organizationId: string) {
   return getOrCreateUsage(db, id, organizationId);
 }
 
+/**
+ * Atomically check the message limit AND increment the counter in one
+ * operation. Prevents race conditions where concurrent requests both
+ * pass the check but together exceed the limit.
+ *
+ * For unlimited tiers, skips the atomic check and just increments.
+ */
+export async function checkAndTrackMessages(
+  db: D1Database,
+  organizationId: string,
+  tier: Tier,
+  messageCount: number,
+): Promise<TierCheckResult> {
+  const limits = TIER_LIMITS[tier];
+
+  // Ensure usage row exists
+  await ensureUsage(db, organizationId);
+
+  // Unlimited tier — just increment, no limit check
+  if (limits.messages_per_month === -1) {
+    await incrementMessagesStored(db, organizationId, messageCount);
+    return { allowed: true };
+  }
+
+  // Atomic: increment only if within limit
+  const result = await atomicIncrementMessages(
+    db,
+    organizationId,
+    messageCount,
+    limits.messages_per_month,
+  );
+
+  if (!result) {
+    // Limit would be exceeded — fetch current usage for error message
+    const usage = await ensureUsage(db, organizationId);
+    const used = (usage as { messages_stored: number }).messages_stored;
+    return {
+      allowed: false,
+      error: "message_limit_exceeded",
+      limit: limits.messages_per_month,
+      used,
+      tier,
+    };
+  }
+
+  return { allowed: true };
+}
+
 export async function checkMessageLimit(
   db: D1Database,
   organizationId: string,
@@ -27,7 +75,6 @@ export async function checkMessageLimit(
 ): Promise<TierCheckResult> {
   const limits = TIER_LIMITS[tier];
 
-  // Unlimited
   if (limits.messages_per_month === -1) {
     return { allowed: true };
   }

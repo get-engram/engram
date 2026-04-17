@@ -1,5 +1,5 @@
 import { TIER_LIMITS, type Tier } from "@getengram/shared";
-import { getUsage, getOrCreateUsage, incrementMessagesStored, incrementSearchesRun } from "@getengram/db";
+import { getOrCreateUsage, incrementMessagesStored, incrementSearchesRun } from "@getengram/db";
 import { generateId } from "@getengram/shared";
 
 export interface TierCheckResult {
@@ -8,6 +8,15 @@ export interface TierCheckResult {
   limit?: number;
   used?: number;
   tier?: Tier;
+}
+
+/**
+ * Ensure a usage row exists for the current period and return it.
+ * Single D1 round trip via INSERT ... ON CONFLICT ... RETURNING.
+ */
+async function ensureUsage(db: D1Database, organizationId: string) {
+  const id = generateId("usg");
+  return getOrCreateUsage(db, id, organizationId);
 }
 
 export async function checkMessageLimit(
@@ -23,13 +32,7 @@ export async function checkMessageLimit(
     return { allowed: true };
   }
 
-  // Ensure usage row exists for current period
-  let usage = await getUsage(db, organizationId);
-  if (!usage) {
-    const id = generateId("usg");
-    usage = await getOrCreateUsage(db, id, organizationId);
-  }
-
+  const usage = await ensureUsage(db, organizationId);
   const used = (usage as { messages_stored: number }).messages_stored;
   const remaining = limits.messages_per_month - used;
 
@@ -46,29 +49,26 @@ export async function checkMessageLimit(
   return { allowed: true };
 }
 
+/**
+ * Increment messages_stored counter. Assumes usage row already exists
+ * (checkMessageLimit ensures it via ensureUsage).
+ */
 export async function trackMessagesStored(
   db: D1Database,
   organizationId: string,
   count: number
 ) {
-  // Ensure usage row exists
-  let usage = await getUsage(db, organizationId);
-  if (!usage) {
-    const id = generateId("usg");
-    await getOrCreateUsage(db, id, organizationId);
-  }
   await incrementMessagesStored(db, organizationId, count);
 }
 
+/**
+ * Increment searches_run counter. Ensures usage row exists first.
+ */
 export async function trackSearchRun(
   db: D1Database,
   organizationId: string
 ) {
-  let usage = await getUsage(db, organizationId);
-  if (!usage) {
-    const id = generateId("usg");
-    await getOrCreateUsage(db, id, organizationId);
-  }
+  await ensureUsage(db, organizationId);
   await incrementSearchesRun(db, organizationId);
 }
 

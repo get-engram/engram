@@ -23,6 +23,24 @@ export function getApiKeyByHash(db: D1Database, keyHash: string) {
     .first();
 }
 
+/**
+ * Single-query auth lookup: joins api_keys → organizations to return
+ * key ID, org ID, and tier in one D1 round trip.
+ */
+export function getApiKeyWithOrg(db: D1Database, keyHash: string) {
+  return db
+    .prepare(
+      `SELECT k.id AS key_id, k.organization_id, o.tier
+       FROM api_keys k
+       JOIN organizations o ON o.id = k.organization_id
+       WHERE k.key_hash = ?
+         AND k.revoked_at IS NULL
+         AND (k.expires_at IS NULL OR k.expires_at > datetime('now'))`
+    )
+    .bind(keyHash)
+    .first<{ key_id: string; organization_id: string; tier: string }>();
+}
+
 export function updateApiKeyLastUsed(db: D1Database, id: string) {
   return db
     .prepare("UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?")

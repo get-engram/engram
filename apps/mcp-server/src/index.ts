@@ -61,6 +61,17 @@ app.route("/signup", signup);
 // Mounted BEFORE the /api/* auth middleware so it isn't gated.
 app.route("/billing/webhook", billingWebhook);
 
+// Admin routes — protected by ADMIN_SECRET, not API key auth.
+app.use("/admin/*", async (c, next) => {
+  const auth = c.req.header("Authorization");
+  const secret = (c.env as Env & { ADMIN_SECRET: string }).ADMIN_SECRET;
+  if (!secret || auth !== `Bearer ${secret}`) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  await next();
+});
+app.route("/admin", admin);
+
 // REST API routes (all require auth). CORS runs before the auth middleware
 // so preflight OPTIONS requests succeed without a bearer token.
 app.use(
@@ -78,16 +89,5 @@ app.route("/api/seats", seats);
 app.route("/api/webhooks", webhooks);
 app.route("/api/usage", usage);
 app.route("/api/billing", billing);
-
-// Admin routes — protected by ADMIN_SECRET, not API key auth.
-app.use("/api/admin/*", async (c, next) => {
-  const auth = c.req.header("Authorization");
-  const secret = (c.env as Env & { ADMIN_SECRET: string }).ADMIN_SECRET;
-  if (!secret || auth !== `Bearer ${secret}`) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-  await next();
-});
-app.route("/api/admin", admin);
 
 export default app;

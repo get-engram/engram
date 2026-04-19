@@ -68,7 +68,7 @@ export async function decompressContent(
   content: string,
   encoding: string | null | undefined
 ): Promise<string> {
-  if (!encoding) return content;
+  if (!encoding || encoding === "raw") return content;
 
   if (encoding !== ENCODING_GZIP) {
     throw new Error(`Unknown content encoding: ${encoding}`);

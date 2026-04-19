@@ -9,6 +9,7 @@ import { webhooks } from "./routes/webhooks.js";
 import { usage } from "./routes/usage.js";
 import { signup } from "./routes/signup.js";
 import { billing, billingWebhook } from "./routes/billing.js";
+import { admin } from "./routes/admin.js";
 import type { Env, AuthContext } from "./types.js";
 
 type HonoEnv = {
@@ -77,5 +78,16 @@ app.route("/api/seats", seats);
 app.route("/api/webhooks", webhooks);
 app.route("/api/usage", usage);
 app.route("/api/billing", billing);
+
+// Admin routes — protected by ADMIN_SECRET, not API key auth.
+app.use("/api/admin/*", async (c, next) => {
+  const auth = c.req.header("Authorization");
+  const secret = (c.env as Env & { ADMIN_SECRET: string }).ADMIN_SECRET;
+  if (!secret || auth !== `Bearer ${secret}`) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  await next();
+});
+app.route("/api/admin", admin);
 
 export default app;

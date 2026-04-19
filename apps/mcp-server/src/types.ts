@@ -8,6 +8,7 @@ export interface Env {
   STRIPE_PRICE_ID_PRO: string;
   STRIPE_PRICE_ID_TEAM: string;
   APP_URL: string; // e.g. "https://getengram.app"
+  ADMIN_SECRET: string; // wrangler secret for /api/admin/* routes
   // Shared secret between engram-web and the worker. engram-web's
   // Next.js server action sends this as a Bearer on /signup so random
   // internet traffic can't mint API keys against arbitrary emails.

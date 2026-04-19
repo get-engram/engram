@@ -1,5 +1,6 @@
 import type { Engram } from "@getengram/sdk";
 import { DaemonDb } from "./db.js";
+import { recordSuccess, recordFailure, classifyError } from "./status.js";
 import type { ParsedMessage, SessionMeta, PendingRow } from "./types.js";
 
 const BATCH_SIZE = 200;
@@ -83,14 +84,23 @@ export class Syncer {
         chunks.push(convIds.slice(i, i + CONCURRENCY));
       }
 
+      let hadError = false;
       for (const chunk of chunks) {
-        await Promise.allSettled(
+        const results = await Promise.allSettled(
           chunk.map((id) => this.flushConversation(id)),
         );
+        if (results.some((r) => r.status === "rejected")) hadError = true;
+      }
+
+      // Report sync health
+      const pending = this.db.getPendingCount();
+      if (!hadError && !this.authFailed) {
+        recordSuccess(pending);
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[engram] flush error: ${msg}`);
+      recordFailure(msg, classifyError(msg), this.db.getPendingCount());
     } finally {
       this.flushing = false;
     }
@@ -128,9 +138,11 @@ export class Syncer {
           if (msg.includes("401") || msg.includes("403")) {
             this.authFailed = true;
             console.error(`[engram] auth error, stopping: ${msg}`);
+            recordFailure(msg, "auth", this.db.getPendingCount());
             return;
           }
           console.error(`[engram] create error (will retry): ${msg}`);
+          recordFailure(msg, classifyError(msg), this.db.getPendingCount());
         }
       }
     }
@@ -152,12 +164,14 @@ export class Syncer {
         if (msg.includes("401") || msg.includes("403") || msg.includes("Authentication")) {
           this.authFailed = true;
           console.error(`[engram] auth error, stopping flush: ${msg}`);
+          recordFailure(msg, "auth", this.db.getPendingCount());
           this.stopFlushLoop();
           return;
         }
 
         // Rate limit or network — leave in queue for next cycle
         console.error(`[engram] send failed (will retry): ${msg}`);
+        recordFailure(msg, classifyError(msg), this.db.getPendingCount());
         return;
       }
     }

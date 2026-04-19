@@ -45,7 +45,10 @@ admin.post("/backfill/compress", async (c) => {
   const updates = await Promise.all(
     rows.results.map(async (row) => {
       const { content, encoding } = await compressContent(row.content);
-      return { id: row.id, content, encoding };
+      // Mark uncompressed messages as 'raw' so they're excluded from
+      // future backfill queries (distinguishes "checked, too small" from
+      // "never processed").
+      return { id: row.id, content, encoding: encoding ?? "raw" };
     })
   );
 

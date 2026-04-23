@@ -193,7 +193,7 @@ function printSyncWarnings(status: SyncStatus): void {
 
   const warnings: Record<string, string> = {
     auth: "Authentication failed — run 'engram auth login'",
-    billing: "Plan limit reached — upgrade at getengram.app/pricing",
+    billing: "Plan limit reached — upgrade at getengram.app/pricing\n           Messages are queued locally and will retry with backoff.",
     rate_limit: "Rate limited — messages queued, will retry",
     network: "Can't reach servers — messages queued locally",
     server: "Server error — messages queued, will retry",

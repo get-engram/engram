@@ -1,5 +1,4 @@
 import { writeFileSync, readFileSync, existsSync } from "node:fs";
-import { execSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -88,11 +87,10 @@ export function recordFailure(
 
   writeStatus();
 
-  // Notify on first occurrence of each error type (don't spam)
-  const notifyKey = `${errorType}:${error}`;
-  if (notifyKey !== lastNotifiedError) {
-    lastNotifiedError = notifyKey;
-    notify(errorType, error);
+  // Log once per error type (not per unique message) to avoid spam
+  if (errorType !== lastNotifiedError) {
+    lastNotifiedError = errorType;
+    logWarning(errorType);
   }
 }
 
@@ -120,35 +118,17 @@ function classifyError(message: string): SyncStatus["error_type"] {
 
 export { classifyError };
 
-// macOS desktop notification via osascript
-function notify(errorType: SyncStatus["error_type"], detail: string): void {
-  if (process.platform !== "darwin") return;
-
-  const titles: Record<string, string> = {
-    auth: "Engram: Authentication Failed",
-    billing: "Engram: Billing Issue",
-    rate_limit: "Engram: Rate Limited",
-    network: "Engram: Connection Lost",
-    server: "Engram: Server Error",
+/** Log a warning to stderr (goes to daemon.log). One line per error type. */
+function logWarning(errorType: SyncStatus["error_type"]): void {
+  const warnings: Record<string, string> = {
+    auth: "Authentication failed — run 'engram auth login'",
+    billing: "Plan limit reached — upgrade at https://getengram.app/pricing. Messages are queued locally and will retry with backoff.",
+    rate_limit: "Rate limited — messages queued, will retry",
+    network: "Can't reach servers — messages queued locally",
+    server: "Server error — messages queued, will retry",
   };
 
-  const messages: Record<string, string> = {
-    auth: "Your API key is invalid or expired. Run 'engram auth login' to fix.",
-    billing: "Your plan limit has been reached. Upgrade at getengram.app/pricing",
-    rate_limit: "Too many requests. Messages are queued and will retry.",
-    network: "Can't reach Engram servers. Messages are safely queued locally.",
-    server: "Engram servers are having issues. Messages are safely queued.",
-  };
-
-  const title = titles[errorType ?? "network"] ?? "Engram: Sync Warning";
-  const message = messages[errorType ?? "network"] ?? detail;
-
-  try {
-    execSync(
-      `osascript -e 'display notification "${message}" with title "${title}"'`,
-      { stdio: "pipe", timeout: 3000 },
-    );
-  } catch {
-    // notification failed, not critical
-  }
+  const msg = warnings[errorType ?? "network"] ?? "Unknown sync error";
+  console.error(`[engram] WARNING: ${msg}`);
+  console.error(`[engram] Run 'engram status' for details.`);
 }

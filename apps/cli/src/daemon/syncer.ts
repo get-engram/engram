@@ -7,6 +7,13 @@ const BATCH_SIZE = 200;
 const FLUSH_INTERVAL_MS = 2_000;
 const CONCURRENCY = 5;
 
+/** Backoff schedule for billing/limit errors: 5min → 15min → 1hr → 1hr ... */
+const BILLING_BACKOFF_MS = [
+  5 * 60_000,    // 5 minutes
+  15 * 60_000,   // 15 minutes
+  60 * 60_000,   // 1 hour (cap)
+];
+
 /**
  * Batches parsed messages and sends them to the Engram API.
  * If offline, messages sit in the SQLite queue and are retried
@@ -18,6 +25,10 @@ export class Syncer {
   private timer: ReturnType<typeof setInterval> | null = null;
   private flushing = false;
   private authFailed = false;
+
+  /** Billing backoff state */
+  private billingBackoffUntil: number = 0;
+  private billingBackoffStep: number = 0;
 
   /** Sessions awaiting conversation creation (deferred from parse time). */
   private pendingSessions = new Map<
@@ -67,6 +78,10 @@ export class Syncer {
   /** Flush all pending messages to the API. */
   async flush(): Promise<void> {
     if (this.flushing || this.authFailed) return;
+
+    // Skip if in billing backoff window
+    if (Date.now() < this.billingBackoffUntil) return;
+
     this.flushing = true;
 
     try {
@@ -95,6 +110,7 @@ export class Syncer {
       // Report sync health
       const pending = this.db.getPendingCount();
       if (!hadError && !this.authFailed) {
+        this.resetBillingBackoff();
         recordSuccess(pending);
       }
     } catch (err: unknown) {
@@ -141,8 +157,13 @@ export class Syncer {
             recordFailure(msg, "auth", this.db.getPendingCount());
             return;
           }
+          const errType = classifyError(msg);
+          if (errType === "billing") {
+            this.enterBillingBackoff(msg);
+            return;
+          }
           console.error(`[engram] create error (will retry): ${msg}`);
-          recordFailure(msg, classifyError(msg), this.db.getPendingCount());
+          recordFailure(msg, errType, this.db.getPendingCount());
         }
       }
     }
@@ -169,12 +190,43 @@ export class Syncer {
           return;
         }
 
+        // Billing / limit errors — exponential backoff
+        const errType = classifyError(msg);
+        if (errType === "billing") {
+          this.enterBillingBackoff(msg);
+          return;
+        }
+
         // Rate limit or network — leave in queue for next cycle
         console.error(`[engram] send failed (will retry): ${msg}`);
-        recordFailure(msg, classifyError(msg), this.db.getPendingCount());
+        recordFailure(msg, errType, this.db.getPendingCount());
         return;
       }
     }
+  }
+
+  /** Enter billing backoff — escalates each time: 5min → 15min → 1hr */
+  private enterBillingBackoff(msg: string): void {
+    const delay = BILLING_BACKOFF_MS[
+      Math.min(this.billingBackoffStep, BILLING_BACKOFF_MS.length - 1)
+    ];
+    this.billingBackoffUntil = Date.now() + delay;
+    this.billingBackoffStep++;
+
+    const mins = Math.round(delay / 60_000);
+    console.error(
+      `[engram] billing limit hit, backing off ${mins}m (attempt ${this.billingBackoffStep}): ${msg}`,
+    );
+    recordFailure(msg, "billing", this.db.getPendingCount());
+  }
+
+  /** Reset billing backoff after a successful sync. */
+  private resetBillingBackoff(): void {
+    if (this.billingBackoffStep > 0) {
+      console.log("[engram] billing backoff cleared, resuming normal sync");
+    }
+    this.billingBackoffUntil = 0;
+    this.billingBackoffStep = 0;
   }
 
   private async createConversation(

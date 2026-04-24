@@ -1,11 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import {
-  searchConversations,
-  DEFAULT_SNIPPET_CHARS,
-  DEFAULT_MIN_SCORE,
-  MAX_SNIPPET_CHARS,
-} from "../../services/search.js";
+import { searchConversations } from "../../services/search.js";
 import { trackSearchRun } from "../../services/tier.js";
 import type { Env, AuthContext } from "../../types.js";
 
@@ -16,17 +11,17 @@ export function registerSearch(
 ) {
   server.tool(
     "search",
-    "Hybrid search (semantic + keyword) across stored conversations. Combines vector similarity with BM25 keyword matching for better results. Returns chunk_text snippets with conversation_title, tags, and relevance scores. Use short, focused queries — one search should be enough. For full structured messages, call get_conversation with the returned conversation_id + start_sequence / end_sequence.",
+    "Hybrid search (semantic + keyword) across stored conversations. Returns the most relevant chunk_text snippets with conversation_title, tags, and scores. One search is enough — do not retry with rephrased queries.",
     {
       query: z.string().describe("Search query text"),
       limit: z
         .number()
         .int()
         .min(1)
-        .max(50)
+        .max(20)
         .optional()
         .default(5)
-        .describe("Max results to return (default 5)"),
+        .describe("Max results (default 5)"),
       conversation_id: z
         .string()
         .optional()
@@ -35,32 +30,6 @@ export function registerSearch(
         .array(z.string())
         .optional()
         .describe("Filter by conversation tags"),
-      snippet_chars: z
-        .number()
-        .int()
-        .min(0)
-        .max(MAX_SNIPPET_CHARS)
-        .optional()
-        .default(DEFAULT_SNIPPET_CHARS)
-        .describe(
-          `Max characters of chunk_text to return per result (default ${DEFAULT_SNIPPET_CHARS}, max ${MAX_SNIPPET_CHARS}). Longer snippets = larger responses.`
-        ),
-      min_score: z
-        .number()
-        .min(0)
-        .max(1)
-        .optional()
-        .default(DEFAULT_MIN_SCORE)
-        .describe(
-          `Minimum similarity score (0-1) to include a result (default ${DEFAULT_MIN_SCORE}). Filters out low-relevance noise.`
-        ),
-      dedupe: z
-        .boolean()
-        .optional()
-        .default(true)
-        .describe(
-          "Deduplicate overlapping chunks from the same conversation (default true). Set false to see all matching chunks."
-        ),
     },
     async (params) => {
       const results = await searchConversations(
@@ -70,9 +39,6 @@ export function registerSearch(
         params.limit,
         params.conversation_id,
         params.tags,
-        params.snippet_chars,
-        params.min_score,
-        params.dedupe
       );
 
       // Track usage (non-blocking)

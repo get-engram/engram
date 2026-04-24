@@ -9,8 +9,9 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { bold, dim } from "../output.js";
+import { bold, dim, red } from "../output.js";
 import { DaemonDb } from "./db.js";
+import { readStatus, type SyncStatus } from "./status.js";
 
 const ENGRAM_DIR = join(homedir(), ".engram");
 const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
@@ -171,11 +172,44 @@ export async function daemonStatus(): Promise<void> {
     console.log(`${dim("Files tracked:")}     ${stats.trackedFiles}`);
   }
 
+  // Show sync health warnings
+  const syncStatus = readStatus();
+  printSyncWarnings(syncStatus);
+
   console.log(`${dim("Log:")} ${LOG_FILE}`);
 
   if (isLaunchdInstalled()) {
     console.log(`${dim("Auto-start:")} enabled (launchd)`);
   }
+}
+
+function printSyncWarnings(status: SyncStatus): void {
+  if (status.health === "healthy") {
+    if (status.last_sync_at) {
+      console.log(`${dim("Last sync:")}        ${status.last_sync_at}`);
+    }
+    return;
+  }
+
+  const warnings: Record<string, string> = {
+    auth: "Authentication failed — run 'engram auth login'",
+    billing: "Plan limit reached — upgrade at getengram.app/pricing\n           Messages are queued locally and will retry with backoff.",
+    rate_limit: "Rate limited — messages queued, will retry",
+    network: "Can't reach servers — messages queued locally",
+    server: "Server error — messages queued, will retry",
+  };
+
+  const msg = warnings[status.error_type ?? "network"] ?? status.last_error ?? "Unknown error";
+
+  console.log("");
+  console.log(red(`  WARNING: ${msg}`));
+  if (status.pending_messages > 0) {
+    console.log(red(`  ${status.pending_messages} messages waiting to sync`));
+  }
+  if (status.last_error_at) {
+    console.log(dim(`  Since: ${status.last_error_at}`));
+  }
+  console.log("");
 }
 
 // ── Launchd integration ──

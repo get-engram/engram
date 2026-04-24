@@ -160,6 +160,15 @@ export class DaemonDb {
       .run(...ids);
   }
 
+  /** Count of unsent messages across all conversations. */
+  getPendingCount(): number {
+    return (
+      this.db
+        .prepare("SELECT COUNT(*) as c FROM pending_messages WHERE sent_at IS NULL")
+        .get() as { c: number }
+    ).c;
+  }
+
   // ── Stats ──
 
   getStats(): {

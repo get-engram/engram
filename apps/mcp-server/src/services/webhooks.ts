@@ -21,37 +21,38 @@ export async function fireWebhooks(
     timestamp: new Date().toISOString(),
   });
 
-  for (const ep of endpoints) {
-    const endpoint = ep as { id: string; url: string; secret: string };
-    const deliveryId = generateId("whd");
+  await Promise.all(
+    endpoints.map(async (ep) => {
+      const endpoint = ep as { id: string; url: string; secret: string };
+      const deliveryId = generateId("whd");
 
-    await insertWebhookDelivery(db, deliveryId, endpoint.id, event, payload);
+      await insertWebhookDelivery(db, deliveryId, endpoint.id, event, payload);
 
-    try {
-      // Sign the payload with HMAC-SHA256
-      const signature = await signPayload(payload, endpoint.secret);
+      try {
+        const signature = await signPayload(payload, endpoint.secret);
 
-      const response = await fetch(endpoint.url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Engram-Signature": signature,
-          "X-Engram-Event": event,
-          "X-Engram-Delivery": deliveryId,
-        },
-        body: payload,
-      });
+        const response = await fetch(endpoint.url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Engram-Signature": signature,
+            "X-Engram-Event": event,
+            "X-Engram-Delivery": deliveryId,
+          },
+          body: payload,
+        });
 
-      await updateWebhookDelivery(
-        db,
-        deliveryId,
-        response.status,
-        response.ok
-      );
-    } catch {
-      await updateWebhookDelivery(db, deliveryId, 0, false);
-    }
-  }
+        await updateWebhookDelivery(
+          db,
+          deliveryId,
+          response.status,
+          response.ok
+        );
+      } catch {
+        await updateWebhookDelivery(db, deliveryId, 0, false);
+      }
+    })
+  );
 }
 
 async function signPayload(payload: string, secret: string): Promise<string> {

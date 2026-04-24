@@ -8,6 +8,7 @@ export interface Env {
   STRIPE_PRICE_ID_PRO: string;
   STRIPE_PRICE_ID_TEAM: string;
   APP_URL: string; // e.g. "https://getengram.app"
+  ADMIN_SECRET: string; // wrangler secret for /api/admin/* routes
   // Supabase JWT secret — used to verify access tokens from engram-web.
   // The dashboard sends the user's Supabase access token as a Bearer on
   // /signup; the worker verifies the HS256 signature and extracts the

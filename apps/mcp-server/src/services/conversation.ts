@@ -18,6 +18,7 @@ import {
   getVectorizeIdsByConversation,
 } from "@getengram/db";
 import { generateEmbeddings } from "./embedding.js";
+import { compressContent, decompressContent } from "../utils/compress.js";
 import type { Env } from "../types.js";
 
 export async function createConversation(
@@ -74,15 +75,21 @@ export async function appendMessages(
     return msg;
   });
 
-  // Insert messages
+  // Compress message content for storage
+  const compressed = await Promise.all(
+    messages.map((m) => compressContent(m.content))
+  );
+
+  // Insert messages with compressed content
   await insertMessages(
     env.DB,
-    messages.map((m) => ({
+    messages.map((m, i) => ({
       id: m.id,
       conversationId: m.conversation_id,
       organizationId: m.organization_id,
       role: m.role,
-      content: m.content,
+      content: compressed[i].content,
+      contentEncoding: compressed[i].encoding,
       toolCallId: m.tool_call_id,
       toolName: m.tool_name,
       sequence: m.sequence,
@@ -179,11 +186,17 @@ export async function getConversation(
     messageOffset
   );
 
-  const messages = (msgsResult.results as Array<Record<string, unknown>>).map(
-    (m) => ({
+  // Decompress message content in parallel
+  const rawMessages = msgsResult.results as Array<Record<string, unknown>>;
+  const messages = await Promise.all(
+    rawMessages.map(async (m) => ({
       ...m,
+      content: await decompressContent(
+        m.content as string,
+        m.content_encoding as string | null
+      ),
       metadata: JSON.parse((m.metadata as string) || "{}"),
-    })
+    }))
   ) as Message[];
 
   return { conversation, messages };

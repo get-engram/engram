@@ -6,6 +6,7 @@ export function insertMessages(
     organizationId: string;
     role: string;
     content: string;
+    contentEncoding: string | null;
     toolCallId: string | null;
     toolName: string | null;
     sequence: number;
@@ -15,7 +16,7 @@ export function insertMessages(
   const stmts = messages.map((m) =>
     db
       .prepare(
-        "INSERT INTO messages (id, conversation_id, organization_id, role, content, tool_call_id, tool_name, sequence, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO messages (id, conversation_id, organization_id, role, content, content_encoding, tool_call_id, tool_name, sequence, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
       )
       .bind(
         m.id,
@@ -23,6 +24,7 @@ export function insertMessages(
         m.organizationId,
         m.role,
         m.content,
+        m.contentEncoding,
         m.toolCallId,
         m.toolName,
         m.sequence,

@@ -1,6 +1,7 @@
 import {
   generateId,
   chunkMessages,
+  redactMessages,
   type MessageInput,
   type Message,
   type Conversation,
@@ -75,15 +76,21 @@ export async function appendMessages(
     return msg;
   });
 
+  // Redact secrets, credentials, and PII before storage
+  const { messages: redacted, totalRedactions } = redactMessages(messages);
+  if (totalRedactions > 0) {
+    console.log(`[redact] Scrubbed ${totalRedactions} sensitive pattern(s) from ${conversationId}`);
+  }
+
   // Compress message content for storage
   const compressed = await Promise.all(
-    messages.map((m) => compressContent(m.content))
+    redacted.map((m) => compressContent(m.content))
   );
 
   // Insert messages with compressed content
   await insertMessages(
     env.DB,
-    messages.map((m, i) => ({
+    redacted.map((m, i) => ({
       id: m.id,
       conversationId: m.conversation_id,
       organizationId: m.organization_id,
@@ -98,10 +105,10 @@ export async function appendMessages(
   );
 
   // Update conversation message count
-  await updateConversationMessageCount(env.DB, conversationId, messages.length);
+  await updateConversationMessageCount(env.DB, conversationId, redacted.length);
 
-  // Chunk the new messages for embedding
-  const chunks = chunkMessages(messages);
+  // Chunk the redacted messages for embedding
+  const chunks = chunkMessages(redacted);
 
   if (chunks.length > 0) {
     // Generate embeddings for all chunks

@@ -84,6 +84,8 @@ export function getConversationCount(db: D1Database, organizationId: string) {
 
 export function deleteConversationById(db: D1Database, id: string, organizationId: string) {
   return db.batch([
+    // FTS delete must come before chunks delete (subquery references conversation_chunks)
+    db.prepare("DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ?)").bind(id, organizationId),
     db.prepare("DELETE FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),
     db.prepare("DELETE FROM messages WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),
     db.prepare("DELETE FROM conversations WHERE id = ? AND organization_id = ?").bind(id, organizationId),

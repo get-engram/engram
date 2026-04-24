@@ -15,7 +15,7 @@ import { log as showLog } from "./commands/log.js";
 import { daemonStart, daemonStop, daemonStatus, daemonInstall, daemonUninstall } from "./daemon/index.js";
 import { bold, dim } from "./output.js";
 
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 
 // Commands that take 1 word
 const TOP_COMMANDS = new Set([

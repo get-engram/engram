@@ -9,9 +9,9 @@ interface VectorizeMatch {
   metadata?: Record<string, unknown>;
 }
 
-export const DEFAULT_SNIPPET_CHARS = 800;
-export const MAX_SNIPPET_CHARS = 5000;
-export const DEFAULT_MIN_SCORE = 0.5;
+const DEFAULT_SNIPPET_CHARS = 2000;
+const MAX_SNIPPET_CHARS = 5000;
+const DEFAULT_MIN_SCORE = 0.3;
 const TRUNCATION_MARKER = "\n...[truncated]";
 
 // RRF constant — dampens high-rank dominance. k=60 is standard.

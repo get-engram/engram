@@ -146,8 +146,9 @@ describe("search service", () => {
   });
 
   it("filters out results below min_score", async () => {
-    // vec_short has score 0.99, vec_long has score 0.88
-    const results = await searchConversations(
+    // With RRF normalization, rank-0 vector-only result scores ~0.5
+    // and rank-1 scores slightly less. Use a threshold that splits them.
+    const allResults = await searchConversations(
       env as unknown as Parameters<typeof searchConversations>[0],
       organizationId,
       "greeting",
@@ -155,13 +156,31 @@ describe("search service", () => {
       undefined,
       undefined,
       undefined,
-      0.95,  // only the 0.99 result should pass
-      false  // dedupe off
+      0,     // get all first
+      false
+    );
+    // Both should exist with different scores
+    expect(allResults.length).toBe(2);
+    const topScore = allResults[0].score;
+    const lowScore = allResults[1].score;
+    expect(topScore).toBeGreaterThan(lowScore);
+
+    // Now filter with a threshold between the two scores
+    const midpoint = (topScore + lowScore) / 2;
+    const filtered = await searchConversations(
+      env as unknown as Parameters<typeof searchConversations>[0],
+      organizationId,
+      "greeting",
+      5,
+      undefined,
+      undefined,
+      undefined,
+      midpoint,
+      false
     );
 
-    expect(results.length).toBe(1);
-    expect(results[0].chunk_id).toBe("chk_short");
-    expect(results[0].score).toBe(0.99);
+    expect(filtered.length).toBe(1);
+    expect(filtered[0].chunk_id).toBe("chk_short");
   });
 
   it("deduplicates chunks from the same conversation by default", async () => {
@@ -181,7 +200,7 @@ describe("search service", () => {
     expect(results.length).toBe(1);
     // Highest score wins
     expect(results[0].chunk_id).toBe("chk_short");
-    expect(results[0].score).toBe(0.99);
+    expect(results[0].score).toBeGreaterThan(0);
   });
 
   it("returns all chunks when dedupe is false", async () => {

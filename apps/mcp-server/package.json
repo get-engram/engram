@@ -21,11 +21,11 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250313.0",
+    "@cloudflare/workers-types": "^4.20260423.1",
     "@getengram/sdk": "workspace:*",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0",
-    "wrangler": "^4.77.0"
+    "wrangler": "^4.84.1"
   }
 }

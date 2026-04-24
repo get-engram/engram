@@ -123,6 +123,23 @@ export function createMockD1(): D1Database {
           );
         }
 
+        // Filter by id IN (...) — used by getChunksByIds and conversation metadata
+        if (sql.includes("id IN (") && !sql.includes("vectorize_id") && !sql.includes("chunk_id")) {
+          // Bindings are the IDs followed possibly by organizationId
+          const hasOrgFilter = sql.includes("organization_id = ?");
+          const orgId = hasOrgFilter ? bindings[bindings.length - 1] : null;
+          const ids = hasOrgFilter ? bindings.slice(0, -1) : bindings;
+          results = results.filter((r) => ids.includes(r.id));
+          if (orgId) {
+            results = results.filter((r) => r.organization_id === orgId);
+          }
+        }
+
+        // FTS query — will match against chunks_fts which doesn't exist in mock
+        if (sql.includes("chunks_fts")) {
+          return { results: [], success: true, meta: {} };
+        }
+
         return { results, success: true, meta: {} };
       }),
     };

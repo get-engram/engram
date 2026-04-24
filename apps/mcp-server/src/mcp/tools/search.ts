@@ -16,7 +16,7 @@ export function registerSearch(
 ) {
   server.tool(
     "search",
-    "Semantic search across stored conversations. Returns the matching chunk_text snippets with relevance scores. For the full structured messages of a chunk, call get_conversation with the returned conversation_id + start_sequence / end_sequence.",
+    "Hybrid search (semantic + keyword) across stored conversations. Combines vector similarity with BM25 keyword matching for better results. Returns chunk_text snippets with conversation_title, tags, and relevance scores. Use short, focused queries — one search should be enough. For full structured messages, call get_conversation with the returned conversation_id + start_sequence / end_sequence.",
     {
       query: z.string().describe("Search query text"),
       limit: z

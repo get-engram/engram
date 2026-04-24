@@ -161,7 +161,7 @@ describe("MCP tool contract — wire field names", () => {
       // Schema snake_case.
       expect(tool!.schema).toHaveProperty("query");
       expect(tool!.schema).toHaveProperty("conversation_id");
-      expect(tool!.schema).toHaveProperty("snippet_chars");
+      expect(tool!.schema).toHaveProperty("tags");
 
       const { data, isError } = parseToolResponse(
         await tool!.handler({ query: "anything", limit: 5 })

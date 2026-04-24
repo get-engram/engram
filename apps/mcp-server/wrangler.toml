@@ -6,6 +6,13 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 APP_URL = "https://getengram.app"
 
+# Secrets (set via `wrangler secret put`):
+#   SUPABASE_JWT_SECRET     — Supabase project JWT secret (HS256, from dashboard → Settings → API)
+#   STRIPE_SECRET_KEY       — Stripe API key
+#   STRIPE_WEBHOOK_SECRET   — Stripe webhook signing secret
+#   STRIPE_PRICE_ID_PRO     — Stripe price ID for Pro plan
+#   STRIPE_PRICE_ID_TEAM    — Stripe price ID for Team plan
+
 [[d1_databases]]
 binding = "DB"
 database_name = "engram-db"

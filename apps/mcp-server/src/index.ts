@@ -52,7 +52,7 @@ app.use(
   cors({
     origin: BROWSER_ORIGINS,
     allowMethods: ["POST", "OPTIONS"],
-    allowHeaders: ["Content-Type"],
+    allowHeaders: ["Content-Type", "Authorization"],
   }),
 );
 app.route("/signup", signup);

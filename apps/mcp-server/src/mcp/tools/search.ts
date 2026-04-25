@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { searchConversations } from "../../services/search.js";
 import { trackSearchRun } from "../../services/tier.js";
+import { audit } from "../../services/audit.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerSearch(
@@ -43,6 +44,10 @@ export function registerSearch(
 
       // Track usage (non-blocking)
       trackSearchRun(env.DB, auth.organizationId).catch(() => {});
+      audit(env.DB, auth.organizationId, auth.apiKeyId, "search", null, null, {
+        query: params.query,
+        results: results.length,
+      });
 
       return {
         content: [

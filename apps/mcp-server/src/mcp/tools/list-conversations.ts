@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { listConversations as dbListConversations } from "@getengram/db";
+import { audit } from "../../services/audit.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerListConversations(
@@ -23,6 +24,8 @@ export function registerListConversations(
       order: z.enum(["asc", "desc"]).optional().default("desc"),
     },
     async (params) => {
+      audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.list");
+
       const result = await dbListConversations(env.DB, auth.organizationId, {
         limit: params.limit,
         offset: params.offset,

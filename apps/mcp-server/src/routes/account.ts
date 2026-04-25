@@ -5,6 +5,7 @@ import {
   softDeleteOrganization,
   restoreOrganization,
 } from "@getengram/db";
+import { audit } from "../services/audit.js";
 import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
@@ -25,6 +26,7 @@ account.delete("/", async (c) => {
 
   // Soft-delete: set deleted_at timestamp. Data is purged after 30 days by cron.
   await softDeleteOrganization(c.env.DB, orgId);
+  audit(c.env.DB, orgId, auth.apiKeyId, "account.delete");
 
   return c.json({
     deleted: true,
@@ -54,6 +56,7 @@ account.post("/restore", async (c) => {
   }
 
   await restoreOrganization(c.env.DB, orgId);
+  audit(c.env.DB, orgId, auth.apiKeyId, "account.restore");
 
   return c.json({
     restored: true,

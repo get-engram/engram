@@ -4,6 +4,7 @@ import { createConversation } from "../../services/conversation.js";
 import { getConversationCount } from "@getengram/db";
 import { checkConversationLimit } from "../../services/tier.js";
 import { fireWebhooks } from "../../services/webhooks.js";
+import { audit } from "../../services/audit.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerCreateConversation(
@@ -52,6 +53,8 @@ export function registerCreateConversation(
         params.tags,
         params.metadata as Record<string, unknown>
       );
+
+      audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.create", "conversation", id);
 
       // Fire webhooks (non-blocking)
       fireWebhooks(env.DB, auth.organizationId, "conversation.created", {

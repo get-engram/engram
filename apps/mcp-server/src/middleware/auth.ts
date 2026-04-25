@@ -1,6 +1,7 @@
 import type { Context, Next } from "hono";
 import { hashApiKey } from "@getengram/shared";
 import { getApiKeyWithOrg, updateApiKeyLastUsed } from "@getengram/db";
+import { audit } from "../services/audit.js";
 import type { Env, AuthContext } from "../types.js";
 
 export async function authMiddleware(
@@ -21,6 +22,9 @@ export async function authMiddleware(
   const row = await getApiKeyWithOrg(c.env.DB, keyHash);
 
   if (!row) {
+    audit(c.env.DB, "unknown", null, "auth.failure", null, null, {
+      reason: "invalid_key",
+    });
     return c.json({ error: "Invalid API key" }, 401);
   }
 

@@ -5,6 +5,7 @@ import {
   getMessagesByConversation,
 } from "@getengram/db";
 import { decompressContent } from "../utils/compress.js";
+import { audit } from "../services/audit.js";
 import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
@@ -80,6 +81,10 @@ dataExport.get("/", async (c) => {
     },
     conversations,
   };
+
+  audit(c.env.DB, orgId, auth.apiKeyId, "data.export", null, null, {
+    conversations: conversations.length,
+  });
 
   c.header("Content-Disposition", `attachment; filename="engram-export-${orgId}.json"`);
   return c.json(exportData);

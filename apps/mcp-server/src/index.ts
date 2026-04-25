@@ -11,6 +11,7 @@ import { usage } from "./routes/usage.js";
 import { signup } from "./routes/signup.js";
 import { billing, billingWebhook } from "./routes/billing.js";
 import { admin } from "./routes/admin.js";
+import { account } from "./routes/account.js";
 import type { Env, AuthContext } from "./types.js";
 
 type HonoEnv = {
@@ -91,5 +92,6 @@ app.route("/api/seats", seats);
 app.route("/api/webhooks", webhooks);
 app.route("/api/usage", usage);
 app.route("/api/billing", billing);
+app.route("/api/account", account);
 
 export default app;

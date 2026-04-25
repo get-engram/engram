@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getConversation } from "../../services/conversation.js";
+import { audit } from "../../services/audit.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerGetConversation(
@@ -30,6 +31,8 @@ export function registerGetConversation(
         .describe("Message offset for pagination"),
     },
     async (params) => {
+      audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.read", "conversation", params.conversation_id);
+
       const result = await getConversation(
         env.DB,
         auth.organizationId,

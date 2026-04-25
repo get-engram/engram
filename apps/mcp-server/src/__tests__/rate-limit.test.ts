@@ -77,7 +77,7 @@ describe("rate limit middleware", () => {
 
     const res = await uniqueApp.request("/test");
     expect(res.status).toBe(429);
-    const body = await res.json();
+    const body = (await res.json()) as Record<string, unknown>;
     expect(body.error).toBe("rate_limit_exceeded");
     expect(body.retry_after).toBe(60);
   });

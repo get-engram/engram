@@ -13,6 +13,7 @@ import { billing, billingWebhook } from "./routes/billing.js";
 import { admin } from "./routes/admin.js";
 import { account } from "./routes/account.js";
 import { dataExport } from "./routes/export.js";
+import { purgeDeletedOrganizations } from "./cron/purge-deleted.js";
 import type { Env, AuthContext } from "./types.js";
 
 type HonoEnv = {
@@ -96,4 +97,12 @@ app.route("/api/billing", billing);
 app.route("/api/account", account);
 app.route("/api/export", dataExport);
 
-export default app;
+export default {
+  fetch: app.fetch,
+  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext) {
+    const purged = await purgeDeletedOrganizations(env);
+    if (purged > 0) {
+      console.log(`[cron] Purged ${purged} expired organization(s)`);
+    }
+  },
+};

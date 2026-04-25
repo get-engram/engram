@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { authMiddleware } from "./middleware/auth.js";
+import { rateLimitMiddleware } from "./middleware/rate-limit.js";
 import { createMcpServer } from "./mcp/server.js";
 import { keys } from "./routes/keys.js";
 import { seats } from "./routes/seats.js";
@@ -25,7 +26,7 @@ app.get("/health", (c) => {
 });
 
 // MCP endpoint — all methods
-app.all("/mcp", authMiddleware, async (c) => {
+app.all("/mcp", authMiddleware, rateLimitMiddleware, async (c) => {
   const auth = c.get("auth");
   const server = createMcpServer(c.env, auth);
 
@@ -84,6 +85,7 @@ app.use(
   }),
 );
 app.use("/api/*", authMiddleware);
+app.use("/api/*", rateLimitMiddleware);
 app.route("/api/keys", keys);
 app.route("/api/seats", seats);
 app.route("/api/webhooks", webhooks);

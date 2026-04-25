@@ -25,7 +25,7 @@ function createApp(orgId: string) {
 }
 
 describe("DELETE /api/account", () => {
-  it("deletes an organization and returns stats", async () => {
+  it("soft-deletes an organization and returns grace period info", async () => {
     const db = createMockD1();
     const env = createMockEnv(db);
     await insertOrganization(db, "org_del", "Delete Me");
@@ -38,7 +38,7 @@ describe("DELETE /api/account", () => {
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.deleted).toBe(true);
     expect(body.organization_id).toBe("org_del");
-    expect(body.deleted_records).toBeDefined();
+    expect(body.grace_period_days).toBe(30);
   });
 
   it("returns 404 for non-existent org", async () => {
@@ -52,24 +52,30 @@ describe("DELETE /api/account", () => {
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.error).toBe("Organization not found");
   });
+});
 
-  it("calls VECTORIZE.deleteByIds when vectors exist", async () => {
+describe("POST /api/account/restore", () => {
+  it("returns 400 when org is not deleted", async () => {
     const db = createMockD1();
     const env = createMockEnv(db);
-    await insertOrganization(db, "org_vec", "Vec Org");
+    await insertOrganization(db, "org_active", "Active Org");
 
-    // Manually insert a chunk with a vectorize_id
-    await db
-      .prepare(
-        "INSERT INTO conversation_chunks (id, conversation_id, organization_id, chunk_text, start_sequence, end_sequence, vectorize_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      )
-      .bind("chk_1", "conv_1", "org_vec", "test", 1, 1, "vec_abc")
-      .run();
+    const app = createApp("org_active");
+    const res = await app.request("/api/account/restore", { method: "POST" }, env);
 
-    const app = createApp("org_vec");
-    const res = await app.request("/api/account", { method: "DELETE" }, env);
+    // Org exists but has no deleted_at set — should return 400
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.error).toBe("Account is not marked for deletion");
+  });
 
-    expect(res.status).toBe(200);
-    expect(env.VECTORIZE.deleteByIds).toHaveBeenCalledWith(["vec_abc"]);
+  it("returns 404 for non-existent org", async () => {
+    const db = createMockD1();
+    const env = createMockEnv(db);
+
+    const app = createApp("org_gone");
+    const res = await app.request("/api/account/restore", { method: "POST" }, env);
+
+    expect(res.status).toBe(404);
   });
 });

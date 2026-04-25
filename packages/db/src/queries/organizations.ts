@@ -92,6 +92,30 @@ export function deleteOrganizationById(db: D1Database, id: string) {
   ]);
 }
 
+export function softDeleteOrganization(db: D1Database, id: string) {
+  return db
+    .prepare(
+      "UPDATE organizations SET deleted_at = datetime('now') WHERE id = ?",
+    )
+    .bind(id)
+    .run();
+}
+
+export function restoreOrganization(db: D1Database, id: string) {
+  return db
+    .prepare("UPDATE organizations SET deleted_at = NULL WHERE id = ?")
+    .bind(id)
+    .run();
+}
+
+export function getExpiredOrganizations(db: D1Database) {
+  return db
+    .prepare(
+      "SELECT id FROM organizations WHERE deleted_at IS NOT NULL AND deleted_at < datetime('now', '-30 days')",
+    )
+    .all<{ id: string }>();
+}
+
 export function getOrganizationStats(db: D1Database, organizationId: string) {
   return db
     .prepare(

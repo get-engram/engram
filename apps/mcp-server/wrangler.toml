@@ -30,3 +30,7 @@ binding = "AI"
 [[routes]]
 pattern = "mcp.getengram.app/*"
 zone_name = "getengram.app"
+
+# Daily cron — purge soft-deleted orgs older than 30 days (GDPR)
+[triggers]
+crons = ["0 3 * * *"]

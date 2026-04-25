@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { deleteConversation } from "../../services/conversation.js";
+import { audit } from "../../services/audit.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerDeleteConversation(
@@ -20,6 +21,8 @@ export function registerDeleteConversation(
         auth.organizationId,
         params.conversation_id
       );
+
+      audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.delete", "conversation", params.conversation_id);
 
       if (!deleted) {
         return {

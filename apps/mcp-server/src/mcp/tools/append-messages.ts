@@ -3,6 +3,7 @@ import { z } from "zod";
 import { appendMessages } from "../../services/conversation.js";
 import { checkAndTrackMessages } from "../../services/tier.js";
 import { fireWebhooks } from "../../services/webhooks.js";
+import { audit } from "../../services/audit.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerAppendMessages(
@@ -66,6 +67,10 @@ export function registerAppendMessages(
           metadata: m.metadata as Record<string, unknown>,
         }))
       );
+
+      audit(env.DB, auth.organizationId, auth.apiKeyId, "messages.append", "conversation", params.conversation_id, {
+        count: messages.length,
+      });
 
       // Fire webhooks (non-blocking)
       fireWebhooks(env.DB, auth.organizationId, "messages.appended", {

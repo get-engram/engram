@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { getAuditLogs } from "@getengram/db";
 import { compressContent, ENCODING_GZIP } from "../utils/compress.js";
 import type { Env } from "../types.js";
 
@@ -15,6 +16,22 @@ export const admin = new Hono<AdminEnv>();
  * Body (optional):
  *   { "batch_size": 500 }   — how many messages to process per call (max 1000)
  */
+// GET /admin/audit/:orgId — query audit logs for an organization
+admin.get("/audit/:orgId", async (c) => {
+  const orgId = c.req.param("orgId");
+  const limit = Math.min(Number(c.req.query("limit") || "50"), 200);
+  const offset = Number(c.req.query("offset") || "0");
+  const action = c.req.query("action");
+
+  const result = await getAuditLogs(c.env.DB, orgId, {
+    limit,
+    offset,
+    action: action || undefined,
+  });
+
+  return c.json({ logs: result.results, count: result.results.length });
+});
+
 admin.post("/backfill/compress", async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const batchSize = Math.min(Math.max(body.batch_size ?? 500, 1), 1000);

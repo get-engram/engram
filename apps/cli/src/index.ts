@@ -3,6 +3,7 @@
 import { Engram } from "@getengram/sdk";
 import { loadConfig, getBaseUrl } from "./config.js";
 import { authLogin, authLogout, authStatus } from "./commands/auth.js";
+import { signup, login } from "./commands/login.js";
 import {
   listConversations,
   createConversation,
@@ -21,6 +22,7 @@ const VERSION = "0.2.1";
 const TOP_COMMANDS = new Set([
   "help", "version", "store", "append", "search", "find", "convs",
   "start", "stop", "status", "install", "uninstall", "log",
+  "signup", "login",
 ]);
 // Commands that take 2 words (group + subcommand)
 const GROUP_COMMANDS = new Set(["auth", "conversations", "conv", "daemon"]);
@@ -91,9 +93,8 @@ async function getClient(): Promise<Engram> {
   if (!apiKey) {
     console.error(
       "Not authenticated. Run:\n\n" +
-        "  engram auth login <api-key>\n" +
-        "  # or\n" +
-        "  export ENGRAM_API_KEY=engram_sk_live_...\n",
+        "  engram signup     # create a free account\n" +
+        "  engram login      # sign in with email + password\n",
     );
     process.exit(1);
   }
@@ -112,7 +113,10 @@ ${bold("USAGE")}
   engram <command> [options]
 
 ${bold("COMMANDS")}
-  ${bold("auth login")} <key>         Authenticate with API key
+  ${bold("signup")}                   Create a free account instantly
+  ${bold("login")}                    Sign in with email + password
+
+  ${bold("auth login")} <key>         Authenticate with API key ${dim("(manual)")}
   ${bold("auth logout")}              Remove stored credentials
   ${bold("auth status")}              Show authentication status
 
@@ -141,7 +145,8 @@ ${bold("OPTIONS")}
   --agent <id>    Filter by agent ID
 
 ${bold("EXAMPLES")}
-  engram auth login engram_sk_live_abc123
+  engram signup
+  engram login
   engram conversations create --title "My Chat" --tags dev,test
   engram store -c conv_abc "deployed v2.1 to production"
   engram search "when did we deploy"
@@ -177,6 +182,14 @@ async function main(): Promise<void> {
       case "--version":
       case "-v":
         console.log(`engram ${VERSION}`);
+        break;
+
+      case "signup":
+        await signup();
+        break;
+
+      case "login":
+        await login();
         break;
 
       case "auth login":

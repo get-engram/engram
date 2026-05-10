@@ -6,6 +6,7 @@ import {
 } from "@getengram/shared";
 import {
   getOrganizationByEmail,
+  insertOrganization,
   insertOrganizationWithEmail,
   insertApiKey,
 } from "@getengram/db";
@@ -45,7 +46,7 @@ signup.post("/", async (c) => {
 
   let claims;
   try {
-    claims = await verifySupabaseJwt(token, jwtSecret);
+    claims = await verifySupabaseJwt(token, jwtSecret, c.env.SUPABASE_URL);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Invalid token";
     return c.json({ error: "unauthorized", message }, 401);
@@ -96,6 +97,31 @@ signup.post("/", async (c) => {
       created,
     },
     created ? 201 : 200,
+  );
+});
+
+// POST /signup/anonymous — mint an org + API key with no auth required.
+// This powers `engram signup` from the CLI, letting AI agents self-provision
+// accounts without any human interaction.
+signup.post("/anonymous", async (c) => {
+  const orgId = generateId("org");
+  const orgName = `anon-${orgId.slice(4, 12)}`;
+  await insertOrganization(c.env.DB, orgId, orgName);
+
+  const keyId = generateId("key");
+  const { raw, prefix } = generateApiKeyRaw();
+  const keyHash = await hashApiKey(raw);
+  await insertApiKey(c.env.DB, keyId, orgId, keyHash, prefix, "Default");
+
+  return c.json(
+    {
+      organization_id: orgId,
+      api_key: raw,
+      key_prefix: prefix,
+      plan: "free",
+      created: true,
+    },
+    201,
   );
 });
 

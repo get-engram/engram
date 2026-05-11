@@ -31,6 +31,17 @@ export function getOrganizationByEmail(db: D1Database, email: string) {
     .first();
 }
 
+export function setOrganizationEmail(
+  db: D1Database,
+  id: string,
+  email: string,
+) {
+  return db
+    .prepare("UPDATE organizations SET email = ? WHERE id = ?")
+    .bind(email, id)
+    .run();
+}
+
 export function getOrganizationByStripeCustomer(
   db: D1Database,
   stripeCustomerId: string,

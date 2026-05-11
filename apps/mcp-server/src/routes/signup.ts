@@ -10,8 +10,10 @@ import {
   insertOrganization,
   insertOrganizationWithEmail,
   insertApiKey,
+  getApiKeyCount,
   setOrganizationEmail,
 } from "@getengram/db";
+import { TIER_LIMITS, type Tier } from "@getengram/shared";
 import type { Env } from "../types.js";
 import { verifySupabaseJwt } from "../utils/jwt.js";
 
@@ -82,9 +84,27 @@ signup.post("/", async (c) => {
     created = true;
   }
 
-  // Always mint a fresh API key. The caller cannot recover the prior
-  // key (it's hashed at rest), so callers rely on this being the
-  // canonical way to bootstrap server-side credentials for a user.
+  // Only mint a key if the org doesn't already have one at its limit.
+  // Existing orgs that already have keys should use them (or the dashboard
+  // to manage keys) — minting on every login caused duplicate key bloat.
+  if (!created) {
+    const org = (await getOrganizationById(c.env.DB, orgId)) as { tier?: string } | null;
+    const tier = (org?.tier as Tier) ?? "free";
+    const limits = TIER_LIMITS[tier];
+    const count = await getApiKeyCount(c.env.DB, orgId);
+    if (limits.api_keys !== -1 && (count?.count ?? 0) >= limits.api_keys) {
+      return c.json(
+        {
+          error: "api_key_limit_reached",
+          message: "Your account already has an API key. Use your existing key, or manage keys on the dashboard.",
+          organization_id: orgId,
+          plan,
+        },
+        409,
+      );
+    }
+  }
+
   const keyId = generateId("key");
   const { raw, prefix } = generateApiKeyRaw();
   const keyHash = await hashApiKey(raw);

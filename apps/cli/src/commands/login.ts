@@ -53,6 +53,16 @@ function prompt(question: string, hidden = false): Promise<string> {
  * No email, no password. Just get a key and start using Engram.
  */
 export async function signup(): Promise<void> {
+  const existing = await loadConfig();
+  if (existing.apiKey) {
+    console.error(
+      "You already have an account. Your API key is saved in ~/.engram/config.json\n\n" +
+        "  engram auth status    # check your account\n" +
+        "  engram auth logout    # remove credentials before creating a new account\n",
+    );
+    process.exit(1);
+  }
+
   console.log("Creating account...");
 
   const res = await fetch(`${API_URL}/signup/anonymous`, {
@@ -214,6 +224,21 @@ export async function login(): Promise<void> {
     },
     body: JSON.stringify({ plan: "free" }),
   });
+
+  if (signupRes.status === 409) {
+    // Account already has a key — check if we have one locally
+    const config = await loadConfig();
+    if (config.apiKey) {
+      console.log(green(`✓ Signed in as ${email.trim()}`));
+      console.log(`  Using existing API key from ~/.engram/config.json`);
+      return;
+    }
+    console.error(
+      red("Your account already has an API key.\n") +
+        "  Use 'engram auth login <key>' to set it, or manage keys at getengram.app/dashboard",
+    );
+    process.exit(1);
+  }
 
   if (!signupRes.ok) {
     const body = await signupRes.text().catch(() => "");

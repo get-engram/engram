@@ -3,7 +3,7 @@
 import { Engram } from "@getengram/sdk";
 import { loadConfig, getBaseUrl } from "./config.js";
 import { authLogin, authLogout, authStatus } from "./commands/auth.js";
-import { signup, login } from "./commands/login.js";
+import { signup, login, link } from "./commands/login.js";
 import {
   listConversations,
   createConversation,
@@ -22,7 +22,7 @@ const VERSION = "0.2.1";
 const TOP_COMMANDS = new Set([
   "help", "version", "store", "append", "search", "find", "convs",
   "start", "stop", "status", "install", "uninstall", "log",
-  "signup", "login",
+  "signup", "login", "link",
 ]);
 // Commands that take 2 words (group + subcommand)
 const GROUP_COMMANDS = new Set(["auth", "conversations", "conv", "daemon"]);
@@ -115,6 +115,7 @@ ${bold("USAGE")}
 ${bold("COMMANDS")}
   ${bold("signup")}                   Create a free account instantly
   ${bold("login")}                    Sign in with email + password
+  ${bold("link")}                     Link email to your account for dashboard access
 
   ${bold("auth login")} <key>         Authenticate with API key ${dim("(manual)")}
   ${bold("auth logout")}              Remove stored credentials
@@ -190,6 +191,10 @@ async function main(): Promise<void> {
 
       case "login":
         await login();
+        break;
+
+      case "link":
+        await link();
         break;
 
       case "auth login":

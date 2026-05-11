@@ -6,9 +6,11 @@ import {
 } from "@getengram/shared";
 import {
   getOrganizationByEmail,
+  getOrganizationById,
   insertOrganization,
   insertOrganizationWithEmail,
   insertApiKey,
+  setOrganizationEmail,
 } from "@getengram/db";
 import type { Env } from "../types.js";
 import { verifySupabaseJwt } from "../utils/jwt.js";
@@ -123,6 +125,53 @@ signup.post("/anonymous", async (c) => {
     },
     201,
   );
+});
+
+// POST /signup/link — attach an email to an anonymous org.
+// Auth: Engram API key Bearer. The CLI sends the user's API key.
+// Body: { email: string }
+//
+// This updates the organization's email field so the account can be
+// found via email-based login later.
+signup.post("/link", async (c) => {
+  // Verify the API key manually (this route is under /signup, not /api/*)
+  const authHeader = c.req.header("authorization") ?? "";
+  const token = authHeader.replace(/^Bearer\s+/i, "");
+  if (!token || !token.startsWith("engram_sk_live_")) {
+    return c.json({ error: "unauthorized", message: "Missing or invalid API key" }, 401);
+  }
+
+  // Hash and look up the key
+  const { hashApiKey } = await import("@getengram/shared");
+  const keyHash = await hashApiKey(token);
+  const keyRow = await c.env.DB.prepare(
+    "SELECT k.organization_id FROM api_keys k WHERE k.key_hash = ?",
+  )
+    .bind(keyHash)
+    .first<{ organization_id: string }>();
+
+  if (!keyRow) {
+    return c.json({ error: "unauthorized", message: "Invalid API key" }, 401);
+  }
+
+  const body = await c.req.json<{ email?: string }>().catch(() => ({}));
+  const email = body.email?.trim();
+  if (!email || !email.includes("@")) {
+    return c.json({ error: "invalid_email", message: "A valid email is required" }, 400);
+  }
+
+  // Check if another org already uses this email
+  const existing = await getOrganizationByEmail(c.env.DB, email);
+  if (existing && (existing as { id: string }).id !== keyRow.organization_id) {
+    return c.json(
+      { error: "email_taken", message: "This email is already linked to another account" },
+      409,
+    );
+  }
+
+  await setOrganizationEmail(c.env.DB, keyRow.organization_id, email);
+
+  return c.json({ linked: true, organization_id: keyRow.organization_id, email });
 });
 
 export { signup };

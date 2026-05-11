@@ -87,6 +87,81 @@ export async function signup(): Promise<void> {
 }
 
 /**
+ * `engram link` — attach an email + password to an anonymous account.
+ * Creates a Supabase user and links it to the existing org.
+ */
+export async function link(): Promise<void> {
+  const config = await loadConfig();
+  const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
+
+  if (!apiKey) {
+    console.error(red("Not authenticated. Run 'engram signup' first."));
+    process.exit(1);
+  }
+
+  const email = await prompt("Email: ");
+  const password = await prompt("Password: ", true);
+
+  if (!email || !password) {
+    console.error(red("Email and password are required."));
+    process.exit(1);
+  }
+
+  if (password.length < 8) {
+    console.error(red("Password must be at least 8 characters."));
+    process.exit(1);
+  }
+
+  console.log("Linking account...");
+
+  // 1. Create Supabase user
+  const supabaseUrl = "https://ygfqaafyfjrutxjeswks.supabase.co";
+  const supabaseAnonKey =
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlnZnFhYWZ5ZmpydXR4amVzd2tzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ1MDg3ODcsImV4cCI6MjA2MDA4NDc4N30.pK_3TgpMFsYi_4fRR-gBnLGoXxqYINOqSjjKcBqe70c";
+
+  const signupRes = await fetch(`${supabaseUrl}/auth/v1/signup`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: supabaseAnonKey,
+    },
+    body: JSON.stringify({ email: email.trim(), password }),
+  });
+
+  if (!signupRes.ok) {
+    const err = (await signupRes.json().catch(() => ({}))) as {
+      msg?: string;
+      error_description?: string;
+    };
+    const msg = err.msg || err.error_description || `Signup failed: ${signupRes.status}`;
+    // "User already registered" is fine — they can still link
+    if (!msg.includes("already")) {
+      console.error(red(msg));
+      process.exit(1);
+    }
+  }
+
+  // 2. Link email to org via worker
+  const linkRes = await fetch(`${API_URL}/signup/link`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ email: email.trim() }),
+  });
+
+  if (!linkRes.ok) {
+    const err = (await linkRes.json().catch(() => ({}))) as { message?: string };
+    console.error(red(err.message || `Link failed: ${linkRes.status}`));
+    process.exit(1);
+  }
+
+  console.log(green(`✓ Account linked to ${email.trim()}`));
+  console.log(`  You can now sign in at getengram.app/login`);
+}
+
+/**
  * `engram login` — sign in with email + password.
  * Calls Supabase auth, then the worker /signup to get an API key.
  */

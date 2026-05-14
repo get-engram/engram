@@ -14,6 +14,7 @@ import { store } from "./commands/store.js";
 import { search } from "./commands/search.js";
 import { log as showLog } from "./commands/log.js";
 import { daemonStart, daemonStop, daemonStatus, daemonInstall, daemonUninstall } from "./daemon/index.js";
+import { upgrade } from "./commands/upgrade.js";
 import { bold, dim } from "./output.js";
 
 const VERSION = "0.2.1";
@@ -22,7 +23,7 @@ const VERSION = "0.2.1";
 const TOP_COMMANDS = new Set([
   "help", "version", "store", "append", "search", "find", "convs",
   "start", "stop", "status", "install", "uninstall", "log",
-  "signup", "login", "link",
+  "signup", "login", "link", "upgrade",
 ]);
 // Commands that take 2 words (group + subcommand)
 const GROUP_COMMANDS = new Set(["auth", "conversations", "conv", "daemon"]);
@@ -129,6 +130,7 @@ ${bold("COMMANDS")}
   ${bold("store")} -c <id> <message>  Store a message
   ${bold("search")} <query>           Semantic search across memory
   ${bold("log")}                      Show recent AI conversation activity
+  ${bold("upgrade")} [pro|team]       Upgrade your plan (opens Stripe checkout)
 
   ${bold("start")}                    Start background daemon (auto-capture)
   ${bold("stop")}                     Stop the daemon
@@ -243,6 +245,10 @@ async function main(): Promise<void> {
 
       case "log":
         await showLog(await getClient(), args, flags);
+        break;
+
+      case "upgrade":
+        await upgrade(args, flags);
         break;
 
       // Daemon commands — short aliases + namespaced

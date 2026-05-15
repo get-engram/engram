@@ -37,7 +37,7 @@ describe("redact", () => {
 
   it("redacts Cloudflare keys", () => {
     const { text } = redact(
-      "cfk_REDACTED_KEY_REMOVED_FROM_HISTORY_000000000"
+      "cfk_xFakeTestKey0000000000000000000000000000000000"
     );
     expect(text).toBe(R);
   });

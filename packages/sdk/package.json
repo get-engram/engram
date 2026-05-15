@@ -31,7 +31,7 @@
     "context",
     "cloudflare"
   ],
-  "license": "MIT",
+  "license": "MPL-2.0",
   "publishConfig": {
     "access": "public"
   },

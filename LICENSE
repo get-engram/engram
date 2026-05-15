@@ -24,6 +24,11 @@ Additional Use Grant: You may make use of the Licensed Work, provided that
 Change Date:          May 14, 2030
 Change License:       Apache License, Version 2.0
 
+Exception: The following subdirectory is licensed under the MIT License,
+as indicated by a LICENSE file within the directory:
+
+  - packages/sdk  (@getengram/sdk, published to npm)
+
 For information about alternative licensing arrangements for the Licensed Work,
 please contact hello@getengram.app.
 

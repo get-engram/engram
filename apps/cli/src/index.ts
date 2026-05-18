@@ -118,6 +118,8 @@ ${bold("COMMANDS")}
   ${bold("login")}                    Sign in with email + password
   ${bold("link")}                     Link email to your account for dashboard access
 
+  All auth commands accept ${dim("--email")} and ${dim("--password")} flags for non-interactive (agent) usage.
+
   ${bold("auth login")} <key>         Authenticate with API key ${dim("(manual)")}
   ${bold("auth logout")}              Remove stored credentials
   ${bold("auth status")}              Show authentication status
@@ -192,11 +194,11 @@ async function main(): Promise<void> {
         break;
 
       case "login":
-        await login();
+        await login(args, flags);
         break;
 
       case "link":
-        await link();
+        await link(args, flags);
         break;
 
       case "auth login":

@@ -1,6 +1,6 @@
 {
   "name": "@getengram/cli",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "CLI for Engram — persistent memory for AI agents",
   "type": "module",
   "bin": {

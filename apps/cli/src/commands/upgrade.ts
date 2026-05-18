@@ -40,7 +40,10 @@ export async function upgrade(
     if (body.error === "missing_email") {
       console.error(
         red("Your account needs an email before upgrading.\n") +
-          "\n  Run: engram link\n",
+          "\n  Link an email to this account:\n" +
+          "    engram link --email you@example.com --password <password>\n" +
+          "\n  Or if you already have an account, sign in:\n" +
+          "    engram login --email you@example.com --password <password>\n",
       );
       process.exit(1);
     }

@@ -162,8 +162,16 @@ export async function link(args: string[] = [], flags: Record<string, string> = 
   });
 
   if (!linkRes.ok) {
-    const err = (await linkRes.json().catch(() => ({}))) as { message?: string };
-    console.error(red(err.message || `Link failed: ${linkRes.status}`));
+    const err = (await linkRes.json().catch(() => ({}))) as { error?: string; message?: string };
+    if (err.error === "email_taken") {
+      console.error(
+        red(`An account already exists for ${email.trim()}.\n`) +
+          "\n  If that's your account, sign in instead:\n" +
+          `    engram login --email ${email.trim()} --password <your-password>\n`,
+      );
+    } else {
+      console.error(red(err.message || `Link failed: ${linkRes.status}`));
+    }
     process.exit(1);
   }
 

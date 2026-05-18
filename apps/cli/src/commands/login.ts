@@ -100,7 +100,7 @@ export async function signup(): Promise<void> {
  * `engram link` — attach an email + password to an anonymous account.
  * Creates a Supabase user and links it to the existing org.
  */
-export async function link(): Promise<void> {
+export async function link(args: string[] = [], flags: Record<string, string> = {}): Promise<void> {
   const config = await loadConfig();
   const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
 
@@ -109,8 +109,8 @@ export async function link(): Promise<void> {
     process.exit(1);
   }
 
-  const email = await prompt("Email: ");
-  const password = await prompt("Password: ", true);
+  const email = flags.email || await prompt("Email: ");
+  const password = flags.password || await prompt("Password: ", true);
 
   if (!email || !password) {
     console.error(red("Email and password are required."));
@@ -175,9 +175,9 @@ export async function link(): Promise<void> {
  * `engram login` — sign in with email + password.
  * Calls Supabase auth, then the worker /signup to get an API key.
  */
-export async function login(): Promise<void> {
-  const email = await prompt("Email: ");
-  const password = await prompt("Password: ", true);
+export async function login(args: string[] = [], flags: Record<string, string> = {}): Promise<void> {
+  const email = flags.email || await prompt("Email: ");
+  const password = flags.password || await prompt("Password: ", true);
 
   if (!email || !password) {
     console.error(red("Email and password are required."));

@@ -44,7 +44,7 @@ export function registerSearch(
 
       // Track usage (non-blocking)
       trackSearchRun(env.DB, auth.organizationId).catch(() => {});
-      audit(env.DB, auth.organizationId, auth.apiKeyId, "search", null, null, {
+      audit(env.DB, auth.organizationId, auth.apiKeyId, "search", undefined, undefined, {
         query: params.query,
         results: results.length,
       });

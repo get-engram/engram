@@ -186,11 +186,14 @@ export function createMockEnv(db: D1Database) {
       run: vi.fn(async () => ({
         data: [[0.1, 0.2, 0.3]], // minimal fake embedding
       })),
-    },
+    } as unknown as Ai,
     VECTORIZE: {
       query: vi.fn(async () => ({ matches: [] })),
       upsert: vi.fn(async () => ({ count: 0 })),
       deleteByIds: vi.fn(async () => ({ count: 0 })),
-    },
+      describe: vi.fn(async () => ({})),
+      insert: vi.fn(async () => ({ count: 0 })),
+      getByIds: vi.fn(async () => []),
+    } as unknown as VectorizeIndex,
   };
 }

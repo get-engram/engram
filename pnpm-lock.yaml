@@ -25,8 +25,8 @@ importers:
   apps/cli:
     dependencies:
       '@getengram/sdk':
-        specifier: workspace:*
-        version: link:../../packages/sdk
+        specifier: ^0.1.1
+        version: 0.1.1
       better-sqlite3:
         specifier: ^12.8.0
         version: 12.8.0
@@ -490,6 +490,9 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [win32]
+
+  '@getengram/sdk@0.1.1':
+    resolution: {integrity: sha512-9n1qjNYnn1oTaoysPox7ZyR9xJQ+2icLg7gTpmfl1fCVy69Po5VXuKikw/8FnQpAg7f0qlSXQzyqAYcc5B6zAQ==}
 
   '@hono/node-server@1.19.13':
     resolution: {integrity: sha512-TsQLe4i2gvoTtrHje625ngThGBySOgSK3Xo2XRYOdqGN1teR8+I7vchQC46uLJi8OF62YTYA3AhSpumtkhsaKQ==}
@@ -1846,6 +1849,8 @@ snapshots:
 
   '@esbuild/win32-x64@0.27.4':
     optional: true
+
+  '@getengram/sdk@0.1.1': {}
 
   '@hono/node-server@1.19.13(hono@4.12.12)':
     dependencies:

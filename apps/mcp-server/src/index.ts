@@ -88,12 +88,15 @@ app.use(
   }),
 );
 app.use("/api/*", authMiddleware);
+
+// Billing routes are exempt from rate limiting — never block someone trying to pay.
+app.route("/api/billing", billing);
+
 app.use("/api/*", rateLimitMiddleware);
 app.route("/api/keys", keys);
 app.route("/api/seats", seats);
 app.route("/api/webhooks", webhooks);
 app.route("/api/usage", usage);
-app.route("/api/billing", billing);
 app.route("/api/account", account);
 app.route("/api/export", dataExport);
 

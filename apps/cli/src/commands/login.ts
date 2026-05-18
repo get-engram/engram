@@ -110,48 +110,17 @@ export async function link(args: string[] = [], flags: Record<string, string> = 
   }
 
   const email = flags.email || await prompt("Email: ");
-  const password = flags.password || await prompt("Password: ", true);
 
-  if (!email || !password) {
-    console.error(red("Email and password are required."));
-    process.exit(1);
-  }
-
-  if (password.length < 8) {
-    console.error(red("Password must be at least 8 characters."));
+  if (!email) {
+    console.error(red("Email is required."));
     process.exit(1);
   }
 
   console.log("Linking account...");
 
-  // 1. Create Supabase user
-  const supabaseUrl = "https://ygfqaafyfjrutxjeswks.supabase.co";
-  const supabaseAnonKey =
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlnZnFhYWZ5ZmpydXR4amVzd2tzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ1MDg3ODcsImV4cCI6MjA2MDA4NDc4N30.pK_3TgpMFsYi_4fRR-gBnLGoXxqYINOqSjjKcBqe70c";
-
-  const signupRes = await fetch(`${supabaseUrl}/auth/v1/signup`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      apikey: supabaseAnonKey,
-    },
-    body: JSON.stringify({ email: email.trim(), password }),
-  });
-
-  if (!signupRes.ok) {
-    const err = (await signupRes.json().catch(() => ({}))) as {
-      msg?: string;
-      error_description?: string;
-    };
-    const msg = err.msg || err.error_description || `Signup failed: ${signupRes.status}`;
-    // "User already registered" is fine — they can still link
-    if (!msg.includes("already")) {
-      console.error(red(msg));
-      process.exit(1);
-    }
-  }
-
-  // 2. Link email to org via worker
+  // Link email to org via worker. Supabase user creation happens
+  // lazily on first dashboard login — the CLI only needs the email
+  // attached to the org for billing.
   const linkRes = await fetch(`${API_URL}/signup/link`, {
     method: "POST",
     headers: {
@@ -192,45 +161,13 @@ export async function login(args: string[] = [], flags: Record<string, string> =
     process.exit(1);
   }
 
-  // Sign in via Supabase REST API
-  const supabaseUrl = "https://ygfqaafyfjrutxjeswks.supabase.co";
-  const supabaseAnonKey =
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlnZnFhYWZ5ZmpydXR4amVzd2tzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ1MDg3ODcsImV4cCI6MjA2MDA4NDc4N30.pK_3TgpMFsYi_4fRR-gBnLGoXxqYINOqSjjKcBqe70c";
-
   console.log("Signing in...");
 
-  const authRes = await fetch(
-    `${supabaseUrl}/auth/v1/token?grant_type=password`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: supabaseAnonKey,
-      },
-      body: JSON.stringify({ email: email.trim(), password }),
-    },
-  );
-
-  if (!authRes.ok) {
-    const err = (await authRes.json().catch(() => ({}))) as {
-      error_description?: string;
-    };
-    console.error(
-      red(err.error_description || `Login failed: ${authRes.status}`),
-    );
-    process.exit(1);
-  }
-
-  const session = (await authRes.json()) as { access_token: string };
-
-  // Exchange Supabase token for Engram API key
-  const signupRes = await fetch(`${API_URL}/signup`, {
+  // Authenticate via worker — keeps Supabase credentials server-side
+  const signupRes = await fetch(`${API_URL}/signup/login`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${session.access_token}`,
-    },
-    body: JSON.stringify({ plan: "free" }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: email.trim(), password }),
   });
 
   if (signupRes.status === 409) {
@@ -249,8 +186,8 @@ export async function login(args: string[] = [], flags: Record<string, string> =
   }
 
   if (!signupRes.ok) {
-    const body = await signupRes.text().catch(() => "");
-    console.error(red(`Failed to get API key: ${signupRes.status} ${body}`));
+    const err = (await signupRes.json().catch(() => ({}))) as { message?: string };
+    console.error(red(err.message || `Login failed: ${signupRes.status}`));
     process.exit(1);
   }
 

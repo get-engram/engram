@@ -17,7 +17,7 @@ import { daemonStart, daemonStop, daemonStatus, daemonInstall, daemonUninstall }
 import { upgrade } from "./commands/upgrade.js";
 import { bold, dim } from "./output.js";
 
-const VERSION = "0.2.1";
+const VERSION = "0.3.1";
 
 // Commands that take 1 word
 const TOP_COMMANDS = new Set([

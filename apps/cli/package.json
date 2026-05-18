@@ -1,6 +1,6 @@
 {
   "name": "@getengram/cli",
-  "version": "0.2.1",
+  "version": "0.3.1",
   "description": "CLI for Engram — persistent memory for AI agents",
   "type": "module",
   "bin": {
@@ -35,7 +35,7 @@
   },
   "homepage": "https://getengram.app",
   "dependencies": {
-    "@getengram/sdk": "workspace:*",
+    "@getengram/sdk": "^0.1.1",
     "better-sqlite3": "^12.8.0",
     "chokidar": "^5.0.0"
   },

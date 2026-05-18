@@ -42,7 +42,8 @@ describe("search service", () => {
       .run();
 
     env = createMockEnv(db);
-    env.VECTORIZE.query = vi.fn(async () => ({
+    (env.VECTORIZE as unknown as Record<string, unknown>).query = vi.fn(async () => ({
+      count: 2,
       matches: [
         { id: "vec_short", score: 0.99 },
         { id: "vec_long", score: 0.88 },

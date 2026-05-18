@@ -28,6 +28,7 @@ function base64UrlDecode(str: string): Uint8Array {
 export async function verifySupabaseJwt(
   token: string,
   jwtSecret: string,
+  _issuer?: string,
 ): Promise<SupabaseJwtPayload> {
   const parts = token.split(".");
   if (parts.length !== 3) {

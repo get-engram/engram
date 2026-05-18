@@ -10,6 +10,7 @@ const PREFIXES = {
   whk: "whk_",
   whd: "whd_",
   usg: "usg_",
+  aud: "aud_",
 } as const;
 
 type PrefixKey = keyof typeof PREFIXES;

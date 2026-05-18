@@ -14,6 +14,7 @@ export interface Env {
   // /signup; the worker verifies the HS256 signature and extracts the
   // user's email from the claims.
   SUPABASE_JWT_SECRET: string;
+  SUPABASE_URL: string;
 }
 
 export interface AuthContext {

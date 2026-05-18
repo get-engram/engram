@@ -22,7 +22,7 @@ export async function authMiddleware(
   const row = await getApiKeyWithOrg(c.env.DB, keyHash);
 
   if (!row) {
-    audit(c.env.DB, "unknown", null, "auth.failure", null, null, {
+    audit(c.env.DB, "unknown", null, "auth.failure", undefined, undefined, {
       reason: "invalid_key",
     });
     return c.json({ error: "Invalid API key" }, 401);

@@ -174,7 +174,7 @@ signup.post("/link", async (c) => {
     return c.json({ error: "unauthorized", message: "Invalid API key" }, 401);
   }
 
-  const body = await c.req.json<{ email?: string }>().catch(() => ({}));
+  const body = await c.req.json<{ email?: string }>().catch(() => ({} as { email?: string }));
   const email = body.email?.trim();
   if (!email || !email.includes("@")) {
     return c.json({ error: "invalid_email", message: "A valid email is required" }, 400);

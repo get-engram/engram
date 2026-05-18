@@ -194,4 +194,80 @@ signup.post("/link", async (c) => {
   return c.json({ linked: true, organization_id: keyRow.organization_id, email });
 });
 
+// POST /signup/login — authenticate with email + password, return API key.
+// Handles Supabase auth server-side so the CLI doesn't need credentials.
+signup.post("/login", async (c) => {
+  const body = await c.req.json<{ email?: string; password?: string }>().catch(() => ({} as Record<string, string>));
+  const email = body.email?.trim();
+  const password = body.password;
+
+  if (!email || !password) {
+    return c.json({ error: "invalid_request", message: "Email and password are required" }, 400);
+  }
+
+  const supabaseUrl = c.env.SUPABASE_URL;
+  const supabaseAnonKey = c.env.SUPABASE_ANON_KEY;
+  if (!supabaseUrl || !supabaseAnonKey) {
+    return c.json({ error: "server_misconfigured", message: "Supabase is not configured" }, 500);
+  }
+
+  // Authenticate with Supabase
+  const authRes = await fetch(
+    `${supabaseUrl}/auth/v1/token?grant_type=password`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: supabaseAnonKey,
+      },
+      body: JSON.stringify({ email, password }),
+    },
+  );
+
+  if (!authRes.ok) {
+    const err = (await authRes.json().catch(() => ({}))) as { error_description?: string };
+    return c.json(
+      { error: "auth_failed", message: err.error_description || "Invalid email or password" },
+      401,
+    );
+  }
+
+  // Find the org by email
+  const org = (await getOrganizationByEmail(c.env.DB, email)) as { id: string } | null;
+  if (!org) {
+    return c.json(
+      { error: "no_account", message: "No Engram account found for this email. Run 'engram signup' first." },
+      404,
+    );
+  }
+
+  // Check if org already has a key at limit
+  const orgRecord = (await getOrganizationById(c.env.DB, org.id)) as { tier?: string } | null;
+  const tier = (orgRecord?.tier as Tier) ?? "free";
+  const limits = TIER_LIMITS[tier];
+  const count = await getApiKeyCount(c.env.DB, org.id);
+  if (limits.api_keys !== -1 && (count?.count ?? 0) >= limits.api_keys) {
+    return c.json(
+      {
+        error: "api_key_limit_reached",
+        message: "Your account already has an API key. Use your existing key, or manage keys on the dashboard.",
+        organization_id: org.id,
+      },
+      409,
+    );
+  }
+
+  // Mint a new API key
+  const keyId = generateId("key");
+  const { raw, prefix } = generateApiKeyRaw();
+  const keyHash = await hashApiKey(raw);
+  await insertApiKey(c.env.DB, keyId, org.id, keyHash, prefix, "CLI login");
+
+  return c.json({
+    organization_id: org.id,
+    api_key: raw,
+    key_prefix: prefix,
+  });
+});
+
 export { signup };

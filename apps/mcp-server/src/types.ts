@@ -15,6 +15,7 @@ export interface Env {
   // user's email from the claims.
   SUPABASE_JWT_SECRET: string;
   SUPABASE_URL: string;
+  SUPABASE_ANON_KEY: string;
 }
 
 export interface AuthContext {

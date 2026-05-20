@@ -78,7 +78,7 @@ billing.post("/checkout", async (c) => {
 
   const successUrl =
     body.success_url ||
-    `${c.env.APP_URL}/dashboard?upgrade=success&session_id={CHECKOUT_SESSION_ID}`;
+    `${c.env.APP_URL}/upgrade/success?session_id={CHECKOUT_SESSION_ID}`;
   const cancelUrl = body.cancel_url || `${c.env.APP_URL}/pricing?upgrade=cancelled`;
 
   const quantity = plan === "team" ? Math.max(1, body.quantity ?? 1) : 1;

@@ -84,27 +84,9 @@ signup.post("/", async (c) => {
     created = true;
   }
 
-  // Only mint a key if the org doesn't already have one at its limit.
-  // Existing orgs that already have keys should use them (or the dashboard
-  // to manage keys) — minting on every login caused duplicate key bloat.
-  if (!created) {
-    const org = (await getOrganizationById(c.env.DB, orgId)) as { tier?: string } | null;
-    const tier = (org?.tier as Tier) ?? "free";
-    const limits = TIER_LIMITS[tier];
-    const count = await getApiKeyCount(c.env.DB, orgId);
-    if (limits.api_keys !== -1 && (count?.count ?? 0) >= limits.api_keys) {
-      return c.json(
-        {
-          error: "api_key_limit_reached",
-          message: "Your account already has an API key. Use your existing key, or manage keys on the dashboard.",
-          organization_id: orgId,
-          plan,
-        },
-        409,
-      );
-    }
-  }
-
+  // Always mint a key during the signup/provisioning flow. This endpoint
+  // is only called once per Supabase user (the dashboard caches the
+  // profile row). Manual key limits are enforced in /api/keys instead.
   const keyId = generateId("key");
   const { raw, prefix } = generateApiKeyRaw();
   const keyHash = await hashApiKey(raw);

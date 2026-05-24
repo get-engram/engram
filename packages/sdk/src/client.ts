@@ -1,5 +1,12 @@
 import { McpTransport } from "./transport.js";
 import { EngramError } from "./errors.js";
+import {
+  processContent,
+  resolveContent,
+  generateVaultKey,
+  type VaultConfig,
+  type VaultEntry,
+} from "./vault.js";
 import type {
   EngramConfig,
   CreateConversationParams,
@@ -43,6 +50,14 @@ const DEFAULT_TIMEOUT = 30_000;
  */
 export class Engram {
   private transport: McpTransport;
+  private vaultConfig: VaultConfig | null;
+
+  /**
+   * Generate a new AES-256 vault encryption key.
+   * Returns a base64-encoded 32-byte key. Store this securely —
+   * Engram never sees it.
+   */
+  static generateVaultKey = generateVaultKey;
 
   constructor(config: EngramConfig) {
     if (!config.apiKey) {
@@ -53,6 +68,7 @@ export class Engram {
     const timeout = config.timeout ?? DEFAULT_TIMEOUT;
 
     this.transport = new McpTransport(baseUrl, config.apiKey, timeout);
+    this.vaultConfig = config.vault ?? null;
   }
 
   /**
@@ -75,28 +91,98 @@ export class Engram {
   /**
    * Store messages in a conversation. Messages are stored verbatim and
    * automatically chunked + embedded for semantic search.
+   *
+   * When vault is configured, secrets are detected and encrypted
+   * client-side before transmission. The server stores only encrypted
+   * blobs and vault reference tokens.
    */
   async store(params: StoreParams): Promise<StoreResponse> {
-    const messages = params.messages.map((m) => {
-      const msg: Record<string, unknown> = {
-        role: m.role,
-        content: m.content,
-      };
-      if (m.toolCallId !== undefined) msg.tool_call_id = m.toolCallId;
-      if (m.toolName !== undefined) msg.tool_name = m.toolName;
-      if (m.metadata !== undefined) msg.metadata = m.metadata;
-      return msg;
-    });
+    let allVaultEntries: VaultEntry[] = [];
 
-    const raw = await this.transport.callTool("append_messages", {
+    const messages = await Promise.all(
+      params.messages.map(async (m) => {
+        let content = m.content;
+
+        // Client-side vault: detect & encrypt secrets before sending
+        if (this.vaultConfig) {
+          const processed = await processContent(content, this.vaultConfig);
+          content = processed.content;
+          allVaultEntries.push(...processed.vaultEntries);
+        }
+
+        const msg: Record<string, unknown> = { role: m.role, content };
+        if (m.toolCallId !== undefined) msg.tool_call_id = m.toolCallId;
+        if (m.toolName !== undefined) msg.tool_name = m.toolName;
+        if (m.metadata !== undefined) msg.metadata = m.metadata;
+        return msg;
+      })
+    );
+
+    const args: Record<string, unknown> = {
       conversation_id: params.conversationId,
       messages,
-    });
+    };
+
+    if (allVaultEntries.length > 0) {
+      args.vault_entries = allVaultEntries.map((e) => ({
+        id: e.id,
+        encrypted_value: e.encrypted_value,
+        iv: e.iv,
+        secret_type: e.secret_type,
+      }));
+    }
+
+    const raw = await this.transport.callTool("append_messages", args);
     const data = JSON.parse(raw);
     return {
       appended: data.appended,
       messageIds: data.message_ids,
     };
+  }
+
+  /**
+   * Resolve vault tokens in message content back to plaintext secrets.
+   * Fetches encrypted blobs from the server and decrypts client-side.
+   * Requires vault to be configured.
+   */
+  async resolveSecrets(messages: Message[]): Promise<Message[]> {
+    if (!this.vaultConfig) {
+      throw new EngramError(
+        "Vault is not configured. Pass vault.encryptionKey in the Engram constructor."
+      );
+    }
+
+    // Collect all vault IDs from message content
+    const vaultIdSet = new Set<string>();
+    const vaultTokenRegex = /\[VAULT:(vlt_[A-Za-z0-9_-]+)\]/g;
+    for (const msg of messages) {
+      let match: RegExpExecArray | null;
+      while ((match = vaultTokenRegex.exec(msg.content)) !== null) {
+        vaultIdSet.add(match[1]);
+      }
+    }
+
+    if (vaultIdSet.size === 0) return messages;
+
+    // Fetch encrypted entries from server
+    const raw = await this.transport.callTool("resolve_vault", {
+      vault_ids: [...vaultIdSet],
+    });
+    const data = JSON.parse(raw);
+    const entries: Array<{ id: string; encrypted_value: string; iv: string }> =
+      data.entries ?? [];
+
+    // Decrypt and replace in each message
+    return Promise.all(
+      messages.map(async (msg) => ({
+        ...msg,
+        content: await resolveContent(
+          msg.content,
+          entries,
+          this.vaultConfig!
+        ),
+      }))
+    );
   }
 
   /**

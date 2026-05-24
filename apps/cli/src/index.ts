@@ -15,6 +15,7 @@ import { search } from "./commands/search.js";
 import { log as showLog } from "./commands/log.js";
 import { daemonStart, daemonStop, daemonStatus, daemonInstall, daemonUninstall } from "./daemon/index.js";
 import { upgrade } from "./commands/upgrade.js";
+import { vaultKeygen, vaultStatus, loadVaultKey } from "./commands/vault.js";
 import { bold, dim } from "./output.js";
 
 const VERSION = "0.3.4";
@@ -26,7 +27,7 @@ const TOP_COMMANDS = new Set([
   "signup", "login", "link", "upgrade",
 ]);
 // Commands that take 2 words (group + subcommand)
-const GROUP_COMMANDS = new Set(["auth", "conversations", "conv", "daemon"]);
+const GROUP_COMMANDS = new Set(["auth", "conversations", "conv", "daemon", "vault"]);
 
 function parseArgs(argv: string[]): {
   command: string[];
@@ -100,9 +101,12 @@ async function getClient(): Promise<Engram> {
     process.exit(1);
   }
 
+  const vaultKey = await loadVaultKey();
+
   return new Engram({
     apiKey,
     baseUrl: process.env.ENGRAM_BASE_URL ?? config.baseUrl ?? getBaseUrl(),
+    vault: vaultKey ? { encryptionKey: vaultKey } : undefined,
   });
 }
 
@@ -134,6 +138,10 @@ ${bold("COMMANDS")}
   ${bold("log")}                      Show recent AI conversation activity
   ${bold("upgrade")} [pro|team]       Upgrade your plan (opens Stripe checkout)
 
+  ${bold("vault keygen")}             Generate a new vault encryption key
+  ${bold("vault keygen --save")}      Generate and save key to ~/.engram/vault-key
+  ${bold("vault status")}             Show vault configuration status
+
   ${bold("start")}                    Start background daemon (auto-capture)
   ${bold("stop")}                     Stop the daemon
   ${bold("status")}                   Show daemon status and sync info
@@ -159,6 +167,7 @@ ${bold("EXAMPLES")}
 ${bold("ENVIRONMENT")}
   ENGRAM_API_KEY      API key ${dim("(overrides auth login)")}
   ENGRAM_BASE_URL     Custom endpoint ${dim("(default: https://mcp.getengram.app)")}
+  ENGRAM_VAULT_KEY    Vault encryption key ${dim("(enables client-side secret encryption)")}
 
 ${dim(`v${VERSION} — https://getengram.app`)}
 `);
@@ -251,6 +260,16 @@ async function main(): Promise<void> {
 
       case "upgrade":
         await upgrade(args, flags);
+        break;
+
+      // Vault commands
+      case "vault keygen":
+        await vaultKeygen(args, flags);
+        break;
+
+      case "vault status":
+      case "vault":
+        await vaultStatus();
         break;
 
       // Daemon commands — short aliases + namespaced

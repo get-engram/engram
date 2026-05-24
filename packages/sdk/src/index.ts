@@ -1,5 +1,6 @@
 export { Engram } from "./client.js";
 export { EngramError, AuthenticationError, NotFoundError, TimeoutError } from "./errors.js";
+export { generateVaultKey } from "./vault.js";
 export type {
   EngramConfig,
   MessageRole,

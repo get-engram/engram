@@ -17,6 +17,7 @@ import {
   getMaxSequence,
   insertChunks,
   getVectorizeIdsByConversation,
+  insertVaultEntries,
 } from "@getengram/db";
 import { generateEmbeddings } from "./embedding.js";
 import { compressContent, decompressContent } from "../utils/compress.js";
@@ -43,11 +44,19 @@ export async function createConversation(
   return id;
 }
 
+export interface VaultEntryInput {
+  id: string;
+  encrypted_value: string;
+  iv: string;
+  secret_type: string;
+}
+
 export async function appendMessages(
   env: Env,
   organizationId: string,
   conversationId: string,
-  messageInputs: MessageInput[]
+  messageInputs: MessageInput[],
+  vaultEntries?: VaultEntryInput[]
 ): Promise<Message[]> {
   // Verify conversation exists and belongs to org
   const conv = await getConversationById(env.DB, conversationId, organizationId);
@@ -103,6 +112,26 @@ export async function appendMessages(
       metadata: m.metadata,
     }))
   );
+
+  // Store client-encrypted vault entries (zero-knowledge — server never decrypts)
+  if (vaultEntries && vaultEntries.length > 0) {
+    await insertVaultEntries(
+      env.DB,
+      vaultEntries.map((e) => ({
+        id: e.id,
+        organizationId,
+        conversationId,
+        messageId: null,
+        secretType: e.secret_type,
+        encryptedValue: e.encrypted_value,
+        iv: e.iv,
+        expiresAt: null,
+      }))
+    );
+    console.log(
+      `[vault] Stored ${vaultEntries.length} encrypted vault entry(ies) for ${conversationId}`
+    );
+  }
 
   // Update conversation message count
   await updateConversationMessageCount(env.DB, conversationId, redacted.length);

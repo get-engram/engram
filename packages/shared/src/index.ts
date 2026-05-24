@@ -4,4 +4,6 @@ export * from "./utils/id.js";
 export * from "./utils/chunk.js";
 export * from "./utils/auth.js";
 export * from "./utils/redact.js";
+export * from "./utils/detect.js";
+export * from "./utils/vault.js";
 export * from "./constants.js";

@@ -7,6 +7,18 @@ export interface EngramConfig {
   baseUrl?: string;
   /** Request timeout in milliseconds. Defaults to 30000 */
   timeout?: number;
+  /**
+   * Enable client-side secrets vault. When set, the SDK detects secrets
+   * (API keys, passwords, PII, etc.) in message content, encrypts them
+   * with your key before transmission, and replaces them with vault
+   * reference tokens. The server never sees plaintext secrets.
+   *
+   * Generate a key with `Engram.generateVaultKey()`.
+   */
+  vault?: {
+    /** Base64-encoded AES-256 key (32 bytes). */
+    encryptionKey: string;
+  };
 }
 
 // ── Message Types ──

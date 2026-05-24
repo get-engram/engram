@@ -5,6 +5,7 @@ import { registerSearch } from "./tools/search.js";
 import { registerGetConversation } from "./tools/get-conversation.js";
 import { registerListConversations } from "./tools/list-conversations.js";
 import { registerDeleteConversation } from "./tools/delete-conversation.js";
+import { registerResolveVault } from "./tools/resolve-vault.js";
 import type { Env, AuthContext } from "../types.js";
 
 export function createMcpServer(env: Env, auth: AuthContext): McpServer {
@@ -19,6 +20,7 @@ export function createMcpServer(env: Env, auth: AuthContext): McpServer {
   registerGetConversation(server, env, auth);
   registerListConversations(server, env, auth);
   registerDeleteConversation(server, env, auth);
+  registerResolveVault(server, env, auth);
 
   return server;
 }

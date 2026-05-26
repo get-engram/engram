@@ -6,6 +6,10 @@ import { registerGetConversation } from "./tools/get-conversation.js";
 import { registerListConversations } from "./tools/list-conversations.js";
 import { registerDeleteConversation } from "./tools/delete-conversation.js";
 import { registerResolveVault } from "./tools/resolve-vault.js";
+import { registerVaultSet } from "./tools/vault-set.js";
+import { registerVaultGet } from "./tools/vault-get.js";
+import { registerVaultList } from "./tools/vault-list.js";
+import { registerVaultDelete } from "./tools/vault-delete.js";
 import type { Env, AuthContext } from "../types.js";
 
 export function createMcpServer(env: Env, auth: AuthContext): McpServer {
@@ -21,6 +25,10 @@ export function createMcpServer(env: Env, auth: AuthContext): McpServer {
   registerListConversations(server, env, auth);
   registerDeleteConversation(server, env, auth);
   registerResolveVault(server, env, auth);
+  registerVaultSet(server, env, auth);
+  registerVaultGet(server, env, auth);
+  registerVaultList(server, env, auth);
+  registerVaultDelete(server, env, auth);
 
   return server;
 }

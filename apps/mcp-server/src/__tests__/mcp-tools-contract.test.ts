@@ -9,6 +9,10 @@ import { registerGetConversation } from "../mcp/tools/get-conversation.js";
 import { registerListConversations } from "../mcp/tools/list-conversations.js";
 import { registerDeleteConversation } from "../mcp/tools/delete-conversation.js";
 import { registerResolveVault } from "../mcp/tools/resolve-vault.js";
+import { registerVaultSet } from "../mcp/tools/vault-set.js";
+import { registerVaultGet } from "../mcp/tools/vault-get.js";
+import { registerVaultList } from "../mcp/tools/vault-list.js";
+import { registerVaultDelete } from "../mcp/tools/vault-delete.js";
 import type { Env, AuthContext } from "../types.js";
 
 /**
@@ -286,6 +290,10 @@ describe("MCP tool contract — wire field names", () => {
         "list_conversations",
         "delete_conversation",
         "resolve_vault",
+        "vault_set",
+        "vault_get",
+        "vault_list",
+        "vault_delete",
       ].sort();
 
       const { server, tools } = createCaptureServer();
@@ -296,6 +304,10 @@ describe("MCP tool contract — wire field names", () => {
       registerListConversations(server, env, auth);
       registerDeleteConversation(server, env, auth);
       registerResolveVault(server, env, auth);
+      registerVaultSet(server, env, auth);
+      registerVaultGet(server, env, auth);
+      registerVaultList(server, env, auth);
+      registerVaultDelete(server, env, auth);
 
       const registered = Array.from(tools.keys()).sort();
       expect(registered).toEqual(EXPECTED_TOOL_NAMES);

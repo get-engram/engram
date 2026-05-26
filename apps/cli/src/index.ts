@@ -15,7 +15,7 @@ import { search } from "./commands/search.js";
 import { log as showLog } from "./commands/log.js";
 import { daemonStart, daemonStop, daemonStatus, daemonInstall, daemonUninstall } from "./daemon/index.js";
 import { upgrade } from "./commands/upgrade.js";
-import { vaultKeygen, vaultStatus, loadVaultKey } from "./commands/vault.js";
+import { vaultKeygen, vaultStatus, loadVaultKey, vaultSet, vaultGet, vaultList, vaultDelete } from "./commands/vault.js";
 import { bold, dim } from "./output.js";
 
 const VERSION = "0.3.4";
@@ -141,6 +141,10 @@ ${bold("COMMANDS")}
   ${bold("vault keygen")}             Generate a new vault encryption key
   ${bold("vault keygen --save")}      Generate and save key to ~/.engram/vault-key
   ${bold("vault status")}             Show vault configuration status
+  ${bold("vault set")} <name> [value] Store a named secret ${dim("(encrypted client-side)")}
+  ${bold("vault get")} <name>         Retrieve a named secret ${dim("(decrypted locally)")}
+  ${bold("vault list")}               List secret names ${dim("(never shows values)")}
+  ${bold("vault delete")} <name>      Delete a named secret permanently
 
   ${bold("start")}                    Start background daemon (auto-capture)
   ${bold("stop")}                     Stop the daemon
@@ -265,6 +269,24 @@ async function main(): Promise<void> {
       // Vault commands
       case "vault keygen":
         await vaultKeygen(args, flags);
+        break;
+
+      case "vault set":
+        await vaultSet(await getClient(), args, flags);
+        break;
+
+      case "vault get":
+        await vaultGet(await getClient(), args, flags);
+        break;
+
+      case "vault list":
+      case "vault ls":
+        await vaultList(await getClient(), args, flags);
+        break;
+
+      case "vault delete":
+      case "vault rm":
+        await vaultDelete(await getClient(), args, flags);
         break;
 
       case "vault status":

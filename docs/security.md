@@ -91,9 +91,28 @@ Cloudflare Workers terminate TLS at the edge, so traffic between the client and 
 
 Cloudflare D1 and Vectorize encrypt data at rest. Engram does not add application-level encryption on top of this.
 
+### Client-Side Secret Encryption (Vault)
+
+Engram includes a **Secrets Vault** that encrypts sensitive data before it leaves your machine:
+
+- **Detection:** The SDK scans message content for API keys, private keys, JWTs, connection strings, PII, and other secret patterns
+- **Encryption:** Each detected secret is encrypted with **AES-256-GCM** using a key that only you hold
+- **Tokenization:** Secrets are replaced with `[VAULT:vlt_...]` tokens in the message content
+- **Zero-knowledge storage:** The server stores encrypted blobs alongside the tokens — it never sees plaintext secrets
+- **Client-side decryption:** On retrieval, the SDK decrypts vault entries locally with your key
+
+This provides **three layers** of protection:
+1. **TLS** — encrypts data in transit
+2. **Client-side vault encryption** — encrypts secrets before they leave your machine
+3. **Cloudflare at-rest encryption** — encrypts the database on disk
+
+Even if the database were fully compromised, vaulted secrets remain encrypted with a key the server never had.
+
+See [Secrets Vault](./vault.md) for setup and configuration.
+
 ### Content Storage
 
-Message content is stored **verbatim** — exactly as sent by the client. Engram does not:
+Message content is stored **verbatim** — exactly as sent by the client (with vault tokens replacing any detected secrets when vault is enabled). Engram does not:
 - Inspect or filter message content
 - Send content to third-party services (embeddings are generated on Cloudflare's own Workers AI)
 - Log message content outside of D1 storage
@@ -112,10 +131,11 @@ Worker → Workers AI (same network) → Vectorize (same network)
 
 When a conversation is deleted:
 
-1. All vector embeddings are removed from Vectorize
-2. All chunk records are deleted from D1
-3. All message records are deleted from D1
-4. The conversation record is deleted from D1
+1. All vault entries are deleted from D1 (cascade)
+2. All vector embeddings are removed from Vectorize
+3. All chunk records are deleted from D1
+4. All message records are deleted from D1
+5. The conversation record is deleted from D1
 
 Foreign key constraints with `ON DELETE CASCADE` ensure database-level integrity. The Vectorize cleanup happens in application code before the D1 delete.
 

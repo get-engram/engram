@@ -7,6 +7,7 @@ import {
   type VaultConfig,
   type VaultEntry,
 } from "./vault.js";
+import { VaultManager } from "./vault-manager.js";
 import type {
   EngramConfig,
   CreateConversationParams,
@@ -51,6 +52,29 @@ const DEFAULT_TIMEOUT = 30_000;
 export class Engram {
   private transport: McpTransport;
   private vaultConfig: VaultConfig | null;
+
+  /**
+   * Named secrets manager. Store, retrieve, list, and delete
+   * named secrets with client-side encryption.
+   *
+   * Requires vault to be configured. Access via `engram.vault`.
+   *
+   * @example
+   * ```typescript
+   * await engram.vault.set('DATABASE_URL', 'postgres://...')
+   * const url = await engram.vault.get('DATABASE_URL')
+   * const secrets = await engram.vault.list()
+   * await engram.vault.delete('DATABASE_URL')
+   * ```
+   */
+  get vault(): VaultManager {
+    if (!this.vaultConfig) {
+      throw new EngramError(
+        "Vault is not configured. Pass vault.encryptionKey in the Engram constructor."
+      );
+    }
+    return new VaultManager(this.transport, this.vaultConfig);
+  }
 
   /**
    * Generate a new AES-256 vault encryption key.

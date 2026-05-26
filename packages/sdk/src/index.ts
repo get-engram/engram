@@ -1,4 +1,5 @@
 export { Engram } from "./client.js";
+export { VaultManager } from "./vault-manager.js";
 export { EngramError, AuthenticationError, NotFoundError, TimeoutError } from "./errors.js";
 export { generateVaultKey } from "./vault.js";
 export type {
@@ -19,4 +20,5 @@ export type {
   ListConversationsParams,
   ListConversationsResponse,
   DeleteConversationResponse,
+  NamedSecretMetadata,
 } from "./types.js";

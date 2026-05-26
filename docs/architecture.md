@@ -155,7 +155,7 @@ D1 is **SQLite running as a service on Cloudflare's network.** It's not Postgres
 
 ### How Engram uses D1
 
-Five tables, all scoped by `organization_id`:
+Six tables, all scoped by `organization_id`:
 
 ```sql
 organizations         ── Tenants
@@ -163,6 +163,7 @@ organizations         ── Tenants
   └── conversations   ── Containers for messages
         └── messages           ── Verbatim content, ordered by sequence
         └── conversation_chunks ── Text windows for embedding
+        └── secrets_vault      ── Encrypted secret blobs (zero-knowledge)
 ```
 
 Every query includes `WHERE organization_id = ?`. The org_id is **denormalized** — it's stored directly on messages and chunks, not just on the parent conversation. This means tenant-scoped queries never need JOINs:
@@ -186,6 +187,8 @@ Schema changes are standard SQL files in `packages/db/migrations/`:
 ```
 0001_initial_schema.sql  ── 5 tables with foreign keys + cascading deletes
 0002_add_indexes.sql     ── 7 indexes for query performance
+...
+0009_secrets_vault.sql   ── Zero-knowledge secrets vault table
 ```
 
 Applied via: `wrangler d1 migrations apply engram-db --remote`
@@ -405,25 +408,30 @@ MCP Client sends POST /mcp
   ├── 4b. Get max sequence
   │   Query D1: SELECT MAX(sequence) FROM messages WHERE conversation_id = ?
   │
-  ├── 4c. Insert messages
+  ├── 4c. Store vault entries (if present)
+  │   If vault_entries provided:
+  │   Batch insert into secrets_vault (id, encrypted_value, iv, secret_type, ...)
+  │   (Server stores opaque blobs — never decrypts)
+  │
+  ├── 4d. Insert messages
   │   Batch insert into D1: INSERT INTO messages (id, conversation_id, ..., sequence)
   │   Sequences: max_seq + 1, max_seq + 2, ...
   │
-  ├── 4d. Update count
+  ├── 4e. Update count
   │   D1: UPDATE conversations SET message_count = message_count + N
   │
-  ├── 4e. Chunk messages
+  ├── 4f. Chunk messages
   │   Sliding window: [msg1..msg5], [msg4..msg8], ...
   │   Format: "[role]: content\n..."
   │
-  ├── 4f. Generate embeddings
+  ├── 4g. Generate embeddings
   │   Workers AI: env.AI.run("@cf/baai/bge-base-en-v1.5", { text: chunk_texts })
   │   Returns: [[0.12, -0.45, ...], [0.34, ...], ...]
   │
-  ├── 4g. Store chunks in D1
+  ├── 4h. Store chunks in D1
   │   Batch insert: INSERT INTO conversation_chunks (id, chunk_text, vectorize_id, ...)
   │
-  └── 4h. Index in Vectorize
+  └── 4i. Index in Vectorize
       env.VECTORIZE.upsert([
         { id: "chk_abc", values: [0.12, ...], metadata: {org_id, conv_id} },
         ...

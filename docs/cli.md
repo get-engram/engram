@@ -146,6 +146,95 @@ Output shows relevance score, conversation ID, and matched text:
   [user]: User wants npm and brew distribution...
 ```
 
+### engram vault keygen
+
+Generate a new AES-256 vault encryption key for client-side secret encryption.
+
+```bash
+# Print key to stdout
+engram vault keygen
+
+# Save to ~/.engram/vault-key (permissions 600)
+engram vault keygen --save
+```
+
+| Flag | Description |
+|------|-------------|
+| `--save` | Save key to `~/.engram/vault-key` |
+
+### engram vault set
+
+Store a named secret. Value is encrypted client-side before transmission.
+
+```bash
+# Pipe from stdin (recommended — avoids shell history)
+echo "postgres://admin:secret@db.example.com/prod" | engram vault set DATABASE_URL
+
+# Pass as argument
+engram vault set OPENAI_KEY "sk-abc123..."
+
+# Pass with flag
+engram vault set STRIPE_KEY --value "sk_live_..."
+```
+
+| Flag | Description |
+|------|-------------|
+| `--value <val>` | Secret value (alternative to positional arg or stdin) |
+
+### engram vault get
+
+Retrieve a named secret. Decrypted locally with your vault key.
+
+```bash
+engram vault get DATABASE_URL
+# → postgres://admin:secret@db.example.com/prod
+
+# Pipe to clipboard
+engram vault get DATABASE_URL | pbcopy
+
+# JSON output
+engram vault get DATABASE_URL --json
+```
+
+| Flag | Description |
+|------|-------------|
+| `--json` | Output as JSON |
+
+### engram vault list
+
+List all named secrets. Shows names and metadata only — never values.
+
+```bash
+engram vault list
+# NAME            TYPE                 UPDATED
+# DATABASE_URL    connection_string    2026-05-25
+# OPENAI_KEY      api_key              2026-05-25
+
+engram vault list --json
+```
+
+| Flag | Description |
+|------|-------------|
+| `--json` | Output as JSON |
+
+### engram vault delete
+
+Delete a named secret permanently.
+
+```bash
+engram vault delete DATABASE_URL
+```
+
+### engram vault status
+
+Check vault configuration status.
+
+```bash
+engram vault status
+# Vault: configured (key at /Users/you/.engram/vault-key)
+# Key prefix: dGhpcyBp...
+```
+
 ### engram help
 
 Show help text with all commands and options.
@@ -167,6 +256,7 @@ engram version
 |----------|-------------|---------|
 | `ENGRAM_API_KEY` | API key (overrides `~/.engram/config.json`) | — |
 | `ENGRAM_BASE_URL` | Custom Engram endpoint | `https://mcp.getengram.app` |
+| `ENGRAM_VAULT_KEY` | Vault encryption key (base64, 32 bytes) | — |
 
 ## Configuration File
 

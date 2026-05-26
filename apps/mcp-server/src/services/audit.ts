@@ -12,7 +12,12 @@ export type AuditAction =
   | "account.restore"
   | "data.export"
   | "auth.success"
-  | "auth.failure";
+  | "auth.failure"
+  | "vault.resolve"
+  | "vault.set"
+  | "vault.get"
+  | "vault.list"
+  | "vault.delete";
 
 /**
  * Fire-and-forget audit log entry. Never throws — audit logging

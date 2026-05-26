@@ -146,3 +146,12 @@ export interface ListConversationsResponse {
 export interface DeleteConversationResponse {
   deleted: boolean;
 }
+
+// ── Named Secrets ──
+
+export interface NamedSecretMetadata {
+  name: string;
+  secretType: string;
+  createdAt: string;
+  updatedAt: string;
+}

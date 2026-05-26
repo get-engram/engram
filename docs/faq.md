@@ -32,6 +32,8 @@ If you self-host, data stays on your own Cloudflare account.
 
 Data is encrypted at rest and in transit by Cloudflare. API keys are hashed with SHA-256 before storage — the raw key is never stored.
 
+For sensitive data in conversations, Engram's [Secrets Vault](./vault.md) adds client-side AES-256-GCM encryption — secrets are encrypted before they leave your machine, and the server never sees plaintext.
+
 ### Can one organization see another's data?
 
 No. Every query is scoped by `organization_id`. The ID is determined by the API key used, and all database queries and vector searches filter by it. There is no API to query across organizations.
@@ -75,6 +77,18 @@ The MCP transport uses Streamable HTTP, which supports server-sent events. Howev
 ### Can I use Engram without MCP?
 
 Not yet. The current MVP only exposes MCP tools. A REST API is planned for Phase 2.
+
+### How do I protect secrets and credentials in my conversations?
+
+Enable the [Secrets Vault](./vault.md). Generate a vault key with `engram vault keygen --save`, then set `ENGRAM_VAULT_KEY` or pass it in the SDK config. The SDK automatically detects API keys, passwords, connection strings, PII, and other sensitive patterns, encrypts them client-side, and replaces them with `[VAULT:vlt_...]` tokens.
+
+### What types of secrets are detected?
+
+API keys (OpenAI, AWS, GitHub, Stripe, Slack, etc.), PEM private keys, JWTs, database connection strings, secret assignments (`password=`, `token=`), SSNs, credit card numbers, emails, phone numbers, and high-entropy tokens. See the [full list](./vault.md#what-gets-detected).
+
+### What happens if I lose my vault key?
+
+Vaulted secrets are permanently unrecoverable. Engram never has your key — that's the point of zero-knowledge encryption. Back up your key securely.
 
 ## Pricing
 

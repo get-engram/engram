@@ -197,16 +197,40 @@ No re-explaining. No lost context. The agent just knows.
 
 ---
 
+## Protecting Secrets
+
+If your agents handle sensitive data (API keys, credentials, PII), enable the **Secrets Vault** for client-side encryption:
+
+```bash
+# Generate and save a vault key
+engram vault keygen --save
+```
+
+Then configure the SDK:
+
+```typescript
+const engram = new Engram({
+  apiKey: process.env.ENGRAM_API_KEY!,
+  vault: { encryptionKey: process.env.ENGRAM_VAULT_KEY! },
+})
+```
+
+Secrets in message content are automatically detected, encrypted on your machine, and replaced with `[VAULT:vlt_...]` tokens before being sent to Engram. The server never sees plaintext secrets.
+
+See [Secrets Vault](./vault.md) for the full guide.
+
 ## Concepts
 
 - **Conversations** — A container for messages. Has a title, optional tags, and metadata.
 - **Messages** — Verbatim records of what was said. Roles: `user`, `assistant`, `system`, `tool`.
 - **Chunks** — Sliding windows of messages, automatically created and embedded for search.
+- **Vault** — Client-side secret encryption. Detects and encrypts sensitive data before it leaves your machine.
 - **Organizations** — Tenant isolation. Each API key belongs to one org. Data never leaks across orgs.
 
 ## Next Steps
 
-- [API Reference](./api-reference.md) — All 6 MCP tools with parameters and examples
+- [Secrets Vault](./vault.md) — Client-side encryption for sensitive data
+- [API Reference](./api-reference.md) — All 7 MCP tools with parameters and examples
 - [Integrations](./integrations.md) — Claude Desktop, Cursor, Windsurf, custom clients
 - [Concepts](./concepts.md) — How storage and search work under the hood
 - [Architecture](./architecture.md) — Deep dive into how everything works

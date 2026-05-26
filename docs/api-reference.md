@@ -1,6 +1,6 @@
 # API Reference
 
-Engram exposes 6 tools via the Model Context Protocol (MCP). All tools are accessed through the `/mcp` endpoint using Streamable HTTP transport.
+Engram exposes 11 tools via the Model Context Protocol (MCP). All tools are accessed through the `/mcp` endpoint using Streamable HTTP transport.
 
 All requests require an `Authorization: Bearer engram_sk_live_...` header.
 
@@ -49,6 +49,7 @@ Append messages to a conversation. Messages are stored verbatim and automaticall
 |------|------|----------|-------------|
 | `conversation_id` | string | Yes | The conversation to append to |
 | `messages` | MessageInput[] | Yes | One or more messages to append (min 1) |
+| `vault_entries` | VaultEntry[] | No | Encrypted secret entries from client-side vault |
 
 **MessageInput:**
 
@@ -93,9 +94,10 @@ append_messages
 ### What happens on append
 
 1. Messages are inserted into the database with sequential ordering
-2. New messages are grouped into overlapping chunks (window of 5 messages, stride of 3)
-3. Each chunk is embedded using `bge-base-en-v1.5` (768 dimensions)
-4. Vectors are upserted to the search index with conversation and organization metadata
+2. If `vault_entries` are provided, encrypted blobs are stored in the secrets vault
+3. New messages are grouped into overlapping chunks (window of 5 messages, stride of 3)
+4. Each chunk is embedded using `bge-base-en-v1.5` (768 dimensions)
+5. Vectors are upserted to the search index with conversation and organization metadata
 
 ---
 
@@ -257,6 +259,150 @@ Permanently delete a conversation and all its messages, chunks, and vector embed
 ```
 
 Returns an error if the conversation is not found or doesn't belong to your organization.
+
+---
+
+## resolve_vault
+
+Retrieve encrypted vault entries by ID. Returns encrypted blobs — decryption happens client-side with your vault key.
+
+### Parameters
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `vault_ids` | string[] | Yes | Vault entry IDs to resolve (1–50) |
+
+### Response
+
+```json
+{
+  "entries": [
+    {
+      "id": "vlt_x7KdR4yLRaBcDeFgHiJkLm",
+      "encrypted_value": "base64-encoded-ciphertext",
+      "iv": "base64-encoded-iv",
+      "secret_type": "api_key",
+      "conversation_id": "conv_abc123",
+      "created_at": "2026-05-25T10:00:00Z"
+    }
+  ],
+  "total": 1
+}
+```
+
+### Example
+
+```
+resolve_vault
+  vault_ids: ["vlt_x7KdR4yLRaBcDeFgHiJkLm", "vlt_9PqRsTuVwXyZaBcDeFgHi"]
+```
+
+The SDK's `resolveSecrets()` method handles this automatically — you typically don't call this tool directly. See [Secrets Vault](./vault.md) for details.
+
+---
+
+## vault_set
+
+Store a named secret. The value must be encrypted client-side before calling this tool. The server stores the encrypted blob — it never sees plaintext.
+
+### Parameters
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `name` | string | Yes | Secret name (e.g. `DATABASE_URL`). Must match `^[A-Za-z_][A-Za-z0-9_.-]*$` |
+| `encrypted_value` | string | Yes | Base64-encoded AES-256-GCM ciphertext |
+| `iv` | string | Yes | Base64-encoded initialization vector |
+| `secret_type` | string | No | Type hint (e.g. `api_key`, `connection_string`). Default: `unknown` |
+
+### Response
+
+```json
+{
+  "stored": true,
+  "name": "DATABASE_URL",
+  "secret_type": "connection_string"
+}
+```
+
+If a secret with the same name exists, it is overwritten.
+
+---
+
+## vault_get
+
+Retrieve a named secret's encrypted blob. Decryption happens client-side with your vault key.
+
+### Parameters
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `name` | string | Yes | Secret name to retrieve |
+
+### Response
+
+```json
+{
+  "name": "DATABASE_URL",
+  "encrypted_value": "base64-encoded-ciphertext",
+  "iv": "base64-encoded-iv",
+  "secret_type": "connection_string",
+  "created_at": "2026-05-25T10:00:00Z",
+  "updated_at": "2026-05-25T10:00:00Z"
+}
+```
+
+Returns `{ "error": "Secret \"NAME\" not found" }` if the secret doesn't exist.
+
+---
+
+## vault_list
+
+List all named secrets. Returns names and metadata only — never values or encrypted blobs.
+
+### Parameters
+
+None.
+
+### Response
+
+```json
+{
+  "secrets": [
+    {
+      "name": "DATABASE_URL",
+      "secret_type": "connection_string",
+      "created_at": "2026-05-25T10:00:00Z",
+      "updated_at": "2026-05-25T10:00:00Z"
+    }
+  ],
+  "total": 1
+}
+```
+
+---
+
+## vault_delete
+
+Delete a named secret permanently. This action cannot be undone.
+
+### Parameters
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `name` | string | Yes | Secret name to delete |
+
+### Response
+
+```json
+{
+  "deleted": true,
+  "name": "DATABASE_URL"
+}
+```
+
+Returns `{ "error": "Secret \"NAME\" not found" }` if the secret doesn't exist.
+
+See [Secrets Vault](./vault.md) for the full vault guide including CLI usage and SDK integration.
 
 ---
 

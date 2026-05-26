@@ -8,3 +8,4 @@ export * from "./queries/seats.js";
 export * from "./queries/webhooks.js";
 export * from "./queries/audit-log.js";
 export * from "./queries/vault.js";
+export * from "./queries/named-secrets.js";

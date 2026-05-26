@@ -17,6 +17,7 @@ const engram = new Engram({
   apiKey: process.env.ENGRAM_API_KEY!,
   // baseUrl: 'http://localhost:8787',  // optional — for local dev
   // timeout: 30000,                     // optional — request timeout (ms)
+  // vault: { encryptionKey: '...' },   // optional — client-side secret encryption
 })
 ```
 
@@ -126,6 +127,47 @@ Delete a conversation and all associated data (messages, chunks, embeddings).
 await engram.deleteConversation('conv_abc')
 ```
 
+### resolveSecrets
+
+Decrypt vault tokens in messages back to plaintext secrets. Requires vault to be configured.
+
+```typescript
+const { messages } = await engram.getConversation('conv_abc')
+
+// Messages may contain [VAULT:vlt_...] tokens where secrets were encrypted
+const decrypted = await engram.resolveSecrets(messages)
+// Tokens are replaced with the original plaintext secrets
+```
+
+### Engram.generateVaultKey (static)
+
+Generate a new AES-256 vault encryption key.
+
+```typescript
+const key = await Engram.generateVaultKey()
+// → base64-encoded 32-byte key (e.g., "dGhpcyBpcyBhIDMyLWJ5dGUga2V5ISEh...")
+```
+
+### vault (named secrets manager)
+
+Store, retrieve, list, and delete named secrets. Accessed via `engram.vault`.
+
+```typescript
+// Store a named secret (encrypted client-side)
+await engram.vault.set('DATABASE_URL', 'postgres://admin:secret@db.example.com/prod')
+
+// Retrieve (decrypted locally)
+const url = await engram.vault.get('DATABASE_URL')
+
+// List all secrets (names and metadata only)
+const secrets = await engram.vault.list()
+
+// Delete
+await engram.vault.delete('DATABASE_URL')
+```
+
+See [Secrets Vault](./vault.md) for the full vault guide.
+
 ## Error Handling
 
 ```typescript
@@ -174,6 +216,10 @@ import type {
   ListConversationsResponse,
   DeleteConversationResponse,
 } from '@getengram/sdk'
+
+// Vault types
+import { generateVaultKey } from '@getengram/sdk'
+import type { VaultConfig, VaultEntry, ProcessedContent } from '@getengram/sdk'
 ```
 
 ## Architecture

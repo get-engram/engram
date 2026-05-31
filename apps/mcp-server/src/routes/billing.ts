@@ -130,6 +130,69 @@ billing.post("/portal", async (c) => {
 export { billing };
 
 // ---------------------------------------------------------------------------
+// Public session verification — lets the success page look up org info from
+// a Stripe checkout session_id (unguessable). No API key needed.
+// ---------------------------------------------------------------------------
+
+export const billingSession = new Hono<{ Bindings: Env }>();
+
+interface StripeCheckoutSession {
+  id: string;
+  status: string;
+  metadata: Record<string, string>;
+  customer_details?: { email?: string };
+}
+
+billingSession.post("/", async (c) => {
+  const body = await c.req.json<{ session_id?: string }>().catch(() => ({}));
+  const sessionId = (body as { session_id?: string }).session_id;
+  if (!sessionId || !sessionId.startsWith("cs_")) {
+    return c.json({ error: "invalid_session_id" }, 400);
+  }
+
+  // Look up the checkout session from Stripe
+  const stripeKey = c.env.STRIPE_SECRET_KEY;
+  if (!stripeKey) {
+    return c.json({ error: "stripe_not_configured" }, 500);
+  }
+
+  const res = await fetch(
+    `https://api.stripe.com/v1/checkout/sessions/${sessionId}`,
+    {
+      headers: { Authorization: `Bearer ${stripeKey}` },
+    },
+  );
+  if (!res.ok) {
+    return c.json({ error: "session_not_found" }, 404);
+  }
+
+  const session = (await res.json()) as StripeCheckoutSession;
+  if (session.status !== "complete") {
+    return c.json({ error: "session_not_complete" }, 400);
+  }
+
+  const orgId = session.metadata?.organization_id;
+  if (!orgId) {
+    return c.json({ error: "no_organization" }, 400);
+  }
+
+  const org = (await getOrganizationById(c.env.DB, orgId)) as {
+    id: string;
+    email: string | null;
+    tier: string;
+  } | null;
+  if (!org) {
+    return c.json({ error: "organization_not_found" }, 404);
+  }
+
+  return c.json({
+    organization_id: org.id,
+    email: org.email,
+    tier: org.tier,
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Public webhook handler (NOT authed — verified by HMAC signature instead)
 // ---------------------------------------------------------------------------
 

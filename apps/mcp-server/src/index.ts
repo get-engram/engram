@@ -9,7 +9,7 @@ import { seats } from "./routes/seats.js";
 import { webhooks } from "./routes/webhooks.js";
 import { usage } from "./routes/usage.js";
 import { signup } from "./routes/signup.js";
-import { billing, billingWebhook } from "./routes/billing.js";
+import { billing, billingSession, billingWebhook } from "./routes/billing.js";
 import { admin } from "./routes/admin.js";
 import { account } from "./routes/account.js";
 import { dataExport } from "./routes/export.js";
@@ -64,6 +64,18 @@ app.route("/signup", signup);
 // Stripe webhook — public, verified by HMAC signature instead of API key.
 // Mounted BEFORE the /api/* auth middleware so it isn't gated.
 app.route("/billing/webhook", billingWebhook);
+
+// Public session verification — lets the upgrade success page look up the
+// org after a Stripe checkout without needing an API key.
+app.use(
+  "/billing/verify-session",
+  cors({
+    origin: BROWSER_ORIGINS,
+    allowMethods: ["POST", "OPTIONS"],
+    allowHeaders: ["Content-Type"],
+  }),
+);
+app.route("/billing/verify-session", billingSession);
 
 // Admin routes — protected by ADMIN_SECRET, not API key auth.
 app.use("/admin/*", async (c, next) => {

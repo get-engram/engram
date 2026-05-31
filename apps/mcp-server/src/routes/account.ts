@@ -4,6 +4,7 @@ import {
   getOrganizationStats,
   softDeleteOrganization,
   restoreOrganization,
+  setOrganizationEmail,
 } from "@getengram/db";
 import { audit } from "../services/audit.js";
 import type { Env, AuthContext } from "../types.js";
@@ -11,6 +12,23 @@ import type { Env, AuthContext } from "../types.js";
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
 
 const account = new Hono<HonoEnv>();
+
+// PATCH /api/account — update organization settings (email)
+account.patch("/", async (c) => {
+  const auth = c.get("auth");
+  const orgId = auth.organizationId;
+  const body = await c.req.json<{ email?: string }>().catch(() => ({}));
+  const email = (body as { email?: string }).email?.trim();
+
+  if (!email || !email.includes("@")) {
+    return c.json({ error: "invalid_email", message: "A valid email is required" }, 400);
+  }
+
+  await setOrganizationEmail(c.env.DB, orgId, email);
+  audit(c.env.DB, orgId, auth.apiKeyId, "account.update_email");
+
+  return c.json({ updated: true, email });
+});
 
 // DELETE /api/account — soft-delete the organization (30-day grace period)
 account.delete("/", async (c) => {

@@ -76,6 +76,25 @@ billing.post("/checkout", async (c) => {
     await setOrganizationStripeCustomer(c.env.DB, org.id, customerId);
   }
 
+  // If the customer already has an active subscription for this price,
+  // send them to the billing portal instead of creating a duplicate.
+  if (customerId) {
+    const subsRes = await fetch(
+      `https://api.stripe.com/v1/subscriptions?customer=${customerId}&status=active&price=${priceId}&limit=1`,
+      { headers: { Authorization: `Bearer ${c.env.STRIPE_SECRET_KEY}` } },
+    );
+    if (subsRes.ok) {
+      const subs = (await subsRes.json()) as { data: unknown[] };
+      if (subs.data.length > 0) {
+        const portal = await createPortalSession(c.env.STRIPE_SECRET_KEY, {
+          customerId,
+          returnUrl: `${c.env.APP_URL}/dashboard`,
+        });
+        return c.json({ url: portal.url, already_subscribed: true, plan });
+      }
+    }
+  }
+
   const successUrl =
     body.success_url ||
     `${c.env.APP_URL}/upgrade/success?session_id={CHECKOUT_SESSION_ID}`;

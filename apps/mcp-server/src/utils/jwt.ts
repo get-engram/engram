@@ -1,5 +1,5 @@
 /**
- * Verify a Supabase JWT using the project's JWT secret (HS256).
+ * Verify a Supabase JWT using HS256 (shared secret) or ES256 (JWKS).
  * Uses only the Web Crypto API — no Node.js dependencies.
  */
 
@@ -11,6 +11,15 @@ interface SupabaseJwtPayload {
   iss?: string;
   exp?: number;
   iat?: number;
+}
+
+interface JwksKey {
+  alg: string;
+  kty: string;
+  crv: string;
+  x: string;
+  y: string;
+  kid: string;
 }
 
 function base64UrlDecode(str: string): Uint8Array {
@@ -25,25 +34,12 @@ function base64UrlDecode(str: string): Uint8Array {
   return bytes;
 }
 
-export async function verifySupabaseJwt(
-  token: string,
+async function verifyHS256(
+  headerB64: string,
+  payloadB64: string,
+  signatureB64: string,
   jwtSecret: string,
-  _issuer?: string,
-): Promise<SupabaseJwtPayload> {
-  const parts = token.split(".");
-  if (parts.length !== 3) {
-    throw new Error("Invalid JWT: expected 3 parts");
-  }
-
-  const [headerB64, payloadB64, signatureB64] = parts;
-
-  // Verify header declares HS256
-  const header = JSON.parse(new TextDecoder().decode(base64UrlDecode(headerB64)));
-  if (header.alg !== "HS256") {
-    throw new Error(`Unsupported JWT algorithm: ${header.alg}`);
-  }
-
-  // Import the secret as an HMAC key
+): Promise<void> {
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
     "raw",
@@ -52,14 +48,80 @@ export async function verifySupabaseJwt(
     false,
     ["verify"],
   );
-
-  // Verify signature
   const data = encoder.encode(`${headerB64}.${payloadB64}`);
   const signature = base64UrlDecode(signatureB64);
   const valid = await crypto.subtle.verify("HMAC", key, signature, data);
-
   if (!valid) {
     throw new Error("Invalid JWT signature");
+  }
+}
+
+async function verifyES256(
+  headerB64: string,
+  payloadB64: string,
+  signatureB64: string,
+  supabaseUrl: string,
+  kid?: string,
+): Promise<void> {
+  // Fetch the JWKS from Supabase
+  const jwksUrl = `${supabaseUrl}/auth/v1/.well-known/jwks.json`;
+  const res = await fetch(jwksUrl);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch JWKS from ${jwksUrl}`);
+  }
+  const jwks = (await res.json()) as { keys: JwksKey[] };
+  const jwk = kid
+    ? jwks.keys.find((k) => k.kid === kid)
+    : jwks.keys[0];
+  if (!jwk) {
+    throw new Error("No matching key found in JWKS");
+  }
+
+  const key = await crypto.subtle.importKey(
+    "jwk",
+    jwk,
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["verify"],
+  );
+
+  const encoder = new TextEncoder();
+  const data = encoder.encode(`${headerB64}.${payloadB64}`);
+  const signature = base64UrlDecode(signatureB64);
+  const valid = await crypto.subtle.verify(
+    { name: "ECDSA", hash: "SHA-256" },
+    key,
+    signature,
+    data,
+  );
+  if (!valid) {
+    throw new Error("Invalid JWT signature");
+  }
+}
+
+export async function verifySupabaseJwt(
+  token: string,
+  jwtSecret: string,
+  supabaseUrl?: string,
+): Promise<SupabaseJwtPayload> {
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    throw new Error("Invalid JWT: expected 3 parts");
+  }
+
+  const [headerB64, payloadB64, signatureB64] = parts;
+
+  const header = JSON.parse(new TextDecoder().decode(base64UrlDecode(headerB64)));
+
+  if (header.alg === "HS256") {
+    await verifyHS256(headerB64, payloadB64, signatureB64, jwtSecret);
+  } else if (header.alg === "ES256") {
+    if (!supabaseUrl) {
+      throw new Error("SUPABASE_URL is required for ES256 JWT verification");
+    }
+    await verifyES256(headerB64, payloadB64, signatureB64, supabaseUrl, header.kid);
+  } else {
+    throw new Error(`Unsupported JWT algorithm: ${header.alg}`);
   }
 
   // Decode payload

@@ -76,11 +76,11 @@ billing.post("/checkout", async (c) => {
     await setOrganizationStripeCustomer(c.env.DB, org.id, customerId);
   }
 
-  // If the customer already has an active subscription for this price,
-  // send them to the billing portal instead of creating a duplicate.
+  // One subscription per customer. If they already have any active
+  // subscription, send them to the billing portal to manage it.
   if (customerId) {
     const subsRes = await fetch(
-      `https://api.stripe.com/v1/subscriptions?customer=${customerId}&status=active&price=${priceId}&limit=1`,
+      `https://api.stripe.com/v1/subscriptions?customer=${customerId}&status=active&limit=1`,
       { headers: { Authorization: `Bearer ${c.env.STRIPE_SECRET_KEY}` } },
     );
     if (subsRes.ok) {

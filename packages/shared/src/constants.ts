@@ -38,8 +38,8 @@ export const TIER_LIMITS: Record<Tier, {
   team: {
     messages_per_month: 500_000,
     conversations: -1,
-    seats: 5,
-    api_keys: 5,
+    seats: -1, // dynamic — enforced via org.seat_limit from Stripe quantity
+    api_keys: -1, // scales with seats
     webhooks: true,
     usage_dashboard: true,
   },

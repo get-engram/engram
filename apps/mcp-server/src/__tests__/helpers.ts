@@ -63,6 +63,15 @@ export function createMockD1(): D1Database {
         if (!tableMatch) return null;
         const table = getTable(tableMatch[1]);
 
+        // COUNT(*) query
+        if (sql.includes("COUNT(*)")) {
+          let rows = [...table];
+          if (sql.includes("organization_id = ?") && bindings.length >= 1) {
+            rows = rows.filter((r) => r.organization_id === bindings[0]);
+          }
+          return { count: rows.length };
+        }
+
         // Simple WHERE id = ? AND organization_id = ?
         if (sql.includes("WHERE") && bindings.length >= 1) {
           const row = table.find((r) => {
@@ -157,9 +166,14 @@ export function createMockD1(): D1Database {
         if (insertMatch) {
           const table = getTable(insertMatch[1]);
           const cols = insertMatch[2].split(",").map((c) => c.trim());
-          const vals = insertMatch[3].split(",").map((v) =>
-            v.trim().replace(/^'|'$/g, "")
-          );
+          const vals = insertMatch[3].split(",").map((v) => {
+            const trimmed = v.trim().replace(/^'|'$/g, "");
+            // Coerce unquoted numeric values to numbers
+            if (!v.trim().startsWith("'") && /^-?\d+(\.\d+)?$/.test(trimmed)) {
+              return Number(trimmed);
+            }
+            return trimmed;
+          });
           const row: Record<string, unknown> = {};
           cols.forEach((col, i) => (row[col] = vals[i]));
           table.push(row);

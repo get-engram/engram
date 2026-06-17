@@ -298,9 +298,10 @@ billingWebhook.post("/", async (c) => {
 
       const status = obj.status as string;
       const subscriptionId = obj.id as string;
-      const items = (obj.items as { data?: Array<{ price?: { id?: string } }> })
+      const items = (obj.items as { data?: Array<{ price?: { id?: string }; quantity?: number }> })
         ?.data;
       const priceId = items?.[0]?.price?.id;
+      const quantity = items?.[0]?.quantity ?? 1;
 
       const newTier = priceToTier(c.env, priceId);
 
@@ -308,14 +309,15 @@ billingWebhook.post("/", async (c) => {
         (status === "active" || status === "trialing") &&
         newTier
       ) {
-        await setOrganizationTier(c.env.DB, orgId, newTier, subscriptionId);
+        const seatLimit = newTier === "team" ? quantity : 1;
+        await setOrganizationTier(c.env.DB, orgId, newTier, subscriptionId, seatLimit);
       } else if (
         status === "canceled" ||
         status === "incomplete_expired" ||
         status === "unpaid" ||
         status === "past_due"
       ) {
-        await setOrganizationTier(c.env.DB, orgId, "free", null);
+        await setOrganizationTier(c.env.DB, orgId, "free", null, 1);
       }
       break;
     }
@@ -323,7 +325,7 @@ billingWebhook.post("/", async (c) => {
     case "customer.subscription.deleted": {
       const orgId = await resolveOrgIdFromEvent(c.env, obj);
       if (orgId) {
-        await setOrganizationTier(c.env.DB, orgId, "free", null);
+        await setOrganizationTier(c.env.DB, orgId, "free", null, 1);
       }
       break;
     }

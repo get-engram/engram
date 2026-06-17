@@ -68,12 +68,13 @@ export function setOrganizationTier(
   id: string,
   tier: "free" | "pro" | "team" | "enterprise",
   stripeSubscriptionId: string | null,
+  seatLimit?: number,
 ) {
   return db
     .prepare(
-      "UPDATE organizations SET tier = ?, stripe_subscription_id = ? WHERE id = ?",
+      "UPDATE organizations SET tier = ?, stripe_subscription_id = ?, seat_limit = ? WHERE id = ?",
     )
-    .bind(tier, stripeSubscriptionId, id)
+    .bind(tier, stripeSubscriptionId, seatLimit ?? 1, id)
     .run();
 }
 

@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { generateId } from "@getengram/shared";
-import { insertSeat, getSeatsByOrg, getSeatCount, getSeatByEmail, deleteSeat, acceptSeat, getOrganizationById } from "@getengram/db";
+import { insertSeat, getSeatsByOrg, getSeatCount, getSeatByEmail, deleteSeat, acceptSeat, getOrganizationById, revokeApiKeysBySeat } from "@getengram/db";
 import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
@@ -74,10 +74,11 @@ seats.post("/:id/accept", async (c) => {
   return c.json({ id: seatId, status: "accepted" });
 });
 
-// Remove a seat
+// Remove a seat (and revoke its API keys)
 seats.delete("/:id", async (c) => {
   const auth = c.get("auth");
   const seatId = c.req.param("id");
+  await revokeApiKeysBySeat(c.env.DB, seatId);
   await deleteSeat(c.env.DB, seatId);
   return c.json({ removed: true });
 });

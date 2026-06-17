@@ -70,3 +70,10 @@ export function revokeApiKey(db: D1Database, id: string, organizationId: string)
     .bind(id, organizationId)
     .run();
 }
+
+export function revokeApiKeysBySeat(db: D1Database, seatId: string) {
+  return db
+    .prepare("UPDATE api_keys SET revoked_at = datetime('now') WHERE seat_id = ? AND revoked_at IS NULL")
+    .bind(seatId)
+    .run();
+}

@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { TIER_LIMITS } from "@getengram/shared";
-import { getUsage, getUsageHistory, getApiKeyCount, getSeatCount } from "@getengram/db";
+import { getUsage, getUsageHistory, getApiKeyCount, getSeatCount, getOrganizationById } from "@getengram/db";
 import { checkFeatureAccess } from "../services/tier.js";
 import type { Env, AuthContext } from "../types.js";
 
@@ -13,13 +13,16 @@ usage.get("/", async (c) => {
   const auth = c.get("auth");
   const limits = TIER_LIMITS[auth.tier];
 
-  const [currentUsage, keyCount, seatCount] = await Promise.all([
+  const [currentUsage, keyCount, seatCount, org] = await Promise.all([
     getUsage(c.env.DB, auth.organizationId),
     getApiKeyCount(c.env.DB, auth.organizationId),
     getSeatCount(c.env.DB, auth.organizationId),
+    getOrganizationById(c.env.DB, auth.organizationId) as Promise<{ seat_limit: number } | null>,
   ]);
 
   const u = currentUsage as { messages_stored: number; searches_run: number; period: string } | null;
+  // For team tier, seat limit comes from Stripe subscription quantity
+  const seatLimit = limits.seats === -1 ? (org?.seat_limit ?? 1) : limits.seats;
 
   return c.json({
     tier: auth.tier,
@@ -33,11 +36,11 @@ usage.get("/", async (c) => {
     },
     api_keys: {
       used: keyCount?.count ?? 0,
-      limit: limits.api_keys,
+      limit: limits.api_keys === -1 ? seatLimit : limits.api_keys,
     },
     seats: {
       used: seatCount?.count ?? 0,
-      limit: limits.seats,
+      limit: seatLimit,
     },
     features: {
       webhooks: limits.webhooks,

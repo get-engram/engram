@@ -18,7 +18,11 @@ export type AuditAction =
   | "vault.set"
   | "vault.get"
   | "vault.list"
-  | "vault.delete";
+  | "vault.delete"
+  | "subscription.status"
+  | "subscription.portal"
+  | "subscription.checkout"
+  | "subscription.upgrade_redirect";
 
 /**
  * Fire-and-forget audit log entry. Never throws — audit logging

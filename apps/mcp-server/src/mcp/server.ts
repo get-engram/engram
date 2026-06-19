@@ -10,6 +10,7 @@ import { registerVaultSet } from "./tools/vault-set.js";
 import { registerVaultGet } from "./tools/vault-get.js";
 import { registerVaultList } from "./tools/vault-list.js";
 import { registerVaultDelete } from "./tools/vault-delete.js";
+import { registerManageSubscription } from "./tools/manage-subscription.js";
 import type { Env, AuthContext } from "../types.js";
 
 export function createMcpServer(env: Env, auth: AuthContext): McpServer {
@@ -29,6 +30,7 @@ export function createMcpServer(env: Env, auth: AuthContext): McpServer {
   registerVaultGet(server, env, auth);
   registerVaultList(server, env, auth);
   registerVaultDelete(server, env, auth);
+  registerManageSubscription(server, env, auth);
 
   return server;
 }

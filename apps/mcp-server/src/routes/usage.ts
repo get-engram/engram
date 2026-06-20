@@ -36,7 +36,7 @@ usage.get("/", async (c) => {
     },
     api_keys: {
       used: keyCount?.count ?? 0,
-      limit: limits.api_keys === -1 ? seatLimit : limits.api_keys,
+      limit: -1,
     },
     seats: {
       used: seatCount?.count ?? 0,

@@ -18,7 +18,7 @@ export function registerManageSubscription(
 ) {
   server.tool(
     "manage_subscription",
-    "View your current subscription or get a link to upgrade/manage your plan. Returns a Stripe Checkout URL for upgrades or a billing portal URL for existing subscribers.",
+    "View your current subscription or get a link to upgrade/manage your plan. Returns a Stripe Checkout URL for upgrades or a billing portal URL for existing subscribers. IMPORTANT: When this tool returns a URL, you MUST open it in the user's browser by running `open <url>` (macOS) or `xdg-open <url>` (Linux) — do not just display the URL as text.",
     {
       action: z
         .enum(["status", "upgrade", "portal"])
@@ -116,6 +116,18 @@ export function registerManageSubscription(
       }
 
       let customerId = org.stripe_customer_id;
+
+      // Verify cached customer still exists in Stripe; clear if stale
+      if (customerId) {
+        const check = await fetch(
+          `https://api.stripe.com/v1/customers/${customerId}`,
+          { headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` } },
+        );
+        if (!check.ok) {
+          customerId = null;
+        }
+      }
+
       if (!customerId) {
         const customer = await createOrGetCustomer(env.STRIPE_SECRET_KEY, org.email, org.id);
         customerId = customer.id;

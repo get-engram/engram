@@ -21,17 +21,17 @@ export const TIER_LIMITS: Record<Tier, {
 }> = {
   free: {
     messages_per_month: 1_000,
-    conversations: -1, // unlimited — messages/month is the only binding cap on free
+    conversations: -1,
     seats: 1,
-    api_keys: 1,
+    api_keys: -1, // unlimited — usage caps are the billing gate, not key count
     webhooks: false,
     usage_dashboard: false,
   },
   pro: {
     messages_per_month: 100_000,
-    conversations: -1, // unlimited
+    conversations: -1,
     seats: 1,
-    api_keys: 1,
+    api_keys: -1,
     webhooks: false,
     usage_dashboard: false,
   },
@@ -39,7 +39,7 @@ export const TIER_LIMITS: Record<Tier, {
     messages_per_month: 500_000,
     conversations: -1,
     seats: -1, // dynamic — enforced via org.seat_limit from Stripe quantity
-    api_keys: -1, // scales with seats
+    api_keys: -1,
     webhooks: true,
     usage_dashboard: true,
   },

@@ -185,20 +185,26 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Handle top-level flags before parsing
+  if (raw.length === 1 && (raw[0] === "--help" || raw[0] === "-h")) {
+    printHelp();
+    return;
+  }
+  if (raw.length === 1 && (raw[0] === "--version" || raw[0] === "-v")) {
+    console.log(`engram ${VERSION}`);
+    return;
+  }
+
   const { command, args, flags } = parseArgs(raw);
   const cmd = command.join(" ");
 
   try {
     switch (cmd) {
       case "help":
-      case "--help":
-      case "-h":
         printHelp();
         break;
 
       case "version":
-      case "--version":
-      case "-v":
         console.log(`engram ${VERSION}`);
         break;
 

@@ -5,6 +5,8 @@ import { getConversationCount } from "@getengram/db";
 import { checkConversationLimit } from "../../services/tier.js";
 import { fireWebhooks } from "../../services/webhooks.js";
 import { audit } from "../../services/audit.js";
+import { isExternalOAuthClient } from "../auth-kind.js";
+import { limitMessage } from "../usage-messaging.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerCreateConversation(
@@ -34,16 +36,26 @@ export function registerCreateConversation(
       const tierCheck = checkConversationLimit(auth.tier, currentCount);
 
       if (!tierCheck.allowed) {
+        const isOAuth = isExternalOAuthClient(auth);
         return {
           content: [
             {
               type: "text" as const,
               text: JSON.stringify({
                 error: tierCheck.error,
-                message: `Conversation limit exceeded. Your ${tierCheck.tier} plan allows ${tierCheck.limit} conversations. Upgrade at https://getengram.app/pricing`,
+                message: limitMessage({
+                  unit: "conversations",
+                  tier: tierCheck.tier,
+                  limit: tierCheck.limit,
+                  used: tierCheck.used,
+                  isOAuth,
+                }),
                 limit: tierCheck.limit,
                 used: tierCheck.used,
                 tier: tierCheck.tier,
+                upgrade_url: isOAuth
+                  ? "https://getengram.app/dashboard"
+                  : "https://getengram.app/pricing",
               }),
             },
           ],

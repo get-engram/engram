@@ -292,7 +292,6 @@ export class Engram {
 function mapConversation(raw: Record<string, unknown>): Conversation {
   return {
     id: raw.id as string,
-    organizationId: raw.organization_id as string,
     title: (raw.title as string) ?? null,
     agentId: (raw.agent_id as string) ?? null,
     tags: (raw.tags as string[]) ?? [],
@@ -307,7 +306,6 @@ function mapMessage(raw: Record<string, unknown>): Message {
   return {
     id: raw.id as string,
     conversationId: raw.conversation_id as string,
-    organizationId: raw.organization_id as string,
     role: raw.role as Message["role"],
     content: raw.content as string,
     toolCallId: (raw.tool_call_id as string) ?? null,

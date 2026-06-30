@@ -211,7 +211,8 @@ describe("Engram SDK", () => {
 
       const result = await engram.getConversation("conv_1");
       expect(result.conversation.id).toBe("conv_1");
-      expect(result.conversation.organizationId).toBe("org_1");
+      // organization_id is intentionally not surfaced (internal account ID).
+      expect("organizationId" in result.conversation).toBe(false);
 
       const body = JSON.parse(mockFetch.mock.calls[0][1].body);
       expect(body.params.arguments.conversation_id).toBe("conv_1");

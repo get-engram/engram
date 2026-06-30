@@ -1,6 +1,6 @@
 {
   "name": "@getengram/sdk",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "TypeScript SDK for Engram — persistent memory for AI agents",
   "type": "module",
   "main": "./dist/index.js",

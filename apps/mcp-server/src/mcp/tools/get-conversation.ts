@@ -60,11 +60,23 @@ export function registerGetConversation(
         };
       }
 
+      // Strip internal fields the model/user don't need and that app
+      // marketplaces flag (internal account IDs, storage encoding).
+      const { organization_id: _o, ...conversation } = result.conversation;
+      const messages = result.messages.map((m) => {
+        const {
+          organization_id: _mo,
+          content_encoding: _enc,
+          ...rest
+        } = m as typeof m & { organization_id?: string; content_encoding?: string };
+        return rest;
+      });
+
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify(result),
+            text: JSON.stringify({ conversation, messages }),
           },
         ],
       };

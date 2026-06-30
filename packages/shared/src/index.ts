@@ -6,4 +6,5 @@ export * from "./utils/auth.js";
 export * from "./utils/redact.js";
 export * from "./utils/detect.js";
 export * from "./utils/vault.js";
+export * from "./utils/oauth.js";
 export * from "./constants.js";

@@ -14,6 +14,12 @@ import { admin } from "./routes/admin.js";
 import { account } from "./routes/account.js";
 import { dataExport } from "./routes/export.js";
 import { purgeDeletedOrganizations } from "./cron/purge-deleted.js";
+import { oauth } from "./oauth/router.js";
+import {
+  originOf,
+  protectedResourceMetadata,
+  authorizationServerMetadata,
+} from "./oauth/metadata.js";
 import type { Env, AuthContext } from "./types.js";
 
 type HonoEnv = {
@@ -27,6 +33,18 @@ const app = new Hono<HonoEnv>();
 app.get("/health", (c) => {
   return c.json({ status: "ok", service: "engram-mcp-server", version: "0.2.0" });
 });
+
+// OAuth 2.1 discovery (RFC 9728 / RFC 8414) — public, enable MCP clients like
+// ChatGPT and Claude to auto-discover and connect via OAuth.
+app.get("/.well-known/oauth-protected-resource", (c) =>
+  c.json(protectedResourceMetadata(originOf(c.req.url))),
+);
+app.get("/.well-known/oauth-authorization-server", (c) =>
+  c.json(authorizationServerMetadata(originOf(c.req.url))),
+);
+
+// OAuth authorization server endpoints (register, authorize, token).
+app.route("/oauth", oauth);
 
 // MCP endpoint — all methods
 app.all("/mcp", authMiddleware, rateLimitMiddleware, async (c) => {

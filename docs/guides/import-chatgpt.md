@@ -1,15 +1,18 @@
-# Import your ChatGPT history into Engram
+# Import your ChatGPT / Claude history into Engram
 
-ChatGPT (the model) can't bulk-upload your past conversations — it only sees the
-current chat. To give Engram your real history, export your data from ChatGPT and
-import the file with the Engram CLI. Every conversation is stored verbatim and
-embedded for semantic search, so you can recall it from any connected client.
+A chat model can't bulk-upload your past conversations — it only sees the current
+chat. To give Engram your real history, export your data and import the file with
+the Engram CLI. **ChatGPT and Claude exports are both supported** (the format is
+auto-detected). Every conversation is stored verbatim and embedded for semantic
+search, so you can recall it from any connected client.
 
-## 1. Export your data from ChatGPT
+## 1. Export your data
 
-1. ChatGPT → **Settings → Data controls → Export data**.
-2. Confirm. OpenAI emails you a download link (can take a few minutes to hours).
-3. Download and unzip it. Inside is **`conversations.json`** — that's the file you need.
+**ChatGPT:** Settings → **Data controls → Export data**. You'll be emailed a
+download link; unzip it and find **`conversations.json`**.
+
+**Claude:** Settings → **Account → Export data**. Same idea — unzip and find
+**`conversations.json`**.
 
 ## 2. Import it
 

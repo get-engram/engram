@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { linearize, type ChatConversation } from "../commands/import.js";
+import {
+  linearize,
+  linearizeClaude,
+  normalizeExport,
+  type ChatConversation,
+} from "../commands/import.js";
 
 describe("CLI", () => {
   it("exports all command modules", async () => {
@@ -63,5 +68,39 @@ describe("ChatGPT import — linearize", () => {
   it("returns [] for an empty/parentless mapping", () => {
     expect(linearize({ current_node: "x", mapping: {} })).toEqual([]);
     expect(linearize({})).toEqual([]);
+  });
+});
+
+describe("import — Claude + format detection", () => {
+  it("linearizes a Claude conversation (text and content blocks)", () => {
+    const msgs = linearizeClaude({
+      name: "Test",
+      chat_messages: [
+        { sender: "human", text: "hi" },
+        { sender: "assistant", content: [{ type: "text", text: "hello" }] },
+        { sender: "tool", text: "ignored" },
+        { sender: "human", text: "  " },
+      ],
+    });
+    expect(msgs).toEqual([
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+    ]);
+  });
+
+  it("detects ChatGPT vs Claude vs unknown", () => {
+    expect(normalizeExport([{ mapping: {}, current_node: null }]).format).toBe("chatgpt");
+    expect(normalizeExport([{ chat_messages: [] }]).format).toBe("claude");
+    expect(normalizeExport([{ foo: "bar" }]).format).toBe("unknown");
+    expect(normalizeExport([]).format).toBe("unknown");
+  });
+
+  it("normalizes Claude conversations with title + messages", () => {
+    const { format, conversations } = normalizeExport([
+      { name: "My chat", created_at: "2026-01-01", chat_messages: [{ sender: "human", text: "yo" }] },
+    ]);
+    expect(format).toBe("claude");
+    expect(conversations[0].title).toBe("My chat");
+    expect(conversations[0].messages).toEqual([{ role: "user", content: "yo" }]);
   });
 });

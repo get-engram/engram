@@ -31,18 +31,33 @@ export function createMcpServer(env: Env, auth: AuthContext): McpServer {
     { instructions: SERVER_INSTRUCTIONS },
   );
 
+  // Core memory tools — available to every client (incl. OAuth-connected
+  // apps like ChatGPT).
   registerCreateConversation(server, env, auth);
   registerAppendMessages(server, env, auth);
   registerSearch(server, env, auth);
   registerGetConversation(server, env, auth);
   registerListConversations(server, env, auth);
   registerDeleteConversation(server, env, auth);
-  registerResolveVault(server, env, auth);
-  registerVaultSet(server, env, auth);
-  registerVaultGet(server, env, auth);
-  registerVaultList(server, env, auth);
-  registerVaultDelete(server, env, auth);
-  registerManageSubscription(server, env, auth);
+
+  // First-party-only tools. External OAuth clients (auth.apiKeyId is
+  // "oauth:<client_id>") get the memory-only surface: the secrets vault
+  // stores credentials (which app marketplaces like ChatGPT's prohibit
+  // collecting) and manage_subscription is billing, not memory. API-key /
+  // SDK callers — the user's own agents — keep the full toolset.
+  if (!isExternalOAuthClient(auth)) {
+    registerResolveVault(server, env, auth);
+    registerVaultSet(server, env, auth);
+    registerVaultGet(server, env, auth);
+    registerVaultList(server, env, auth);
+    registerVaultDelete(server, env, auth);
+    registerManageSubscription(server, env, auth);
+  }
 
   return server;
+}
+
+/** True when the session is an external app connected via OAuth (not an API key). */
+export function isExternalOAuthClient(auth: AuthContext): boolean {
+  return typeof auth.apiKeyId === "string" && auth.apiKeyId.startsWith("oauth:");
 }

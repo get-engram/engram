@@ -13,6 +13,7 @@ import {
 import { store } from "./commands/store.js";
 import { search } from "./commands/search.js";
 import { log as showLog } from "./commands/log.js";
+import { importChatgpt } from "./commands/import.js";
 import { daemonStart, daemonStop, daemonStatus, daemonInstall, daemonUninstall } from "./daemon/index.js";
 import { upgrade } from "./commands/upgrade.js";
 import { vaultKeygen, vaultStatus, loadVaultKey, vaultSet, vaultGet, vaultList, vaultDelete } from "./commands/vault.js";
@@ -24,7 +25,7 @@ const VERSION = "0.3.4";
 const TOP_COMMANDS = new Set([
   "help", "version", "store", "append", "search", "find", "convs",
   "start", "stop", "status", "install", "uninstall", "log",
-  "signup", "login", "link", "upgrade",
+  "signup", "login", "link", "upgrade", "import",
 ]);
 // Commands that take 2 words (group + subcommand)
 const GROUP_COMMANDS = new Set(["auth", "conversations", "conv", "daemon", "vault"]);
@@ -135,6 +136,7 @@ ${bold("COMMANDS")}
 
   ${bold("store")} -c <id> <message>  Store a message
   ${bold("search")} <query>           Semantic search across memory
+  ${bold("import")} <file.json>       Import a ChatGPT data export into memory
   ${bold("log")}                      Show recent AI conversation activity
   ${bold("upgrade")} [pro|team]       Upgrade your plan (opens Stripe checkout)
 
@@ -266,6 +268,10 @@ async function main(): Promise<void> {
 
       case "log":
         await showLog(await getClient(), args, flags);
+        break;
+
+      case "import":
+        await importChatgpt(await getClient(), args, flags);
         break;
 
       case "upgrade":

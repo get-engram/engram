@@ -11,6 +11,7 @@ import { registerVaultGet } from "./tools/vault-get.js";
 import { registerVaultList } from "./tools/vault-list.js";
 import { registerVaultDelete } from "./tools/vault-delete.js";
 import { registerManageSubscription } from "./tools/manage-subscription.js";
+import { isExternalOAuthClient } from "./auth-kind.js";
 import type { Env, AuthContext } from "../types.js";
 
 // Surfaced to clients (ChatGPT, Claude, …) in the MCP `initialize` response so
@@ -55,9 +56,4 @@ export function createMcpServer(env: Env, auth: AuthContext): McpServer {
   }
 
   return server;
-}
-
-/** True when the session is an external app connected via OAuth (not an API key). */
-export function isExternalOAuthClient(auth: AuthContext): boolean {
-  return typeof auth.apiKeyId === "string" && auth.apiKeyId.startsWith("oauth:");
 }

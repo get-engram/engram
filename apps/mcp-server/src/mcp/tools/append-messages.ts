@@ -4,6 +4,12 @@ import {
   appendMessages,
   getOrCreateDefaultConversation,
 } from "../../services/conversation.js";
+import { isExternalOAuthClient } from "../auth-kind.js";
+import {
+  usageMeter,
+  limitMessage,
+  approachingLimitNotice,
+} from "../usage-messaging.js";
 import { checkAndTrackMessages } from "../../services/tier.js";
 import { fireWebhooks } from "../../services/webhooks.js";
 import { audit } from "../../services/audit.js";
@@ -72,6 +78,8 @@ export function registerAppendMessages(
         params.messages.length
       );
 
+      const isOAuth = isExternalOAuthClient(auth);
+
       if (!tierCheck.allowed) {
         return {
           content: [
@@ -79,10 +87,19 @@ export function registerAppendMessages(
               type: "text" as const,
               text: JSON.stringify({
                 error: tierCheck.error,
-                message: `Message limit exceeded. Your ${tierCheck.tier} plan allows ${tierCheck.limit?.toLocaleString()} messages/month. Used: ${tierCheck.used?.toLocaleString()}. Upgrade at https://getengram.app/pricing`,
+                message: limitMessage({
+                  unit: "messages",
+                  tier: tierCheck.tier,
+                  limit: tierCheck.limit,
+                  used: tierCheck.used,
+                  isOAuth,
+                }),
                 limit: tierCheck.limit,
                 used: tierCheck.used,
                 tier: tierCheck.tier,
+                upgrade_url: isOAuth
+                  ? "https://getengram.app/dashboard"
+                  : "https://getengram.app/pricing",
               }),
             },
           ],
@@ -126,6 +143,11 @@ export function registerAppendMessages(
         message_ids: messages.map((m) => m.id),
       }).catch(() => {});
 
+      // Usage meter — surfaced so the client can show progress and warn the
+      // user before they hit the monthly cap.
+      const meter = usageMeter(tierCheck.used, tierCheck.limit);
+      const notice = approachingLimitNotice(meter, isOAuth);
+
       return {
         content: [
           {
@@ -135,6 +157,8 @@ export function registerAppendMessages(
               appended: messages.length,
               message_ids: messages.map((m) => m.id),
               vault_entries_stored: params.vault_entries?.length ?? 0,
+              ...(meter ? { usage: meter } : {}),
+              ...(notice ? { notice } : {}),
             }),
           },
         ],

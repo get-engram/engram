@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
 import app from "../index.js";
-import { verifyPkceS256, sha256Base64Url } from "@getengram/shared";
+import {
+  verifyPkceS256,
+  sha256Base64Url,
+  hashApiKey,
+  generateApiKeyRaw,
+} from "@getengram/shared";
 import {
   createOAuthD1,
   createOAuthEnv,
@@ -9,6 +14,14 @@ import {
 } from "./oauth-helpers.js";
 
 const REDIRECT = "https://chatgpt.com/connector/callback";
+
+// API-key auth updates last_used_at via executionCtx.waitUntil; tests must
+// supply a mock context (the OAuth-token path doesn't need it).
+const MOCK_CTX = {
+  waitUntil: () => {},
+  passThroughOnException: () => {},
+  props: {},
+} as unknown as ExecutionContext;
 
 function form(fields: Record<string, string>): Request {
   return new Request("http://mcp.test/oauth/token", {
@@ -36,13 +49,14 @@ async function getAuthCode(
   env: ReturnType<typeof createOAuthEnv>,
   clientId: string,
   challenge: string,
+  email = "alice@example.com",
 ): Promise<string> {
   const approve = await app.fetch(
     new Request("http://mcp.test/oauth/authorize/approve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        supabase_token: await signSupabaseJwt("alice@example.com"),
+        supabase_token: await signSupabaseJwt(email),
         client_id: clientId,
         redirect_uri: REDIRECT,
         code_challenge: challenge,
@@ -336,5 +350,92 @@ describe("Access token authenticates the MCP endpoint", () => {
     );
     expect(bad.status).toBe(401);
     expect(bad.headers.get("WWW-Authenticate")).toContain("resource_metadata");
+  });
+});
+
+describe("Connected apps management (/api/oauth/connections)", () => {
+  // Seed an org + API key, then connect an app (OAuth) to the same org so the
+  // API-key-authenticated dashboard can list and revoke it.
+  async function setup() {
+    const db = createOAuthD1();
+    const env = createOAuthEnv(db);
+    const { raw: apiKey, prefix } = generateApiKeyRaw();
+    const email = "apps@example.com";
+
+    await db.prepare("INSERT INTO organizations (id, name, email, tier) VALUES (?, ?, ?, ?)")
+      .bind("org_ca", "Apps Org", email, "free").run();
+    await db.prepare("INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, name, expires_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .bind("key_ca", "org_ca", await hashApiKey(apiKey), prefix, "Default", "2999-01-01 00:00:00").run();
+
+    // Connect an app via the full OAuth flow (same email → same org).
+    const clientId = await registerClient(env);
+    const { verifier, challenge } = await pkcePair();
+    const code = await getAuthCode(env, clientId, challenge, email);
+    const tok = (await (await app.fetch(
+      form({ grant_type: "authorization_code", client_id: clientId, code, redirect_uri: REDIRECT, code_verifier: verifier }),
+      env,
+    )).json()) as { access_token: string };
+
+    return { env, apiKey, clientId, accessToken: tok.access_token };
+  }
+
+  const listReq = (apiKey: string) =>
+    new Request("http://mcp.test/api/oauth/connections", { headers: { Authorization: `Bearer ${apiKey}` } });
+
+  it("lists a connected app for the org", async () => {
+    const { env, apiKey, clientId } = await setup();
+    const res = await app.fetch(listReq(apiKey), env, MOCK_CTX);
+    expect(res.status).toBe(200);
+    const { connections } = (await res.json()) as { connections: Array<{ client_id: string; client_name: string }> };
+    expect(connections).toHaveLength(1);
+    expect(connections[0].client_id).toBe(clientId);
+    expect(connections[0].client_name).toBe("ChatGPT");
+  });
+
+  it("revokes a connection and drops it from the list", async () => {
+    const { env, apiKey, clientId } = await setup();
+    const del = await app.fetch(
+      new Request(`http://mcp.test/api/oauth/connections/${clientId}`, {
+        method: "DELETE", headers: { Authorization: `Bearer ${apiKey}` },
+      }),
+      env,
+      MOCK_CTX,
+    );
+    expect(del.status).toBe(200);
+    expect(((await del.json()) as { revoked: boolean }).revoked).toBe(true);
+
+    const after = (await (await app.fetch(listReq(apiKey), env, MOCK_CTX)).json()) as { connections: unknown[] };
+    expect(after.connections).toHaveLength(0);
+  });
+
+  it("revoking invalidates the app's access token on /mcp", async () => {
+    const { env, apiKey, clientId, accessToken } = await setup();
+    // Token works before revoke.
+    const before = await app.fetch(
+      new Request("http://mcp.test/mcp", { method: "POST", headers: { Authorization: `Bearer ${accessToken}` } }),
+      env,
+    );
+    expect(before.status).not.toBe(401);
+
+    await app.fetch(
+      new Request(`http://mcp.test/api/oauth/connections/${clientId}`, {
+        method: "DELETE", headers: { Authorization: `Bearer ${apiKey}` },
+      }),
+      env,
+      MOCK_CTX,
+    );
+
+    // Access token deleted → 401.
+    const after = await app.fetch(
+      new Request("http://mcp.test/mcp", { method: "POST", headers: { Authorization: `Bearer ${accessToken}` } }),
+      env,
+    );
+    expect(after.status).toBe(401);
+  });
+
+  it("requires authentication", async () => {
+    const { env } = await setup();
+    const res = await app.fetch(new Request("http://mcp.test/api/oauth/connections"), env);
+    expect(res.status).toBe(401);
   });
 });

@@ -217,3 +217,54 @@ export function revokeRefreshTokenChain(
     .bind(clientId, organizationId)
     .run();
 }
+
+// ---------------------------------------------------------------------------
+// Connected apps (dashboard "manage access")
+// ---------------------------------------------------------------------------
+
+/**
+ * List the OAuth apps an org has an active connection to. A connection is a
+ * live (non-revoked, unexpired) refresh token — the durable grant that
+ * outlives the 1-hour access tokens. One row per client.
+ */
+export function getConnectedAppsByOrg(db: D1Database, organizationId: string) {
+  return db
+    .prepare(
+      `SELECT c.id AS client_id,
+              COALESCE(c.client_name, 'Application') AS client_name,
+              MAX(r.created_at) AS authorized_at,
+              MAX(r.expires_at) AS expires_at
+       FROM oauth_refresh_tokens r
+       JOIN oauth_clients c ON c.id = r.client_id
+       WHERE r.organization_id = ?
+         AND r.revoked_at IS NULL
+         AND r.expires_at > datetime('now')
+       GROUP BY c.id, c.client_name
+       ORDER BY authorized_at DESC`,
+    )
+    .bind(organizationId)
+    .all();
+}
+
+/**
+ * Revoke an org's connection to a client: delete its access tokens and revoke
+ * its refresh tokens. The app must re-run the OAuth flow to reconnect.
+ */
+export function revokeOAuthConnection(
+  db: D1Database,
+  organizationId: string,
+  clientId: string,
+) {
+  return db.batch([
+    db
+      .prepare(
+        "DELETE FROM oauth_access_tokens WHERE organization_id = ? AND client_id = ?",
+      )
+      .bind(organizationId, clientId),
+    db
+      .prepare(
+        "UPDATE oauth_refresh_tokens SET revoked_at = datetime('now') WHERE organization_id = ? AND client_id = ? AND revoked_at IS NULL",
+      )
+      .bind(organizationId, clientId),
+  ]);
+}

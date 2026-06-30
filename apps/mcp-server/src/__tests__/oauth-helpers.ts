@@ -80,6 +80,13 @@ export function createOAuthD1(): D1Database {
         }
         return { results: [], success: true, meta: {} };
       }
+      const del = sql.match(/DELETE\s+FROM\s+(\w+)\s+WHERE\s/is);
+      if (del) {
+        const name = del[1];
+        const w = parseWhere(sql, args);
+        tables[name] = table(name).filter((r) => !matches(r, w));
+        return { results: [], success: true, meta: {} };
+      }
       return { results: [], success: true, meta: {} };
     }),
     first: vi.fn(async () => {
@@ -99,7 +106,27 @@ export function createOAuthD1(): D1Database {
       const from = sql.match(/FROM\s+(\w+)/i);
       if (!from) return { results: [], success: true, meta: {} };
       const w = parseWhere(sql, args);
-      return { results: table(from[1]).filter((r) => matches(r, w)), success: true, meta: {} };
+      const rows = table(from[1]).filter((r) => matches(r, w));
+      // Connected-apps query: JOIN oauth_clients + GROUP BY client. Shape the
+      // rows like the real SELECT (client_id, client_name, authorized_at) and
+      // dedup by client_id to mimic GROUP BY.
+      if (/JOIN\s+oauth_clients/i.test(sql)) {
+        const byClient = new Map<string, Row>();
+        for (const r of rows) {
+          const client = table("oauth_clients").find((c) => c.id === r.client_id);
+          const existing = byClient.get(r.client_id as string);
+          if (!existing || String(r.created_at) > String(existing.authorized_at)) {
+            byClient.set(r.client_id as string, {
+              client_id: r.client_id,
+              client_name: client?.client_name ?? "Application",
+              authorized_at: r.created_at,
+              expires_at: r.expires_at,
+            });
+          }
+        }
+        return { results: [...byClient.values()], success: true, meta: {} };
+      }
+      return { results: rows, success: true, meta: {} };
     }),
   });
 

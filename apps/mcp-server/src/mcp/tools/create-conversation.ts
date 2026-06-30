@@ -14,20 +14,26 @@ export function registerCreateConversation(
   env: Env,
   auth: AuthContext
 ) {
-  server.tool(
+  server.registerTool(
     "create_conversation",
-    "Create a new conversation and return its conversation_id. Call this yourself to obtain an id before appending — the id is yours to generate and reuse; never ask the user to provide one. Create one conversation per session/topic and reuse its id for all subsequent append_messages calls.",
     {
-      title: z.string().optional().describe("Title for the conversation"),
-      agent_id: z.string().optional().describe("Agent identifier (e.g. \"chatgpt\")"),
-      tags: z.array(z.string()).optional().describe("Tags for filtering"),
-      metadata: z.record(z.unknown()).optional().describe("Arbitrary metadata"),
-    },
-    {
-      title: "Create conversation",
-      readOnlyHint: false,
-      destructiveHint: false,
-      openWorldHint: false,
+      description:
+        "Create a new conversation and return its conversation_id. Call this yourself to obtain an id before appending — the id is yours to generate and reuse; never ask the user to provide one. Create one conversation per session/topic and reuse its id for all subsequent append_messages calls.",
+      inputSchema: {
+        title: z.string().optional().describe("Title for the conversation"),
+        agent_id: z.string().optional().describe("Agent identifier (e.g. \"chatgpt\")"),
+        tags: z.array(z.string()).optional().describe("Tags for filtering"),
+        metadata: z.record(z.unknown()).optional().describe("Arbitrary metadata"),
+      },
+      outputSchema: {
+        conversation_id: z.string().describe("The id of the created conversation"),
+      },
+      annotations: {
+        title: "Create conversation",
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
     },
     async (params) => {
       // Check conversation limit
@@ -87,6 +93,7 @@ export function registerCreateConversation(
             text: JSON.stringify({ conversation_id: id }),
           },
         ],
+        structuredContent: { conversation_id: id },
       };
     }
   );

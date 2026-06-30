@@ -9,26 +9,45 @@ export function registerListConversations(
   env: Env,
   auth: AuthContext
 ) {
-  server.tool(
+  server.registerTool(
     "list_conversations",
-    "List conversations with filtering and sorting options.",
     {
-      limit: z.number().int().min(1).max(100).optional().default(20),
-      offset: z.number().int().min(0).optional().default(0),
-      agent_id: z.string().optional().describe("Filter by agent ID"),
-      tags: z.array(z.string()).optional().describe("Filter by tags"),
-      sort: z
-        .enum(["created_at", "updated_at", "message_count"])
-        .optional()
-        .default("updated_at"),
-      order: z.enum(["asc", "desc"]).optional().default("desc"),
-    },
-    {
-      title: "List conversations",
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
+      description: "List conversations with filtering and sorting options.",
+      inputSchema: {
+        limit: z.number().int().min(1).max(100).optional().default(20),
+        offset: z.number().int().min(0).optional().default(0),
+        agent_id: z.string().optional().describe("Filter by agent ID"),
+        tags: z.array(z.string()).optional().describe("Filter by tags"),
+        sort: z
+          .enum(["created_at", "updated_at", "message_count"])
+          .optional()
+          .default("updated_at"),
+        order: z.enum(["asc", "desc"]).optional().default("desc"),
+      },
+      outputSchema: {
+        conversations: z.array(
+          z
+            .object({
+              id: z.string().optional(),
+              title: z.string().nullable().optional(),
+              agent_id: z.string().nullable().optional(),
+              tags: z.array(z.string()).optional(),
+              metadata: z.record(z.unknown()).optional(),
+              message_count: z.number().optional(),
+              created_at: z.string().optional(),
+              updated_at: z.string().optional(),
+            })
+            .passthrough(),
+        ),
+        total: z.number(),
+      },
+      annotations: {
+        title: "List conversations",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
     },
     async (params) => {
       audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.list");
@@ -60,6 +79,7 @@ export function registerListConversations(
             }),
           },
         ],
+        structuredContent: { conversations, total: conversations.length },
       };
     }
   );

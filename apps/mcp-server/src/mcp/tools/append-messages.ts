@@ -20,10 +20,12 @@ export function registerAppendMessages(
   env: Env,
   auth: AuthContext
 ) {
-  server.tool(
+  server.registerTool(
     "append_messages",
-    "Store messages in Engram memory, verbatim and automatically chunked + embedded for search. conversation_id is OPTIONAL: omit it to append to the user's default memory (recommended for general 'remember this' requests) — never ask the user for an id. Pass a conversation_id (from create_conversation) only when you want to group a specific topic. The response returns the conversation_id used. Optionally accepts client-encrypted vault entries for secrets detected client-side.",
     {
+      description:
+        "Store messages in Engram memory, verbatim and automatically chunked + embedded for search. conversation_id is OPTIONAL: omit it to append to the user's default memory (recommended for general 'remember this' requests) — never ask the user for an id. Pass a conversation_id (from create_conversation) only when you want to group a specific topic. The response returns the conversation_id used. Optionally accepts client-encrypted vault entries for secrets detected client-side.",
+      inputSchema: {
       conversation_id: z
         .string()
         .optional()
@@ -59,13 +61,25 @@ export function registerAppendMessages(
         .describe(
           "Client-encrypted vault entries. Server stores these as opaque blobs — zero knowledge."
         ),
-    },
-    {
-      title: "Append messages",
-      readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: false,
-      openWorldHint: false,
+      },
+      outputSchema: {
+        conversation_id: z.string().describe("The conversation the messages were stored in"),
+        appended: z.number().describe("Number of messages stored"),
+        message_ids: z.array(z.string()),
+        vault_entries_stored: z.number(),
+        usage: z
+          .object({ used: z.number(), limit: z.number(), remaining: z.number() })
+          .optional()
+          .describe("Monthly message usage for the org (limited tiers only)"),
+        notice: z.string().optional().describe("Heads-up shown when approaching the plan limit"),
+      },
+      annotations: {
+        title: "Append messages",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
     },
     async (params) => {
       // Atomically check tier limit AND increment usage in one operation.
@@ -148,20 +162,18 @@ export function registerAppendMessages(
       const meter = usageMeter(tierCheck.used, tierCheck.limit);
       const notice = approachingLimitNotice(meter, isOAuth);
 
+      const payload = {
+        conversation_id: conversationId,
+        appended: messages.length,
+        message_ids: messages.map((m) => m.id),
+        vault_entries_stored: params.vault_entries?.length ?? 0,
+        ...(meter ? { usage: meter } : {}),
+        ...(notice ? { notice } : {}),
+      };
+
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({
-              conversation_id: conversationId,
-              appended: messages.length,
-              message_ids: messages.map((m) => m.id),
-              vault_entries_stored: params.vault_entries?.length ?? 0,
-              ...(meter ? { usage: meter } : {}),
-              ...(notice ? { notice } : {}),
-            }),
-          },
-        ],
+        content: [{ type: "text" as const, text: JSON.stringify(payload) }],
+        structuredContent: payload,
       };
     }
   );

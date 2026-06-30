@@ -42,6 +42,7 @@ interface CapturedTool {
   description: string;
   schema: Record<string, unknown>;
   annotations?: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
   handler: ToolHandler;
 }
 
@@ -59,6 +60,26 @@ function createCaptureServer(): {
       const annotations =
         rest.length >= 3 ? (rest[1] as Record<string, unknown>) : undefined;
       tools.set(name, { name, description, schema, annotations, handler });
+    },
+    // registerTool(name, { description, inputSchema, outputSchema, annotations }, handler)
+    registerTool: (
+      name: string,
+      config: {
+        description?: string;
+        inputSchema?: Record<string, unknown>;
+        outputSchema?: Record<string, unknown>;
+        annotations?: Record<string, unknown>;
+      },
+      handler: ToolHandler,
+    ) => {
+      tools.set(name, {
+        name,
+        description: config.description ?? "",
+        schema: config.inputSchema ?? {},
+        annotations: config.annotations,
+        outputSchema: config.outputSchema,
+        handler,
+      });
     },
   } as unknown as McpServer;
   return { server, tools };

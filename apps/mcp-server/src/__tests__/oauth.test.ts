@@ -439,3 +439,54 @@ describe("Connected apps management (/api/oauth/connections)", () => {
     expect(res.status).toBe(401);
   });
 });
+
+describe("Published (OAuth) toolset is memory-only", () => {
+  async function listTools(env: ReturnType<typeof createOAuthEnv>, token: string) {
+    const res = await app.fetch(
+      new Request("http://mcp.test/mcp", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      }),
+      env,
+      MOCK_CTX,
+    );
+    return res.text();
+  }
+
+  it("OAuth clients get the 6 memory tools and NOT vault/subscription", async () => {
+    const env = createOAuthEnv(createOAuthD1());
+    const clientId = await registerClient(env);
+    const { verifier, challenge } = await pkcePair();
+    const code = await getAuthCode(env, clientId, challenge);
+    const tok = (await (await app.fetch(
+      form({ grant_type: "authorization_code", client_id: clientId, code, redirect_uri: REDIRECT, code_verifier: verifier }),
+      env,
+    )).json()) as { access_token: string };
+
+    const text = await listTools(env, tok.access_token);
+    for (const name of ["create_conversation", "append_messages", "search", "get_conversation", "list_conversations", "delete_conversation"]) {
+      expect(text, name).toContain(name);
+    }
+    for (const name of ["vault_set", "vault_get", "vault_list", "vault_delete", "resolve_vault", "manage_subscription"]) {
+      expect(text, name).not.toContain(name);
+    }
+  });
+
+  it("API-key clients keep the full toolset incl. vault", async () => {
+    const db = createOAuthD1();
+    const env = createOAuthEnv(db);
+    const { raw: apiKey, prefix } = generateApiKeyRaw();
+    await db.prepare("INSERT INTO organizations (id, name, tier) VALUES (?, ?, ?)").bind("org_full", "Full", "free").run();
+    await db.prepare("INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, name, expires_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .bind("key_full", "org_full", await hashApiKey(apiKey), prefix, "Default", "2999-01-01 00:00:00").run();
+
+    const text = await listTools(env, apiKey);
+    expect(text).toContain("vault_set");
+    expect(text).toContain("manage_subscription");
+  });
+});

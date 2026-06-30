@@ -102,6 +102,15 @@ describe("OAuth discovery", () => {
     expect(body.grant_types_supported).toContain("refresh_token");
   });
 
+  it("serves the OpenAI App Directory domain-verification token", async () => {
+    const res = await app.fetch(
+      new Request("http://mcp.test/.well-known/openai-apps-challenge"),
+      env,
+    );
+    expect(res.status).toBe(200);
+    expect((await res.text()).trim()).toBe("wcJv6LrYXHjM7WuahvvnVsS-MHiXsf198fF43dpFkB8");
+  });
+
   it("challenges unauthenticated /mcp with resource_metadata", async () => {
     const res = await app.fetch(
       new Request("http://mcp.test/mcp", { method: "POST" }),

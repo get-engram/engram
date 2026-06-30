@@ -33,6 +33,13 @@ export function registerVaultSet(
         .default("unknown")
         .describe("Type of secret (e.g. api_key, connection_string, token)"),
     },
+    {
+      title: "Set vault secret",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (params) => {
       const id = generateId("vlt");
 

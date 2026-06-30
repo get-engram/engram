@@ -18,6 +18,13 @@ export function registerVaultDelete(
         .min(1)
         .describe("Secret name to delete"),
     },
+    {
+      title: "Delete vault secret",
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (params) => {
       // Check existence first for audit
       const existing = await getNamedSecret(

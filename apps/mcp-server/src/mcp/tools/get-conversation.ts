@@ -30,6 +30,13 @@ export function registerGetConversation(
         .default(0)
         .describe("Message offset for pagination"),
     },
+    {
+      title: "Get conversation",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (params) => {
       audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.read", "conversation", params.conversation_id);
 

@@ -18,6 +18,13 @@ export function registerVaultGet(
         .min(1)
         .describe("Secret name to retrieve (e.g. DATABASE_URL)"),
     },
+    {
+      title: "Get vault secret",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (params) => {
       const row = await getNamedSecret(
         env.DB,

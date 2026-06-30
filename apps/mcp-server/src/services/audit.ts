@@ -22,7 +22,8 @@ export type AuditAction =
   | "subscription.status"
   | "subscription.portal"
   | "subscription.checkout"
-  | "subscription.upgrade_redirect";
+  | "subscription.upgrade_redirect"
+  | "oauth.connection.revoked";
 
 /**
  * Fire-and-forget audit log entry. Never throws — audit logging

@@ -499,3 +499,44 @@ describe("Published (OAuth) toolset is memory-only", () => {
     expect(text).toContain("manage_subscription");
   });
 });
+
+describe("Tool output schemas (structuredContent validates at runtime)", () => {
+  it("create_conversation returns validated structuredContent via a real tools/call", async () => {
+    const env = createOAuthEnv(createOAuthD1());
+    const clientId = await registerClient(env);
+    const { verifier, challenge } = await pkcePair();
+    const code = await getAuthCode(env, clientId, challenge);
+    const tok = (await (await app.fetch(
+      form({ grant_type: "authorization_code", client_id: clientId, code, redirect_uri: REDIRECT, code_verifier: verifier }),
+      env,
+    )).json()) as { access_token: string };
+
+    // tools/call goes through the real McpServer, which validates the returned
+    // structuredContent against the tool's outputSchema. A schema mismatch
+    // would surface as a JSON-RPC error here.
+    const res = await app.fetch(
+      new Request("http://mcp.test/mcp", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${tok.access_token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "create_conversation", arguments: { title: "Schema test" } },
+        }),
+      }),
+      env,
+      MOCK_CTX,
+    );
+    const text = await res.text();
+    expect(res.status).not.toBe(401);
+    expect(text).toContain("structuredContent");
+    expect(text).toContain("conversation_id");
+    // No JSON-RPC error object (e.g. a validation failure).
+    expect(text).not.toMatch(/"error"\s*:\s*\{/);
+  });
+});

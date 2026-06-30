@@ -13,11 +13,23 @@ import { registerVaultDelete } from "./tools/vault-delete.js";
 import { registerManageSubscription } from "./tools/manage-subscription.js";
 import type { Env, AuthContext } from "../types.js";
 
+// Surfaced to clients (ChatGPT, Claude, …) in the MCP `initialize` response so
+// the model knows to use Engram for memory proactively, without being asked —
+// and that it owns the conversation_id rather than asking the user for one.
+const SERVER_INSTRUCTIONS = `Engram is persistent, searchable memory for AI agents. Use it proactively, without waiting to be asked.
+
+- At the start of a task or session, call \`search\` with a short summary of the user's request to recall relevant prior context, and use what you find.
+- When something worth remembering is established — decisions, preferences, facts, project or personal context — persist it: call \`create_conversation\` once to get a conversation_id (you own this id; never ask the user for it), then \`append_messages\` to store the user's message and your reply verbatim. Reuse that same conversation_id for the rest of the session.
+- Do not store trivial chatter (greetings, acknowledgements). Storage is verbatim and searchable by meaning.`;
+
 export function createMcpServer(env: Env, auth: AuthContext): McpServer {
-  const server = new McpServer({
-    name: "Engram",
-    version: "0.1.0",
-  });
+  const server = new McpServer(
+    {
+      name: "Engram",
+      version: "0.1.0",
+    },
+    { instructions: SERVER_INSTRUCTIONS },
+  );
 
   registerCreateConversation(server, env, auth);
   registerAppendMessages(server, env, auth);

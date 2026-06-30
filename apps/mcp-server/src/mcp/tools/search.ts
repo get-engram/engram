@@ -32,6 +32,13 @@ export function registerSearch(
         .optional()
         .describe("Filter by conversation tags"),
     },
+    {
+      title: "Search memory",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (params) => {
       const results = await searchConversations(
         env,

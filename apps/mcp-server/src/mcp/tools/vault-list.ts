@@ -12,6 +12,13 @@ export function registerVaultList(
     "vault_list",
     "List all named secrets. Returns names and metadata only — never values or encrypted blobs.",
     {},
+    {
+      title: "List vault secrets",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async () => {
       const result = await listNamedSecrets(env.DB, auth.organizationId);
 

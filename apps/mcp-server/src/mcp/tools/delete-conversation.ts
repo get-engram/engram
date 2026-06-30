@@ -9,18 +9,23 @@ export function registerDeleteConversation(
   env: Env,
   auth: AuthContext
 ) {
-  server.tool(
+  server.registerTool(
     "delete_conversation",
-    "Delete a conversation and all its messages, chunks, and vector embeddings.",
     {
-      conversation_id: z.string().describe("The conversation to delete"),
-    },
-    {
-      title: "Delete conversation",
-      readOnlyHint: false,
-      destructiveHint: true,
-      idempotentHint: true,
-      openWorldHint: false,
+      description: "Delete a conversation and all its messages, chunks, and vector embeddings.",
+      inputSchema: {
+        conversation_id: z.string().describe("The conversation to delete"),
+      },
+      outputSchema: {
+        deleted: z.boolean().describe("True when the conversation was deleted"),
+      },
+      annotations: {
+        title: "Delete conversation",
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
     },
     async (params) => {
       const deleted = await deleteConversation(
@@ -50,6 +55,7 @@ export function registerDeleteConversation(
             text: JSON.stringify({ deleted: true }),
           },
         ],
+        structuredContent: { deleted: true },
       };
     }
   );

@@ -9,10 +9,11 @@ export function registerGetConversation(
   env: Env,
   auth: AuthContext
 ) {
-  server.tool(
+  server.registerTool(
     "get_conversation",
-    "Get a conversation with its full verbatim messages. Supports pagination.",
     {
+      description: "Get a conversation with its full verbatim messages. Supports pagination.",
+      inputSchema: {
       conversation_id: z.string().describe("The conversation to retrieve"),
       message_limit: z
         .number()
@@ -29,13 +30,40 @@ export function registerGetConversation(
         .optional()
         .default(0)
         .describe("Message offset for pagination"),
-    },
-    {
-      title: "Get conversation",
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
+      },
+      outputSchema: {
+        conversation: z
+          .object({
+            id: z.string().optional(),
+            title: z.string().nullable().optional(),
+            agent_id: z.string().nullable().optional(),
+            tags: z.array(z.string()).optional(),
+            metadata: z.record(z.unknown()).optional(),
+            message_count: z.number().optional(),
+            created_at: z.string().optional(),
+            updated_at: z.string().optional(),
+          })
+          .passthrough(),
+        messages: z.array(
+          z
+            .object({
+              id: z.string().optional(),
+              conversation_id: z.string().optional(),
+              role: z.string().optional(),
+              content: z.string().optional(),
+              sequence: z.number().optional(),
+              created_at: z.string().optional(),
+            })
+            .passthrough(),
+        ),
+      },
+      annotations: {
+        title: "Get conversation",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
     },
     async (params) => {
       audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.read", "conversation", params.conversation_id);
@@ -79,6 +107,7 @@ export function registerGetConversation(
             text: JSON.stringify({ conversation, messages }),
           },
         ],
+        structuredContent: { conversation, messages },
       };
     }
   );

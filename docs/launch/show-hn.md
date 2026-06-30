@@ -1,30 +1,49 @@
 # Show HN Draft
 
-**Title:** Show HN: Engram – Persistent memory for AI agents via semantic search
+**Title:** Show HN: Engram – Long-term memory for ChatGPT, Claude, and Cursor
+
+> Draft — not posted. Post from your own HN account when ready (ideally once the
+> ChatGPT App Directory listing is approved). Be available to answer comments in
+> the first hour.
 
 ---
 
-I've been using Claude Code daily and the biggest pain point is that every session starts from zero. The agent has no memory of what you discussed yesterday — the bugs you investigated, the architecture decisions you made, the preferences you expressed. You end up repeating yourself constantly.
+I've been using AI assistants daily and the biggest pain point is that every session starts from zero. The model has no memory of what you discussed yesterday — the decisions you made, the bugs you chased, the preferences you stated. You end up re-explaining yourself constantly.
 
-Engram fixes this. It's a memory service that stores complete conversation transcripts and makes them searchable via semantic search. When a new session starts, the agent searches Engram for relevant context and picks up where you left off.
+Engram fixes that. It stores your conversations verbatim and makes them searchable by meaning, so your assistant can recall context across sessions instead of forgetting it. Ask it to remember something today and search for it next week.
 
-How it works:
+It's MCP-native (Model Context Protocol), so it works across clients:
 
-- Install the CLI (`brew tap get-engram/engram && brew install engram` or `npm i -g @getengram/cli`)
-- A background daemon watches your Claude Code sessions and auto-captures transcripts
-- Engram chunks the conversations and generates embeddings
-- The MCP server exposes search/store tools that any MCP-compatible client can use (Claude Code, Cursor, etc.)
+- **ChatGPT** — connect it as a custom connector: Settings → Apps → Developer mode → add `https://mcp.getengram.app/mcp` and sign in (OAuth). No install.
+- **Claude Desktop / Claude Code / Cursor / Windsurf** — drop the MCP server URL + an API key into your config.
+- For Claude Code specifically, the CLI (`npm i -g @getengram/cli`) runs a background daemon that auto-captures your sessions, so you don't have to think about it.
 
-It speaks Model Context Protocol (MCP), so the agent calls `search` with a natural language query and gets back relevant snippets from past conversations. No manual note-taking required.
+How it works: the agent calls `search` with a natural-language query and gets back the most relevant snippets from your past conversations; `append_messages` stores new ones. Everything is chunked and embedded automatically. The model decides when to remember and when to recall.
 
-The backend runs on Cloudflare Workers with D1 for storage and Vectorize for embeddings. It's fast and globally distributed.
+The backend runs entirely on Cloudflare's developer platform — Workers for the API/MCP server, D1 for storage, Vectorize for semantic search, Workers AI for embeddings. Fast and globally distributed.
 
-The whole thing is MIT licensed: https://github.com/get-engram/engram
+Source (Business Source License 1.1): https://github.com/get-engram/engram
 
-There's a free tier (50 conversations, 500 messages) if you want to try it. Pro is $39/mo for heavier use.
+There's a free tier (1,000 messages/month) if you want to try it. Pro is $39/mo for heavier use.
 
-I built this because I wanted my coding agent to actually learn from our interactions over time — to remember that we chose Hono over Express, that the prod database needs a specific migration order, that I prefer explicit error handling over try/catch. The kind of stuff that lives in your head but not in the codebase.
+I built this because I wanted my assistants to actually learn from our interactions over time — to remember that we chose Hono over Express, that prod needs a specific migration order, that I prefer explicit error handling over swallowing exceptions. The stuff that lives in your head but not in the codebase.
 
-Would love feedback, especially from other people using AI coding agents daily. What context do you find yourself repeating most often?
+Would love feedback, especially from people using AI assistants daily. What context do you find yourself repeating the most?
 
 Site: https://getengram.app
+
+---
+
+## How to post (yourself)
+
+1. Go to https://news.ycombinator.com/submit (logged into your account).
+2. **Title:** `Show HN: Engram – Long-term memory for ChatGPT, Claude, and Cursor`
+3. **URL:** `https://getengram.app` (or leave blank and paste the text below as the post body — a text Show HN often does better for discussion).
+4. Paste the body above as the first comment if you used the URL field.
+5. Post in the morning US time (Tue–Thu tends to be best), then **stay and reply to comments** for the first hour.
+
+### Accuracy checklist (don't repeat the old draft's mistakes)
+- License is **BSL-1.1**, not MIT.
+- Free tier is **1,000 messages/month**.
+- Don't claim a Homebrew tap until `engram` is actually on homebrew (issue #36).
+- Only say "in the ChatGPT App Directory" once it's **approved** — until then, "connect via a custom connector."

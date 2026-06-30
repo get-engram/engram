@@ -44,6 +44,13 @@ app.get("/.well-known/oauth-authorization-server", (c) =>
   c.json(authorizationServerMetadata(originOf(c.req.url))),
 );
 
+// OpenAI App Directory domain-ownership verification. Serves the challenge
+// token (a public proof, not a secret) at the well-known path OpenAI checks.
+const OPENAI_APPS_CHALLENGE_TOKEN = "wcJv6LrYXHjM7WuahvvnVsS-MHiXsf198fF43dpFkB8";
+app.get("/.well-known/openai-apps-challenge", (c) =>
+  c.text(OPENAI_APPS_CHALLENGE_TOKEN),
+);
+
 // OAuth authorization server endpoints (register, authorize, token).
 app.route("/oauth", oauth);
 

@@ -64,7 +64,13 @@ export async function checkAndTrackMessages(
     };
   }
 
-  return { allowed: true };
+  // Success — surface the new count + limit so callers can show a usage meter.
+  return {
+    allowed: true,
+    used: result.messages_stored,
+    limit: limits.messages_per_month,
+    tier,
+  };
 }
 
 export async function checkMessageLimit(

@@ -22,6 +22,25 @@ export function getConversationById(db: D1Database, id: string, organizationId: 
     .first();
 }
 
+/** Tag marking the org's auto-created default memory conversation. */
+export const DEFAULT_CONVERSATION_TAG = "__engram_default__";
+
+/**
+ * Find the org's default memory conversation (the one append_messages writes
+ * to when no conversation_id is supplied). Returns its id or null.
+ */
+export function getDefaultConversationId(db: D1Database, organizationId: string) {
+  return db
+    .prepare(
+      `SELECT id FROM conversations
+       WHERE organization_id = ?
+         AND EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?)
+       ORDER BY created_at LIMIT 1`,
+    )
+    .bind(organizationId, DEFAULT_CONVERSATION_TAG)
+    .first<{ id: string }>();
+}
+
 export function listConversations(
   db: D1Database,
   organizationId: string,

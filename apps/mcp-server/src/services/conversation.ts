@@ -9,6 +9,8 @@ import {
 import {
   insertConversation,
   getConversationById,
+  getDefaultConversationId,
+  DEFAULT_CONVERSATION_TAG,
   listConversations as dbListConversations,
   updateConversationMessageCount,
   deleteConversationById,
@@ -42,6 +44,22 @@ export async function createConversation(
     metadata ?? {}
   );
   return id;
+}
+
+/**
+ * Get the org's default memory conversation, creating it on first use. This
+ * is the target for append_messages calls that don't specify a conversation —
+ * it lets agents "just remember this" without managing conversation ids.
+ */
+export async function getOrCreateDefaultConversation(
+  db: D1Database,
+  organizationId: string,
+): Promise<string> {
+  const existing = await getDefaultConversationId(db, organizationId);
+  if (existing?.id) return existing.id;
+  return createConversation(db, organizationId, "Memory", undefined, [
+    DEFAULT_CONVERSATION_TAG,
+  ]);
 }
 
 export interface VaultEntryInput {

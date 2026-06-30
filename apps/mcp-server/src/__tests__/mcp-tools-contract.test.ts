@@ -158,6 +158,22 @@ describe("MCP tool contract — wire field names", () => {
       // Every id the SDK will map into messageIds must be a string.
       data.message_ids.forEach((id: unknown) => expect(typeof id).toBe("string"));
     });
+
+    it("works with no conversation_id and returns the conversation_id used", async () => {
+      const { server, tools } = createCaptureServer();
+      registerAppendMessages(server, env, { ...auth, tier: "enterprise" });
+      const tool = tools.get("append_messages");
+
+      const { data, isError } = parseToolResponse(
+        await tool!.handler({
+          messages: [{ role: "user", content: "remember this" }],
+        })
+      );
+      expect(isError).toBe(false);
+      expect(typeof data.conversation_id).toBe("string");
+      expect(data.conversation_id).toMatch(/^conv_/);
+      expect(data.appended).toBe(1);
+    });
   });
 
   describe("search", () => {

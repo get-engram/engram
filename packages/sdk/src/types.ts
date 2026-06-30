@@ -36,7 +36,6 @@ export interface MessageInput {
 export interface Message {
   id: string;
   conversationId: string;
-  organizationId: string;
   role: MessageRole;
   content: string;
   toolCallId: string | null;
@@ -50,7 +49,6 @@ export interface Message {
 
 export interface Conversation {
   id: string;
-  organizationId: string;
   title: string | null;
   agentId: string | null;
   tags: string[];

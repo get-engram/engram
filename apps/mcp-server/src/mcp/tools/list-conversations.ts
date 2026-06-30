@@ -42,11 +42,13 @@ export function registerListConversations(
         order: params.order,
       });
 
-      const conversations = (result.results as Array<Record<string, unknown>>).map((c) => ({
-        ...c,
-        tags: JSON.parse((c.tags as string) || "[]"),
-        metadata: JSON.parse((c.metadata as string) || "{}"),
-      }));
+      const conversations = (result.results as Array<Record<string, unknown>>).map(
+        ({ organization_id: _o, ...c }) => ({
+          ...c,
+          tags: JSON.parse((c.tags as string) || "[]"),
+          metadata: JSON.parse((c.metadata as string) || "{}"),
+        }),
+      );
 
       return {
         content: [

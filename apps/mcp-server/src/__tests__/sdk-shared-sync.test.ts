@@ -48,9 +48,11 @@ type ReverseFieldMap<S, D> = {
 describe("SDK ↔ shared type-sync contract", () => {
   describe("Conversation", () => {
     it("has a complete snake→camel field mapping", () => {
-      const sharedToSdk: FieldMap<SharedConversation, SdkConversation> = {
+      // organization_id is intentionally NOT surfaced by the SDK (it's an
+      // internal account ID; see get-conversation/list-conversations), so it's
+      // excluded from the sync contract.
+      const sharedToSdk: FieldMap<Omit<SharedConversation, "organization_id">, SdkConversation> = {
         id: "id",
-        organization_id: "organizationId",
         title: "title",
         agent_id: "agentId",
         tags: "tags",
@@ -62,7 +64,6 @@ describe("SDK ↔ shared type-sync contract", () => {
 
       const sdkToShared: ReverseFieldMap<SharedConversation, SdkConversation> = {
         id: "id",
-        organizationId: "organization_id",
         title: "title",
         agentId: "agent_id",
         tags: "tags",
@@ -86,10 +87,10 @@ describe("SDK ↔ shared type-sync contract", () => {
 
   describe("Message", () => {
     it("has a complete snake→camel field mapping", () => {
-      const sharedToSdk: FieldMap<SharedMessage, SdkMessage> = {
+      // organization_id intentionally omitted from the SDK (internal account ID).
+      const sharedToSdk: FieldMap<Omit<SharedMessage, "organization_id">, SdkMessage> = {
         id: "id",
         conversation_id: "conversationId",
-        organization_id: "organizationId",
         role: "role",
         content: "content",
         tool_call_id: "toolCallId",
@@ -102,7 +103,6 @@ describe("SDK ↔ shared type-sync contract", () => {
       const sdkToShared: ReverseFieldMap<SharedMessage, SdkMessage> = {
         id: "id",
         conversationId: "conversation_id",
-        organizationId: "organization_id",
         role: "role",
         content: "content",
         toolCallId: "tool_call_id",

@@ -2,7 +2,7 @@
 
 **An Engram whitepaper on seven use cases for persistent agent memory**
 
-*Published April 11, 2026 · Get Engram LLC*
+*Published April 11, 2026 · Get Engram Inc*
 
 ---
 
@@ -183,6 +183,6 @@ If any of the seven patterns in this paper describe a gap on your own team, the 
 
 ---
 
-*Written by an agent, for agents. Published April 11, 2026 by Get Engram LLC, Delaware. Comments and corrections: [hello@getengram.app](mailto:hello@getengram.app).*
+*Written by an agent, for agents. Published April 11, 2026 by Get Engram Inc, Delaware. Comments and corrections: [hello@getengram.app](mailto:hello@getengram.app).*
 
 *Visit [getengram.app](https://getengram.app) to get started.*

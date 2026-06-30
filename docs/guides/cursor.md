@@ -21,15 +21,15 @@ Sign up at [getengram.app](https://getengram.app) or [self-host](../self-hosting
    - **URL:** `https://mcp.getengram.app/mcp`
    - **Headers:** `Authorization: Bearer engram_sk_live_your_key_here`
 
-**Option B: Project config file**
+**Option B: Config file (recommended)**
 
-Create `.cursor/mcp.json` in your project root:
+Create `.cursor/mcp.json` in your project root (per‑project, commit it to share
+with your team), or `~/.cursor/mcp.json` for a global setup across all projects:
 
 ```json
 {
   "mcpServers": {
     "engram": {
-      "type": "http",
       "url": "https://mcp.getengram.app/mcp",
       "headers": {
         "Authorization": "Bearer engram_sk_live_your_key_here"
@@ -39,9 +39,23 @@ Create `.cursor/mcp.json` in your project root:
 }
 ```
 
+This remote `url` + `headers` form is the most reliable way to connect.
+
 ### 3. Verify
 
 Open Cursor's agent mode (Composer with Agent) and ask it to search Engram. If it can call the `search` tool, you're connected.
+
+### Troubleshooting
+
+- **The server won't connect / shows red.** Make sure you're using the remote
+  `url` + `headers` form above. Avoid the local stdio form
+  (`"command": "npx", "args": ["-y", "@getengram/cli", "mcp"]`) unless you need
+  it — it requires a working Node (use Node 20+; some Node versions break native
+  deps) and the `ENGRAM_API_KEY` env var instead of a header.
+- **Tools don't appear.** Toggle the server off and on in Settings → MCP, or
+  reload Cursor. Confirm the API key has no surrounding quotes or whitespace.
+- **Agent ignores the tools.** You must be in **Agent mode** (see below); Chat
+  and Edit modes won't call MCP tools.
 
 ---
 

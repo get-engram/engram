@@ -14,12 +14,18 @@ export function registerCreateConversation(
 ) {
   server.tool(
     "create_conversation",
-    "Create a new conversation to store messages in. Returns the conversation ID.",
+    "Create a new conversation and return its conversation_id. Call this yourself to obtain an id before appending — the id is yours to generate and reuse; never ask the user to provide one. Create one conversation per session/topic and reuse its id for all subsequent append_messages calls.",
     {
       title: z.string().optional().describe("Title for the conversation"),
-      agent_id: z.string().optional().describe("Agent identifier"),
+      agent_id: z.string().optional().describe("Agent identifier (e.g. \"chatgpt\")"),
       tags: z.array(z.string()).optional().describe("Tags for filtering"),
       metadata: z.record(z.unknown()).optional().describe("Arbitrary metadata"),
+    },
+    {
+      title: "Create conversation",
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: false,
     },
     async (params) => {
       // Check conversation limit

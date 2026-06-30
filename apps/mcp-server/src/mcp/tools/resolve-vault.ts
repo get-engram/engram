@@ -19,6 +19,13 @@ export function registerResolveVault(
         .max(50)
         .describe("Vault entry IDs to resolve (e.g. vlt_abc123)"),
     },
+    {
+      title: "Resolve vault entries",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (params) => {
       const result = await getVaultEntriesByIds(
         env.DB,

@@ -15,6 +15,13 @@ export function registerDeleteConversation(
     {
       conversation_id: z.string().describe("The conversation to delete"),
     },
+    {
+      title: "Delete conversation",
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (params) => {
       const deleted = await deleteConversation(
         env,

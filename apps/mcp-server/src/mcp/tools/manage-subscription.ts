@@ -35,6 +35,12 @@ export function registerManageSubscription(
         .optional()
         .describe("Number of seats for team plan. Only used with action \"upgrade\" and plan \"team\"."),
     },
+    {
+      title: "Manage subscription",
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: true,
+    },
     async (params) => {
       const org = (await getOrganizationById(env.DB, auth.organizationId)) as {
         id: string;

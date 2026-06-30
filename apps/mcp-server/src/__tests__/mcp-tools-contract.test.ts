@@ -41,6 +41,7 @@ interface CapturedTool {
   name: string;
   description: string;
   schema: Record<string, unknown>;
+  annotations?: Record<string, unknown>;
   handler: ToolHandler;
 }
 
@@ -50,8 +51,14 @@ function createCaptureServer(): {
 } {
   const tools = new Map<string, CapturedTool>();
   const server = {
-    tool: (name: string, description: string, schema: Record<string, unknown>, handler: ToolHandler) => {
-      tools.set(name, { name, description, schema, handler });
+    // tool() is variadic: (name, description, schema, [annotations], handler).
+    // The handler is always the last argument.
+    tool: (name: string, description: string, ...rest: unknown[]) => {
+      const handler = rest[rest.length - 1] as ToolHandler;
+      const schema = (rest.length >= 2 ? rest[0] : {}) as Record<string, unknown>;
+      const annotations =
+        rest.length >= 3 ? (rest[1] as Record<string, unknown>) : undefined;
+      tools.set(name, { name, description, schema, annotations, handler });
     },
   } as unknown as McpServer;
   return { server, tools };
@@ -311,6 +318,49 @@ describe("MCP tool contract — wire field names", () => {
 
       const registered = Array.from(tools.keys()).sort();
       expect(registered).toEqual(EXPECTED_TOOL_NAMES);
+    });
+
+    it("declares accurate tool annotations (App Directory requirement)", () => {
+      const { server, tools } = createCaptureServer();
+      registerCreateConversation(server, env, auth);
+      registerAppendMessages(server, env, auth);
+      registerSearch(server, env, auth);
+      registerGetConversation(server, env, auth);
+      registerListConversations(server, env, auth);
+      registerDeleteConversation(server, env, auth);
+      registerResolveVault(server, env, auth);
+      registerVaultSet(server, env, auth);
+      registerVaultGet(server, env, auth);
+      registerVaultList(server, env, auth);
+      registerVaultDelete(server, env, auth);
+
+      // read-only tools
+      for (const name of [
+        "search",
+        "get_conversation",
+        "list_conversations",
+        "resolve_vault",
+        "vault_get",
+        "vault_list",
+      ]) {
+        const a = tools.get(name)!.annotations;
+        expect(a, name).toBeDefined();
+        expect(a!.readOnlyHint, name).toBe(true);
+      }
+
+      // write (non-destructive) tools
+      for (const name of ["create_conversation", "append_messages", "vault_set"]) {
+        const a = tools.get(name)!.annotations;
+        expect(a!.readOnlyHint, name).toBe(false);
+        expect(a!.destructiveHint, name).toBe(false);
+      }
+
+      // destructive tools
+      for (const name of ["delete_conversation", "vault_delete"]) {
+        const a = tools.get(name)!.annotations;
+        expect(a!.readOnlyHint, name).toBe(false);
+        expect(a!.destructiveHint, name).toBe(true);
+      }
     });
   });
 });

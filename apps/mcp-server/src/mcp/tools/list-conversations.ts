@@ -23,6 +23,13 @@ export function registerListConversations(
         .default("updated_at"),
       order: z.enum(["asc", "desc"]).optional().default("desc"),
     },
+    {
+      title: "List conversations",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (params) => {
       audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.list");
 

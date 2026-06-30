@@ -13,9 +13,11 @@ export function registerAppendMessages(
 ) {
   server.tool(
     "append_messages",
-    "Append messages to a conversation. Messages are stored verbatim and automatically chunked + embedded for search. Optionally accepts client-encrypted vault entries for secrets detected client-side.",
+    "Append messages to a conversation, stored verbatim and automatically chunked + embedded for search. If you don't have a conversation_id yet, call create_conversation first to get one — do NOT ask the user for it. Optionally accepts client-encrypted vault entries for secrets detected client-side.",
     {
-      conversation_id: z.string().describe("The conversation to append to"),
+      conversation_id: z
+        .string()
+        .describe("The conversation to append to. Obtain it from create_conversation; do not ask the user."),
       messages: z
         .array(
           z.object({
@@ -47,6 +49,13 @@ export function registerAppendMessages(
         .describe(
           "Client-encrypted vault entries. Server stores these as opaque blobs — zero knowledge."
         ),
+    },
+    {
+      title: "Append messages",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
     },
     async (params) => {
       // Atomically check tier limit AND increment usage in one operation.

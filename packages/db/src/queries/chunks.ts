@@ -8,8 +8,13 @@ export function insertChunks(
     startSequence: number;
     endSequence: number;
     vectorizeId: string;
-  }>
+  }>,
+  ftsContext?: string
 ) {
+  // P1: Prepend conversation title/tags to FTS text so keyword search
+  // matches on conversation-level metadata, not just message content.
+  const ftsPrefix = ftsContext ? ftsContext + "\n" : "";
+
   const stmts = chunks.flatMap((c) => [
     db
       .prepare(
@@ -29,7 +34,7 @@ export function insertChunks(
       .prepare(
         "INSERT INTO chunks_fts(chunk_text, chunk_id, organization_id) VALUES (?, ?, ?)"
       )
-      .bind(c.chunkText, c.id, c.organizationId),
+      .bind(ftsPrefix + c.chunkText, c.id, c.organizationId),
   ]);
   return db.batch(stmts);
 }

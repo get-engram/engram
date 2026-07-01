@@ -140,8 +140,21 @@ export async function appendMessages(
   const chunks = chunkMessages(redacted);
 
   if (chunks.length > 0) {
-    // Generate embeddings for all chunks
-    const texts = chunks.map((c) => c.text);
+    // P1 + P4: Build context prefix from conversation title/tags.
+    // This enriches both FTS (keyword search on title) and embeddings
+    // (semantic search understands what the conversation is about).
+    const convTitle = (conv as Record<string, unknown>).title as string | null;
+    const convTags = JSON.parse(((conv as Record<string, unknown>).tags as string) || "[]") as string[];
+    const contextParts: string[] = [];
+    if (convTitle) contextParts.push(`Title: ${convTitle}`);
+    if (convTags.length > 0) contextParts.push(`Tags: ${convTags.join(", ")}`);
+    const contextPrefix = contextParts.join(" | ");
+
+    // P4: Prepend context to chunk text before embedding so vector search
+    // captures conversation-level meaning (e.g. "email to Antonia")
+    const texts = chunks.map((c) =>
+      contextPrefix ? `${contextPrefix}\n${c.text}` : c.text
+    );
     const embeddings = await generateEmbeddings(env.AI, texts);
 
     // Prepare chunk records with vectorize IDs
@@ -159,7 +172,7 @@ export async function appendMessages(
       };
     });
 
-    // Insert chunks into D1
+    // Insert chunks into D1 (P1: pass context prefix for FTS enrichment)
     await insertChunks(
       env.DB,
       chunkRecords.map((c) => ({
@@ -170,7 +183,8 @@ export async function appendMessages(
         startSequence: c.startSequence,
         endSequence: c.endSequence,
         vectorizeId: c.vectorizeId,
-      }))
+      })),
+      contextPrefix || undefined
     );
 
     // Upsert vectors to Vectorize

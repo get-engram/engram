@@ -11,6 +11,7 @@ export type AuditAction =
   | "account.update_email"
   | "account.delete"
   | "account.restore"
+  | "privacy.update"
   | "data.export"
   | "auth.success"
   | "auth.failure"

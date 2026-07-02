@@ -12,6 +12,7 @@ import { signup } from "./routes/signup.js";
 import { billing, billingSession, billingWebhook } from "./routes/billing.js";
 import { admin } from "./routes/admin.js";
 import { account } from "./routes/account.js";
+import { privacy } from "./routes/privacy.js";
 import { dataExport } from "./routes/export.js";
 import { oauthConnections } from "./routes/oauth-connections.js";
 import { purgeDeletedOrganizations } from "./cron/purge-deleted.js";
@@ -136,6 +137,7 @@ app.route("/api/seats", seats);
 app.route("/api/webhooks", webhooks);
 app.route("/api/usage", usage);
 app.route("/api/account", account);
+app.route("/api/privacy", privacy);
 app.route("/api/export", dataExport);
 app.route("/api/oauth/connections", oauthConnections);
 

@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getConversation } from "../../services/conversation.js";
 import { audit } from "../../services/audit.js";
+import { loadPrivacy, PRIVACY_BODIES_NOTICE } from "../../services/privacy.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerGetConversation(
@@ -91,23 +92,37 @@ export function registerGetConversation(
       // Strip internal fields the model/user don't need and that app
       // marketplaces flag (internal account IDs, storage encoding).
       const { organization_id: _o, ...conversation } = result.conversation;
+      const privacy = await loadPrivacy(env.DB, auth.organizationId);
       const messages = result.messages.map((m) => {
         const {
           organization_id: _mo,
           content_encoding: _enc,
+          content,
           ...rest
-        } = m as typeof m & { organization_id?: string; content_encoding?: string };
-        return rest;
+        } = m as typeof m & {
+          organization_id?: string;
+          content_encoding?: string;
+          content?: string;
+        };
+        // Honor the org's privacy setting: when bodies are hidden, return
+        // message metadata (role, sequence, timestamps) but not content.
+        return privacy.canReadBodies
+          ? { ...rest, content }
+          : { ...rest, body_hidden: true };
       });
+
+      const payload = privacy.canReadBodies
+        ? { conversation, messages }
+        : { conversation, messages, privacy_notice: PRIVACY_BODIES_NOTICE };
 
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify({ conversation, messages }),
+            text: JSON.stringify(payload),
           },
         ],
-        structuredContent: { conversation, messages },
+        structuredContent: payload,
       };
     }
   );

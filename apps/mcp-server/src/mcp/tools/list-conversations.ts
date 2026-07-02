@@ -2,6 +2,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { listConversations as dbListConversations } from "@getengram/db";
 import { audit } from "../../services/audit.js";
+import {
+  loadPrivacy,
+  PRIVACY_CROSS_CONVERSATION_NOTICE,
+} from "../../services/privacy.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerListConversations(
@@ -51,6 +55,23 @@ export function registerListConversations(
     },
     async (params) => {
       audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.list");
+
+      // Listing all conversations is cross-conversation metadata sharing;
+      // honor the org's privacy setting.
+      const privacy = await loadPrivacy(env.DB, auth.organizationId);
+      if (!privacy.canReadCrossConversation) {
+        const payload = {
+          conversations: [],
+          total: 0,
+          privacy_notice: PRIVACY_CROSS_CONVERSATION_NOTICE,
+        };
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(payload) },
+          ],
+          structuredContent: payload,
+        };
+      }
 
       const result = await dbListConversations(env.DB, auth.organizationId, {
         limit: params.limit,

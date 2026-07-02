@@ -3,6 +3,11 @@ import { z } from "zod";
 import { searchConversations } from "../../services/search.js";
 import { trackSearchRun } from "../../services/tier.js";
 import { audit } from "../../services/audit.js";
+import {
+  loadPrivacy,
+  PRIVACY_BODIES_NOTICE,
+  PRIVACY_CROSS_CONVERSATION_NOTICE,
+} from "../../services/privacy.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerSearch(
@@ -62,7 +67,26 @@ export function registerSearch(
       },
     },
     async (params) => {
-      const results = await searchConversations(
+      const privacy = await loadPrivacy(env.DB, auth.organizationId);
+
+      // A search without a conversation_id spans all conversations. When
+      // cross-conversation access is off, only single-conversation search
+      // is allowed.
+      if (!privacy.canReadCrossConversation && !params.conversation_id) {
+        const payload = {
+          results: [],
+          total: 0,
+          privacy_notice: PRIVACY_CROSS_CONVERSATION_NOTICE,
+        };
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(payload) },
+          ],
+          structuredContent: payload,
+        };
+      }
+
+      const raw = await searchConversations(
         env,
         auth.organizationId,
         params.query,
@@ -71,6 +95,12 @@ export function registerSearch(
         params.tags,
       );
 
+      // When bodies are hidden, return the matching conversations'
+      // metadata (title, tags, score) but drop the verbatim snippet.
+      const results = privacy.canReadBodies
+        ? raw
+        : raw.map(({ chunk_text: _c, ...rest }) => rest);
+
       // Track usage (non-blocking)
       trackSearchRun(env.DB, auth.organizationId).catch(() => {});
       audit(env.DB, auth.organizationId, auth.apiKeyId, "search", undefined, undefined, {
@@ -78,14 +108,18 @@ export function registerSearch(
         results: results.length,
       });
 
+      const payload = privacy.canReadBodies
+        ? { results, total: results.length }
+        : { results, total: results.length, privacy_notice: PRIVACY_BODIES_NOTICE };
+
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify({ results, total: results.length }),
+            text: JSON.stringify(payload),
           },
         ],
-        structuredContent: { results, total: results.length },
+        structuredContent: payload,
       };
     }
   );

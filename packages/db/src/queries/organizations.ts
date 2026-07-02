@@ -78,6 +78,40 @@ export function setOrganizationTier(
     .run();
 }
 
+export interface PrivacySettingsRow {
+  assistant_can_read_bodies: number;
+  assistant_can_read_cross_conversation: number;
+}
+
+export function getPrivacySettings(db: D1Database, organizationId: string) {
+  return db
+    .prepare(
+      "SELECT assistant_can_read_bodies, assistant_can_read_cross_conversation FROM organizations WHERE id = ?",
+    )
+    .bind(organizationId)
+    .first<PrivacySettingsRow>();
+}
+
+export function updatePrivacySettings(
+  db: D1Database,
+  organizationId: string,
+  settings: {
+    assistant_can_read_bodies: boolean;
+    assistant_can_read_cross_conversation: boolean;
+  },
+) {
+  return db
+    .prepare(
+      "UPDATE organizations SET assistant_can_read_bodies = ?, assistant_can_read_cross_conversation = ? WHERE id = ?",
+    )
+    .bind(
+      settings.assistant_can_read_bodies ? 1 : 0,
+      settings.assistant_can_read_cross_conversation ? 1 : 0,
+      organizationId,
+    )
+    .run();
+}
+
 export function getVectorizeIdsByOrganization(
   db: D1Database,
   organizationId: string,

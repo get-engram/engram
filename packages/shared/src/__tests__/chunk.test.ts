@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { chunkMessages, estimateTokens } from "../utils/chunk.js";
+import { chunkMessages, estimateTokens, summarizeChunk } from "../utils/chunk.js";
 import type { Message } from "../types/index.js";
 
 const MAX_CHARS = 480 * 4; // mirrors MAX_TOKENS * CHARS_PER_TOKEN in chunk.ts
@@ -172,6 +172,33 @@ describe("chunkMessages", () => {
         expect(c.endSequence).toBe(1);
       }
       expect(onWarn).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe("summarizeChunk (#61)", () => {
+    it("strips role prefixes and returns short text as-is", () => {
+      expect(summarizeChunk("[user]: Fix the login bug")).toBe(
+        "Fix the login bug",
+      );
+    });
+
+    it("collapses whitespace across messages", () => {
+      expect(
+        summarizeChunk("[user]:  hello \n[assistant]:  hi   there"),
+      ).toBe("hello hi there");
+    });
+
+    it("truncates long text to ~200 chars with an ellipsis or sentence end", () => {
+      const long = "[user]: " + "word ".repeat(100);
+      const summary = summarizeChunk(long);
+      expect(summary.length).toBeLessThanOrEqual(201);
+      expect(summary.length).toBeGreaterThan(80);
+    });
+
+    it("prefers a sentence boundary when one exists in range", () => {
+      const text =
+        "[assistant]: First sentence here. " + "x".repeat(300);
+      expect(summarizeChunk(text)).toBe("First sentence here.");
     });
   });
 });

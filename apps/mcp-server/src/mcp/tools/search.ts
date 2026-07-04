@@ -19,7 +19,7 @@ export function registerSearch(
     "search",
     {
       description:
-        "Hybrid search (semantic + keyword) across stored conversations. Returns the most relevant chunk_text snippets with conversation_title, tags, and scores. One search is enough — do not retry with rephrased queries.",
+        "Hybrid search (semantic + keyword) across stored conversations. Each result has a short chunk_summary for quick triage plus the full chunk_text snippet, with conversation_title, tags, and scores. Read chunk_summary to pick the relevant result, then use chunk_text or get_conversation for full context. One search is enough — do not retry with rephrased queries.",
       inputSchema: {
       query: z.string().describe("Search query text"),
       limit: z
@@ -47,6 +47,7 @@ export function registerSearch(
                 conversation_id: z.string().optional(),
                 conversation_title: z.string().optional(),
                 chunk_text: z.string().optional(),
+                chunk_summary: z.string().optional(),
                 score: z.number().optional(),
                 chunk_id: z.string().optional(),
                 start_sequence: z.number().optional(),

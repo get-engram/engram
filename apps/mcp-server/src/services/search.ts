@@ -94,6 +94,7 @@ export async function searchConversations(
     conversation_id: string;
     organization_id: string;
     chunk_text: string;
+    chunk_summary: string | null;
     start_sequence: number;
     end_sequence: number;
     vectorize_id: string;
@@ -163,6 +164,7 @@ export async function searchConversations(
       conversation_title: meta?.title,
       tags: meta?.tags,
       chunk_text: truncateSnippet(chunk.chunk_text, cappedSnippet),
+      chunk_summary: chunk.chunk_summary ?? undefined,
       score: rawScore / RRF_MAX, // normalize to [0, 1]
       start_sequence: chunk.start_sequence,
       end_sequence: chunk.end_sequence,

@@ -1,6 +1,7 @@
 import {
   generateId,
   chunkMessages,
+  summarizeChunk,
   redactMessages,
   type MessageInput,
   type Message,
@@ -170,6 +171,7 @@ export async function appendMessages(
         conversationId,
         organizationId,
         chunkText: chunk.text,
+        chunkSummary: summarizeChunk(chunk.text),
         startSequence: chunk.startSequence,
         endSequence: chunk.endSequence,
         vectorizeId,
@@ -185,6 +187,7 @@ export async function appendMessages(
         conversationId: c.conversationId,
         organizationId: c.organizationId,
         chunkText: c.chunkText,
+        chunkSummary: c.chunkSummary,
         startSequence: c.startSequence,
         endSequence: c.endSequence,
         vectorizeId: c.vectorizeId,

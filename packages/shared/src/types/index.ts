@@ -121,6 +121,13 @@ export interface SearchResult {
    * the full structured messages.
    */
   chunk_text: string;
+  /**
+   * A short (~1-2 sentence) extractive summary of this chunk, generated at
+   * chunk time. Read this to triage which result is relevant before pulling
+   * the full `chunk_text` or calling `get_conversation`. May be absent for
+   * chunks created before summaries were introduced.
+   */
+  chunk_summary?: string;
   score: number;
   start_sequence: number;
   end_sequence: number;

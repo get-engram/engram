@@ -5,6 +5,7 @@ export function insertChunks(
     conversationId: string;
     organizationId: string;
     chunkText: string;
+    chunkSummary: string;
     startSequence: number;
     endSequence: number;
     vectorizeId: string;
@@ -13,13 +14,14 @@ export function insertChunks(
   const stmts = chunks.flatMap((c) => [
     db
       .prepare(
-        "INSERT INTO conversation_chunks (id, conversation_id, organization_id, chunk_text, start_sequence, end_sequence, vectorize_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO conversation_chunks (id, conversation_id, organization_id, chunk_text, chunk_summary, start_sequence, end_sequence, vectorize_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
       )
       .bind(
         c.id,
         c.conversationId,
         c.organizationId,
         c.chunkText,
+        c.chunkSummary,
         c.startSequence,
         c.endSequence,
         c.vectorizeId

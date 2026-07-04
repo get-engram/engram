@@ -27,6 +27,38 @@ export function estimateTokens(text: string): number {
   return Math.ceil(text.length / CHARS_PER_TOKEN);
 }
 
+const SUMMARY_MAX_CHARS = 200;
+
+/**
+ * Build a short extractive summary of a chunk so agents can triage search
+ * results without reading the full chunk_text (engram#61). Strips the
+ * "[role]: " line prefixes, collapses whitespace, and returns the first
+ * sentence(s) up to ~200 chars. Cheap and synchronous — no model call.
+ */
+export function summarizeChunk(text: string): string {
+  const cleaned = text
+    .replace(/^\[[^\]]+\]:\s*/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (cleaned.length <= SUMMARY_MAX_CHARS) return cleaned;
+
+  // Prefer whole sentences up to the budget (a natural 1-2 sentence summary).
+  const sentences = cleaned.match(/[^.!?]+[.!?]+(?:\s|$)/g);
+  if (sentences) {
+    let out = "";
+    for (const s of sentences) {
+      if (out.length > 0 && out.length + s.length > SUMMARY_MAX_CHARS) break;
+      out += s;
+    }
+    out = out.trim();
+    if (out.length > 0 && out.length <= SUMMARY_MAX_CHARS) return out;
+  }
+  // Fallback: cut on a word boundary and ellipsize.
+  const window = cleaned.slice(0, SUMMARY_MAX_CHARS);
+  const space = window.lastIndexOf(" ");
+  return (space >= 80 ? window.slice(0, space) : window).trimEnd() + "…";
+}
+
 interface Part {
   seq: number;
   text: string;

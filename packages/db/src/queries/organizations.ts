@@ -133,6 +133,7 @@ export function deleteOrganizationById(db: D1Database, id: string) {
     // CASCADE handles the rest, but explicit deletes are safer for ordering
     db.prepare("DELETE FROM conversation_chunks WHERE organization_id = ?").bind(id),
     db.prepare("DELETE FROM messages WHERE organization_id = ?").bind(id),
+    db.prepare("DELETE FROM conversation_tags WHERE organization_id = ?").bind(id),
     db.prepare("DELETE FROM conversations WHERE organization_id = ?").bind(id),
     db.prepare("DELETE FROM organizations WHERE id = ?").bind(id),
   ]);

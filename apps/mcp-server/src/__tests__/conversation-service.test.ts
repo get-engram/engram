@@ -75,7 +75,11 @@ describe("Conversation service", () => {
           return null;
         },
       });
-      return { prepare: (sql: string) => stmt(sql) } as unknown as D1Database;
+      return {
+        prepare: (sql: string) => stmt(sql),
+        batch: async (stmts: Array<{ run: () => Promise<unknown> }>) =>
+          Promise.all(stmts.map((s) => s.run())),
+      } as unknown as D1Database;
     }
 
     it("creates a default conversation, then reuses it on subsequent calls", async () => {

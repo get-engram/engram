@@ -1,6 +1,34 @@
 import { describe, it, expect, beforeAll, vi } from "vitest";
 import { createMockD1, createMockEnv } from "./helpers.js";
-import { searchConversations } from "../services/search.js";
+import {
+  searchConversations,
+  recencyMultiplier,
+  queryTerms,
+} from "../services/search.js";
+
+describe("search recall helpers (#215)", () => {
+  it("recencyMultiplier is 1.0 for missing/invalid timestamps", () => {
+    expect(recencyMultiplier()).toBe(1);
+    expect(recencyMultiplier(null)).toBe(1);
+    expect(recencyMultiplier("not-a-date")).toBe(1);
+  });
+
+  it("recencyMultiplier boosts recent conversations more than old ones", () => {
+    const now = new Date().toISOString();
+    const old = new Date(Date.now() - 365 * 86_400_000).toISOString();
+    const recent = recencyMultiplier(now);
+    const stale = recencyMultiplier(old);
+    expect(recent).toBeGreaterThan(stale);
+    expect(recent).toBeGreaterThan(1);
+    expect(recent).toBeLessThanOrEqual(1.5);
+    expect(stale).toBeGreaterThanOrEqual(1);
+  });
+
+  it("queryTerms extracts distinct lowercased terms >= 3 chars", () => {
+    expect(queryTerms("email to Antonia")).toEqual(["email", "antonia"]);
+    expect(queryTerms("a to Antonia Antonia")).toEqual(["antonia"]);
+  });
+});
 
 describe("search service", () => {
   const organizationId = "org_search";

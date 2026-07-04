@@ -28,6 +28,20 @@ export async function authMiddleware(
 
   const token = authHeader.slice(7);
 
+  // Admin access via ADMIN_SECRET — cross-org visibility for the business owner.
+  const adminSecret = (c.env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET;
+  if (adminSecret && token === adminSecret) {
+    c.set("auth", {
+      organizationId: "admin",
+      apiKeyId: "admin",
+      tier: "enterprise" as AuthContext["tier"],
+      scopes: [...ALL_SCOPES],
+      isAdmin: true,
+    });
+    await next();
+    return;
+  }
+
   // OAuth 2.1 access token (issued via /oauth/token).
   if (token.startsWith("engram_at_")) {
     const tokenHash = await hashApiKey(token);

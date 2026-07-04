@@ -27,4 +27,6 @@ export interface AuthContext {
   tier: "free" | "pro" | "team" | "enterprise";
   /** Scopes granted to the calling key: subset of read/write/search/delete. */
   scopes: Scope[];
+  /** True when authenticated via ADMIN_SECRET — grants cross-org visibility. */
+  isAdmin?: boolean;
 }

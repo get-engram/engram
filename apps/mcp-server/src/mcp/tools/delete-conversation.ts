@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { deleteConversation } from "../../services/conversation.js";
 import { audit } from "../../services/audit.js";
+import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerDeleteConversation(
@@ -28,6 +29,7 @@ export function registerDeleteConversation(
       },
     },
     async (params) => {
+      if (!hasScope(auth, "delete")) return scopeError("delete");
       const deleted = await deleteConversation(
         env,
         auth.organizationId,

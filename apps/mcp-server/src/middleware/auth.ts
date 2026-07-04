@@ -7,6 +7,7 @@ import {
 } from "@getengram/db";
 import { audit } from "../services/audit.js";
 import { originOf, wwwAuthenticate } from "../oauth/metadata.js";
+import { ALL_SCOPES, parseScopes } from "../mcp/scopes.js";
 import type { Env, AuthContext } from "../types.js";
 
 export async function authMiddleware(
@@ -39,6 +40,9 @@ export async function authMiddleware(
       organizationId: row.organization_id,
       apiKeyId: `oauth:${row.client_id}`,
       tier: (row.tier ?? "free") as AuthContext["tier"],
+      // OAuth connections get the full memory scope set; their tool surface
+      // is already narrowed elsewhere (isExternalOAuthClient).
+      scopes: [...ALL_SCOPES],
     });
     await next();
     return;
@@ -65,6 +69,7 @@ export async function authMiddleware(
     organizationId: row.organization_id,
     apiKeyId: row.key_id,
     tier: (row.tier ?? "free") as AuthContext["tier"],
+    scopes: parseScopes(row.scopes),
   });
 
   // Update last_used_at non-blocking

@@ -7,8 +7,9 @@ export function insertConversation(
   tags: string[],
   metadata: Record<string, unknown>
 ) {
-  // Insert the row and bump the denormalized org counter atomically (engram#41).
-  return db.batch([
+  // Insert the row, bump the denormalized org counter (engram#41), and populate
+  // the conversation_tags junction index (engram#42) — all atomically.
+  const statements = [
     db
       .prepare(
         "INSERT INTO conversations (id, organization_id, title, agent_id, tags, metadata) VALUES (?, ?, ?, ?, ?, ?)"
@@ -19,7 +20,18 @@ export function insertConversation(
         "UPDATE organizations SET conversation_count = conversation_count + 1 WHERE id = ?"
       )
       .bind(organizationId),
-  ]);
+  ];
+  for (const tag of tags) {
+    if (!tag) continue;
+    statements.push(
+      db
+        .prepare(
+          "INSERT OR IGNORE INTO conversation_tags (conversation_id, organization_id, tag) VALUES (?, ?, ?)"
+        )
+        .bind(id, organizationId, tag),
+    );
+  }
+  return db.batch(statements);
 }
 
 export function getConversationById(db: D1Database, id: string, organizationId: string) {
@@ -69,9 +81,11 @@ export function listConversations(
   }
 
   if (opts.tags && opts.tags.length > 0) {
+    // Filter via the conversation_tags junction index (engram#42) instead of
+    // a json_each scan. One EXISTS per tag = AND semantics (must have all).
     for (const tag of opts.tags) {
-      sql += ` AND EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?)`;
-      params.push(tag);
+      sql += ` AND EXISTS (SELECT 1 FROM conversation_tags ct WHERE ct.organization_id = ? AND ct.tag = ? AND ct.conversation_id = conversations.id)`;
+      params.push(organizationId, tag);
     }
   }
 
@@ -123,6 +137,7 @@ export function deleteConversationById(db: D1Database, id: string, organizationI
     db.prepare("DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ?)").bind(id, organizationId),
     db.prepare("DELETE FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),
     db.prepare("DELETE FROM messages WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),
+    db.prepare("DELETE FROM conversation_tags WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),
     db.prepare("DELETE FROM conversations WHERE id = ? AND organization_id = ?").bind(id, organizationId),
     // Keep the denormalized org counter in sync; clamp at 0 defensively.
     db.prepare("UPDATE organizations SET conversation_count = MAX(conversation_count - 1, 0) WHERE id = ?").bind(organizationId),

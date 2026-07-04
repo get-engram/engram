@@ -11,6 +11,7 @@ import { registerVaultGet } from "./tools/vault-get.js";
 import { registerVaultList } from "./tools/vault-list.js";
 import { registerVaultDelete } from "./tools/vault-delete.js";
 import { registerManageSubscription } from "./tools/manage-subscription.js";
+import { registerAdminMetrics } from "./tools/admin-metrics.js";
 import { isExternalOAuthClient } from "./auth-kind.js";
 import type { Env, AuthContext } from "../types.js";
 
@@ -53,6 +54,12 @@ export function createMcpServer(env: Env, auth: AuthContext): McpServer {
     registerVaultList(server, env, auth);
     registerVaultDelete(server, env, auth);
     registerManageSubscription(server, env, auth);
+  }
+
+  // Admin tools — only available when authenticated via ADMIN_SECRET.
+  // Cross-org visibility for the business owner.
+  if (auth.isAdmin) {
+    registerAdminMetrics(server, env, auth);
   }
 
   return server;

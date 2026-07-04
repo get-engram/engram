@@ -4,13 +4,14 @@ export function insertApiKey(
   organizationId: string,
   keyHash: string,
   keyPrefix: string,
-  name: string
+  name: string,
+  scopes: string = "read,write,search,delete"
 ) {
   return db
     .prepare(
-      "INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, name) VALUES (?, ?, ?, ?, ?)"
+      "INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, name, scopes) VALUES (?, ?, ?, ?, ?, ?)"
     )
-    .bind(id, organizationId, keyHash, keyPrefix, name)
+    .bind(id, organizationId, keyHash, keyPrefix, name, scopes)
     .run();
 }
 
@@ -30,7 +31,7 @@ export function getApiKeyByHash(db: D1Database, keyHash: string) {
 export function getApiKeyWithOrg(db: D1Database, keyHash: string) {
   return db
     .prepare(
-      `SELECT k.id AS key_id, k.organization_id, o.tier
+      `SELECT k.id AS key_id, k.organization_id, k.scopes, o.tier
        FROM api_keys k
        JOIN organizations o ON o.id = k.organization_id
        WHERE k.key_hash = ?
@@ -38,7 +39,7 @@ export function getApiKeyWithOrg(db: D1Database, keyHash: string) {
          AND (k.expires_at IS NULL OR k.expires_at > datetime('now'))`
     )
     .bind(keyHash)
-    .first<{ key_id: string; organization_id: string; tier: string }>();
+    .first<{ key_id: string; organization_id: string; scopes: string; tier: string }>();
 }
 
 export function updateApiKeyLastUsed(db: D1Database, id: string) {
@@ -51,7 +52,7 @@ export function updateApiKeyLastUsed(db: D1Database, id: string) {
 export function getApiKeysByOrg(db: D1Database, organizationId: string) {
   return db
     .prepare(
-      "SELECT id, key_prefix AS prefix, name, expires_at, last_used_at, created_at FROM api_keys WHERE organization_id = ? AND revoked_at IS NULL ORDER BY created_at"
+      "SELECT id, key_prefix AS prefix, name, scopes, expires_at, last_used_at, created_at FROM api_keys WHERE organization_id = ? AND revoked_at IS NULL ORDER BY created_at"
     )
     .bind(organizationId)
     .all();

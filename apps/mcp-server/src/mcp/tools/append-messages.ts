@@ -13,6 +13,7 @@ import {
 import { checkAndTrackMessages } from "../../services/tier.js";
 import { fireWebhooks } from "../../services/webhooks.js";
 import { audit } from "../../services/audit.js";
+import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerAppendMessages(
@@ -82,6 +83,7 @@ export function registerAppendMessages(
       },
     },
     async (params) => {
+      if (!hasScope(auth, "write")) return scopeError("write");
       // Atomically check tier limit AND increment usage in one operation.
       // Prevents race conditions where concurrent requests both pass the
       // check but together exceed the limit.

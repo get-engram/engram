@@ -3,6 +3,7 @@ import { z } from "zod";
 import { getConversation } from "../../services/conversation.js";
 import { audit } from "../../services/audit.js";
 import { loadPrivacy, PRIVACY_BODIES_NOTICE } from "../../services/privacy.js";
+import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerGetConversation(
@@ -67,6 +68,7 @@ export function registerGetConversation(
       },
     },
     async (params) => {
+      if (!hasScope(auth, "read")) return scopeError("read");
       audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.read", "conversation", params.conversation_id);
 
       const result = await getConversation(

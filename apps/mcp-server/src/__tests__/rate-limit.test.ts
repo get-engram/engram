@@ -13,6 +13,7 @@ function createApp(tier: AuthContext["tier"] = "free") {
     c.set("auth", {
       organizationId: `org_${tier}`,
       apiKeyId: "key_test",
+      scopes: ["read", "write", "search", "delete"],
       tier,
     });
     await next();
@@ -40,6 +41,7 @@ describe("rate limit middleware", () => {
       c.set("auth", {
         organizationId: "org_burst_test",
         apiKeyId: "key_test",
+        scopes: ["read", "write", "search", "delete"],
         tier: "free",
       });
       await next();
@@ -63,6 +65,7 @@ describe("rate limit middleware", () => {
       c.set("auth", {
         organizationId: "org_error_body_test",
         apiKeyId: "key_test",
+        scopes: ["read", "write", "search", "delete"],
         tier: "free",
       });
       await next();
@@ -89,6 +92,7 @@ describe("rate limit middleware", () => {
       c.set("auth", {
         organizationId: "org_enterprise_test",
         apiKeyId: "key_test",
+        scopes: ["read", "write", "search", "delete"],
         tier: "enterprise",
       });
       await next();

@@ -31,6 +31,16 @@ type HonoEnv = {
 
 const app = new Hono<HonoEnv>();
 
+// Global error handler — catches any uncaught exception and returns a
+// structured 500 instead of letting Cloudflare surface `scriptThrewException`.
+app.onError((err, c) => {
+  console.error(`[error] ${c.req.method} ${c.req.path}: ${err.message}`);
+  return c.json(
+    { error: "internal_error", message: err.message },
+    500,
+  );
+});
+
 // Health check
 app.get("/health", (c) => {
   return c.json({ status: "ok", service: "engram-mcp-server", version: "0.2.0" });
@@ -64,9 +74,14 @@ app.all("/mcp", authMiddleware, rateLimitMiddleware, async (c) => {
     sessionIdGenerator: undefined, // stateless
   });
 
-  await server.connect(transport);
-
-  return transport.handleRequest(c.req.raw);
+  try {
+    await server.connect(transport);
+    return await transport.handleRequest(c.req.raw);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[mcp] transport error: ${msg}`);
+    return c.json({ error: "mcp_error", message: msg }, 500);
+  }
 });
 
 // CORS for browser-originated calls from the marketing site + dashboard.

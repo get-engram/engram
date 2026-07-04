@@ -74,20 +74,33 @@ export async function searchConversations(
   }
 
   // Run embedding generation and FTS5 keyword search in parallel.
-  // FTS errors (malformed queries) degrade gracefully to vector-only.
-  const [queryEmbedding, ftsResults] = await Promise.all([
-    generateEmbedding(env.AI, query),
+  // Both degrade gracefully — if the AI model or Vectorize is down,
+  // search falls back to whichever source is available.
+  const [embeddingResult, ftsResults] = await Promise.all([
+    generateEmbedding(env.AI, query)
+      .then((emb) => ({ ok: true as const, embedding: emb }))
+      .catch((err) => {
+        console.error(`[search] embedding failed, falling back to FTS-only: ${err instanceof Error ? err.message : err}`);
+        return { ok: false as const, embedding: null };
+      }),
     searchChunksFts(env.DB, query, organizationId, fetchK, conversationId)
       .catch(() => ({ results: [] as { chunk_id: string; rank: number }[] })),
   ]);
 
-  const vectorResults = await env.VECTORIZE.query(queryEmbedding, {
-    topK: fetchK,
-    filter,
-    returnMetadata: "all",
-  });
+  let vectorMatches: VectorizeMatch[] = [];
+  if (embeddingResult.ok) {
+    try {
+      const vectorResults = await env.VECTORIZE.query(embeddingResult.embedding, {
+        topK: fetchK,
+        filter,
+        returnMetadata: "all",
+      });
+      vectorMatches = (vectorResults.matches ?? []) as VectorizeMatch[];
+    } catch (err) {
+      console.error(`[search] vectorize query failed, using FTS-only: ${err instanceof Error ? err.message : err}`);
+    }
+  }
 
-  const vectorMatches = (vectorResults.matches ?? []) as VectorizeMatch[];
   const ftsMatches = ftsResults.results ?? [];
 
   if (vectorMatches.length === 0 && ftsMatches.length === 0) {

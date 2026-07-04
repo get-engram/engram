@@ -155,58 +155,70 @@ export async function appendMessages(
   // Update conversation message count
   await updateConversationMessageCount(env.DB, conversationId, redacted.length);
 
-  // Chunk the redacted messages for embedding
+  // Chunk the redacted messages for embedding.
+  // Indexing (embeddings + vectorize) is best-effort — if it fails, messages
+  // are still stored. They just won't be searchable until the next successful
+  // index run. This prevents AI model or Vectorize rate limits from crashing
+  // the entire append_messages request.
   const chunks = chunkMessages(redacted);
 
   if (chunks.length > 0) {
-    // Generate embeddings for all chunks
-    const texts = chunks.map((c) => c.text);
-    const embeddings = await generateEmbeddings(env.AI, texts);
+    try {
+      // Generate embeddings for all chunks
+      const texts = chunks.map((c) => c.text);
+      const embeddings = await generateEmbeddings(env.AI, texts);
 
-    // Prepare chunk records with vectorize IDs
-    const chunkRecords = chunks.map((chunk, i) => {
-      const vectorizeId = generateId("chk");
-      return {
-        id: generateId("chk"),
-        conversationId,
-        organizationId,
-        chunkText: chunk.text,
-        chunkSummary: summarizeChunk(chunk.text),
-        startSequence: chunk.startSequence,
-        endSequence: chunk.endSequence,
-        vectorizeId,
-        embedding: embeddings[i],
-      };
-    });
+      // Prepare chunk records with vectorize IDs
+      const chunkRecords = chunks.map((chunk, i) => {
+        const vectorizeId = generateId("chk");
+        return {
+          id: generateId("chk"),
+          conversationId,
+          organizationId,
+          chunkText: chunk.text,
+          chunkSummary: summarizeChunk(chunk.text),
+          startSequence: chunk.startSequence,
+          endSequence: chunk.endSequence,
+          vectorizeId,
+          embedding: embeddings[i],
+        };
+      });
 
-    // Insert chunks into D1
-    await insertChunks(
-      env.DB,
-      chunkRecords.map((c) => ({
-        id: c.id,
-        conversationId: c.conversationId,
-        organizationId: c.organizationId,
-        chunkText: c.chunkText,
-        chunkSummary: c.chunkSummary,
-        startSequence: c.startSequence,
-        endSequence: c.endSequence,
-        vectorizeId: c.vectorizeId,
-      }))
-    );
+      // Insert chunks into D1
+      await insertChunks(
+        env.DB,
+        chunkRecords.map((c) => ({
+          id: c.id,
+          conversationId: c.conversationId,
+          organizationId: c.organizationId,
+          chunkText: c.chunkText,
+          chunkSummary: c.chunkSummary,
+          startSequence: c.startSequence,
+          endSequence: c.endSequence,
+          vectorizeId: c.vectorizeId,
+        }))
+      );
 
-    // Upsert vectors to Vectorize
-    const vectors = chunkRecords.map((c) => ({
-      id: c.vectorizeId,
-      values: c.embedding,
-      metadata: {
-        organization_id: organizationId,
-        conversation_id: conversationId,
-        start_sequence: c.startSequence,
-        end_sequence: c.endSequence,
-      },
-    }));
+      // Upsert vectors to Vectorize
+      const vectors = chunkRecords.map((c) => ({
+        id: c.vectorizeId,
+        values: c.embedding,
+        metadata: {
+          organization_id: organizationId,
+          conversation_id: conversationId,
+          start_sequence: c.startSequence,
+          end_sequence: c.endSequence,
+        },
+      }));
 
-    await env.VECTORIZE.upsert(vectors);
+      await env.VECTORIZE.upsert(vectors);
+    } catch (err) {
+      // Log but don't fail — messages are already stored above.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[index] Failed to index ${chunks.length} chunk(s) for ${conversationId}: ${msg}`,
+      );
+    }
   }
 
   return messages;

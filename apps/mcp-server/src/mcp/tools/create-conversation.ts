@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { createConversation } from "../../services/conversation.js";
-import { getConversationCount } from "@getengram/db";
+import { getOrgConversationCount } from "@getengram/db";
 import { checkConversationLimit } from "../../services/tier.js";
 import { fireWebhooks } from "../../services/webhooks.js";
 import { audit } from "../../services/audit.js";
@@ -37,7 +37,7 @@ export function registerCreateConversation(
     },
     async (params) => {
       // Check conversation limit
-      const countResult = await getConversationCount(env.DB, auth.organizationId);
+      const countResult = await getOrgConversationCount(env.DB, auth.organizationId);
       const currentCount = countResult?.count ?? 0;
       const tierCheck = checkConversationLimit(auth.tier, currentCount);
 

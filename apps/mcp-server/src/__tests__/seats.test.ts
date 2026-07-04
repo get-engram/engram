@@ -55,7 +55,7 @@ describe("GET /api/seats", () => {
   it("returns empty list for new org", async () => {
     const db = createMockD1();
     const env = createSeatsEnv(db);
-    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team" };
+    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team", scopes: ["read", "write", "search", "delete"] };
     await insertOrgWithSeatLimit(db, "org_1", "Test Org", "test@example.com", "team", 5);
 
     const app = createSeatsApp(env, auth);
@@ -69,7 +69,7 @@ describe("GET /api/seats", () => {
   it("returns invited seats", async () => {
     const db = createMockD1();
     const env = createSeatsEnv(db);
-    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team" };
+    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team", scopes: ["read", "write", "search", "delete"] };
     await insertOrgWithSeatLimit(db, "org_1", "Test Org", "test@example.com", "team", 5);
 
     const app = createSeatsApp(env, auth);
@@ -96,7 +96,7 @@ describe("POST /api/seats", () => {
   it("invites a seat successfully", async () => {
     const db = createMockD1();
     const env = createSeatsEnv(db);
-    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team" };
+    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team", scopes: ["read", "write", "search", "delete"] };
     await insertOrgWithSeatLimit(db, "org_1", "Test Org", "test@example.com", "team", 5);
 
     const app = createSeatsApp(env, auth);
@@ -116,7 +116,7 @@ describe("POST /api/seats", () => {
   it("returns 400 without email", async () => {
     const db = createMockD1();
     const env = createSeatsEnv(db);
-    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team" };
+    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team", scopes: ["read", "write", "search", "delete"] };
     await insertOrgWithSeatLimit(db, "org_1", "Test Org", "test@example.com", "team", 5);
 
     const app = createSeatsApp(env, auth);
@@ -132,7 +132,7 @@ describe("POST /api/seats", () => {
   it("enforces seat limit from org.seat_limit", async () => {
     const db = createMockD1();
     const env = createSeatsEnv(db);
-    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team" };
+    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team", scopes: ["read", "write", "search", "delete"] };
     // Only 2 seats allowed
     await insertOrgWithSeatLimit(db, "org_1", "Test Org", "test@example.com", "team", 2);
 
@@ -168,7 +168,7 @@ describe("POST /api/seats", () => {
   it("free tier defaults to 1 seat", async () => {
     const db = createMockD1();
     const env = createSeatsEnv(db);
-    const auth: AuthContext = { organizationId: "org_free", apiKeyId: "key_1", tier: "free" };
+    const auth: AuthContext = { organizationId: "org_free", apiKeyId: "key_1", tier: "free", scopes: ["read", "write", "search", "delete"] };
     await insertOrgWithSeatLimit(db, "org_free", "Free Org", "free@example.com", "free", 1);
 
     const app = createSeatsApp(env, auth);
@@ -193,7 +193,7 @@ describe("POST /api/seats", () => {
   it("allows custom role", async () => {
     const db = createMockD1();
     const env = createSeatsEnv(db);
-    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team" };
+    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team", scopes: ["read", "write", "search", "delete"] };
     await insertOrgWithSeatLimit(db, "org_1", "Test Org", "test@example.com", "team", 5);
 
     const app = createSeatsApp(env, auth);
@@ -217,7 +217,7 @@ describe("POST /api/seats/:id/accept", () => {
   it("accepts an invited seat", async () => {
     const db = createMockD1();
     const env = createSeatsEnv(db);
-    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team" };
+    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team", scopes: ["read", "write", "search", "delete"] };
     await insertOrgWithSeatLimit(db, "org_1", "Test Org", "test@example.com", "team", 5);
 
     const app = createSeatsApp(env, auth);
@@ -242,7 +242,7 @@ describe("POST /api/seats/:id/accept", () => {
   it("returns 404 for nonexistent seat", async () => {
     const db = createMockD1();
     const env = createSeatsEnv(db);
-    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team" };
+    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team", scopes: ["read", "write", "search", "delete"] };
     await insertOrgWithSeatLimit(db, "org_1", "Test Org", "test@example.com", "team", 5);
 
     const app = createSeatsApp(env, auth);
@@ -261,7 +261,7 @@ describe("DELETE /api/seats/:id", () => {
   it("removes a seat", async () => {
     const db = createMockD1();
     const env = createSeatsEnv(db);
-    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team" };
+    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team", scopes: ["read", "write", "search", "delete"] };
     await insertOrgWithSeatLimit(db, "org_1", "Test Org", "test@example.com", "team", 5);
 
     const app = createSeatsApp(env, auth);

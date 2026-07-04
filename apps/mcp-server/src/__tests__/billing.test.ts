@@ -134,7 +134,7 @@ describe("POST /api/billing/checkout", () => {
   beforeEach(async () => {
     db = createMockD1();
     env = createBillingEnv(db);
-    auth = { organizationId: "org_test", apiKeyId: "key_test", tier: "free" };
+    auth = { organizationId: "org_test", apiKeyId: "key_test", tier: "free", scopes: ["read", "write", "search", "delete"] };
     await insertOrganizationWithEmail(db, "org_test", "Test Org", "test@example.com");
   });
 
@@ -241,7 +241,7 @@ describe("POST /api/billing/portal", () => {
   beforeEach(async () => {
     db = createMockD1();
     env = createBillingEnv(db);
-    auth = { organizationId: "org_test", apiKeyId: "key_test", tier: "pro" };
+    auth = { organizationId: "org_test", apiKeyId: "key_test", tier: "pro", scopes: ["read", "write", "search", "delete"] };
   });
 
   it("creates a portal session for org with Stripe customer", async () => {

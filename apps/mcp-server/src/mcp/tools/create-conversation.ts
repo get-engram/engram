@@ -7,6 +7,7 @@ import { fireWebhooks } from "../../services/webhooks.js";
 import { audit } from "../../services/audit.js";
 import { isExternalOAuthClient } from "../auth-kind.js";
 import { limitMessage } from "../usage-messaging.js";
+import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerCreateConversation(
@@ -36,6 +37,7 @@ export function registerCreateConversation(
       },
     },
     async (params) => {
+      if (!hasScope(auth, "write")) return scopeError("write");
       // Check conversation limit
       const countResult = await getOrgConversationCount(env.DB, auth.organizationId);
       const currentCount = countResult?.count ?? 0;

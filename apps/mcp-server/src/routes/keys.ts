@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { generateId, generateApiKeyRaw, hashApiKey, TIER_LIMITS } from "@getengram/shared";
 import { insertApiKey, getApiKeysByOrg, getApiKeyCount, revokeApiKey } from "@getengram/db";
+import { ALL_SCOPES, isScope } from "../mcp/scopes.js";
 import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
@@ -17,7 +18,31 @@ keys.get("/", async (c) => {
 // Create a new API key
 keys.post("/", async (c) => {
   const auth = c.get("auth");
-  const body = await c.req.json<{ name?: string }>();
+  const body = await c.req.json<{ name?: string; scopes?: unknown }>();
+
+  // Optional least-privilege scopes; default to full access when omitted.
+  let scopes = [...ALL_SCOPES];
+  if (body.scopes !== undefined) {
+    if (
+      !Array.isArray(body.scopes) ||
+      !body.scopes.every((s) => typeof s === "string" && isScope(s))
+    ) {
+      return c.json(
+        {
+          error: "invalid_scopes",
+          message: `scopes must be a subset of: ${ALL_SCOPES.join(", ")}`,
+        },
+        400,
+      );
+    }
+    scopes = [...new Set(body.scopes as (typeof ALL_SCOPES)[number][])];
+    if (scopes.length === 0) {
+      return c.json(
+        { error: "invalid_scopes", message: "at least one scope is required" },
+        400,
+      );
+    }
+  }
 
   // Check key limit
   const limits = TIER_LIMITS[auth.tier];
@@ -37,10 +62,10 @@ keys.post("/", async (c) => {
   const keyHash = await hashApiKey(raw);
   const name = body.name || "default";
 
-  await insertApiKey(c.env.DB, id, auth.organizationId, keyHash, prefix, name);
+  await insertApiKey(c.env.DB, id, auth.organizationId, keyHash, prefix, name, scopes.join(","));
 
   // Return the raw key ONCE — it can never be retrieved again
-  return c.json({ id, key: raw, prefix, name }, 201);
+  return c.json({ id, key: raw, prefix, name, scopes }, 201);
 });
 
 // Revoke an API key

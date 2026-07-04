@@ -8,6 +8,7 @@ import {
   PRIVACY_BODIES_NOTICE,
   PRIVACY_CROSS_CONVERSATION_NOTICE,
 } from "../../services/privacy.js";
+import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerSearch(
@@ -68,6 +69,7 @@ export function registerSearch(
       },
     },
     async (params) => {
+      if (!hasScope(auth, "search")) return scopeError("search");
       const privacy = await loadPrivacy(env.DB, auth.organizationId);
 
       // A search without a conversation_id spans all conversations. When

@@ -15,6 +15,7 @@ function createApp(orgId: string) {
     c.set("auth", {
       organizationId: orgId,
       apiKeyId: "key_test",
+      scopes: ["read", "write", "search", "delete"],
       tier: "free" as const,
     });
     await next();

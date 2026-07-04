@@ -18,8 +18,13 @@ export interface Env {
   SUPABASE_ANON_KEY: string;
 }
 
+/** Least-privilege scopes for API keys (engram#69). */
+export type Scope = "read" | "write" | "search" | "delete";
+
 export interface AuthContext {
   organizationId: string;
   apiKeyId: string;
   tier: "free" | "pro" | "team" | "enterprise";
+  /** Scopes granted to the calling key: subset of read/write/search/delete. */
+  scopes: Scope[];
 }

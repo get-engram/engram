@@ -108,7 +108,7 @@ describe("MCP tool contract — wire field names", () => {
   beforeAll(async () => {
     db = createMockD1();
     env = createMockEnv(db) as unknown as Env;
-    auth = { organizationId: ORG, apiKeyId: "key_test", tier: TIER };
+    auth = { organizationId: ORG, apiKeyId: "key_test", tier: TIER, scopes: ["read", "write", "search", "delete"] };
     await insertOrganization(db, ORG, "Contract Org");
     // Pro tier uses usage tracking, so seed a usage row so checkMessageLimit
     // doesn't try to run a getOrCreateUsage write the mock can't satisfy.

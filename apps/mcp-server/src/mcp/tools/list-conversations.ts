@@ -6,6 +6,7 @@ import {
   loadPrivacy,
   PRIVACY_CROSS_CONVERSATION_NOTICE,
 } from "../../services/privacy.js";
+import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerListConversations(
@@ -54,6 +55,7 @@ export function registerListConversations(
       },
     },
     async (params) => {
+      if (!hasScope(auth, "read")) return scopeError("read");
       audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.list");
 
       // Listing all conversations is cross-conversation metadata sharing;

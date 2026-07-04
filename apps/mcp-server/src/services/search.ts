@@ -19,9 +19,34 @@ const RRF_K = 60;
 // Max possible RRF score with 2 lists: 2 / (k + 0)
 const RRF_MAX = 2 / RRF_K;
 
+// Recall tuning (engram#215).
+// Recency: "remember when we were doing X" almost always means recently, so
+// boost recent conversations. Multiplier decays from (1 + weight) at age 0 to
+// 1.0 for old conversations, half-life 30 days — a tie-breaker, not an override.
+const RECENCY_WEIGHT = 0.5;
+const RECENCY_HALFLIFE_DAYS = 30;
+// Title/proper-noun match: names ("Antonia") get diluted in embedding space,
+// so boost results whose conversation title contains a query term.
+const TITLE_BOOST = 1.4;
+
 function truncateSnippet(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
   return text.slice(0, maxChars) + TRUNCATION_MARKER;
+}
+
+/** Recency multiplier in [1, 1+RECENCY_WEIGHT]; 1.0 when the timestamp is missing/invalid. */
+export function recencyMultiplier(updatedAt?: string | null): number {
+  if (!updatedAt) return 1;
+  const t = Date.parse(updatedAt);
+  if (Number.isNaN(t)) return 1;
+  const ageDays = (Date.now() - t) / 86_400_000;
+  if (ageDays <= 0) return 1 + RECENCY_WEIGHT;
+  return 1 + RECENCY_WEIGHT * Math.pow(0.5, ageDays / RECENCY_HALFLIFE_DAYS);
+}
+
+/** Distinct lowercased query terms of length >= 3 for title matching. */
+export function queryTerms(query: string): string[] {
+  return [...new Set(query.toLowerCase().match(/[a-z0-9]{3,}/g) ?? [])];
 }
 
 export async function searchConversations(
@@ -134,30 +159,43 @@ export async function searchConversations(
 
   // Hydrate conversation title + tags
   const uniqueConvIds = [...new Set([...chunkMap.values()].map((c) => c.conversation_id))];
-  const convMeta = new Map<string, { title: string; tags: string[] }>();
+  const convMeta = new Map<
+    string,
+    { title: string; tags: string[]; updatedAt: string | null }
+  >();
 
   if (uniqueConvIds.length > 0) {
     const placeholders = uniqueConvIds.map(() => "?").join(",");
     const rows = await env.DB.prepare(
-      `SELECT id, title, tags FROM conversations WHERE id IN (${placeholders}) AND organization_id = ?`
+      `SELECT id, title, tags, updated_at FROM conversations WHERE id IN (${placeholders}) AND organization_id = ?`
     )
       .bind(...uniqueConvIds, organizationId)
-      .all<{ id: string; title: string; tags: string }>();
+      .all<{ id: string; title: string; tags: string; updated_at: string | null }>();
 
     for (const row of rows.results) {
       convMeta.set(row.id, {
         title: row.title,
         tags: row.tags ? JSON.parse(row.tags) : [],
+        updatedAt: row.updated_at ?? null,
       });
     }
   }
 
-  // Build results with normalized RRF scores [0, 1]
+  // Build results with normalized RRF scores, then apply recall boosts:
+  // recency (recent conversations) and title match (proper nouns). (engram#215)
+  const terms = queryTerms(query);
   let results: SearchResult[] = [];
   for (const [chunkId, rawScore] of rrfScores) {
     const chunk = chunkMap.get(chunkId);
     if (!chunk) continue;
     const meta = convMeta.get(chunk.conversation_id);
+    const titleHit =
+      !!meta?.title &&
+      terms.some((t) => meta.title.toLowerCase().includes(t));
+    const boosted =
+      (rawScore / RRF_MAX) *
+      recencyMultiplier(meta?.updatedAt) *
+      (titleHit ? TITLE_BOOST : 1);
     results.push({
       chunk_id: chunk.id,
       conversation_id: chunk.conversation_id,
@@ -165,7 +203,7 @@ export async function searchConversations(
       tags: meta?.tags,
       chunk_text: truncateSnippet(chunk.chunk_text, cappedSnippet),
       chunk_summary: chunk.chunk_summary ?? undefined,
-      score: rawScore / RRF_MAX, // normalize to [0, 1]
+      score: boosted,
       start_sequence: chunk.start_sequence,
       end_sequence: chunk.end_sequence,
     });

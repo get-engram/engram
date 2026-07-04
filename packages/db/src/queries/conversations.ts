@@ -7,12 +7,19 @@ export function insertConversation(
   tags: string[],
   metadata: Record<string, unknown>
 ) {
-  return db
-    .prepare(
-      "INSERT INTO conversations (id, organization_id, title, agent_id, tags, metadata) VALUES (?, ?, ?, ?, ?, ?)"
-    )
-    .bind(id, organizationId, title, agentId, JSON.stringify(tags), JSON.stringify(metadata))
-    .run();
+  // Insert the row and bump the denormalized org counter atomically (engram#41).
+  return db.batch([
+    db
+      .prepare(
+        "INSERT INTO conversations (id, organization_id, title, agent_id, tags, metadata) VALUES (?, ?, ?, ?, ?, ?)"
+      )
+      .bind(id, organizationId, title, agentId, JSON.stringify(tags), JSON.stringify(metadata)),
+    db
+      .prepare(
+        "UPDATE organizations SET conversation_count = conversation_count + 1 WHERE id = ?"
+      )
+      .bind(organizationId),
+  ]);
 }
 
 export function getConversationById(db: D1Database, id: string, organizationId: string) {
@@ -94,9 +101,18 @@ export function updateConversationMessageCount(
     .run();
 }
 
+/** COUNT(*) fallback — kept for backfills/reconciliation and tests. */
 export function getConversationCount(db: D1Database, organizationId: string) {
   return db
     .prepare("SELECT COUNT(*) as count FROM conversations WHERE organization_id = ?")
+    .bind(organizationId)
+    .first<{ count: number }>();
+}
+
+/** O(1) read of the denormalized counter on the org row (engram#41). */
+export function getOrgConversationCount(db: D1Database, organizationId: string) {
+  return db
+    .prepare("SELECT conversation_count as count FROM organizations WHERE id = ?")
     .bind(organizationId)
     .first<{ count: number }>();
 }
@@ -108,5 +124,7 @@ export function deleteConversationById(db: D1Database, id: string, organizationI
     db.prepare("DELETE FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),
     db.prepare("DELETE FROM messages WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),
     db.prepare("DELETE FROM conversations WHERE id = ? AND organization_id = ?").bind(id, organizationId),
+    // Keep the denormalized org counter in sync; clamp at 0 defensively.
+    db.prepare("UPDATE organizations SET conversation_count = MAX(conversation_count - 1, 0) WHERE id = ?").bind(organizationId),
   ]);
 }

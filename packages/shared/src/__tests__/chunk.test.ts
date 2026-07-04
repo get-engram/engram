@@ -1,6 +1,8 @@
-import { describe, it, expect } from "vitest";
-import { chunkMessages } from "../utils/chunk.js";
+import { describe, it, expect, vi } from "vitest";
+import { chunkMessages, estimateTokens } from "../utils/chunk.js";
 import type { Message } from "../types/index.js";
+
+const MAX_CHARS = 480 * 4; // mirrors MAX_TOKENS * CHARS_PER_TOKEN in chunk.ts
 
 function makeMessage(sequence: number, role: string, content: string): Message {
   return {
@@ -129,5 +131,47 @@ describe("chunkMessages", () => {
     expect(chunks[0].startSequence).toBe(1);
     expect(chunks[0].endSequence).toBe(1);
     expect(chunks[0].text).toBe("[user]: Hello");
+  });
+
+  describe("token-aware splitting (#45)", () => {
+    it("estimateTokens approximates chars/4", () => {
+      expect(estimateTokens("")).toBe(0);
+      expect(estimateTokens("abcd")).toBe(1);
+      expect(estimateTokens("a".repeat(2000))).toBe(500);
+    });
+
+    it("keeps every chunk within the embedding budget when a window overflows", () => {
+      const onWarn = vi.fn();
+      // 5 messages of ~500 chars each => window well over MAX_CHARS.
+      const messages = Array.from({ length: 5 }, (_, i) =>
+        makeMessage(i + 1, "user", "x".repeat(500)),
+      );
+
+      const chunks = chunkMessages(messages, { onWarn });
+
+      // The window got split, so we produce more than the naive 2 chunks.
+      expect(chunks.length).toBeGreaterThan(2);
+      for (const c of chunks) {
+        expect(c.text.length).toBeLessThanOrEqual(MAX_CHARS);
+      }
+      // Multi-message split doesn't warn (no single message is oversized).
+      expect(onWarn).not.toHaveBeenCalled();
+    });
+
+    it("hard-splits a single oversized message and warns", () => {
+      const onWarn = vi.fn();
+      const messages = [makeMessage(1, "user", "y".repeat(2500))];
+
+      const chunks = chunkMessages(messages, { onWarn });
+
+      expect(chunks.length).toBeGreaterThan(1);
+      for (const c of chunks) {
+        expect(c.text.length).toBeLessThanOrEqual(MAX_CHARS);
+        // All pieces belong to the one message's sequence.
+        expect(c.startSequence).toBe(1);
+        expect(c.endSequence).toBe(1);
+      }
+      expect(onWarn).toHaveBeenCalledOnce();
+    });
   });
 });

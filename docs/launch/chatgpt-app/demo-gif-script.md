@@ -16,15 +16,15 @@ The single highest-leverage launch asset. It carries Product Hunt, Show HN, the 
 The setup. Show memory going *in*, on request.
 
 - On screen: a ChatGPT chat with Engram connected (tools visible).
-- Type: `Remember that we're using Hono, not Express, for the API — decided for edge/Workers support.`
+- Type: `Remember: for the team offsite we picked Lisbon over Barcelona, and we're capping it at 12 people.`
 - ChatGPT calls Engram and confirms it saved. Text overlay: **"Save anything to memory."**
 
 **Beat 2 — Recall in a DIFFERENT app (0:08–0:18) ← the money shot**
 Prove it's not locked to ChatGPT. This is the whole pitch.
 
-- Hard cut to **Cursor** (or Claude). New session, different tool. Text overlay: **"Open a different app…"**
-- Type: `What web framework did we pick for the API, and why?`
-- It calls Engram `search` and answers: *"Hono — chosen over Express for edge/Cloudflare Workers support."*
+- Hard cut to **Claude** (or Cursor). New session, different tool. Text overlay: **"Open a different app…"**
+- Type: `Where did we land for the team offsite, and how many people?`
+- It calls Engram `search` and answers: *"Lisbon (over Barcelona), capped at 12 people."*
 - Text overlay: **"…it remembers. One memory, every AI."**
 
 **Beat 3 — Import your history (0:18–0:25) — the kicker**

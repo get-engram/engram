@@ -18,11 +18,12 @@ import type { Env, AuthContext } from "../types.js";
 // Surfaced to clients (ChatGPT, Claude, …) in the MCP `initialize` response so
 // the model knows to use Engram for memory proactively, without being asked —
 // and that it owns the conversation_id rather than asking the user for one.
-const SERVER_INSTRUCTIONS = `Engram is persistent, searchable memory for AI agents. Use it proactively, without waiting to be asked.
+const SERVER_INSTRUCTIONS = `Engram is persistent, searchable memory. Use it proactively, without waiting to be asked.
 
-- At the start of a task or session, call \`search\` with a short summary of the user's request to recall relevant prior context, and use what you find.
-- When something worth remembering is established — decisions, preferences, facts, project or personal context — persist it: call \`create_conversation\` once to get a conversation_id (you own this id; never ask the user for it), then \`append_messages\` to store the user's message and your reply verbatim. Reuse that same conversation_id for the rest of the session.
-- Do not store trivial chatter (greetings, acknowledgements). Storage is verbatim and searchable by meaning.`;
+- Recall: at the start of a task, call \`search\` with a short summary of the user's request to surface relevant prior context, and use what you find.
+- Store: when something worth remembering is established — a decision, preference, fact, or useful context — call \`append_messages\` with the relevant messages from the current conversation, verbatim. conversation_id is OPTIONAL — omit it to use the user's default memory; never ask the user for one. Use \`create_conversation\` first only to group a distinct topic, then reuse that id.
+- "Remember this / save this chat": store the messages already in THIS conversation. You cannot retrieve the user's past or external conversations — so if they ask you to remember their whole history, save the current exchange, then tell them Engram records going forward and that they can bulk-import their full history by exporting their ChatGPT (or Claude) data and running \`engram import\` (see getengram.app/docs). Do not attempt to gather, reconstruct, or forward their entire chat history — you don't have access to it.
+- Skip trivial chatter (greetings, acknowledgements). Storage is verbatim and searchable by meaning.`;
 
 export function createMcpServer(env: Env, auth: AuthContext): McpServer {
   const server = new McpServer(

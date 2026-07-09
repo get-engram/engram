@@ -25,7 +25,7 @@ export function registerAppendMessages(
     "append_messages",
     {
       description:
-        "Store messages in Engram memory, verbatim and automatically chunked + embedded for search. conversation_id is OPTIONAL: omit it to append to the user's default memory (recommended for general 'remember this' requests) — never ask the user for an id. Pass a conversation_id (from create_conversation) only when you want to group a specific topic. The response returns the conversation_id used. Optionally accepts client-encrypted vault entries for secrets detected client-side.",
+        "Store messages in Engram memory, verbatim and automatically chunked + embedded for search. Pass the relevant messages from the CURRENT conversation. conversation_id is OPTIONAL: omit it to append to the user's default memory (recommended for general 'remember this' requests) — never ask the user for an id. Pass a conversation_id (from create_conversation) only when you want to group a specific topic. The response returns the conversation_id used. Note: you can only store messages from the current conversation — you cannot fetch a user's past or external chat history; for bulk history, tell them to export their data and run `engram import`. Optionally accepts client-encrypted vault entries for secrets detected client-side.",
       inputSchema: {
       conversation_id: z
         .string()

@@ -1,13 +1,23 @@
 # ChatGPT Integration Guide
 
-Connect Engram to ChatGPT as a custom MCP connector. ChatGPT authenticates via
+Connect Engram to ChatGPT as an **app / MCP connector**. ChatGPT authenticates via
 **OAuth**, and Engram is a full OAuth 2.1 authorization server, so you sign in
 with your Engram account once and ChatGPT stays connected — no API key to paste.
 
-## Add the connector
+Once connected, memories saved in ChatGPT are searchable from Claude, Cursor, and
+every other connected tool — one shared memory across all of them.
 
-> Requires a paid ChatGPT tier (Plus/Pro/Business/Enterprise). Developer-mode
-> custom connectors vary by tier and region.
+## Add Engram
+
+### Option A — Add the Engram app (recommended)
+
+1. **Settings → Apps & Connectors.**
+2. Search for **Engram** and add it.
+3. Sign in with your Engram account (OAuth) and authorize. Engram's tools appear.
+
+### Option B — Developer-mode custom connector
+
+> Developer-mode custom connectors vary by tier and region.
 
 1. **Settings → Apps & Connectors → Advanced settings → enable Developer mode.**
 2. Back on the Connectors page, choose **Create / Add custom connector**.
@@ -17,12 +27,8 @@ with your Engram account once and ChatGPT stays connected — no API key to past
 5. Click **Connect**. A getengram.app window opens — **sign in** and **Authorize**.
 6. ChatGPT returns to the connector and Engram's tools appear. Done.
 
-That's it. ChatGPT now has `search`, `create_conversation`, `append_messages`,
-and the rest of Engram's tools.
-
-> **Not the Apps directory.** The **Apps** entry in the ChatGPT sidebar is a
-> curated, publish-only store — Engram is not a published ChatGPT app and won't
-> appear there. Custom connectors (above) are the path for connecting Engram.
+Either way, ChatGPT now has `search`, `create_conversation`, `append_messages`,
+and the rest of the memory tools.
 
 ## How the OAuth flow works
 
@@ -42,10 +48,23 @@ You don't need to know this to use it, but for the curious:
 Access is scoped to your account. You can revoke a connected app anytime from
 your [dashboard](https://getengram.app/dashboard).
 
-## Auto-memory in ChatGPT
+## How memory capture works in ChatGPT
 
-To make ChatGPT use Engram automatically, add memory instructions to a
-**Project** (Settings → Projects) or a Custom GPT's instructions:
+Unlike Claude Code or Cursor — which run on your machine and let Engram capture
+every message automatically — **ChatGPT is a hosted app with no background capture
+hook.** By OpenAI's design and app-store policy, no connector can silently record
+your entire conversation. So in ChatGPT, Engram works two complementary ways.
+
+### 1. Save on request — "remember this"
+
+Tell ChatGPT to remember something and it's stored in Engram verbatim, then
+searchable from every connected tool:
+
+- *"Save this decision to Engram."*
+- *"Remember that we're using Postgres for the billing service."*
+
+To make this proactive, add memory instructions to a **Project**
+(Settings → Projects) or a Custom GPT's instructions:
 
 ```
 At the start of a conversation, call Engram's `search` tool with a summary of
@@ -58,27 +77,61 @@ Store: preferences, decisions and their reasoning, important facts.
 Don't store: greetings or trivial, temporary details.
 ```
 
+ChatGPT honors this on a best-effort basis — it decides when to call tools —
+which is reliable for the things you explicitly want kept.
+
+### 2. Import your full history — one time
+
+To bring **everything you've already said in ChatGPT** into Engram, use the
+native export plus `engram import`:
+
+1. **ChatGPT → Settings → Data Controls → Export data.** Unzip the emailed
+   download to find `conversations.json`.
+2. Import it:
+
+   ```bash
+   export ENGRAM_API_KEY=engram_sk_live_...
+   npx @getengram/cli import ~/Downloads/chatgpt-export/conversations.json --dry-run  # preview
+   npx @getengram/cli import ~/Downloads/chatgpt-export/conversations.json            # import
+   ```
+
+Every conversation is stored verbatim, tagged `chatgpt-import`, and embedded for
+search. See the [import guide](./import-chatgpt.md) for options.
+
+> **Note:** the native export is available on ChatGPT Free / Plus / Pro / eligible
+> Edu plans, can take up to 7 days to arrive (link expires 24h after delivery),
+> and is not currently available for ChatGPT Business / Enterprise workspaces.
+
+### What ChatGPT can't do (and no app can)
+
+Engram can't silently auto-record every ChatGPT message in the background the way
+it does for Claude Code and Cursor — there's no per-message hook for connectors,
+and OpenAI's policy prohibits pulling your full chat log. The honest, complete
+story is: **save what matters on request + import your history in bulk**, and get
+automatic verbatim capture in the local tools that support it.
+
 ## Other clients
 
-Engram works the same across every MCP-native client — memories stored in one
-are searchable from the others:
+Engram works across every MCP-native client — memories stored in one are
+searchable from the others:
 
-| Client | Best for |
-|--------|----------|
-| [Claude Desktop](./claude-desktop.md) | General conversations, research, personal use |
-| [Claude Code](./claude-code.md) | CLI-based coding and engineering |
-| [Cursor](./cursor.md) | IDE-based coding |
-| [Windsurf](./windsurf.md) | IDE-based coding with Cascade flows |
-| [Codex CLI](./codex.md) | CLI-based coding with OpenAI models |
-
-These use a Bearer API key directly; ChatGPT uses the OAuth flow above. Either
-way it's the same memory.
+| Client | Capture |
+|--------|---------|
+| [Claude Code](./claude-code.md) | Automatic, verbatim (local) |
+| [Cursor](./cursor.md) | Automatic, verbatim (local) |
+| [Claude Desktop](./claude-desktop.md) | On request (MCP) |
+| ChatGPT | On request + bulk import |
+| [Windsurf](./windsurf.md) | On request (MCP) |
+| [Codex CLI](./codex.md) | On request (MCP) |
 
 ## Troubleshooting
 
 - **No "OAuth" option / can't add a connector.** Developer-mode custom connectors
-  require a paid tier and aren't available in every region yet.
+  require a paid tier and aren't available in every region yet — try Option A.
 - **Login window doesn't return to ChatGPT.** Make sure pop-ups for chatgpt.com
   are allowed, then retry **Connect**.
 - **Tools don't appear after authorizing.** Remove and re-add the connector; on
   re-add, ChatGPT re-runs discovery.
+- **A tool call was "blocked."** ChatGPT's safety layer can refuse broad requests
+  like "save my entire history" before they reach Engram. Ask it to save the
+  current exchange ("remember this"), or use the import path above for bulk history.

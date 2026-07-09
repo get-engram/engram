@@ -17,20 +17,35 @@ and epic get-engram/engram#184.
 ## Description
 
 **Short (one line):**
-> Persistent, searchable memory for ChatGPT — remember context across conversations.
+> Lasting, portable memory for ChatGPT — remember context across chats, and bring your history with you.
 
 **Long:**
-> Engram gives ChatGPT long-term memory. It stores conversations verbatim and
-> makes them searchable by meaning, so context, decisions, and preferences carry
-> across sessions instead of being forgotten. Ask ChatGPT to remember something
-> and recall it days or weeks later. Your memory is private to your account, and
-> the same memory works across any MCP client you connect.
+> Engram gives ChatGPT durable, private memory that you own. Tell ChatGPT to
+> remember something — a decision, a preference, a fact — and recall it days or
+> weeks later, in this chat or a brand-new one. Already have months of ChatGPT
+> history? Import it in one step and make all of it searchable by meaning.
+>
+> Your memory isn't locked to ChatGPT: the same Engram memory works across Claude,
+> Cursor, and any MCP-compatible tool, so context follows you everywhere instead of
+> being trapped in one app. Everything is stored verbatim, searchable by meaning,
+> and private to your account.
+
+**Getting started (put in the listing so first-run works):**
+> - Say **"remember this"** or **"save that to Engram"** to store something.
+> - Ask **"search Engram for …"** — or just ask about past context — to recall it.
+> - Bring your history: export your ChatGPT data and run `engram import` (see getengram.app/docs).
 
 **What it does (for the "functionality not native to ChatGPT" requirement):**
 ChatGPT has no durable, user-owned, semantically-searchable memory store that
 persists across conversations and is portable across clients. Engram provides
 exactly that — verbatim storage + hybrid (semantic + keyword) retrieval that the
 model calls as tools.
+
+> **Honesty guardrail (keep the listing compliant):** Describe Engram as
+> **save-on-request + import** — never "automatically records everything you say."
+> ChatGPT gives connectors no per-turn hook, and OpenAI's guidelines prohibit
+> pulling the full chat log; claiming silent full-capture would misrepresent the
+> app and risk the listing. The framing above is both accurate and compelling.
 
 ## Categories / availability
 

@@ -86,8 +86,8 @@ See the [API reference](https://getengram.app/docs/api-reference) for full param
 | Plan | Price | Messages/month |
 |------|-------|----------------|
 | Free | $0 | 1,000 |
-| Pro | $39/mo | 100,000 |
-| Team | $49/seat/mo | 500,000 |
+| Pro | $9/mo | 100,000 |
+| Team | $27/seat/mo | 500,000 |
 | Enterprise | Custom | Unlimited |
 
 [View pricing](https://getengram.app/pricing)

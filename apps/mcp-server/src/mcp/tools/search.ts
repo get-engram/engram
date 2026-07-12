@@ -39,6 +39,10 @@ export function registerSearch(
         .array(z.string())
         .optional()
         .describe("Filter by conversation tags"),
+      project: z
+        .string()
+        .optional()
+        .describe("Filter by project name (matches conversation title prefix, case-insensitive). Use to avoid cross-project noise."),
       },
       outputSchema: {
         results: z
@@ -96,6 +100,10 @@ export function registerSearch(
         params.limit,
         params.conversation_id,
         params.tags,
+        undefined, // snippetChars
+        undefined, // minScore
+        undefined, // dedupe
+        params.project,
       );
 
       // When bodies are hidden, return the matching conversations'

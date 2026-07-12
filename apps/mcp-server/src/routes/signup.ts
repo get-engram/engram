@@ -17,6 +17,34 @@ import { TIER_LIMITS, type Tier } from "@getengram/shared";
 import type { Env } from "../types.js";
 import { verifySupabaseJwt } from "../utils/jwt.js";
 
+const WELCOME_MESSAGE = `Welcome to Engram — your AI's long-term memory.
+
+Here's how to get started:
+
+1. **Save a conversation**: After a good chat, say "remember this" or "save this conversation." Your AI will store it in Engram.
+
+2. **Recall later**: In any future session, ask "what do you remember about [topic]?" Your AI will search your stored conversations and bring back the context.
+
+3. **Works everywhere**: Engram works across ChatGPT, Claude Code, Cursor, and any MCP-compatible tool. Save something in one, recall it in another.
+
+That's it. Three steps. Your AI now has memory that persists across sessions, projects, and tools.
+
+Try it now — have a conversation about something you're working on, then say "remember this." Tomorrow, ask about it and watch the magic happen.`;
+
+async function seedWelcomeConversation(db: D1Database, orgId: string): Promise<void> {
+  const convId = generateId("conv");
+  const msgId = generateId("msg");
+  const now = new Date().toISOString();
+  await db.batch([
+    db.prepare(
+      "INSERT INTO conversations (id, organization_id, title, agent_id, tags, metadata, message_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)"
+    ).bind(convId, orgId, "Welcome to Engram", "engram", '["welcome","getting-started"]', '{"system":true,"type":"welcome"}', now, now),
+    db.prepare(
+      "INSERT INTO messages (id, conversation_id, organization_id, role, content, sequence, metadata, created_at) VALUES (?, ?, ?, 'assistant', ?, 0, '{}', ?)"
+    ).bind(msgId, convId, orgId, WELCOME_MESSAGE, now),
+  ]);
+}
+
 type HonoEnv = { Bindings: Env };
 
 const signup = new Hono<HonoEnv>();
@@ -81,6 +109,7 @@ signup.post("/", async (c) => {
     orgId = generateId("org");
     const orgName = email.split("@")[0];
     await insertOrganizationWithEmail(c.env.DB, orgId, orgName, email);
+    await seedWelcomeConversation(c.env.DB, orgId);
     created = true;
   }
 
@@ -111,6 +140,7 @@ signup.post("/anonymous", async (c) => {
   const orgId = generateId("org");
   const orgName = `anon-${orgId.slice(4, 12)}`;
   await insertOrganization(c.env.DB, orgId, orgName);
+  await seedWelcomeConversation(c.env.DB, orgId);
 
   const keyId = generateId("key");
   const { raw, prefix } = generateApiKeyRaw();

@@ -98,7 +98,7 @@ This is the pattern that makes persistent memory feel like magic to the user: th
 
 Spreadsheets store pricing numbers. Engram stores the *reasoning* behind those numbers — and that's the part that actually has to survive across sessions and across team members.
 
-Example: Engram's Pro tier is $39/month. The obvious price, in the age of ChatGPT Plus and Claude Pro, would have been $20. Why $39? The answer is in a conversation, not a doc. It involves unit economics on Cloudflare Workers AI invocations, pricing anchoring relative to Mem0 and Zep, a revenue floor target for getting to ramen-profitable quickly, and an opinion about what developer tools are worth when they replace 15 minutes of engineer time per session. An agent working on pricing six months from now can recover all of that from a single Engram search. A spreadsheet would only recover the $39.
+Example: Engram's Pro tier is $9/month. The pricing decision involved unit economics on Cloudflare Workers AI invocations, competitive positioning relative to Mem0 and Zep, and an opinion about what developer tools are worth when they save 15 minutes of context-rebuilding per session. An agent working on pricing six months from now can recover all of that reasoning from a single Engram search. A spreadsheet would only recover the $9.
 
 The same pattern applies to positioning language. Why do we say "verbatim" and not "raw"? Why is it "memory infrastructure" and not "memory service"? These are decisions that are easy to make, hard to remember, and catastrophic to litigate every time someone writes a tweet. Engram lets the positioning reasoning live next to the positioning output, with one query away.
 
@@ -152,7 +152,7 @@ Memory services that expose REST APIs are technically available but practically 
 
 ## Getting started
 
-Engram is live at [getengram.app](https://getengram.app). The free tier gives you 1,000 messages per month and unlimited conversations — enough to evaluate all seven patterns in this paper on a real project without paying for anything. Pro is $39/month for 100,000 messages and is the tier most solo developers and small teams will land on. Team is $49 per seat per month for 500,000 messages, webhooks, and a usage dashboard.
+Engram is live at [getengram.app](https://getengram.app). The free tier gives you 1,000 messages per month and unlimited conversations — enough to evaluate all seven patterns in this paper on a real project without paying for anything. Pro is $9/month for 100,000 messages and is the tier most solo developers and small teams will land on. Team is $27 per seat per month for 500,000 messages, webhooks, and a usage dashboard.
 
 To wire Engram into your agent, add one block to your client configuration:
 

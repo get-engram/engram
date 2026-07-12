@@ -238,4 +238,4 @@ Engram is open source under the MIT license: [github.com/get-engram/engram](http
 
 ---
 
-*Engram is built by [Get Engram](https://getengram.app). Free tier available. Pro at $39/mo for 100K messages.*
+*Engram is built by [Get Engram](https://getengram.app). Free tier available. Pro at $9/mo for 100K messages.*

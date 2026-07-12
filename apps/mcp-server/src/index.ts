@@ -65,8 +65,17 @@ app.get("/.well-known/openai-apps-challenge", (c) =>
 // OAuth authorization server endpoints (register, authorize, token).
 app.route("/oauth", oauth);
 
-// MCP endpoint — all methods
-app.all("/mcp", authMiddleware, rateLimitMiddleware, async (c) => {
+// MCP endpoint — POST only for stateless transport. GET (SSE listen) and
+// DELETE (session teardown) are not supported without server-side sessions.
+// Returning 405 immediately prevents Cloudflare from killing the request as
+// "hung" (scriptThrewException) when clients like Claude Code poll with GET.
+app.get("/mcp", (c) =>
+  c.json({ error: "method_not_allowed", message: "This server is stateless. Use POST for MCP requests." }, 405),
+);
+app.delete("/mcp", (c) =>
+  c.json({ error: "method_not_allowed", message: "This server is stateless. Session deletion is not supported." }, 405),
+);
+app.post("/mcp", authMiddleware, rateLimitMiddleware, async (c) => {
   const auth = c.get("auth");
   const server = createMcpServer(c.env, auth);
 

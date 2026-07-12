@@ -230,3 +230,115 @@ describe("search service", () => {
     expect(results.length).toBe(2);
   });
 });
+
+describe("search project filtering", () => {
+  const organizationId = "org_proj";
+  let db: D1Database;
+  let env: ReturnType<typeof createMockEnv>;
+
+  beforeAll(() => {
+    db = createMockD1();
+
+    // Seed conversations with different project titles
+    db.prepare(
+      "INSERT INTO conversations (id, organization_id, title, tags, updated_at) VALUES (?,?,?,?,?)"
+    )
+      .bind("conv_engram", organizationId, "engram (2026-04-12 11:37)", "[]", "2026-04-12")
+      .run();
+    db.prepare(
+      "INSERT INTO conversations (id, organization_id, title, tags, updated_at) VALUES (?,?,?,?,?)"
+    )
+      .bind("conv_isleep", organizationId, "isleep (2026-04-12 11:38)", "[]", "2026-04-12")
+      .run();
+
+    // Seed chunks for each conversation
+    db.prepare(
+      "INSERT INTO conversation_chunks (id, conversation_id, organization_id, chunk_text, start_sequence, end_sequence, vectorize_id, created_at) VALUES (?,?,?,?,?,?,?,?)"
+    )
+      .bind("chk_eng", "conv_engram", organizationId, "[user]: deploy the worker", 1, 2, "vec_eng", "2026-04-12")
+      .run();
+    db.prepare(
+      "INSERT INTO conversation_chunks (id, conversation_id, organization_id, chunk_text, start_sequence, end_sequence, vectorize_id, created_at) VALUES (?,?,?,?,?,?,?,?)"
+    )
+      .bind("chk_isl", "conv_isleep", organizationId, "[user]: fix the lambda crash", 1, 2, "vec_isl", "2026-04-12")
+      .run();
+
+    env = createMockEnv(db);
+    (env.VECTORIZE as unknown as Record<string, unknown>).query = vi.fn(async () => ({
+      count: 2,
+      matches: [
+        { id: "vec_eng", score: 0.95 },
+        { id: "vec_isl", score: 0.90 },
+      ],
+    }));
+  });
+
+  it("returns results from all projects when no project filter", async () => {
+    const results = await searchConversations(
+      env as unknown as Parameters<typeof searchConversations>[0],
+      organizationId,
+      "deploy",
+      10,
+      undefined,
+      undefined,
+      undefined,
+      0,
+      true
+    );
+
+    expect(results.length).toBe(2);
+  });
+
+  it("filters to only matching project by title prefix", async () => {
+    const results = await searchConversations(
+      env as unknown as Parameters<typeof searchConversations>[0],
+      organizationId,
+      "deploy",
+      10,
+      undefined,
+      undefined,
+      undefined,
+      0,
+      true,
+      "engram"
+    );
+
+    expect(results.length).toBe(1);
+    expect(results[0].conversation_title).toContain("engram");
+  });
+
+  it("project filter is case-insensitive", async () => {
+    const results = await searchConversations(
+      env as unknown as Parameters<typeof searchConversations>[0],
+      organizationId,
+      "deploy",
+      10,
+      undefined,
+      undefined,
+      undefined,
+      0,
+      true,
+      "Engram"
+    );
+
+    expect(results.length).toBe(1);
+    expect(results[0].conversation_title).toContain("engram");
+  });
+
+  it("returns empty when no conversations match project", async () => {
+    const results = await searchConversations(
+      env as unknown as Parameters<typeof searchConversations>[0],
+      organizationId,
+      "deploy",
+      10,
+      undefined,
+      undefined,
+      undefined,
+      0,
+      true,
+      "nonexistent"
+    );
+
+    expect(results.length).toBe(0);
+  });
+});

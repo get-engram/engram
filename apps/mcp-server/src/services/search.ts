@@ -58,15 +58,17 @@ export async function searchConversations(
   tags?: string[],
   snippetChars: number = DEFAULT_SNIPPET_CHARS,
   minScore: number = DEFAULT_MIN_SCORE,
-  dedupe: boolean = true
+  dedupe: boolean = true,
+  project?: string
 ): Promise<SearchResult[]> {
   const cappedSnippet = Math.min(
     Math.max(snippetChars, 0),
     MAX_SNIPPET_CHARS
   );
 
-  // Over-fetch for post-processing headroom
-  const fetchK = Math.min(limit * 3, 50);
+  // Over-fetch for post-processing headroom. When a project filter is active,
+  // many results will be discarded so we fetch more aggressively.
+  const fetchK = Math.min(project ? limit * 6 : limit * 3, 50);
 
   const filter: VectorizeVectorMetadataFilter = { organization_id: organizationId };
   if (conversationId) {
@@ -235,6 +237,17 @@ export async function searchConversations(
     results = results.filter((r) => {
       if (!r.tags) return false;
       return tags.every((t) => r.tags!.includes(t));
+    });
+  }
+
+  // Filter by project — matches conversation titles that start with the
+  // project name (case-insensitive). This eliminates cross-project noise
+  // when the caller knows which project they care about.
+  if (project) {
+    const prefix = project.toLowerCase();
+    results = results.filter((r) => {
+      if (!r.conversation_title) return false;
+      return r.conversation_title.toLowerCase().startsWith(prefix);
     });
   }
 

@@ -92,9 +92,10 @@ signup.post("/", async (c) => {
     );
   }
 
-  // Accept optional plan from body (defaults to free)
+  // Accept optional plan and referral source from body
   const body = await c.req.json().catch(() => ({}));
   const plan = body.plan === "pro" ? "pro" : "free";
+  const ref = body.ref || body.referral_source || null;
 
   // Find-or-create the org
   let orgId: string;
@@ -108,7 +109,7 @@ signup.post("/", async (c) => {
   } else {
     orgId = generateId("org");
     const orgName = email.split("@")[0];
-    await insertOrganizationWithEmail(c.env.DB, orgId, orgName, email);
+    await insertOrganizationWithEmail(c.env.DB, orgId, orgName, email, ref);
     await seedWelcomeConversation(c.env.DB, orgId);
     created = true;
   }
@@ -137,9 +138,11 @@ signup.post("/", async (c) => {
 // This powers `engram signup` from the CLI, letting AI agents self-provision
 // accounts without any human interaction.
 signup.post("/anonymous", async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const ref = body.ref || body.referral_source || "cli";
   const orgId = generateId("org");
   const orgName = `anon-${orgId.slice(4, 12)}`;
-  await insertOrganization(c.env.DB, orgId, orgName);
+  await insertOrganization(c.env.DB, orgId, orgName, ref);
   await seedWelcomeConversation(c.env.DB, orgId);
 
   const keyId = generateId("key");

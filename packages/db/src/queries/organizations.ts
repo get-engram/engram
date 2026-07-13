@@ -1,7 +1,7 @@
-export function insertOrganization(db: D1Database, id: string, name: string) {
+export function insertOrganization(db: D1Database, id: string, name: string, referralSource?: string) {
   return db
-    .prepare("INSERT INTO organizations (id, name) VALUES (?, ?)")
-    .bind(id, name)
+    .prepare("INSERT INTO organizations (id, name, referral_source) VALUES (?, ?, ?)")
+    .bind(id, name, referralSource ?? null)
     .run();
 }
 
@@ -17,10 +17,11 @@ export function insertOrganizationWithEmail(
   id: string,
   name: string,
   email: string,
+  referralSource?: string,
 ) {
   return db
-    .prepare("INSERT INTO organizations (id, name, email) VALUES (?, ?, ?)")
-    .bind(id, name, email)
+    .prepare("INSERT INTO organizations (id, name, email, referral_source) VALUES (?, ?, ?, ?)")
+    .bind(id, name, email, referralSource ?? null)
     .run();
 }
 

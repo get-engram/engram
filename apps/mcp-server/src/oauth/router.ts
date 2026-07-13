@@ -269,7 +269,7 @@ oauth.post("/authorize/approve", async (c) => {
     orgId = existing.id;
   } else {
     orgId = generateId("org");
-    await insertOrganizationWithEmail(c.env.DB, orgId, email.split("@")[0], email);
+    await insertOrganizationWithEmail(c.env.DB, orgId, email.split("@")[0], email, "chatgpt");
   }
 
   const scope = body.scope || DEFAULT_SCOPE;

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "engram": {
+      "url": "https://mcp.getengram.app/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_ENGRAM_API_KEY"
+      }
+    }
+  }
+}

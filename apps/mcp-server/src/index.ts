@@ -129,6 +129,15 @@ app.use(
 app.route("/billing/verify-session", billingSession);
 
 // Admin routes — protected by ADMIN_SECRET, not API key auth.
+app.use(
+  "/admin/*",
+  cors({
+    origin: BROWSER_ORIGINS,
+    allowMethods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization"],
+    maxAge: 86400,
+  }),
+);
 app.use("/admin/*", async (c, next) => {
   const auth = c.req.header("Authorization");
   const secret = (c.env as Env & { ADMIN_SECRET: string }).ADMIN_SECRET;

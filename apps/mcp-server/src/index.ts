@@ -16,6 +16,7 @@ import { privacy } from "./routes/privacy.js";
 import { dataExport } from "./routes/export.js";
 import { oauthConnections } from "./routes/oauth-connections.js";
 import { purgeDeletedOrganizations } from "./cron/purge-deleted.js";
+import { sendDailyReport } from "./services/daily-report.js";
 import { oauth } from "./oauth/router.js";
 import {
   originOf,
@@ -167,7 +168,14 @@ app.route("/api/oauth/connections", oauthConnections);
 
 export default {
   fetch: app.fetch,
-  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext) {
+  async scheduled(event: ScheduledEvent, env: Env, _ctx: ExecutionContext) {
+    // Two daily crons (see wrangler.toml [triggers]):
+    //   03:00 UTC — GDPR purge of soft-deleted orgs
+    //   13:00 UTC — daily ops report, emailed via engram-web
+    if (event.cron === "0 13 * * *") {
+      await sendDailyReport(env);
+      return;
+    }
     const purged = await purgeDeletedOrganizations(env);
     if (purged > 0) {
       console.log(`[cron] Purged ${purged} expired organization(s)`);

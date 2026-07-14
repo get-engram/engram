@@ -31,6 +31,7 @@ binding = "AI"
 pattern = "mcp.getengram.app/*"
 zone_name = "getengram.app"
 
-# Daily cron — purge soft-deleted orgs older than 30 days (GDPR)
+# Daily crons — 03:00 GDPR purge of soft-deleted orgs; 13:00 daily ops
+# report (built here, emailed by engram-web /api/reports/daily).
 [triggers]
-crons = ["0 3 * * *"]
+crons = ["0 3 * * *", "0 13 * * *"]

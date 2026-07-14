@@ -80,7 +80,7 @@ describe("search service", () => {
   });
 
   it("does not return a `messages` field on search results", async () => {
-    const results = await searchConversations(
+    const { results } = await searchConversations(
       env as unknown as Parameters<typeof searchConversations>[0],
       organizationId,
       "greeting",
@@ -101,7 +101,7 @@ describe("search service", () => {
   });
 
   it("truncates chunk_text to the snippet cap with a marker", async () => {
-    const results = await searchConversations(
+    const { results } = await searchConversations(
       env as unknown as Parameters<typeof searchConversations>[0],
       organizationId,
       "greeting",
@@ -125,7 +125,7 @@ describe("search service", () => {
   });
 
   it("honours a custom snippet_chars parameter", async () => {
-    const results = await searchConversations(
+    const { results } = await searchConversations(
       env as unknown as Parameters<typeof searchConversations>[0],
       organizationId,
       "greeting",
@@ -143,7 +143,7 @@ describe("search service", () => {
   });
 
   it("caps snippet_chars at 5000", async () => {
-    const results = await searchConversations(
+    const { results } = await searchConversations(
       env as unknown as Parameters<typeof searchConversations>[0],
       organizationId,
       "greeting",
@@ -162,7 +162,7 @@ describe("search service", () => {
   });
 
   it("filters out results below min_score", async () => {
-    const allResults = await searchConversations(
+    const { results: allResults } = await searchConversations(
       env as unknown as Parameters<typeof searchConversations>[0],
       organizationId,
       "greeting",
@@ -180,7 +180,7 @@ describe("search service", () => {
 
     // Filter with a threshold between the two scores
     const midpoint = (topScore + lowScore) / 2;
-    const filtered = await searchConversations(
+    const { results: filtered } = await searchConversations(
       env as unknown as Parameters<typeof searchConversations>[0],
       organizationId,
       "greeting",
@@ -197,7 +197,7 @@ describe("search service", () => {
   });
 
   it("deduplicates chunks from the same conversation by default", async () => {
-    const results = await searchConversations(
+    const { results } = await searchConversations(
       env as unknown as Parameters<typeof searchConversations>[0],
       organizationId,
       "greeting",
@@ -215,7 +215,7 @@ describe("search service", () => {
   });
 
   it("returns all chunks when dedupe is false", async () => {
-    const results = await searchConversations(
+    const { results } = await searchConversations(
       env as unknown as Parameters<typeof searchConversations>[0],
       organizationId,
       "greeting",
@@ -274,7 +274,7 @@ describe("search project filtering", () => {
   });
 
   it("returns results from all projects when no project filter", async () => {
-    const results = await searchConversations(
+    const { results } = await searchConversations(
       env as unknown as Parameters<typeof searchConversations>[0],
       organizationId,
       "deploy",
@@ -290,7 +290,7 @@ describe("search project filtering", () => {
   });
 
   it("filters to only matching project by title prefix", async () => {
-    const results = await searchConversations(
+    const { results } = await searchConversations(
       env as unknown as Parameters<typeof searchConversations>[0],
       organizationId,
       "deploy",
@@ -308,7 +308,7 @@ describe("search project filtering", () => {
   });
 
   it("project filter is case-insensitive", async () => {
-    const results = await searchConversations(
+    const { results } = await searchConversations(
       env as unknown as Parameters<typeof searchConversations>[0],
       organizationId,
       "deploy",
@@ -326,7 +326,7 @@ describe("search project filtering", () => {
   });
 
   it("returns empty when no conversations match project", async () => {
-    const results = await searchConversations(
+    const { results } = await searchConversations(
       env as unknown as Parameters<typeof searchConversations>[0],
       organizationId,
       "deploy",

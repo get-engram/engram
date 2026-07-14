@@ -1,4 +1,4 @@
-import { TIER_LIMITS, type Tier } from "@getengram/shared";
+import { TIER_LIMITS, RETENTION_ENFORCEMENT_DATE, type Tier } from "@getengram/shared";
 import { getOrCreateUsage, atomicIncrementMessages, incrementMessagesStored, incrementSearchesRun } from "@getengram/db";
 import { generateId } from "@getengram/shared";
 
@@ -150,4 +150,19 @@ export function checkConversationLimit(
 
 export function checkFeatureAccess(tier: Tier, feature: "webhooks" | "usage_dashboard"): boolean {
   return TIER_LIMITS[tier][feature];
+}
+
+/**
+ * Memory-window cutoff for a tier (engram#252). Conversations last updated
+ * before this ISO timestamp are ARCHIVED for the org: hidden from search and
+ * recall, never deleted, instantly unlocked on upgrade.
+ *
+ * Returns null when the tier has permanent retention, or before the announced
+ * enforcement date (14-day notice for existing free orgs).
+ */
+export function retentionCutoff(tier: Tier, now: number = Date.now()): string | null {
+  const days = TIER_LIMITS[tier].retention_days;
+  if (days <= 0) return null;
+  if (now < Date.parse(RETENTION_ENFORCEMENT_DATE)) return null;
+  return new Date(now - days * 86_400_000).toISOString();
 }

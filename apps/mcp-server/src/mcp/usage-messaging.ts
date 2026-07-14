@@ -61,3 +61,26 @@ export function approachingLimitNotice(
     `To avoid interruption, ${where}.`
   );
 }
+
+/**
+ * Notice when archived (memory-window) results were withheld (engram#252).
+ * Tone: nothing is lost, upgrading unlocks — never "deleted".
+ */
+export function retentionNotice(opts: {
+  archivedCount: number;
+  retentionDays: number;
+  isOAuth: boolean;
+}): string {
+  const { archivedCount, retentionDays, isOAuth } = opts;
+  const what =
+    archivedCount === 1
+      ? "1 older conversation matched"
+      : `${archivedCount} older conversations matched`;
+  const where = isOAuth
+    ? `sign in at ${DASHBOARD} with the email used to connect this app and upgrade`
+    : `upgrade at ${PRICING}`;
+  return (
+    `${what} but ${archivedCount === 1 ? "is" : "are"} archived — the free plan keeps a rolling ` +
+    `${retentionDays}-day memory window. Nothing is deleted: ${where} to unlock your full history instantly.`
+  );
+}

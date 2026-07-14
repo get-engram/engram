@@ -3,6 +3,10 @@ import { z } from "zod";
 import { getConversation } from "../../services/conversation.js";
 import { audit } from "../../services/audit.js";
 import { loadPrivacy, PRIVACY_BODIES_NOTICE } from "../../services/privacy.js";
+import { retentionCutoff } from "../../services/tier.js";
+import { retentionNotice } from "../usage-messaging.js";
+import { isExternalOAuthClient } from "../auth-kind.js";
+import { TIER_LIMITS } from "@getengram/shared";
 import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
 
@@ -58,6 +62,16 @@ export function registerGetConversation(
             })
             .passthrough(),
         ),
+        archived: z
+          .boolean()
+          .optional()
+          .describe(
+            "True when this conversation is outside the free plan's memory window — messages withheld, never deleted; upgrading unlocks it",
+          ),
+        retention_notice: z
+          .string()
+          .optional()
+          .describe("Present when archived — relay this to the user"),
       },
       annotations: {
         title: "Get conversation",
@@ -94,6 +108,34 @@ export function registerGetConversation(
       // Strip internal fields the model/user don't need and that app
       // marketplaces flag (internal account IDs, storage encoding).
       const { organization_id: _o, ...conversation } = result.conversation;
+
+      // Memory window (engram#252): archived conversations return their
+      // metadata but not their messages — mirrors the search-side wall so
+      // get_conversation can't bypass it. Never deleted; upgrade unlocks.
+      const cutoff = retentionCutoff(auth.tier);
+      const updatedAt = (conversation as { updated_at?: string }).updated_at;
+      if (
+        cutoff &&
+        updatedAt &&
+        !Number.isNaN(Date.parse(updatedAt)) &&
+        Date.parse(updatedAt) < Date.parse(cutoff)
+      ) {
+        const payload = {
+          conversation,
+          messages: [],
+          archived: true,
+          retention_notice: retentionNotice({
+            archivedCount: 1,
+            retentionDays: TIER_LIMITS[auth.tier].retention_days,
+            isOAuth: isExternalOAuthClient(auth),
+          }),
+        };
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(payload) }],
+          structuredContent: payload,
+        };
+      }
+
       const privacy = await loadPrivacy(env.DB, auth.organizationId);
       const messages = result.messages.map((m) => {
         const {

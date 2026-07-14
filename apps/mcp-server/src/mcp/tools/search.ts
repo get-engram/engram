@@ -1,7 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { searchConversations } from "../../services/search.js";
-import { trackSearchRun } from "../../services/tier.js";
+import { trackSearchRun, retentionCutoff } from "../../services/tier.js";
+import { retentionNotice } from "../usage-messaging.js";
+import { isExternalOAuthClient } from "../auth-kind.js";
+import { TIER_LIMITS } from "@getengram/shared";
 import { audit } from "../../services/audit.js";
 import {
   loadPrivacy,
@@ -63,6 +66,16 @@ export function registerSearch(
           )
           .describe("Relevant conversation snippets, best match first"),
         total: z.number(),
+        archived_conversations: z
+          .number()
+          .optional()
+          .describe(
+            "Matching conversations hidden by the free plan's rolling memory window — archived, never deleted; upgrading unlocks them",
+          ),
+        retention_notice: z
+          .string()
+          .optional()
+          .describe("Present when archived matches were withheld — relay this to the user"),
       },
       annotations: {
         title: "Search memory",
@@ -93,7 +106,7 @@ export function registerSearch(
         };
       }
 
-      const raw = await searchConversations(
+      const outcome = await searchConversations(
         env,
         auth.organizationId,
         params.query,
@@ -104,7 +117,9 @@ export function registerSearch(
         undefined, // minScore
         undefined, // dedupe
         params.project,
+        retentionCutoff(auth.tier),
       );
+      const raw = outcome.results;
 
       // When bodies are hidden, return the matching conversations'
       // metadata (title, tags, score) but drop the verbatim snippet.
@@ -117,11 +132,23 @@ export function registerSearch(
       audit(env.DB, auth.organizationId, auth.apiKeyId, "search", undefined, undefined, {
         query: params.query,
         results: results.length,
+        archived: outcome.archived_conversations,
       });
 
-      const payload = privacy.canReadBodies
+      const payload: Record<string, unknown> = privacy.canReadBodies
         ? { results, total: results.length }
         : { results, total: results.length, privacy_notice: PRIVACY_BODIES_NOTICE };
+
+      // Memory window (engram#252): tell the model — and through it the
+      // user — that older matches exist and are safe, not gone.
+      if (outcome.archived_conversations > 0) {
+        payload.archived_conversations = outcome.archived_conversations;
+        payload.retention_notice = retentionNotice({
+          archivedCount: outcome.archived_conversations,
+          retentionDays: TIER_LIMITS[auth.tier].retention_days,
+          isOAuth: isExternalOAuthClient(auth),
+        });
+      }
 
       return {
         content: [

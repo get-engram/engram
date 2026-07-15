@@ -11,6 +11,7 @@ import { usage } from "./routes/usage.js";
 import { signup } from "./routes/signup.js";
 import { billing, billingSession, billingWebhook } from "./routes/billing.js";
 import { admin } from "./routes/admin.js";
+import { dashboardHtml } from "./routes/admin-dashboard.js";
 import { account } from "./routes/account.js";
 import { privacy } from "./routes/privacy.js";
 import { dataExport } from "./routes/export.js";
@@ -128,7 +129,10 @@ app.use(
 );
 app.route("/billing/verify-session", billingSession);
 
-// Admin routes — protected by ADMIN_SECRET, not API key auth.
+// Admin dashboard — serves SPA HTML (auth handled client-side via sessionStorage).
+app.get("/admin", (c) => c.html(dashboardHtml));
+
+// Admin API routes — protected by ADMIN_SECRET, not API key auth.
 app.use(
   "/admin/*",
   cors({

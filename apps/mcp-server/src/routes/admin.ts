@@ -159,13 +159,14 @@ admin.get("/users", async (c) => {
 // ---------------------------------------------------------------------------
 admin.patch("/users/:id", async (c) => {
   const id = c.req.param("id");
-  const body = await c.req.json<{ tier?: string }>().catch(() => ({}));
+  const body = await c.req.json<{ tier?: string }>().catch(() => ({} as { tier?: string }));
+  const tier = body.tier;
 
-  if (body.tier && ["free", "pro", "team", "enterprise"].includes(body.tier)) {
+  if (tier && ["free", "pro", "team", "enterprise"].includes(tier)) {
     await c.env.DB.prepare(
       "UPDATE organizations SET tier = ? WHERE id = ?"
-    ).bind(body.tier, id).run();
-    return c.json({ updated: true, id, tier: body.tier });
+    ).bind(tier, id).run();
+    return c.json({ updated: true, id, tier });
   }
 
   return c.json({ error: "invalid_tier" }, 400);

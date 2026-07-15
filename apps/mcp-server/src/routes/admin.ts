@@ -183,6 +183,120 @@ admin.delete("/users/:id", async (c) => {
   return c.json({ deleted: true, id });
 });
 
+// ---------------------------------------------------------------------------
+// GET /admin/users/:id/stripe — Check what Stripe says vs what DB says
+// ---------------------------------------------------------------------------
+admin.get("/users/:id/stripe", async (c) => {
+  const id = c.req.param("id");
+  const org = await c.env.DB.prepare(
+    "SELECT id, name, email, tier, stripe_customer_id, stripe_subscription_id FROM organizations WHERE id = ?"
+  ).bind(id).first<{
+    id: string; name: string; email: string | null; tier: string;
+    stripe_customer_id: string | null; stripe_subscription_id: string | null;
+  }>();
+  if (!org) return c.json({ error: "not_found" }, 404);
+
+  const result: Record<string, unknown> = {
+    db: {
+      id: org.id, name: org.name, email: org.email,
+      tier: org.tier, stripe_customer_id: org.stripe_customer_id,
+      stripe_subscription_id: org.stripe_subscription_id,
+    },
+    stripe: null as unknown,
+    mismatch: false,
+  };
+
+  if (org.stripe_customer_id && c.env.STRIPE_SECRET_KEY) {
+    const subsRes = await fetch(
+      `https://api.stripe.com/v1/subscriptions?customer=${org.stripe_customer_id}&limit=10`,
+      { headers: { Authorization: `Bearer ${c.env.STRIPE_SECRET_KEY}` } },
+    );
+    if (subsRes.ok) {
+      const subs = await subsRes.json() as {
+        data: Array<{
+          id: string; status: string;
+          items: { data: Array<{ price: { id: string }; quantity: number }> };
+          metadata: Record<string, string>;
+          created: number;
+          trial_start: number | null;
+          trial_end: number | null;
+        }>;
+      };
+      const stripeSubs = subs.data.map((s) => ({
+        id: s.id,
+        status: s.status,
+        price_id: s.items?.data?.[0]?.price?.id,
+        quantity: s.items?.data?.[0]?.quantity,
+        metadata: s.metadata,
+        created: new Date(s.created * 1000).toISOString(),
+        trial_start: s.trial_start ? new Date(s.trial_start * 1000).toISOString() : null,
+        trial_end: s.trial_end ? new Date(s.trial_end * 1000).toISOString() : null,
+      }));
+      result.stripe = { customer_id: org.stripe_customer_id, subscriptions: stripeSubs };
+
+      // Detect mismatch: Stripe has active/trialing sub but DB says free
+      const activeSub = subs.data.find((s) => s.status === "active" || s.status === "trialing");
+      if (activeSub && org.tier === "free") {
+        result.mismatch = true;
+        result.expected_tier = activeSub.items?.data?.[0]?.price?.id === c.env.STRIPE_PRICE_ID_TEAM ? "team" : "pro";
+      }
+    }
+  }
+
+  return c.json(result);
+});
+
+// ---------------------------------------------------------------------------
+// POST /admin/users/:id/sync-stripe — Fix DB tier from actual Stripe state
+// ---------------------------------------------------------------------------
+admin.post("/users/:id/sync-stripe", async (c) => {
+  const id = c.req.param("id");
+  const org = await c.env.DB.prepare(
+    "SELECT id, stripe_customer_id FROM organizations WHERE id = ?"
+  ).bind(id).first<{ id: string; stripe_customer_id: string | null }>();
+  if (!org) return c.json({ error: "not_found" }, 404);
+  if (!org.stripe_customer_id) return c.json({ error: "no_stripe_customer" }, 400);
+
+  const subsRes = await fetch(
+    `https://api.stripe.com/v1/subscriptions?customer=${org.stripe_customer_id}&limit=10`,
+    { headers: { Authorization: `Bearer ${c.env.STRIPE_SECRET_KEY}` } },
+  );
+  if (!subsRes.ok) return c.json({ error: "stripe_api_error" }, 502);
+
+  const subs = await subsRes.json() as {
+    data: Array<{
+      id: string; status: string;
+      items: { data: Array<{ price: { id: string }; quantity: number }> };
+    }>;
+  };
+
+  const activeSub = subs.data.find((s) => s.status === "active" || s.status === "trialing");
+  if (!activeSub) {
+    await c.env.DB.prepare(
+      "UPDATE organizations SET tier = 'free', stripe_subscription_id = NULL, seat_limit = 1 WHERE id = ?"
+    ).bind(id).run();
+    return c.json({ synced: true, tier: "free", subscription: null });
+  }
+
+  const priceId = activeSub.items?.data?.[0]?.price?.id;
+  const quantity = activeSub.items?.data?.[0]?.quantity ?? 1;
+  let tier: string = "pro";
+  if (priceId === c.env.STRIPE_PRICE_ID_TEAM) tier = "team";
+  const seatLimit = tier === "team" ? quantity : 1;
+
+  await c.env.DB.prepare(
+    "UPDATE organizations SET tier = ?, stripe_subscription_id = ?, seat_limit = ? WHERE id = ?"
+  ).bind(tier, activeSub.id, seatLimit, id).run();
+
+  return c.json({
+    synced: true,
+    tier,
+    subscription_id: activeSub.id,
+    status: activeSub.status,
+    seat_limit: seatLimit,
+  });
+});
+
 // GET /admin/audit/:orgId — query audit logs for an organization
 admin.get("/audit/:orgId", async (c) => {
   const orgId = c.req.param("orgId");

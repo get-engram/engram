@@ -343,7 +343,8 @@ async function loadUsers() {
     '<td>' + (u.stripe_customer_id ? '<span style="color:var(--green)" title="' + esc(u.stripe_customer_id) + '">Yes</span>' : '<span style="color:var(--muted)">-</span>') + '</td>' +
     '<td>' + u.conversations + '</td>' +
     '<td>' + u.total_messages + '</td>' +
-    '<td><button class="btn btn-sm btn-danger" onclick="deleteUser(\\'' + u.id + '\\', \\'' + esc(u.name).replace(/'/g, "\\\\'") + '\\')">Del</button>' +
+    '<td><button class="btn btn-sm" onclick="checkStripe(\\'' + u.id + '\\')">Stripe</button>' +
+    ' <button class="btn btn-sm btn-danger" onclick="deleteUser(\\'' + u.id + '\\', \\'' + esc(u.name).replace(/'/g, "\\\\'") + '\\')">Del</button>' +
     ' <button class="btn btn-sm" onclick="loadAuditFor(\\'' + u.id + '\\')">Audit</button></td>' +
     '</tr>'
   ).join('') || '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:1rem">No users</td></tr>';
@@ -411,6 +412,84 @@ async function loadAudit() {
     esc(typeof l.details === 'string' ? l.details : JSON.stringify(l.details)) +
     '</td><td>' + shortTime(l.created_at) + '</td></tr>'
   ).join('') || '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:1rem">No audit logs</td></tr>';
+}
+
+// ---- Stripe Check ----
+async function checkStripe(userId) {
+  status('Checking Stripe...');
+  try {
+    const data = await api('/users/' + userId + '/stripe');
+    let html = '<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.5rem;max-width:600px;margin:0 auto;max-height:80vh;overflow-y:auto">';
+    html += '<h3 style="margin-bottom:1rem">Stripe Status: ' + esc(data.db.name) + '</h3>';
+
+    if (data.mismatch) {
+      html += '<div style="background:rgba(239,68,68,.15);border:1px solid var(--red);border-radius:6px;padding:.75rem;margin-bottom:1rem">';
+      html += '<strong style="color:var(--red)">MISMATCH:</strong> DB says <strong>' + data.db.tier + '</strong> but Stripe says <strong>' + data.expected_tier + '</strong>';
+      html += '<br><button class="btn btn-primary btn-sm" style="margin-top:.5rem" onclick="syncStripe(\\'' + userId + '\\')">Sync from Stripe</button>';
+      html += '</div>';
+    }
+
+    html += '<table style="width:100%;font-size:.85rem"><tbody>';
+    html += '<tr><td style="color:var(--muted);padding:.3rem .5rem">DB Tier</td><td style="padding:.3rem .5rem">' + tierBadge(data.db.tier) + '</td></tr>';
+    html += '<tr><td style="color:var(--muted);padding:.3rem .5rem">Stripe Customer</td><td style="padding:.3rem .5rem;font-family:monospace;font-size:.8rem">' + esc(data.db.stripe_customer_id) + '</td></tr>';
+    html += '<tr><td style="color:var(--muted);padding:.3rem .5rem">Stripe Sub ID</td><td style="padding:.3rem .5rem;font-family:monospace;font-size:.8rem">' + esc(data.db.stripe_subscription_id) + '</td></tr>';
+    html += '</tbody></table>';
+
+    if (data.stripe && data.stripe.subscriptions) {
+      html += '<h4 style="margin:.75rem 0 .5rem">Stripe Subscriptions (' + data.stripe.subscriptions.length + ')</h4>';
+      if (data.stripe.subscriptions.length === 0) {
+        html += '<p style="color:var(--muted);font-size:.85rem">No subscriptions found in Stripe</p>';
+      }
+      for (const sub of data.stripe.subscriptions) {
+        const statusColor = sub.status === 'active' ? 'var(--green)' : sub.status === 'trialing' ? 'var(--accent)' : sub.status === 'canceled' ? 'var(--red)' : 'var(--muted)';
+        html += '<div style="border:1px solid var(--border);border-radius:6px;padding:.75rem;margin-bottom:.5rem;font-size:.8rem">';
+        html += '<div><strong style="color:' + statusColor + '">' + sub.status.toUpperCase() + '</strong> <span style="color:var(--muted);font-family:monospace">' + sub.id + '</span></div>';
+        html += '<div style="margin-top:.3rem">Price: <code>' + esc(sub.price_id) + '</code> x' + sub.quantity + '</div>';
+        html += '<div>Created: ' + shortTime(sub.created) + '</div>';
+        if (sub.trial_start) html += '<div>Trial: ' + shortTime(sub.trial_start) + ' - ' + shortTime(sub.trial_end) + '</div>';
+        if (sub.metadata && Object.keys(sub.metadata).length) html += '<div>Metadata: ' + esc(JSON.stringify(sub.metadata)) + '</div>';
+        html += '</div>';
+      }
+    } else if (!data.db.stripe_customer_id) {
+      html += '<p style="color:var(--muted);font-size:.85rem;margin-top:.75rem">No Stripe customer linked</p>';
+    }
+
+    html += '<div style="margin-top:1rem;text-align:right"><button class="btn" onclick="closeModal()">Close</button></div>';
+    html += '</div>';
+    showModal(html);
+  } catch (e) {
+    status('Error: ' + e.message);
+  }
+}
+
+async function syncStripe(userId) {
+  status('Syncing from Stripe...');
+  try {
+    const data = await api('/users/' + userId + '/sync-stripe', { method: 'POST' });
+    status('Synced: tier=' + data.tier + ' sub=' + (data.subscription_id || 'none'));
+    closeModal();
+    refresh();
+  } catch (e) {
+    status('Sync error: ' + e.message);
+  }
+}
+
+function showModal(html) {
+  let overlay = document.getElementById('modal-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'modal-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:1000;padding:1rem';
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
+    document.body.appendChild(overlay);
+  }
+  overlay.innerHTML = html;
+  overlay.style.display = 'flex';
+}
+
+function closeModal() {
+  const overlay = document.getElementById('modal-overlay');
+  if (overlay) overlay.style.display = 'none';
 }
 
 // ---- Refresh ----

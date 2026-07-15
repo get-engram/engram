@@ -184,6 +184,25 @@ admin.delete("/users/:id", async (c) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /admin/users/:id/grant-pro — Give a user pro with a grace period
+// ---------------------------------------------------------------------------
+admin.post("/users/:id/grant-pro", async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.json<{ days?: number }>().catch(() => ({}));
+  const days = (body as { days?: number }).days ?? 14;
+
+  await c.env.DB.prepare(
+    "UPDATE organizations SET tier = 'pro', grace_ends_at = datetime('now', ? || ' days') WHERE id = ?"
+  ).bind(days, id).run();
+
+  const org = await c.env.DB.prepare(
+    "SELECT tier, grace_ends_at FROM organizations WHERE id = ?"
+  ).bind(id).first<{ tier: string; grace_ends_at: string }>();
+
+  return c.json({ granted: true, id, tier: "pro", grace_ends_at: org?.grace_ends_at });
+});
+
+// ---------------------------------------------------------------------------
 // GET /admin/users/:id/stripe — Check what Stripe says vs what DB says
 // ---------------------------------------------------------------------------
 admin.get("/users/:id/stripe", async (c) => {

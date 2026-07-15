@@ -17,6 +17,7 @@ import { privacy } from "./routes/privacy.js";
 import { dataExport } from "./routes/export.js";
 import { oauthConnections } from "./routes/oauth-connections.js";
 import { purgeDeletedOrganizations } from "./cron/purge-deleted.js";
+import { expireGracePeriods } from "./cron/expire-grace.js";
 import { oauth } from "./oauth/router.js";
 import {
   originOf,
@@ -184,6 +185,10 @@ export default {
     const purged = await purgeDeletedOrganizations(env);
     if (purged > 0) {
       console.log(`[cron] Purged ${purged} expired organization(s)`);
+    }
+    const graceExpired = await expireGracePeriods(env);
+    if (graceExpired > 0) {
+      console.log(`[cron] Expired ${graceExpired} grace period(s)`);
     }
   },
 };

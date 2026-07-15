@@ -17,7 +17,11 @@ usage.get("/", async (c) => {
     getUsage(c.env.DB, auth.organizationId),
     getApiKeyCount(c.env.DB, auth.organizationId),
     getSeatCount(c.env.DB, auth.organizationId),
-    getOrganizationById(c.env.DB, auth.organizationId) as Promise<{ seat_limit: number } | null>,
+    getOrganizationById(c.env.DB, auth.organizationId) as Promise<{
+      seat_limit: number;
+      stripe_subscription_id: string | null;
+      grace_ends_at: string | null;
+    } | null>,
   ]);
 
   const u = currentUsage as { messages_stored: number; searches_run: number; period: string } | null;
@@ -26,6 +30,8 @@ usage.get("/", async (c) => {
 
   return c.json({
     tier: auth.tier,
+    has_subscription: !!org?.stripe_subscription_id,
+    grace_ends_at: org?.grace_ends_at ?? null,
     period: u?.period ?? null,
     messages: {
       used: u?.messages_stored ?? 0,

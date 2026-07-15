@@ -18,6 +18,7 @@ import { dataExport } from "./routes/export.js";
 import { oauthConnections } from "./routes/oauth-connections.js";
 import { purgeDeletedOrganizations } from "./cron/purge-deleted.js";
 import { expireGracePeriods } from "./cron/expire-grace.js";
+import { sendDailyReport } from "./cron/daily-report.js";
 import { oauth } from "./oauth/router.js";
 import {
   originOf,
@@ -190,5 +191,6 @@ export default {
     if (graceExpired > 0) {
       console.log(`[cron] Expired ${graceExpired} grace period(s)`);
     }
+    await sendDailyReport(env);
   },
 };

@@ -269,7 +269,10 @@ oauth.post("/authorize/approve", async (c) => {
     orgId = existing.id;
   } else {
     orgId = generateId("org");
-    await insertOrganizationWithEmail(c.env.DB, orgId, email.split("@")[0], email, "chatgpt");
+    // Derive referral source from the OAuth client name (e.g. "ChatGPT",
+    // "Cursor", "Claude Desktop") — lowercase, fallback to "oauth".
+    const ref = (client.client_name || "oauth").toLowerCase().replace(/\s+/g, "-");
+    await insertOrganizationWithEmail(c.env.DB, orgId, email.split("@")[0], email, ref);
   }
 
   const scope = body.scope || DEFAULT_SCOPE;

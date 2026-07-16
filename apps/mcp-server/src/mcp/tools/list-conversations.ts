@@ -7,7 +7,6 @@ import {
   PRIVACY_CROSS_CONVERSATION_NOTICE,
 } from "../../services/privacy.js";
 import { hasScope, scopeError } from "../scopes.js";
-import { retentionCutoff } from "../../services/tier.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerListConversations(
@@ -42,12 +41,6 @@ export function registerListConversations(
               message_count: z.number().optional(),
               created_at: z.string().optional(),
               updated_at: z.string().optional(),
-              archived: z
-                .boolean()
-                .optional()
-                .describe(
-                  "Outside the free plan's memory window — hidden from search/recall, never deleted; upgrading unlocks it",
-                ),
             })
             .passthrough(),
         ),
@@ -91,22 +84,12 @@ export function registerListConversations(
         order: params.order,
       });
 
-      // Memory window (engram#252): archived conversations stay listed —
-      // seeing what exists is part of the upgrade story — but are flagged.
-      const cutoff = retentionCutoff(auth.tier);
-      const cutoffMs = cutoff ? Date.parse(cutoff) : NaN;
       const conversations = (result.results as Array<Record<string, unknown>>).map(
-        ({ organization_id: _o, ...c }) => {
-          const ts = c.updated_at ? Date.parse(c.updated_at as string) : NaN;
-          const archived =
-            !Number.isNaN(cutoffMs) && !Number.isNaN(ts) && ts < cutoffMs;
-          return {
-            ...c,
-            tags: JSON.parse((c.tags as string) || "[]"),
-            metadata: JSON.parse((c.metadata as string) || "{}"),
-            ...(archived ? { archived: true } : {}),
-          };
-        },
+        ({ organization_id: _o, ...c }) => ({
+          ...c,
+          tags: JSON.parse((c.tags as string) || "[]"),
+          metadata: JSON.parse((c.metadata as string) || "{}"),
+        }),
       );
 
       return {

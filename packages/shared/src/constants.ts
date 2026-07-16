@@ -18,7 +18,6 @@ export const TIER_LIMITS: Record<Tier, {
   api_keys: number;
   webhooks: boolean;
   usage_dashboard: boolean;
-  retention_days: number;
 }> = {
   free: {
     messages_per_month: 1_000,
@@ -27,10 +26,6 @@ export const TIER_LIMITS: Record<Tier, {
     api_keys: -1, // unlimited — usage caps are the billing gate, not key count
     webhooks: false,
     usage_dashboard: false,
-    // Rolling memory window (engram#252): conversations not updated within
-    // this many days are ARCHIVED — hidden from search/recall, never deleted.
-    // Upgrading unlocks them instantly. Export is always available.
-    retention_days: 30,
   },
   pro: {
     messages_per_month: 100_000,
@@ -39,7 +34,6 @@ export const TIER_LIMITS: Record<Tier, {
     api_keys: -1,
     webhooks: false,
     usage_dashboard: false,
-    retention_days: -1, // permanent
   },
   team: {
     messages_per_month: 500_000,
@@ -48,7 +42,6 @@ export const TIER_LIMITS: Record<Tier, {
     api_keys: -1,
     webhooks: true,
     usage_dashboard: true,
-    retention_days: -1, // permanent
   },
   enterprise: {
     messages_per_month: -1, // unlimited
@@ -57,11 +50,5 @@ export const TIER_LIMITS: Record<Tier, {
     api_keys: -1,
     webhooks: true,
     usage_dashboard: true,
-    retention_days: -1, // permanent
   },
 };
-
-// Free-tier memory-window enforcement starts after a 14-day public notice
-// (announced 2026-07-14; engram#252). Before this instant the window is not
-// applied, so existing free orgs get the promised grace period.
-export const RETENTION_ENFORCEMENT_DATE = "2026-07-28T00:00:00Z";

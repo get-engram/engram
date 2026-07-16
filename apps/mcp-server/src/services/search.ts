@@ -49,15 +49,6 @@ export function queryTerms(query: string): string[] {
   return [...new Set(query.toLowerCase().match(/[a-z0-9]{3,}/g) ?? [])];
 }
 
-export interface SearchOutcome {
-  results: SearchResult[];
-  /**
-   * Distinct matching conversations hidden by the org's memory window
-   * (engram#252) — archived, not deleted; unlocked on upgrade.
-   */
-  archived_conversations: number;
-}
-
 export async function searchConversations(
   env: Env,
   organizationId: string,
@@ -68,9 +59,8 @@ export async function searchConversations(
   snippetChars: number = DEFAULT_SNIPPET_CHARS,
   minScore: number = DEFAULT_MIN_SCORE,
   dedupe: boolean = true,
-  project?: string,
-  retentionCutoffIso?: string | null
-): Promise<SearchOutcome> {
+  project?: string
+): Promise<SearchResult[]> {
   const cappedSnippet = Math.min(
     Math.max(snippetChars, 0),
     MAX_SNIPPET_CHARS
@@ -116,7 +106,7 @@ export async function searchConversations(
   const ftsMatches = ftsResults.results ?? [];
 
   if (vectorMatches.length === 0 && ftsMatches.length === 0) {
-    return { results: [], archived_conversations: 0 };
+    return [];
   }
 
   // Build rank maps (0-indexed position)
@@ -234,28 +224,6 @@ export async function searchConversations(
     });
   }
 
-  // Memory window (engram#252): drop results whose conversation was last
-  // updated before the org's retention cutoff, counting the distinct
-  // conversations withheld so the caller can tell the user what's archived.
-  // Missing/invalid timestamps are treated as accessible (never over-hide).
-  let archivedConversations = 0;
-  if (retentionCutoffIso) {
-    const cutoffMs = Date.parse(retentionCutoffIso);
-    if (!Number.isNaN(cutoffMs)) {
-      const archived = new Set<string>();
-      results = results.filter((r) => {
-        const updatedAt = convMeta.get(r.conversation_id)?.updatedAt;
-        const ts = updatedAt ? Date.parse(updatedAt) : NaN;
-        if (!Number.isNaN(ts) && ts < cutoffMs) {
-          archived.add(r.conversation_id);
-          return false;
-        }
-        return true;
-      });
-      archivedConversations = archived.size;
-    }
-  }
-
   // Sort by score descending
   results.sort((a, b) => b.score - a.score);
 
@@ -293,8 +261,5 @@ export async function searchConversations(
     });
   }
 
-  return {
-    results: results.slice(0, limit),
-    archived_conversations: archivedConversations,
-  };
+  return results.slice(0, limit);
 }

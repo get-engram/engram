@@ -5,6 +5,7 @@ import {
   getOrCreateDefaultConversation,
 } from "../../services/conversation.js";
 import { isExternalOAuthClient } from "../auth-kind.js";
+import { newUserAppendTip } from "../coaching.js";
 import {
   usageMeter,
   limitMessage,
@@ -164,6 +165,7 @@ export function registerAppendMessages(
       const meter = usageMeter(tierCheck.used, tierCheck.limit);
       const notice = approachingLimitNotice(meter, isOAuth);
 
+      const tip = newUserAppendTip(auth, tierCheck.used);
       const payload = {
         conversation_id: conversationId,
         appended: messages.length,
@@ -171,6 +173,7 @@ export function registerAppendMessages(
         vault_entries_stored: params.vault_entries?.length ?? 0,
         ...(meter ? { usage: meter } : {}),
         ...(notice ? { notice } : {}),
+        ...(tip ? { tip } : {}),
       };
 
       return {

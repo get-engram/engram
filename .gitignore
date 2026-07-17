@@ -5,10 +5,10 @@ dist/
 .turbo/
 *.log
 .DS_Store
-.claude/
 *.tsbuildinfo
 .env
 supabase/.temp/
-.claude/
+.claude/*
+!.claude/skills/
 docs/launch/handoff/
 supabase/.temp/

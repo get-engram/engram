@@ -30,11 +30,15 @@ export function limitMessage(opts: {
 }): string {
   const { unit, tier, limit, used, isOAuth } = opts;
   if (isOAuth) {
+    const planName = tier && tier !== "free" ? `${tier} plan's` : "free plan's";
+    const remedy =
+      tier && tier !== "free"
+        ? `open ${DASHBOARD}, sign in with the email they used to connect this app, and manage their plan (add capacity or seats)`
+        : `open ${DASHBOARD}, sign in with the email they used to connect this app, and choose Upgrade`;
     return (
-      `You've reached the free plan's monthly limit (${limit ?? "the included"} ${unit}). ` +
+      `You've reached the ${planName} monthly limit (${limit ?? "the included"} ${unit}). ` +
       `Everything so far is safely saved in Engram. ` +
-      `Tell the user, warmly, that to keep saving memories they can upgrade their own Engram account: ` +
-      `open ${DASHBOARD}, sign in with the email they used to connect this app, and choose Upgrade — ` +
+      `Tell the user, warmly, that to keep saving memories they can ${remedy} — ` +
       `the same account powers this connection, so the higher limit applies right away. ` +
       `Don't try to collect payment here; just point them to their dashboard.`
     );
@@ -57,7 +61,7 @@ export function approachingLimitNotice(
     ? `sign in at ${DASHBOARD} with the email you connected and upgrade`
     : `upgrade at ${PRICING}`;
   return (
-    `${meter.used}/${meter.limit} free messages used this month (${meter.remaining} left). ` +
+    `${meter.used}/${meter.limit} included messages used this month (${meter.remaining} left). ` +
     `To avoid interruption, ${where}.`
   );
 }

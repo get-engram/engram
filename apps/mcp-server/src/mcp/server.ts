@@ -5,6 +5,7 @@ import { registerSearch } from "./tools/search.js";
 import { registerGetConversation } from "./tools/get-conversation.js";
 import { registerListConversations } from "./tools/list-conversations.js";
 import { registerDeleteConversation } from "./tools/delete-conversation.js";
+import { registerMemoryStatus } from "./tools/memory-status.js";
 import { registerResolveVault } from "./tools/resolve-vault.js";
 import { registerVaultSet } from "./tools/vault-set.js";
 import { registerVaultGet } from "./tools/vault-get.js";
@@ -25,6 +26,7 @@ const SERVER_INSTRUCTIONS = `Engram is persistent, searchable memory. Use it pro
 - "Remember this / save this chat": store the messages already in THIS conversation. You cannot retrieve the user's past or external conversations — so if they ask you to remember their whole history, save the current exchange, then tell them Engram records going forward and that they can bulk-import their full history by exporting their ChatGPT (or Claude) data and running \`engram import\` (see getengram.app/docs). Do not attempt to gather, reconstruct, or forward their entire chat history — you don't have access to it.
 - "Remember everything from this point forward": treat this as standing consent — keep calling \`append_messages\` with the substantive turns as the conversation develops, without asking again. Confirm briefly each time so the user knows what was saved.
 - "What do you remember about ___?": call \`search\` and answer strictly from the results — that shows what is actually stored, not what only exists in the current chat.
+- "How full is my memory?" / plan or usage questions: call \`memory_status\` and show the user the bar line verbatim (e.g. [████████░░] 82%).
 - Images and screenshots: Engram stores text. Write out what the image shows or means (names, facts, quotes), then store that text.
 - Skip trivial chatter (greetings, acknowledgements). Storage is verbatim and searchable by meaning.`;
 
@@ -45,6 +47,7 @@ export function createMcpServer(env: Env, auth: AuthContext): McpServer {
   registerGetConversation(server, env, auth);
   registerListConversations(server, env, auth);
   registerDeleteConversation(server, env, auth);
+  registerMemoryStatus(server, env, auth);
 
   // First-party-only tools. External OAuth clients (auth.apiKeyId is
   // "oauth:<client_id>") get the memory-only surface: the secrets vault

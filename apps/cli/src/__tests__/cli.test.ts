@@ -178,3 +178,13 @@ describe("import — storage_full error parsing", () => {
     expect(parseStorageFullError("")).toBeNull();
   });
 });
+
+describe("usage bars", () => {
+  it("renders proportional bars with padded percentages", async () => {
+    const { renderBar } = await import("../commands/usage.js");
+    expect(renderBar(6_200, 10_000)).toBe("[████████████░░░░░░░░]  62%");
+    expect(renderBar(0, 10_000)).toBe("[░░░░░░░░░░░░░░░░░░░░]   0%");
+    expect(renderBar(10_000, 10_000)).toBe("[████████████████████] 100%");
+    expect(renderBar(20_000, 10_000)).toBe("[████████████████████] 100%");
+  });
+});

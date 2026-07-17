@@ -16,6 +16,7 @@ import { log as showLog } from "./commands/log.js";
 import { importHistory } from "./commands/import.js";
 import { daemonStart, daemonStop, daemonStatus, daemonInstall, daemonUninstall } from "./daemon/index.js";
 import { upgrade } from "./commands/upgrade.js";
+import { usage as showUsage } from "./commands/usage.js";
 import { vaultKeygen, vaultStatus, loadVaultKey, vaultSet, vaultGet, vaultList, vaultDelete } from "./commands/vault.js";
 import { bold, dim } from "./output.js";
 
@@ -139,6 +140,7 @@ ${bold("COMMANDS")}
   ${bold("import")} <file.json>       Import a ChatGPT or Claude data export
   ${bold("log")}                      Show recent AI conversation activity
   ${bold("upgrade")} [pro|team]       Upgrade your plan (opens Stripe checkout)
+  ${bold("usage")}                    Show memory storage and monthly usage meters
 
   ${bold("vault keygen")}             Generate a new vault encryption key
   ${bold("vault keygen --save")}      Generate and save key to ~/.engram/vault-key
@@ -276,6 +278,11 @@ async function main(): Promise<void> {
 
       case "upgrade":
         await upgrade(args, flags);
+        break;
+
+      case "usage":
+      case "status":
+        await showUsage(args, flags);
         break;
 
       // Vault commands

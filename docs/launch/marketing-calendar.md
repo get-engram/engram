@@ -118,7 +118,7 @@ By now you should have 200-400 free signups. Time to convert.
 
 ### In-product nudges
 - Show usage meter in MCP tool responses (you already built this — issue #208)
-- When they hit 800/1,000 messages, show upgrade prompt
+- Built-in: at 80% of memory (8,000/10,000 messages) the product warns and nudges upgrade
 
 ### Direct outreach
 - Anyone who stores 10+ conversations on free tier = warm lead

@@ -29,7 +29,7 @@ What it actually remembers for me:
 
 The backend runs entirely on Cloudflare (Workers, D1, Vectorize). Source is on GitHub under BSL-1.1: https://github.com/get-engram/engram
 
-Free tier is 1,000 messages/month, Pro is $9/mo for heavier use.
+Free tier is 10,000 messages of memory that never expires, Pro is $9/mo for 1,000,000.
 
 Would love to hear how other Claude Code users handle cross-session memory today. What context do you find yourself repeating?
 
@@ -57,7 +57,7 @@ That's it. ChatGPT gets tools to search your memory and store new conversations.
 
 How it works under the hood: conversations get chunked and embedded. When ChatGPT calls `search`, it does semantic matching — so searching "that database migration issue" finds the relevant conversation even if you never used those exact words.
 
-Free tier gives you 1,000 messages/month. Pro is $9/mo if you use it heavily.
+Free tier gives you 10,000 messages of memory — no monthly cap. Pro is $9/mo if you use it heavily.
 
 Source code (BSL-1.1): https://github.com/get-engram/engram
 
@@ -149,7 +149,7 @@ What it remembers for me:
 
 **Tweet 6:**
 
-Free tier: 1,000 messages/month
+Free tier: 10,000 messages of memory, free forever
 Pro: $9/mo
 Team: $27/seat/mo
 

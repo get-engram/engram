@@ -19,7 +19,7 @@ Setup was quick: in ChatGPT it's Settings → Apps & Connectors → add Engram (
 
 Honest caveat so nobody's surprised: ChatGPT doesn't let any app silently record your whole chat in the background (there's no per-turn hook, and OpenAI's policy forbids grabbing your full log). So it's "save what matters + import your history," not magic auto-capture. That was fine for me — the import covers the back-catalog and "remember this" covers going forward.
 
-Free tier is 1,000 messages/month if you want to try it: getengram.app. It's also open source.
+Free tier is 10,000 messages of memory (never expires, no monthly cap) if you want to try it: getengram.app. It's also open source.
 
 Curious what others do here — does anyone else feel the pain of every tool having separate memory, or is ChatGPT's built-in memory enough for you?
 

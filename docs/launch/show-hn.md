@@ -6,6 +6,8 @@
 
 I use Claude Code for hours every day. The biggest friction isn't the model — it's that every session starts from scratch. The agent forgets the bugs you investigated together, the architecture decisions you made, the user preferences you expressed. You end up repeating yourself constantly.
 
+This week OpenAI shipped an importer that pulls your Claude Code setup and chats into Codex — one time, one direction, and only your last 30 days. That convinced me the real battleground is who holds your accumulated context, and that it shouldn't be any single vendor. Engram is the neutral version: continuous, complete, and yours.
+
 Engram is a memory layer for AI agents. It stores complete conversation transcripts, chunks them, and makes them searchable via hybrid semantic + keyword search. When a new session starts, the agent searches Engram and picks up where you left off.
 
 How it works:

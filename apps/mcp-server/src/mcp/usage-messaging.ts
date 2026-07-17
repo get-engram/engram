@@ -12,6 +12,19 @@ export interface UsageMeter {
   remaining: number;
 }
 
+/**
+ * Render a 10-segment progress bar like "[████████░░] 82%" — readable in
+ * chat surfaces (ChatGPT relays it verbatim) and terminals alike.
+ */
+export function meterBar(used?: number, limit?: number): string | undefined {
+  if (typeof used !== "number" || typeof limit !== "number" || limit <= 0) {
+    return undefined;
+  }
+  const pct = Math.min(100, Math.round((used / limit) * 100));
+  const filled = Math.min(10, Math.round(pct / 10));
+  return `[${"█".repeat(filled)}${"░".repeat(10 - filled)}] ${pct}%`;
+}
+
 /** Build a usage meter when the tier is limited; undefined for unlimited tiers. */
 export function usageMeter(used?: number, limit?: number): UsageMeter | undefined {
   if (typeof used !== "number" || typeof limit !== "number" || limit < 0) {

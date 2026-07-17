@@ -3,6 +3,7 @@ import { TIER_LIMITS } from "@getengram/shared";
 import { storageLimitFor } from "../services/tier.js";
 import {
   usageMeter,
+  meterBar,
   storageFullMessage,
   approachingStorageNotice,
 } from "../mcp/usage-messaging.js";
@@ -64,5 +65,14 @@ describe("storage messaging", () => {
     expect(
       approachingStorageNotice(usageMeter(9_500, 10_000), true),
     ).toMatch(/dashboard/);
+  });
+
+  it("meterBar renders a 10-segment bar with percentage", () => {
+    expect(meterBar(8_200, 10_000)).toBe("[████████░░] 82%");
+    expect(meterBar(0, 10_000)).toBe("[░░░░░░░░░░] 0%");
+    expect(meterBar(10_000, 10_000)).toBe("[██████████] 100%");
+    expect(meterBar(15_000, 10_000)).toBe("[██████████] 100%");
+    expect(meterBar(5, -1)).toBeUndefined();
+    expect(meterBar(undefined, 10_000)).toBeUndefined();
   });
 });

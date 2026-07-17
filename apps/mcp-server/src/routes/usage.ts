@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { TIER_LIMITS } from "@getengram/shared";
 import { getUsage, getUsageHistory, getApiKeyCount, getSeatCount, getOrganizationById } from "@getengram/db";
-import { checkFeatureAccess } from "../services/tier.js";
+import { checkFeatureAccess, storageLimitFor } from "../services/tier.js";
 import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
@@ -21,12 +21,14 @@ usage.get("/", async (c) => {
       seat_limit: number;
       stripe_subscription_id: string | null;
       grace_ends_at: string | null;
+      messages_stored_total: number;
     } | null>,
   ]);
 
   const u = currentUsage as { messages_stored: number; searches_run: number; period: string } | null;
   // For team tier, seat limit comes from Stripe subscription quantity
   const seatLimit = limits.seats === -1 ? (org?.seat_limit ?? 1) : limits.seats;
+  const storageLimit = storageLimitFor(auth.tier, org?.seat_limit ?? 1);
 
   return c.json({
     tier: auth.tier,
@@ -36,6 +38,12 @@ usage.get("/", async (c) => {
     messages: {
       used: u?.messages_stored ?? 0,
       limit: limits.messages_per_month,
+    },
+    // Lifetime memory storage (engram#275) — the primary gate. Memory
+    // never expires; it fills up. -1 limit = unlimited.
+    storage: {
+      used: org?.messages_stored_total ?? 0,
+      limit: storageLimit,
     },
     searches: {
       used: u?.searches_run ?? 0,

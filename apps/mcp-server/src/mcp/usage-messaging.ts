@@ -50,6 +50,52 @@ export function limitMessage(opts: {
   );
 }
 
+/**
+ * Warm copy when the lifetime storage cap is reached (engram#275).
+ * Nothing is ever deleted or expired — saving NEW memories pauses until
+ * the user upgrades for more space or deletes old conversations.
+ */
+export function storageFullMessage(opts: {
+  limit?: number;
+  isOAuth: boolean;
+}): string {
+  const { limit, isOAuth } = opts;
+  const size = limit ? `${limit.toLocaleString("en-US")} messages` : "its current size";
+  if (isOAuth) {
+    return (
+      `Engram's memory is full (${size}). Everything already saved is safe, ` +
+      `searchable, and never expires. Tell the user, warmly: to keep saving new ` +
+      `memories they can upgrade for more space — open ${DASHBOARD} and sign in ` +
+      `with the email they used to connect this app — or delete old conversations ` +
+      `to free room. Don't try to collect payment here; just point them to their dashboard.`
+    );
+  }
+  return (
+    `Engram's memory is full (${size}). Everything saved stays safe and searchable. ` +
+    `Upgrade at ${PRICING} for more space, or delete old conversations to free room.`
+  );
+}
+
+/**
+ * Early warning once the storage cap crosses 80%, so "memory full" is
+ * never a surprise.
+ */
+export function approachingStorageNotice(
+  meter: UsageMeter | undefined,
+  isOAuth: boolean,
+): string | undefined {
+  if (!meter || meter.limit <= 0) return undefined;
+  if (meter.used / meter.limit < 0.8) return undefined;
+  const where = isOAuth
+    ? `sign in at ${DASHBOARD} with the email you connected and upgrade for more space`
+    : `upgrade at ${PRICING} for more space`;
+  return (
+    `${meter.used.toLocaleString("en-US")}/${meter.limit.toLocaleString("en-US")} messages of memory used ` +
+    `(${meter.remaining.toLocaleString("en-US")} left). Nothing ever expires — but to keep saving new ` +
+    `memories past the limit, ${where}, or delete old conversations to free room.`
+  );
+}
+
 /** A gentle heads-up once usage crosses 80%, so the user isn't surprised. */
 export function approachingLimitNotice(
   meter: UsageMeter | undefined,

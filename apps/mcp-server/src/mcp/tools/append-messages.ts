@@ -10,8 +10,14 @@ import {
   usageMeter,
   limitMessage,
   approachingLimitNotice,
+  storageFullMessage,
+  approachingStorageNotice,
 } from "../usage-messaging.js";
-import { checkAndTrackMessages } from "../../services/tier.js";
+import {
+  checkAndTrackMessages,
+  checkAndTrackStorage,
+  releaseStorage,
+} from "../../services/tier.js";
 import { fireWebhooks } from "../../services/webhooks.js";
 import { audit } from "../../services/audit.js";
 import { hasScope, scopeError } from "../scopes.js";
@@ -73,7 +79,12 @@ export function registerAppendMessages(
           .object({ used: z.number(), limit: z.number(), remaining: z.number() })
           .optional()
           .describe("Monthly message usage for the org (limited tiers only)"),
+        storage: z
+          .object({ used: z.number(), limit: z.number(), remaining: z.number() })
+          .optional()
+          .describe("Lifetime memory storage for the org (capped tiers only) — memory never expires; it fills up"),
         notice: z.string().optional().describe("Heads-up shown when approaching the plan limit"),
+        storage_notice: z.string().optional().describe("Heads-up shown when memory storage is nearly full"),
       },
       annotations: {
         title: "Append messages",
@@ -85,19 +96,54 @@ export function registerAppendMessages(
     },
     async (params) => {
       if (!hasScope(auth, "write")) return scopeError("write");
-      // Atomically check tier limit AND increment usage in one operation.
-      // Prevents race conditions where concurrent requests both pass the
-      // check but together exceed the limit.
+      const isOAuth = isExternalOAuthClient(auth);
+      const count = params.messages.length;
+
+      // Primary gate (engram#275): lifetime storage. Atomically reserves
+      // space; released below if a later step rejects or fails.
+      const storageCheck = await checkAndTrackStorage(
+        env.DB,
+        auth.organizationId,
+        auth.tier,
+        count
+      );
+
+      if (!storageCheck.allowed) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                error: storageCheck.error,
+                message: storageFullMessage({
+                  limit: storageCheck.limit,
+                  isOAuth,
+                }),
+                limit: storageCheck.limit,
+                used: storageCheck.used,
+                tier: storageCheck.tier,
+                upgrade_url: isOAuth
+                  ? "https://getengram.app/dashboard"
+                  : "https://getengram.app/pricing",
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // Secondary gate: monthly velocity (abuse guard on paid tiers;
+      // unlimited on free — the storage cap is free's only gate).
       const tierCheck = await checkAndTrackMessages(
         env.DB,
         auth.organizationId,
         auth.tier,
-        params.messages.length
+        count
       );
 
-      const isOAuth = isExternalOAuthClient(auth);
-
       if (!tierCheck.allowed) {
+        // Give the reserved storage back — nothing was written.
+        await releaseStorage(env.DB, auth.organizationId, count);
         return {
           content: [
             {
@@ -129,16 +175,24 @@ export function registerAppendMessages(
         params.conversation_id ??
         (await getOrCreateDefaultConversation(env.DB, auth.organizationId));
 
-      const messages = await appendMessages(
-        env,
-        auth.organizationId,
-        conversationId,
-        params.messages.map((m) => ({
-          ...m,
-          metadata: m.metadata as Record<string, unknown>,
-        })),
-        params.vault_entries
-      );
+      let messages;
+      try {
+        messages = await appendMessages(
+          env,
+          auth.organizationId,
+          conversationId,
+          params.messages.map((m) => ({
+            ...m,
+            metadata: m.metadata as Record<string, unknown>,
+          })),
+          params.vault_entries
+        );
+      } catch (err) {
+        // The write failed — free the reserved storage so the lifetime
+        // counter tracks what's actually stored.
+        await releaseStorage(env.DB, auth.organizationId, count).catch(() => {});
+        throw err;
+      }
 
       audit(
         env.DB,
@@ -160,19 +214,26 @@ export function registerAppendMessages(
         message_ids: messages.map((m) => m.id),
       }).catch(() => {});
 
-      // Usage meter — surfaced so the client can show progress and warn the
-      // user before they hit the monthly cap.
+      // Meters — monthly velocity (paid abuse guard) and lifetime storage
+      // (the real gate), so clients can show progress and never surprise
+      // the user.
       const meter = usageMeter(tierCheck.used, tierCheck.limit);
       const notice = approachingLimitNotice(meter, isOAuth);
+      const storageMeterVal = usageMeter(storageCheck.used, storageCheck.limit);
+      const storageNotice = approachingStorageNotice(storageMeterVal, isOAuth);
 
-      const tip = newUserAppendTip(auth, tierCheck.used);
+      // Coaching keys off lifetime storage — the count that exists on
+      // every tier (free has no monthly meter anymore).
+      const tip = newUserAppendTip(auth, storageCheck.used ?? tierCheck.used);
       const payload = {
         conversation_id: conversationId,
         appended: messages.length,
         message_ids: messages.map((m) => m.id),
         vault_entries_stored: params.vault_entries?.length ?? 0,
         ...(meter ? { usage: meter } : {}),
+        ...(storageMeterVal ? { storage: storageMeterVal } : {}),
         ...(notice ? { notice } : {}),
+        ...(storageNotice ? { storage_notice: storageNotice } : {}),
         ...(tip ? { tip } : {}),
       };
 

@@ -11,3 +11,4 @@ dist/
 supabase/.temp/
 .claude/
 docs/launch/handoff/
+supabase/.temp/

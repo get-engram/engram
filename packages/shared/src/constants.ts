@@ -12,6 +12,19 @@ export const DEFAULT_CONVERSATION_LIMIT = 20;
 export type Tier = "free" | "pro" | "team" | "enterprise";
 
 export const TIER_LIMITS: Record<Tier, {
+  /**
+   * Lifetime message storage (engram#275) — the primary billing gate,
+   * Gmail-style: memory fills up, nothing ever expires or is deleted.
+   * Deleting conversations frees space; upgrading raises the ceiling.
+   * For team, this is PER SEAT (pooled: seat_limit × storage_messages).
+   * -1 = unlimited.
+   */
+  storage_messages: number;
+  /**
+   * Monthly write velocity. No longer the marketed gate — kept on paid
+   * tiers purely as an abuse guard; free relies on the storage cap.
+   * -1 = unlimited.
+   */
   messages_per_month: number;
   conversations: number;
   seats: number;
@@ -20,7 +33,8 @@ export const TIER_LIMITS: Record<Tier, {
   usage_dashboard: boolean;
 }> = {
   free: {
-    messages_per_month: 1_000,
+    storage_messages: 10_000,
+    messages_per_month: -1, // replaced by the storage cap — full speed until full
     conversations: -1,
     seats: 1,
     api_keys: -1, // unlimited — usage caps are the billing gate, not key count
@@ -28,7 +42,8 @@ export const TIER_LIMITS: Record<Tier, {
     usage_dashboard: false,
   },
   pro: {
-    messages_per_month: 100_000,
+    storage_messages: 1_000_000,
+    messages_per_month: 100_000, // abuse guard only
     conversations: -1,
     seats: 1,
     api_keys: -1,
@@ -36,7 +51,8 @@ export const TIER_LIMITS: Record<Tier, {
     usage_dashboard: false,
   },
   team: {
-    messages_per_month: 500_000,
+    storage_messages: 1_000_000, // per seat, pooled across the org
+    messages_per_month: 500_000, // abuse guard only
     conversations: -1,
     seats: -1, // dynamic — enforced via org.seat_limit from Stripe quantity
     api_keys: -1,
@@ -44,6 +60,7 @@ export const TIER_LIMITS: Record<Tier, {
     usage_dashboard: true,
   },
   enterprise: {
+    storage_messages: -1, // unlimited
     messages_per_month: -1, // unlimited
     conversations: -1,
     seats: -1,

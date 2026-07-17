@@ -175,3 +175,61 @@ export function getOrganizationStats(db: D1Database, organizationId: string) {
     .bind(organizationId, organizationId, organizationId)
     .first<{ conversations: number; messages: number; chunks: number }>();
 }
+
+// ── Lifetime storage counter (engram#275) ─────────────────────────────
+// The storage cap is the primary billing gate: memory fills up, nothing
+// ever expires. These mirror the race-safe pattern in queries/usage.ts.
+
+/**
+ * Atomically increment the lifetime storage counter only if the new
+ * total stays within `limit`. Returns the updated total, or null when
+ * the increment would exceed the limit (memory full).
+ */
+export function atomicIncrementStorage(
+  db: D1Database,
+  organizationId: string,
+  count: number,
+  limit: number,
+) {
+  return db
+    .prepare(
+      `UPDATE organizations
+       SET messages_stored_total = messages_stored_total + ?
+       WHERE id = ? AND messages_stored_total + ? <= ?
+       RETURNING messages_stored_total`,
+    )
+    .bind(count, organizationId, count, limit)
+    .first<{ messages_stored_total: number }>();
+}
+
+/** Unconditional increment — for unlimited-storage tiers. */
+export function incrementStorage(db: D1Database, organizationId: string, count: number) {
+  return db
+    .prepare(
+      `UPDATE organizations SET messages_stored_total = messages_stored_total + ?
+       WHERE id = ? RETURNING messages_stored_total`,
+    )
+    .bind(count, organizationId)
+    .first<{ messages_stored_total: number }>();
+}
+
+/**
+ * Free storage back up — on conversation delete, or to roll back a
+ * reserved increment when the write that followed it failed.
+ */
+export function decrementStorage(db: D1Database, organizationId: string, count: number) {
+  return db
+    .prepare(
+      `UPDATE organizations SET messages_stored_total = MAX(0, messages_stored_total - ?)
+       WHERE id = ?`,
+    )
+    .bind(count, organizationId)
+    .run();
+}
+
+export function getStorageUsed(db: D1Database, organizationId: string) {
+  return db
+    .prepare("SELECT messages_stored_total FROM organizations WHERE id = ?")
+    .bind(organizationId)
+    .first<{ messages_stored_total: number }>();
+}

@@ -3,6 +3,9 @@ import {
   linearize,
   linearizeClaude,
   normalizeExport,
+  storagePrecheck,
+  storageWarning,
+  parseStorageFullError,
   type ChatConversation,
 } from "../commands/import.js";
 
@@ -102,5 +105,76 @@ describe("import — Claude + format detection", () => {
     expect(format).toBe("claude");
     expect(conversations[0].title).toBe("My chat");
     expect(conversations[0].messages).toEqual([{ role: "user", content: "yo" }]);
+  });
+});
+
+describe("import — lifetime storage pre-check (engram#275)", () => {
+  it("fits when usage is unavailable (fetch failed — server enforces anyway)", () => {
+    expect(storagePrecheck(50_000, null)).toEqual({ fits: true });
+  });
+
+  it("fits when the plan is unlimited (limit === -1)", () => {
+    expect(storagePrecheck(5_000_000, { used: 123, limit: -1 })).toEqual({ fits: true });
+  });
+
+  it("fits when the export is within remaining space", () => {
+    expect(storagePrecheck(8_900, { used: 1_100, limit: 10_000 })).toEqual({ fits: true });
+    expect(storagePrecheck(0, { used: 10_000, limit: 10_000 })).toEqual({ fits: true });
+  });
+
+  it("does not fit when the export exceeds remaining space", () => {
+    expect(storagePrecheck(42_310, { used: 1_100, limit: 10_000 })).toEqual({
+      fits: false,
+      remaining: 8_900,
+      used: 1_100,
+      limit: 10_000,
+    });
+  });
+
+  it("clamps remaining to zero when already over the cap", () => {
+    expect(storagePrecheck(1, { used: 10_001, limit: 10_000 })).toEqual({
+      fits: false,
+      remaining: 0,
+      used: 10_001,
+      limit: 10_000,
+    });
+  });
+
+  it("formats the warning with counts and upgrade link", () => {
+    const warning = storageWarning(42_310, { remaining: 8_900, limit: 10_000 });
+    expect(warning).toContain("42,310 messages");
+    expect(warning).toContain("8,900 of 10,000 messages of memory remaining");
+    expect(warning).toContain("Importing will stop when memory is full");
+    expect(warning).toContain("https://getengram.app/pricing");
+  });
+});
+
+describe("import — storage_full error parsing", () => {
+  it("parses the server's storage_full payload", () => {
+    const raw = JSON.stringify({
+      error: "storage_full",
+      message: "Engram's memory is full (10,000 messages).",
+      limit: 10_000,
+      used: 10_000,
+      tier: "free",
+      upgrade_url: "https://getengram.app/pricing",
+    });
+    expect(parseStorageFullError(raw)).toEqual({
+      message: "Engram's memory is full (10,000 messages).",
+      limit: 10_000,
+      used: 10_000,
+      upgrade_url: "https://getengram.app/pricing",
+    });
+  });
+
+  it("falls back to a default message when the payload has none", () => {
+    const parsed = parseStorageFullError(JSON.stringify({ error: "storage_full" }));
+    expect(parsed?.message).toBe("Engram's memory is full.");
+  });
+
+  it("returns null for other errors and non-JSON messages", () => {
+    expect(parseStorageFullError("Network error: fetch failed")).toBeNull();
+    expect(parseStorageFullError('{"error":"limit_exceeded","message":"x"}')).toBeNull();
+    expect(parseStorageFullError("")).toBeNull();
   });
 });

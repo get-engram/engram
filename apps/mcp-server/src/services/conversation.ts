@@ -23,6 +23,7 @@ import {
   insertVaultEntries,
 } from "@getengram/db";
 import { generateEmbeddings } from "./embedding.js";
+import { releaseStorage } from "./tier.js";
 import { compressContent, decompressContent } from "../utils/compress.js";
 import type { Env } from "../types.js";
 
@@ -294,6 +295,11 @@ export async function deleteConversation(
 
   // Delete from D1 (cascading: chunks, messages, conversation)
   await deleteConversationById(env.DB, conversationId, organizationId);
+
+  // Deleting frees storage (engram#275) — memory never expires on its
+  // own, but the user can always make room.
+  const freed = (conv as { message_count?: number }).message_count ?? 0;
+  await releaseStorage(env.DB, organizationId, freed);
 
   return true;
 }

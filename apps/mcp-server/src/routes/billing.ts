@@ -76,21 +76,25 @@ billing.post("/checkout", async (c) => {
     await setOrganizationStripeCustomer(c.env.DB, org.id, customerId);
   }
 
-  // One subscription per customer. If they already have any active
-  // subscription, send them to the billing portal to manage it.
+  // One subscription per customer. If they already have any active or
+  // trialing subscription, send them to the billing portal to manage it.
+  // Without the trialing check, a user who starts a free trial and comes
+  // back the next day would bypass this guard and create a duplicate.
   if (customerId) {
-    const subsRes = await fetch(
-      `https://api.stripe.com/v1/subscriptions?customer=${customerId}&status=active&limit=1`,
-      { headers: { Authorization: `Bearer ${c.env.STRIPE_SECRET_KEY}` } },
-    );
-    if (subsRes.ok) {
-      const subs = (await subsRes.json()) as { data: unknown[] };
-      if (subs.data.length > 0) {
-        const portal = await createPortalSession(c.env.STRIPE_SECRET_KEY, {
-          customerId,
-          returnUrl: `${c.env.APP_URL}/dashboard`,
-        });
-        return c.json({ url: portal.url, already_subscribed: true, plan });
+    for (const status of ["active", "trialing"] as const) {
+      const subsRes = await fetch(
+        `https://api.stripe.com/v1/subscriptions?customer=${customerId}&status=${status}&limit=1`,
+        { headers: { Authorization: `Bearer ${c.env.STRIPE_SECRET_KEY}` } },
+      );
+      if (subsRes.ok) {
+        const subs = (await subsRes.json()) as { data: unknown[] };
+        if (subs.data.length > 0) {
+          const portal = await createPortalSession(c.env.STRIPE_SECRET_KEY, {
+            customerId,
+            returnUrl: `${c.env.APP_URL}/dashboard`,
+          });
+          return c.json({ url: portal.url, already_subscribed: true, plan });
+        }
       }
     }
   }

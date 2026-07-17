@@ -11,11 +11,13 @@ import { usage } from "./routes/usage.js";
 import { signup } from "./routes/signup.js";
 import { billing, billingSession, billingWebhook } from "./routes/billing.js";
 import { admin } from "./routes/admin.js";
+import { dashboardHtml } from "./routes/admin-dashboard.js";
 import { account } from "./routes/account.js";
 import { privacy } from "./routes/privacy.js";
 import { dataExport } from "./routes/export.js";
 import { oauthConnections } from "./routes/oauth-connections.js";
 import { purgeDeletedOrganizations } from "./cron/purge-deleted.js";
+import { expireGracePeriods } from "./cron/expire-grace.js";
 import { sendDailyReport } from "./services/daily-report.js";
 import { oauth } from "./oauth/router.js";
 import {
@@ -129,7 +131,19 @@ app.use(
 );
 app.route("/billing/verify-session", billingSession);
 
-// Admin routes — protected by ADMIN_SECRET, not API key auth.
+// Admin dashboard — serves SPA HTML (auth handled client-side via sessionStorage).
+app.get("/admin", (c) => c.html(dashboardHtml));
+
+// Admin API routes — protected by ADMIN_SECRET, not API key auth.
+app.use(
+  "/admin/*",
+  cors({
+    origin: BROWSER_ORIGINS,
+    allowMethods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization"],
+    maxAge: 86400,
+  }),
+);
 app.use("/admin/*", async (c, next) => {
   const auth = c.req.header("Authorization");
   const secret = (c.env as Env & { ADMIN_SECRET: string }).ADMIN_SECRET;
@@ -179,6 +193,10 @@ export default {
     const purged = await purgeDeletedOrganizations(env);
     if (purged > 0) {
       console.log(`[cron] Purged ${purged} expired organization(s)`);
+    }
+    const graceExpired = await expireGracePeriods(env);
+    if (graceExpired > 0) {
+      console.log(`[cron] Expired ${graceExpired} grace period(s)`);
     }
   },
 };

@@ -1,5 +1,15 @@
 import { TIER_LIMITS, type Tier } from "@getengram/shared";
-import { getOrCreateUsage, atomicIncrementMessages, incrementMessagesStored, incrementSearchesRun } from "@getengram/db";
+import {
+  getOrCreateUsage,
+  atomicIncrementMessages,
+  incrementMessagesStored,
+  incrementSearchesRun,
+  atomicIncrementStorage,
+  incrementStorage,
+  decrementStorage,
+  getStorageUsed,
+  getOrganizationById,
+} from "@getengram/db";
 import { generateId } from "@getengram/shared";
 
 export interface TierCheckResult {
@@ -123,6 +133,71 @@ export async function trackSearchRun(
 ) {
   await ensureUsage(db, organizationId);
   await incrementSearchesRun(db, organizationId);
+}
+
+/**
+ * Effective lifetime storage limit for an org (engram#275). Team pools
+ * per-seat: seat_limit × storage_messages. -1 = unlimited.
+ */
+export function storageLimitFor(tier: Tier, seatLimit?: number | null): number {
+  const base = TIER_LIMITS[tier].storage_messages;
+  if (base === -1) return -1;
+  if (tier === "team") return base * Math.max(1, seatLimit ?? 1);
+  return base;
+}
+
+/**
+ * Atomically check the lifetime storage cap AND increment the counter.
+ * Same race-safe reserve-then-write pattern as checkAndTrackMessages;
+ * callers must releaseStorage() if the write that follows fails.
+ */
+export async function checkAndTrackStorage(
+  db: D1Database,
+  organizationId: string,
+  tier: Tier,
+  messageCount: number,
+): Promise<TierCheckResult> {
+  let seatLimit: number | null = null;
+  if (tier === "team") {
+    const org = (await getOrganizationById(db, organizationId)) as {
+      seat_limit?: number;
+    } | null;
+    seatLimit = org?.seat_limit ?? 1;
+  }
+  const limit = storageLimitFor(tier, seatLimit);
+
+  if (limit === -1) {
+    const r = await incrementStorage(db, organizationId, messageCount);
+    return { allowed: true, used: r?.messages_stored_total, tier };
+  }
+
+  const result = await atomicIncrementStorage(db, organizationId, messageCount, limit);
+  if (!result) {
+    const row = await getStorageUsed(db, organizationId);
+    return {
+      allowed: false,
+      error: "storage_full",
+      limit,
+      used: row?.messages_stored_total,
+      tier,
+    };
+  }
+  return { allowed: true, used: result.messages_stored_total, limit, tier };
+}
+
+/**
+ * Give reserved storage back — when the monthly gate rejects after the
+ * storage reservation, when the write itself fails, or when a
+ * conversation is deleted (freeing space is a feature: memory is never
+ * expired, but the user can always make room).
+ */
+export async function releaseStorage(
+  db: D1Database,
+  organizationId: string,
+  messageCount: number,
+) {
+  if (messageCount <= 0) return;
+  await decrementStorage(db, organizationId, messageCount);
 }
 
 export function checkConversationLimit(

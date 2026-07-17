@@ -9,6 +9,7 @@ import {
   PRIVACY_CROSS_CONVERSATION_NOTICE,
 } from "../../services/privacy.js";
 import { hasScope, scopeError } from "../scopes.js";
+import { searchEmptyTip } from "../coaching.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerSearch(
@@ -119,9 +120,13 @@ export function registerSearch(
         results: results.length,
       });
 
-      const payload = privacy.canReadBodies
-        ? { results, total: results.length }
-        : { results, total: results.length, privacy_notice: PRIVACY_BODIES_NOTICE };
+      const emptyTip = results.length === 0 ? searchEmptyTip(auth) : undefined;
+      const payload = {
+        results,
+        total: results.length,
+        ...(privacy.canReadBodies ? {} : { privacy_notice: PRIVACY_BODIES_NOTICE }),
+        ...(emptyTip ? { tip: emptyTip } : {}),
+      };
 
       return {
         content: [

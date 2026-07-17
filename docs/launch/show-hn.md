@@ -1,29 +1,38 @@
 # Show HN Draft
 
-**Title:** Show HN: Engram – Long-term memory for ChatGPT, Claude, and Cursor
+**Title:** Show HN: Engram – Persistent memory for AI coding agents
 
 ---
 
-I've been using AI assistants daily and the biggest pain point is that every session starts from zero. The model has no memory of what you discussed yesterday — the decisions you made, the bugs you chased, the preferences you stated. You end up re-explaining yourself constantly.
+I use Claude Code for hours every day. The biggest friction isn't the model — it's that every session starts from scratch. The agent forgets the bugs you investigated together, the architecture decisions you made, the user preferences you expressed. You end up repeating yourself constantly.
 
-Engram fixes that. It stores your conversations verbatim and makes them searchable by meaning, so your assistant can recall context across sessions instead of forgetting it. Ask it to remember something today and search for it next week.
+Engram is a memory layer for AI agents. It stores complete conversation transcripts, chunks them, and makes them searchable via hybrid semantic + keyword search. When a new session starts, the agent searches Engram and picks up where you left off.
 
-It's MCP-native (Model Context Protocol), so it works across clients:
+How it works:
 
-- ChatGPT — connect via custom connector in Settings > Apps > Developer mode, add https://mcp.getengram.app/mcp and sign in (OAuth). No install.
-- Claude Desktop / Claude Code / Cursor / Windsurf — drop the MCP server URL + an API key into your config.
-- For Claude Code, the CLI (npm i -g @getengram/cli) runs a background daemon that auto-captures your sessions so you don't have to think about it.
+- Install the CLI (`brew install get-engram/engram/engram` or `npm i -g @getengram/cli`)
+- A background daemon auto-captures your Claude Code sessions
+- Conversations are chunked, embedded, and indexed (both vector and full-text)
+- The MCP server exposes search/store tools that any MCP-compatible client can use (Claude Code, Cursor, Windsurf, etc.)
 
-How it works: the agent calls `search` with a natural-language query and gets back the most relevant snippets from your past conversations; `append_messages` stores new ones. Everything is chunked and embedded automatically. The model decides when to remember and when to recall.
+The agent calls `search("the auth bug we fixed last week")` and gets back relevant conversation snippets with context. No manual note-taking.
 
-The backend runs entirely on Cloudflare — Workers for the API/MCP server, D1 for storage, Vectorize for semantic search, Workers AI for embeddings. Fast and globally distributed.
+What's under the hood:
 
-Source (Business Source License 1.1): https://github.com/get-engram/engram
+- Hybrid search: Cloudflare Vectorize for semantic similarity + D1 FTS5 for keyword matching, combined via Reciprocal Rank Fusion
+- Recency-weighted scoring — recent conversations rank higher when you say "remember what we were working on"
+- Zero-knowledge secrets vault — the agent can store API keys and credentials client-side encrypted; the server never sees plaintext
+- Immutable audit log for every data access
+- GDPR compliant (right to erasure, data portability, full export)
 
-There's a free tier (1,000 messages/month) if you want to try it. Pro is $9/mo for heavier use.
+Backend is Cloudflare Workers + D1 + Vectorize. Globally distributed, no cold starts.
 
-I built this because I wanted my assistants to actually learn from our interactions over time — to remember that we chose Hono over Express, that prod needs a specific migration order, that I prefer explicit error handling over swallowing exceptions. The stuff that lives in your head but not in the codebase.
+Server is BSL 1.1 (converts to open source after 4 years). SDK is MPL 2.0. Source: https://github.com/get-engram/engram
 
-Would love feedback, especially from people using AI assistants daily. What context do you find yourself repeating the most?
+Free tier: 1,000 messages/month, unlimited conversations. Pro is $39/mo for heavier use. Teams at $49/seat/mo.
+
+I built this because I wanted my coding agent to actually learn from our work together — to remember that we chose Hono over Express, that the prod database needs a specific migration order, that I prefer explicit error handling over try/catch. The kind of context that lives in your head but nowhere in the codebase.
+
+Would love feedback from other people using AI coding agents daily. What context do you find yourself repeating most?
 
 Site: https://getengram.app

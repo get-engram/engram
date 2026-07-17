@@ -26,7 +26,7 @@ It stores conversations **verbatim** (no lossy summaries) and searches them by m
 
 Being upfront about how it works: in ChatGPT you invoke it ("remember this" / "search Engram"), because ChatGPT gives apps no way to silently record everything — and we wouldn't want it to. On local tools like Claude Code it can capture automatically.
 
-Free tier (1,000 messages/mo) to try it. Would love to hear what context *you* keep re-explaining to your AI tools.
+Free tier (10,000 messages of memory — never expires) to try it. Would love to hear what context *you* keep re-explaining to your AI tools.
 
 ## Topics
 Artificial Intelligence · Productivity · Developer Tools · ChatGPT · Open Source

@@ -23,7 +23,7 @@ How capture works, honestly, because it differs per host:
 
 Under the hood it's stored verbatim (no lossy summarization), chunked, and embedded for semantic search. The whole backend runs on Cloudflare — Workers for the MCP server, D1 for storage, Vectorize for search, Workers AI for embeddings.
 
-Connect in ChatGPT: Settings → Apps & Connectors → add Engram (OAuth, no key to paste). Free tier is 1,000 messages/month; Pro is $9/mo.
+Connect in ChatGPT: Plugin directory → install Engram (OAuth, no key to paste). Free tier is 10,000 messages of memory — never expires; Pro is $9/mo.
 
 Source is BSL-1.1; the SDK + CLI are MIT: https://github.com/get-engram/engram
 Site: https://getengram.app

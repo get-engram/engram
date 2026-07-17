@@ -29,7 +29,7 @@ Backend is Cloudflare Workers + D1 + Vectorize. Globally distributed, no cold st
 
 Server is BSL 1.1 (converts to open source after 4 years). SDK is MPL 2.0. Source: https://github.com/get-engram/engram
 
-Free tier: 1,000 messages/month, unlimited conversations. Pro is $39/mo for heavier use. Teams at $49/seat/mo.
+Free tier: 10,000 messages of memory — never expires, no monthly cap. Pro is $9/mo for 1,000,000 messages of memory. Teams at $27/seat/mo.
 
 I built this because I wanted my coding agent to actually learn from our work together — to remember that we chose Hono over Express, that the prod database needs a specific migration order, that I prefer explicit error handling over try/catch. The kind of context that lives in your head but nowhere in the codebase.
 

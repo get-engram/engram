@@ -115,7 +115,7 @@ The whole thing is globally distributed with sub-100ms cold starts.
 
 ## Pricing
 
-- **Free** — 1,000 messages/month (enough to try it out)
+- **Free** — 10,000 messages of memory, free forever (no monthly cap — enough to feel it remember you)
 - **Pro** — $9/month for heavier use
 - **Team** — $27/seat/month with shared memory across your team
 

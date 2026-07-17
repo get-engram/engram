@@ -8,6 +8,7 @@ import { isExternalOAuthClient } from "../auth-kind.js";
 import { newUserAppendTip } from "../coaching.js";
 import {
   usageMeter,
+  meterBar,
   limitMessage,
   approachingLimitNotice,
   storageFullMessage,
@@ -80,7 +81,12 @@ export function registerAppendMessages(
           .optional()
           .describe("Monthly message usage for the org (limited tiers only)"),
         storage: z
-          .object({ used: z.number(), limit: z.number(), remaining: z.number() })
+          .object({
+            used: z.number(),
+            limit: z.number(),
+            remaining: z.number(),
+            bar: z.string().optional().describe("Ready-to-display progress bar, e.g. [████████░░] 82%"),
+          })
           .optional()
           .describe("Lifetime memory storage for the org (capped tiers only) — memory never expires; it fills up"),
         notice: z.string().optional().describe("Heads-up shown when approaching the plan limit"),
@@ -219,8 +225,11 @@ export function registerAppendMessages(
       // the user.
       const meter = usageMeter(tierCheck.used, tierCheck.limit);
       const notice = approachingLimitNotice(meter, isOAuth);
-      const storageMeterVal = usageMeter(storageCheck.used, storageCheck.limit);
-      const storageNotice = approachingStorageNotice(storageMeterVal, isOAuth);
+      const storageMeterBase = usageMeter(storageCheck.used, storageCheck.limit);
+      const storageNotice = approachingStorageNotice(storageMeterBase, isOAuth);
+      const storageMeterVal = storageMeterBase
+        ? { ...storageMeterBase, bar: meterBar(storageCheck.used, storageCheck.limit) }
+        : undefined;
 
       // Coaching keys off lifetime storage — the count that exists on
       // every tier (free has no monthly meter anymore).

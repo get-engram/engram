@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { getAuditLogs } from "@getengram/db";
 import { compressContent, ENCODING_GZIP } from "../utils/compress.js";
 import type { Env } from "../types.js";
+import { sendDailyReport } from "../services/daily-report.js";
 
 type AdminEnv = { Bindings: Env };
 
@@ -314,6 +315,13 @@ admin.post("/users/:id/sync-stripe", async (c) => {
     status: activeSub.status,
     seat_limit: seatLimit,
   });
+});
+
+// POST /admin/daily-report/send — manually trigger the daily ops email
+// (same path the 13:00 UTC cron takes). Useful for testing delivery.
+admin.post("/daily-report/send", async (c) => {
+  await sendDailyReport(c.env);
+  return c.json({ sent: true });
 });
 
 // GET /admin/audit/:orgId — query audit logs for an organization

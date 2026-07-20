@@ -9,15 +9,15 @@ every other connected tool — one shared memory across all of them.
 
 ## Add Engram
 
-### Option A — Add the Engram app (recommended)
+### Option A — Install the Engram plugin (recommended)
 
-1. **Settings → Apps & Connectors.**
-2. Search for **Engram** and add it.
+1. In ChatGPT, open the **Plugin directory** (OpenAI migrated the app directory to plugins in July 2026).
+2. Search for **Engram** and install it.
 3. Sign in with your Engram account (OAuth) and authorize. Engram's tools appear.
 
 ### Option B — Developer-mode custom connector
 
-> Developer-mode custom connectors vary by tier and region.
+> Developer-mode custom connectors vary by tier and region — try Option A first.
 
 1. **Settings → Apps & Connectors → Advanced settings → enable Developer mode.**
 2. Back on the Connectors page, choose **Create / Add custom connector**.
@@ -83,11 +83,13 @@ which is reliable for the things you explicitly want kept.
 ### 2. Import your full history — one time
 
 To bring **everything you've already said in ChatGPT** into Engram, use the
-native export plus `engram import`:
+native export:
 
-1. **ChatGPT → Settings → Data Controls → Export data.** Unzip the emailed
-   download to find `conversations.json`.
-2. Import it:
+1. **Request the export** — on the web: **Settings → Data Controls → Export
+   data**; in the desktop app: **Settings → Account → Data Controls → Export
+   data**. OpenAI emails you a link; unzip it to find `conversations.json`.
+2. Import it — easiest via the [dashboard](https://getengram.app/dashboard)
+   (find **Import your history** → **Upload** → select the file), or the CLI:
 
    ```bash
    export ENGRAM_API_KEY=engram_sk_live_...
@@ -95,8 +97,8 @@ native export plus `engram import`:
    npx @getengram/cli import ~/Downloads/chatgpt-export/conversations.json            # import
    ```
 
-Every conversation is stored verbatim, tagged `chatgpt-import`, and embedded for
-search. See the [import guide](./import-chatgpt.md) for options.
+Either way, every conversation is stored verbatim, tagged `chatgpt-import`, and
+embedded for search.
 
 > **Note:** the native export is available on ChatGPT Free / Plus / Pro / eligible
 > Edu plans, can take up to 7 days to arrive (link expires 24h after delivery),

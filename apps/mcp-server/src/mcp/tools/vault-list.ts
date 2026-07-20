@@ -29,7 +29,7 @@ export function registerVaultList(
         updated_at: r.updated_at,
       }));
 
-      audit(
+      await audit(
         env.DB,
         auth.organizationId,
         auth.apiKeyId,

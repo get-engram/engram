@@ -27,10 +27,18 @@ export type AuditAction =
   | "oauth.connection.revoked";
 
 /**
- * Fire-and-forget audit log entry. Never throws — audit logging
- * should not break the request if it fails.
+ * Audit log entry. Never throws — audit logging should not break the
+ * request if it fails — but callers MUST await it. The /mcp endpoint uses
+ * a stateless transport (no ctx.waitUntil wiring through tool handlers);
+ * a truly fire-and-forget call here is a race against the Workers runtime
+ * tearing down the request right after the response is returned, and
+ * loses that race far more often than not — in production this silently
+ * dropped nearly every "search" and "messages.append" audit entry while
+ * "conversation.read"/"conversation.list" (whose handlers await other
+ * work first, giving the write a head start) mostly survived. Awaiting
+ * costs one D1 round trip per call; that's the price of the log existing.
  */
-export function audit(
+export async function audit(
   db: D1Database,
   organizationId: string,
   apiKeyId: string | null,
@@ -38,8 +46,8 @@ export function audit(
   resourceType?: string,
   resourceId?: string,
   metadata?: Record<string, unknown>,
-) {
-  insertAuditLog(db, {
+): Promise<void> {
+  await insertAuditLog(db, {
     id: generateId("aud"),
     organizationId,
     apiKeyId,

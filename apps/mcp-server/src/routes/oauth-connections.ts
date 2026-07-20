@@ -36,7 +36,7 @@ oauthConnections.delete("/:clientId", async (c) => {
 
   await revokeOAuthConnection(c.env.DB, auth.organizationId, clientId);
 
-  audit(
+  await audit(
     c.env.DB,
     auth.organizationId,
     auth.apiKeyId,

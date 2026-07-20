@@ -12,7 +12,7 @@ export const admin = new Hono<AdminEnv>();
 // GET /admin/metrics — Business metrics dashboard
 // ---------------------------------------------------------------------------
 admin.get("/metrics", async (c) => {
-  const [orgs, active, tiers, totals, dbSize, referrals, todaySignups] = await Promise.all([
+  const [orgs, active, tiers, totals, dbSize, referrals, todaySignups, activation] = await Promise.all([
     c.env.DB.prepare(`
       SELECT
         COUNT(*) as total,
@@ -63,6 +63,49 @@ admin.get("/metrics", async (c) => {
       WHERE date(created_at) = date('now') AND deleted_at IS NULL
       ORDER BY created_at DESC
     `).all<{ id: string; name: string; email: string | null; tier: string; referral_source: string | null; created_at: string }>(),
+
+    // Activation funnel (engram#onboarding) — replaces the misleading
+    // "active in the last 30 days" framing (which was ~true for any org
+    // that merely signed up recently) with events that actually predict
+    // whether someone experienced the product: saved something beyond
+    // the auto-seeded welcome note, searched, got a real recall back,
+    // and came back later.
+    c.env.DB.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM organizations
+           WHERE deleted_at IS NULL AND COALESCE(referral_source,'') != 'internal') AS connected,
+        (SELECT COUNT(*) FROM organizations
+           WHERE deleted_at IS NULL AND COALESCE(referral_source,'') != 'internal'
+             AND messages_stored_total > 1) AS first_memory_saved,
+        (SELECT COUNT(DISTINCT a.organization_id) FROM audit_log a
+           JOIN organizations o ON o.id = a.organization_id
+           WHERE a.action = 'search' AND o.deleted_at IS NULL
+             AND COALESCE(o.referral_source,'') != 'internal') AS first_search,
+        (SELECT COUNT(DISTINCT a.organization_id) FROM audit_log a
+           JOIN organizations o ON o.id = a.organization_id
+           WHERE a.action = 'search'
+             AND CAST(json_extract(a.metadata, '$.results') AS INTEGER) > 0
+             AND o.deleted_at IS NULL
+             AND COALESCE(o.referral_source,'') != 'internal') AS first_successful_recall,
+        (SELECT COUNT(*) FROM (
+           SELECT a.organization_id FROM audit_log a
+             JOIN organizations o ON o.id = a.organization_id
+             WHERE o.deleted_at IS NULL AND COALESCE(o.referral_source,'') != 'internal'
+             GROUP BY a.organization_id
+             HAVING COUNT(DISTINCT date(a.created_at)) >= 2
+         )) AS second_session,
+        (SELECT COUNT(DISTINCT a.organization_id) FROM audit_log a
+           JOIN organizations o ON o.id = a.organization_id
+           WHERE o.deleted_at IS NULL AND COALESCE(o.referral_source,'') != 'internal'
+             AND a.created_at >= datetime(o.created_at, '+7 days')) AS returned_after_7_days
+    `).first<{
+      connected: number;
+      first_memory_saved: number;
+      first_search: number;
+      first_successful_recall: number;
+      second_session: number;
+      returned_after_7_days: number;
+    }>(),
   ]);
 
   const tierMap: Record<string, number> = {};
@@ -83,6 +126,14 @@ admin.get("/metrics", async (c) => {
       last_30d: orgs?.last_30d ?? 0,
     },
     active_users_30d: active?.active ?? 0,
+    activation: {
+      connected: activation?.connected ?? 0,
+      first_memory_saved: activation?.first_memory_saved ?? 0,
+      first_search: activation?.first_search ?? 0,
+      first_successful_recall: activation?.first_successful_recall ?? 0,
+      second_session: activation?.second_session ?? 0,
+      returned_after_7_days: activation?.returned_after_7_days ?? 0,
+    },
     tiers: tierMap,
     referrals: referralMap,
     storage: {

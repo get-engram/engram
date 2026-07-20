@@ -52,7 +52,7 @@ export function registerVaultSet(
         secretType: params.secret_type,
       });
 
-      audit(
+      await audit(
         env.DB,
         auth.organizationId,
         auth.apiKeyId,

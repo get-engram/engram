@@ -32,7 +32,7 @@ export function registerVaultGet(
         params.name
       );
 
-      audit(
+      await audit(
         env.DB,
         auth.organizationId,
         auth.apiKeyId,

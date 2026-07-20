@@ -82,7 +82,7 @@ dataExport.get("/", async (c) => {
     conversations,
   };
 
-  audit(c.env.DB, orgId, auth.apiKeyId, "data.export", undefined, undefined, {
+  await audit(c.env.DB, orgId, auth.apiKeyId, "data.export", undefined, undefined, {
     conversations: conversations.length,
   });
 

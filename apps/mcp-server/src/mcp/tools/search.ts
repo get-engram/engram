@@ -113,9 +113,9 @@ export function registerSearch(
         ? raw
         : raw.map(({ chunk_text: _c, ...rest }) => rest);
 
-      // Track usage (non-blocking)
-      trackSearchRun(env.DB, auth.organizationId).catch(() => {});
-      audit(env.DB, auth.organizationId, auth.apiKeyId, "search", undefined, undefined, {
+      // Track usage
+      await trackSearchRun(env.DB, auth.organizationId).catch(() => {});
+      await audit(env.DB, auth.organizationId, auth.apiKeyId, "search", undefined, undefined, {
         query: params.query,
         results: results.length,
       });

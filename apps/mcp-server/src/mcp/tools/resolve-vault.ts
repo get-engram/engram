@@ -42,7 +42,7 @@ export function registerResolveVault(
         created_at: r.created_at,
       }));
 
-      audit(
+      await audit(
         env.DB,
         auth.organizationId,
         auth.apiKeyId,

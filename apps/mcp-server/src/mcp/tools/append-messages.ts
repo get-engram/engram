@@ -200,7 +200,7 @@ export function registerAppendMessages(
         throw err;
       }
 
-      audit(
+      await audit(
         env.DB,
         auth.organizationId,
         auth.apiKeyId,

@@ -59,7 +59,7 @@ export function registerManageSubscription(
       // --- STATUS ---
       if (params.action === "status") {
         const limits = TIER_LIMITS[auth.tier];
-        audit(env.DB, auth.organizationId, auth.apiKeyId, "subscription.status", "organization", auth.organizationId);
+        await audit(env.DB, auth.organizationId, auth.apiKeyId, "subscription.status", "organization", auth.organizationId);
         return {
           content: [{
             type: "text" as const,
@@ -94,7 +94,7 @@ export function registerManageSubscription(
           returnUrl: `${env.APP_URL}/dashboard`,
         });
 
-        audit(env.DB, auth.organizationId, auth.apiKeyId, "subscription.portal", "organization", auth.organizationId);
+        await audit(env.DB, auth.organizationId, auth.apiKeyId, "subscription.portal", "organization", auth.organizationId);
 
         return {
           content: [{
@@ -153,7 +153,7 @@ export function registerManageSubscription(
             returnUrl: `${env.APP_URL}/dashboard`,
           });
 
-          audit(env.DB, auth.organizationId, auth.apiKeyId, "subscription.upgrade_redirect", "organization", auth.organizationId);
+          await audit(env.DB, auth.organizationId, auth.apiKeyId, "subscription.upgrade_redirect", "organization", auth.organizationId);
 
           return {
             content: [{
@@ -192,7 +192,7 @@ export function registerManageSubscription(
         organizationId: org.id,
       });
 
-      audit(env.DB, auth.organizationId, auth.apiKeyId, "subscription.checkout", "organization", auth.organizationId, { plan });
+      await audit(env.DB, auth.organizationId, auth.apiKeyId, "subscription.checkout", "organization", auth.organizationId, { plan });
 
       return {
         content: [{

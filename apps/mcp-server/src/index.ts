@@ -16,6 +16,7 @@ import { account } from "./routes/account.js";
 import { privacy } from "./routes/privacy.js";
 import { dataExport } from "./routes/export.js";
 import { oauthConnections } from "./routes/oauth-connections.js";
+import { memories } from "./routes/memories.js";
 import { purgeDeletedOrganizations } from "./cron/purge-deleted.js";
 import { expireGracePeriods } from "./cron/expire-grace.js";
 import { sendDailyReport } from "./services/daily-report.js";
@@ -179,6 +180,7 @@ app.route("/api/account", account);
 app.route("/api/privacy", privacy);
 app.route("/api/export", dataExport);
 app.route("/api/oauth/connections", oauthConnections);
+app.route("/api/memories", memories);
 
 export default {
   fetch: app.fetch,

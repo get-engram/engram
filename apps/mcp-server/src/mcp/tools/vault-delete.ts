@@ -48,7 +48,7 @@ export function registerVaultDelete(
 
       await deleteNamedSecret(env.DB, auth.organizationId, params.name);
 
-      audit(
+      await audit(
         env.DB,
         auth.organizationId,
         auth.apiKeyId,

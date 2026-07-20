@@ -36,7 +36,7 @@ export function registerDeleteConversation(
         params.conversation_id
       );
 
-      audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.delete", "conversation", params.conversation_id);
+      await audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.delete", "conversation", params.conversation_id);
 
       if (!deleted) {
         return {

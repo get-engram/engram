@@ -80,7 +80,7 @@ export function registerCreateConversation(
         params.metadata as Record<string, unknown>
       );
 
-      audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.create", "conversation", id);
+      await audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.create", "conversation", id);
 
       // Fire webhooks (non-blocking)
       fireWebhooks(env.DB, auth.organizationId, "conversation.created", {

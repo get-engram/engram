@@ -62,7 +62,7 @@ privacy.patch("/", async (c) => {
   };
 
   await updatePrivacySettings(c.env.DB, orgId, next);
-  audit(c.env.DB, orgId, auth.apiKeyId, "privacy.update", undefined, undefined, next);
+  await audit(c.env.DB, orgId, auth.apiKeyId, "privacy.update", undefined, undefined, next);
 
   return c.json({ updated: true, ...next });
 });

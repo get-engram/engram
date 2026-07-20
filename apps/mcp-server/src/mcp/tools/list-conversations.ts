@@ -56,7 +56,7 @@ export function registerListConversations(
     },
     async (params) => {
       if (!hasScope(auth, "read")) return scopeError("read");
-      audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.list");
+      await audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.list");
 
       // Listing all conversations is cross-conversation metadata sharing;
       // honor the org's privacy setting.

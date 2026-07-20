@@ -69,7 +69,7 @@ export function registerGetConversation(
     },
     async (params) => {
       if (!hasScope(auth, "read")) return scopeError("read");
-      audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.read", "conversation", params.conversation_id);
+      await audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.read", "conversation", params.conversation_id);
 
       const result = await getConversation(
         env.DB,

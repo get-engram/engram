@@ -25,7 +25,7 @@ account.patch("/", async (c) => {
   }
 
   await setOrganizationEmail(c.env.DB, orgId, email);
-  audit(c.env.DB, orgId, auth.apiKeyId, "account.update_email");
+  await audit(c.env.DB, orgId, auth.apiKeyId, "account.update_email");
 
   return c.json({ updated: true, email });
 });
@@ -44,7 +44,7 @@ account.delete("/", async (c) => {
 
   // Soft-delete: set deleted_at timestamp. Data is purged after 30 days by cron.
   await softDeleteOrganization(c.env.DB, orgId);
-  audit(c.env.DB, orgId, auth.apiKeyId, "account.delete");
+  await audit(c.env.DB, orgId, auth.apiKeyId, "account.delete");
 
   return c.json({
     deleted: true,
@@ -74,7 +74,7 @@ account.post("/restore", async (c) => {
   }
 
   await restoreOrganization(c.env.DB, orgId);
-  audit(c.env.DB, orgId, auth.apiKeyId, "account.restore");
+  await audit(c.env.DB, orgId, auth.apiKeyId, "account.restore");
 
   return c.json({
     restored: true,

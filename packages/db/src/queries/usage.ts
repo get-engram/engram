@@ -71,6 +71,24 @@ export function incrementSearchesRun(db: D1Database, organizationId: string) {
     .run();
 }
 
+/**
+ * Count one authenticated data-plane API request (engram#287). Single
+ * round trip: creates the period row if needed, else bumps the counter.
+ * The id is only used when this insert creates the row.
+ */
+export function incrementApiRequests(db: D1Database, id: string, organizationId: string) {
+  const period = getCurrentPeriod();
+  return db
+    .prepare(
+      `INSERT INTO usage (id, organization_id, period, api_requests)
+       VALUES (?, ?, ?, 1)
+       ON CONFLICT(organization_id, period)
+       DO UPDATE SET api_requests = api_requests + 1, updated_at = datetime('now')`
+    )
+    .bind(id, organizationId, period)
+    .run();
+}
+
 export function getUsageHistory(db: D1Database, organizationId: string, months: number = 6) {
   return db
     .prepare(

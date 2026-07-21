@@ -423,3 +423,36 @@ Common errors:
 | `Conversation not found` | Invalid conversation_id or doesn't belong to your organization |
 | `401 Unauthorized` | Missing or invalid API key |
 | `403 Forbidden` | API key expired or revoked |
+
+---
+
+## REST API
+
+Every memory operation is also available as a plain REST endpoint under `/api/v1` — same behavior, same limits, same API key — for backends, scripts, and anywhere an MCP client isn't practical. Base URL: `https://mcp.getengram.app`.
+
+All requests require the same `Authorization: Bearer engram_sk_live_...` header. Requests to `/mcp` and `/api/v1` count toward your monthly API usage, shown on the dashboard and in `GET /api/usage`.
+
+| Endpoint | MCP equivalent | Description |
+|----------|----------------|-------------|
+| `POST /api/v1/conversations` | `create_conversation` | Create a conversation. Body: `{ title?, agent_id?, tags?, metadata? }` → `201 { conversation_id }` |
+| `GET /api/v1/conversations` | `list_conversations` | List conversations. Query: `limit`, `offset`, `agent_id`, `tags` (comma-separated), `sort`, `order` |
+| `GET /api/v1/conversations/:id` | `get_conversation` | Fetch a conversation with messages. Query: `message_limit`, `message_offset` |
+| `DELETE /api/v1/conversations/:id` | `delete_conversation` | Delete a conversation, its messages, and embeddings |
+| `POST /api/v1/messages` | `append_messages` | Store messages. Body: `{ conversation_id?, messages: [{ role, content, ... }] }` — omit `conversation_id` to use the default memory |
+| `GET /api/v1/search` | `search` | Hybrid search. Query: `q` (required), `limit`, `conversation_id`, `tags`, `project` |
+
+### Example
+
+```bash
+# Store a memory
+curl -X POST https://mcp.getengram.app/api/v1/messages \
+  -H "Authorization: Bearer engram_sk_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"We chose Postgres over DynamoDB for the billing service."}]}'
+
+# Search it later
+curl "https://mcp.getengram.app/api/v1/search?q=billing+database+choice" \
+  -H "Authorization: Bearer engram_sk_live_..."
+```
+
+REST error responses use conventional status codes: `400` invalid body/query, `401` bad key, `403` missing scope, `402` storage or plan limit, `404` not found, `429` monthly velocity limit.

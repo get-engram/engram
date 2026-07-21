@@ -4,6 +4,7 @@ import {
   atomicIncrementMessages,
   incrementMessagesStored,
   incrementSearchesRun,
+  incrementApiRequests,
   atomicIncrementStorage,
   incrementStorage,
   decrementStorage,
@@ -133,6 +134,14 @@ export async function trackSearchRun(
 ) {
   await ensureUsage(db, organizationId);
   await incrementSearchesRun(db, organizationId);
+}
+
+/**
+ * Count one authenticated data-plane API request (engram#287).
+ * Upsert-based, so no ensureUsage round trip is needed.
+ */
+export async function trackApiRequest(db: D1Database, organizationId: string) {
+  await incrementApiRequests(db, generateId("usg"), organizationId);
 }
 
 /**

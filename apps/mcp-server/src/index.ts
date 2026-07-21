@@ -17,6 +17,8 @@ import { privacy } from "./routes/privacy.js";
 import { dataExport } from "./routes/export.js";
 import { oauthConnections } from "./routes/oauth-connections.js";
 import { memories } from "./routes/memories.js";
+import { v1 } from "./routes/v1.js";
+import { meterApiRequest } from "./middleware/meter.js";
 import { purgeDeletedOrganizations } from "./cron/purge-deleted.js";
 import { expireGracePeriods } from "./cron/expire-grace.js";
 import { sendDailyReport } from "./services/daily-report.js";
@@ -79,7 +81,7 @@ app.get("/mcp", (c) =>
 app.delete("/mcp", (c) =>
   c.json({ error: "method_not_allowed", message: "This server is stateless. Session deletion is not supported." }, 405),
 );
-app.post("/mcp", authMiddleware, rateLimitMiddleware, async (c) => {
+app.post("/mcp", authMiddleware, rateLimitMiddleware, meterApiRequest, async (c) => {
   const auth = c.get("auth");
   const server = createMcpServer(c.env, auth);
 
@@ -181,6 +183,11 @@ app.route("/api/privacy", privacy);
 app.route("/api/export", dataExport);
 app.route("/api/oauth/connections", oauthConnections);
 app.route("/api/memories", memories);
+
+// Public REST API (engram#287) — the six MCP memory tools as REST
+// endpoints, metered as API usage.
+app.use("/api/v1/*", meterApiRequest);
+app.route("/api/v1", v1);
 
 export default {
   fetch: app.fetch,

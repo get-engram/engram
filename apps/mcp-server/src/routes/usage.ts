@@ -25,7 +25,12 @@ usage.get("/", async (c) => {
     } | null>,
   ]);
 
-  const u = currentUsage as { messages_stored: number; searches_run: number; period: string } | null;
+  const u = currentUsage as {
+    messages_stored: number;
+    searches_run: number;
+    api_requests?: number;
+    period: string;
+  } | null;
   // For team tier, seat limit comes from Stripe subscription quantity
   const seatLimit = limits.seats === -1 ? (org?.seat_limit ?? 1) : limits.seats;
   const storageLimit = storageLimitFor(auth.tier, org?.seat_limit ?? 1);
@@ -47,6 +52,10 @@ usage.get("/", async (c) => {
     },
     searches: {
       used: u?.searches_run ?? 0,
+    },
+    // Data-plane requests (/mcp + /api/v1) this period (engram#287).
+    api_requests: {
+      used: u?.api_requests ?? 0,
     },
     api_keys: {
       used: keyCount?.count ?? 0,

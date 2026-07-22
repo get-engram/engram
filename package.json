@@ -9,17 +9,19 @@
     "test": "turbo test"
   },
   "devDependencies": {
-    "turbo": "^2.4.0",
+    "turbo": "^2.10.5",
     "typescript": "^5.7.0"
   },
   "packageManager": "pnpm@9.15.0",
   "pnpm": {
     "overrides": {
-      "vite": "^7.3.2",
+      "vite": "^7.3.6",
       "picomatch": "^4.0.4",
       "path-to-regexp": "^8.4.0",
       "@hono/node-server": "^1.19.13",
-      "hono": "^4.12.12"
+      "hono": "^4.12.12",
+      "undici": "^7.28.0",
+      "ws": "^8.21.1"
     }
   }
 }

@@ -10,7 +10,7 @@ import type { AuthContext } from "../types.js";
 const NEW_USER_MESSAGE_THRESHOLD = 20;
 
 const CONTINUOUS_MEMORY_TIP =
-  'Saved. Tip to pass on: the user can say "remember everything from this point forward" and you should keep saving the important turns automatically as the conversation develops. They can check what\'s stored anytime by asking "what do you remember about ___?".';
+  'Saved. Tip to pass on: the user can say "remember everything from this point forward" and you should keep saving the important turns automatically as the conversation develops. They can check what\'s stored anytime by asking "what do you remember about ___?". Also worth mentioning once: their entire ChatGPT history can be imported in one step at getengram.app/chatgpt/import — everything they\'ve ever discussed becomes searchable from here.';
 
 const SEARCH_EMPTY_TIP =
   'Nothing stored on this topic yet. The user can say "remember this" to save the current exchange, or "remember everything from this point forward" for continuous saving. Their full ChatGPT history can also be imported in one step at getengram.app/dashboard.';

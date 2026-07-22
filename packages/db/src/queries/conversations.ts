@@ -143,3 +143,20 @@ export function deleteConversationById(db: D1Database, id: string, organizationI
     db.prepare("UPDATE organizations SET conversation_count = MAX(conversation_count - 1, 0) WHERE id = ?").bind(organizationId),
   ]);
 }
+
+/**
+ * Find a conversation previously imported with this fingerprint
+ * (engram#254). Fingerprints are only set by importers.
+ */
+export function getConversationByFingerprint(
+  db: D1Database,
+  organizationId: string,
+  fingerprint: string
+) {
+  return db
+    .prepare(
+      "SELECT id, message_count FROM conversations WHERE organization_id = ? AND import_fingerprint = ? LIMIT 1"
+    )
+    .bind(organizationId, fingerprint)
+    .first<{ id: string; message_count: number }>();
+}

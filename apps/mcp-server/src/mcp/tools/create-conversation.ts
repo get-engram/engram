@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { createConversation } from "../../services/conversation.js";
+import { createConversationDedup } from "../../services/conversation.js";
 import { getOrgConversationCount } from "@getengram/db";
 import { checkConversationLimit } from "../../services/tier.js";
 import { fireWebhooks } from "../../services/webhooks.js";
@@ -28,6 +28,11 @@ export function registerCreateConversation(
       },
       outputSchema: {
         conversation_id: z.string().describe("The id of the created conversation"),
+        existing: z
+          .boolean()
+          .optional()
+          .describe("True when an import_fingerprint matched a previously imported conversation"),
+        message_count: z.number().optional(),
       },
       annotations: {
         title: "Create conversation",
@@ -71,7 +76,7 @@ export function registerCreateConversation(
         };
       }
 
-      const id = await createConversation(
+      const created = await createConversationDedup(
         env.DB,
         auth.organizationId,
         params.title,
@@ -79,23 +84,28 @@ export function registerCreateConversation(
         params.tags,
         params.metadata as Record<string, unknown>
       );
+      const id = created.id;
 
-      await audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.create", "conversation", id);
+      if (!created.existing) {
+        await audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.create", "conversation", id);
+        // Fire webhooks (non-blocking)
+        fireWebhooks(env.DB, auth.organizationId, "conversation.created", {
+          conversation_id: id,
+          title: params.title ?? null,
+        }).catch(() => {});
+      }
 
-      // Fire webhooks (non-blocking)
-      fireWebhooks(env.DB, auth.organizationId, "conversation.created", {
+      // `existing` lets importers skip conversations already imported
+      // (engram#254 — same import_fingerprint in metadata).
+      const payload = {
         conversation_id: id,
-        title: params.title ?? null,
-      }).catch(() => {});
-
+        ...(created.existing
+          ? { existing: true, message_count: created.message_count }
+          : {}),
+      };
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({ conversation_id: id }),
-          },
-        ],
-        structuredContent: { conversation_id: id },
+        content: [{ type: "text" as const, text: JSON.stringify(payload) }],
+        structuredContent: payload,
       };
     }
   );

@@ -1,0 +1,39 @@
+name: Bug report
+description: Something in Engram isn't working as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: |
+        1. Called `search` via MCP with …
+        2. Expected results containing …
+        3. Got …
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where did this happen?
+      options:
+        - MCP server (ChatGPT / Claude / Cursor connection)
+        - REST API (/api/v1)
+        - CLI (engram / npx @getengram/cli)
+        - Dashboard (getengram.app)
+        - SDK (@getengram/sdk)
+        - Other / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Errors or logs
+      description: Error messages, response bodies, or CLI output. Redact API keys.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Client version
+      placeholder: e.g. CLI 0.3.1, SDK 0.2.0, or "hosted MCP"

@@ -211,7 +211,9 @@ admin.get("/users", async (c) => {
 // ---------------------------------------------------------------------------
 admin.patch("/users/:id", async (c) => {
   const id = c.req.param("id");
-  const body = await c.req.json<{ tier?: string }>().catch(() => ({} as { tier?: string }));
+  const body = await c.req
+    .json<{ tier?: string; retention_policy_days?: number | null }>()
+    .catch(() => ({} as { tier?: string; retention_policy_days?: number | null }));
   const tier = body.tier;
 
   if (tier && ["free", "pro", "team", "enterprise"].includes(tier)) {
@@ -219,6 +221,20 @@ admin.patch("/users/:id", async (c) => {
       "UPDATE organizations SET tier = ? WHERE id = ?"
     ).bind(tier, id).run();
     return c.json({ updated: true, id, tier });
+  }
+
+  // Custom retention policy (engram#289) — enterprise contracts only.
+  // null clears the policy (memory never expires again); an integer ≥ 7
+  // sets the idle-conversation purge window in days.
+  if ("retention_policy_days" in body) {
+    const days = body.retention_policy_days;
+    if (days !== null && (!Number.isInteger(days) || (days as number) < 7)) {
+      return c.json({ error: "invalid_retention_policy_days", min: 7 }, 400);
+    }
+    await c.env.DB.prepare(
+      "UPDATE organizations SET retention_policy_days = ? WHERE id = ?"
+    ).bind(days, id).run();
+    return c.json({ updated: true, id, retention_policy_days: days });
   }
 
   return c.json({ error: "invalid_tier" }, 400);

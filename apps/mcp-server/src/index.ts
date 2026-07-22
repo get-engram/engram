@@ -23,6 +23,7 @@ import { meterApiRequest } from "./middleware/meter.js";
 import { purgeDeletedOrganizations } from "./cron/purge-deleted.js";
 import { expireGracePeriods } from "./cron/expire-grace.js";
 import { enforceRetentionPolicies } from "./cron/retention-policy.js";
+import { sendImportNudges } from "./cron/import-nudge.js";
 import { sendDailyReport } from "./services/daily-report.js";
 import { oauth } from "./oauth/router.js";
 import {
@@ -226,6 +227,12 @@ export default {
     const retentionDeleted = await enforceRetentionPolicies(env);
     if (retentionDeleted > 0) {
       console.log(`[cron] Retention policy deleted ${retentionDeleted} conversation(s)`);
+    }
+    // Import-first onboarding (engram#253): one nudge email per org that
+    // signed up yesterday and hasn't stored anything yet.
+    const nudged = await sendImportNudges(env);
+    if (nudged > 0) {
+      console.log(`[cron] Sent ${nudged} import-nudge email(s)`);
     }
   },
 };

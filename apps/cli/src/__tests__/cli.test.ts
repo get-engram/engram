@@ -188,3 +188,28 @@ describe("usage bars", () => {
     expect(renderBar(20_000, 10_000)).toBe("[████████████████████] 100%");
   });
 });
+
+describe("import fingerprints (engram#254)", () => {
+  it("carries the ChatGPT conversation id as sourceId", () => {
+    const { conversations } = normalizeExport([
+      { id: "abc-123", title: "T", mapping: {}, current_node: null },
+    ]);
+    expect(conversations[0].sourceId).toBe("abc-123");
+  });
+
+  it("falls back to conversation_id and null when absent", () => {
+    const { conversations } = normalizeExport([
+      { conversation_id: "xyz", mapping: {}, current_node: null },
+      { mapping: {}, current_node: null },
+    ]);
+    expect(conversations[0].sourceId).toBe("xyz");
+    expect(conversations[1].sourceId).toBeNull();
+  });
+
+  it("carries the Claude uuid as sourceId", () => {
+    const { conversations } = normalizeExport([
+      { uuid: "u-1", name: "N", chat_messages: [] },
+    ]);
+    expect(conversations[0].sourceId).toBe("u-1");
+  });
+});

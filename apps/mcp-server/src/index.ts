@@ -21,6 +21,7 @@ import { v1 } from "./routes/v1.js";
 import { meterApiRequest } from "./middleware/meter.js";
 import { purgeDeletedOrganizations } from "./cron/purge-deleted.js";
 import { expireGracePeriods } from "./cron/expire-grace.js";
+import { enforceRetentionPolicies } from "./cron/retention-policy.js";
 import { sendDailyReport } from "./services/daily-report.js";
 import { oauth } from "./oauth/router.js";
 import {
@@ -206,6 +207,12 @@ export default {
     const graceExpired = await expireGracePeriods(env);
     if (graceExpired > 0) {
       console.log(`[cron] Expired ${graceExpired} grace period(s)`);
+    }
+    // Enterprise custom-retention policies (engram#289) — no-op unless an
+    // admin has explicitly set retention_policy_days on an org.
+    const retentionDeleted = await enforceRetentionPolicies(env);
+    if (retentionDeleted > 0) {
+      console.log(`[cron] Retention policy deleted ${retentionDeleted} conversation(s)`);
     }
   },
 };

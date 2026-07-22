@@ -17,6 +17,7 @@ import { privacy } from "./routes/privacy.js";
 import { dataExport } from "./routes/export.js";
 import { oauthConnections } from "./routes/oauth-connections.js";
 import { memories } from "./routes/memories.js";
+import { invites } from "./routes/invites.js";
 import { v1 } from "./routes/v1.js";
 import { meterApiRequest } from "./middleware/meter.js";
 import { purgeDeletedOrganizations } from "./cron/purge-deleted.js";
@@ -118,6 +119,18 @@ app.use(
   }),
 );
 app.route("/signup", signup);
+
+// Team invite accept flow (engram#263) — public routes keyed by an
+// unguessable single-use token; POST verifies the invitee's Supabase JWT.
+app.use(
+  "/invites/*",
+  cors({
+    origin: BROWSER_ORIGINS,
+    allowMethods: ["GET", "POST", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization"],
+  }),
+);
+app.route("/invites", invites);
 
 // Stripe webhook — public, verified by HMAC signature instead of API key.
 // Mounted BEFORE the /api/* auth middleware so it isn't gated.

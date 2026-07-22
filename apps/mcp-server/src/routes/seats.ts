@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { generateId } from "@getengram/shared";
+import { generateId, hashApiKey } from "@getengram/shared";
 import { insertSeat, getSeatsByOrg, getSeatCount, getSeatByEmail, deleteSeat, acceptSeat, getOrganizationById, revokeApiKeysBySeat } from "@getengram/db";
 import type { Env, AuthContext } from "../types.js";
 
@@ -49,7 +49,21 @@ seats.post("/", async (c) => {
     throw e;
   }
 
-  return c.json({ id, email: body.email, role, status: "invited" }, 201);
+  // Single-use invite token (engram#263) — returned raw exactly once so
+  // the caller (engram-web) can email an accept link; only the hash is
+  // stored. Accepting happens on the public /invites routes.
+  const tokenBytes = new Uint8Array(24);
+  crypto.getRandomValues(tokenBytes);
+  const inviteToken =
+    "inv_" + Array.from(tokenBytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  await c.env.DB.prepare("UPDATE seats SET invite_token_hash = ? WHERE id = ?")
+    .bind(await hashApiKey(inviteToken), id)
+    .run();
+
+  return c.json(
+    { id, email: body.email, role, status: "invited", invite_token: inviteToken },
+    201,
+  );
 });
 
 // Accept a seat invitation

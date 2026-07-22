@@ -25,7 +25,8 @@ export type AuditAction =
   | "subscription.portal"
   | "subscription.checkout"
   | "subscription.upgrade_redirect"
-  | "oauth.connection.revoked";
+  | "oauth.connection.revoked"
+  | "seat.accepted";
 
 /**
  * Audit log entry. Never throws — audit logging should not break the

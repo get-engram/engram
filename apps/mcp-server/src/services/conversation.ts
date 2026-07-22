@@ -10,6 +10,7 @@ import {
 import {
   insertConversation,
   getConversationById,
+  getConversationByFingerprint,
   getDefaultConversationId,
   DEFAULT_CONVERSATION_TAG,
   listConversations as dbListConversations,
@@ -35,6 +36,37 @@ export async function createConversation(
   tags?: string[],
   metadata?: Record<string, unknown>
 ): Promise<string> {
+  const created = await createConversationDedup(
+    db, organizationId, title, agentId, tags, metadata,
+  );
+  return created.id;
+}
+
+/**
+ * Create a conversation, honoring importer idempotency (engram#254):
+ * when metadata.import_fingerprint is present and a conversation with
+ * that fingerprint already exists for the org, return it instead of
+ * creating a duplicate. The fingerprint is also promoted to its indexed
+ * column on insert.
+ */
+export async function createConversationDedup(
+  db: D1Database,
+  organizationId: string,
+  title?: string,
+  agentId?: string,
+  tags?: string[],
+  metadata?: Record<string, unknown>
+): Promise<{ id: string; existing: boolean; message_count: number }> {
+  const fingerprint =
+    typeof metadata?.import_fingerprint === "string" && metadata.import_fingerprint
+      ? metadata.import_fingerprint.slice(0, 200)
+      : null;
+
+  if (fingerprint) {
+    const dupe = await getConversationByFingerprint(db, organizationId, fingerprint);
+    if (dupe) return { id: dupe.id, existing: true, message_count: dupe.message_count ?? 0 };
+  }
+
   const id = generateId("conv");
   await insertConversation(
     db,
@@ -45,7 +77,13 @@ export async function createConversation(
     tags ?? [],
     metadata ?? {}
   );
-  return id;
+  if (fingerprint) {
+    await db
+      .prepare("UPDATE conversations SET import_fingerprint = ? WHERE id = ?")
+      .bind(fingerprint, id)
+      .run();
+  }
+  return { id, existing: false, message_count: 0 };
 }
 
 /**

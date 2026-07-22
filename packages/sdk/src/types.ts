@@ -119,6 +119,13 @@ export interface ListConversationsParams {
 
 export interface CreateConversationResponse {
   conversationId: string;
+  /**
+   * True when metadata.import_fingerprint matched a previously imported
+   * conversation — the returned id is the existing one (engram#254).
+   */
+  existing?: boolean;
+  /** Message count of the existing conversation, when existing is true. */
+  messageCount?: number;
 }
 
 export interface StoreResponse {

@@ -35,6 +35,8 @@ interface ChatNode {
 }
 
 export interface ChatConversation {
+  id?: string | null;
+  conversation_id?: string | null;
   title?: string | null;
   create_time?: number | null;
   current_node?: string | null;
@@ -50,6 +52,7 @@ interface ClaudeMessage {
 }
 
 export interface ClaudeConversation {
+  uuid?: string | null;
   name?: string | null;
   created_at?: string | null;
   chat_messages?: ClaudeMessage[];
@@ -61,6 +64,12 @@ export interface NormalizedConversation {
   title: string;
   created: string | number | null;
   messages: MessageInput[];
+  /**
+   * Stable id from the source export (ChatGPT conversation id / Claude
+   * uuid). Drives idempotent re-imports (engram#254); null when the
+   * export doesn't carry one.
+   */
+  sourceId: string | null;
 }
 
 const STORE_BATCH = 100;
@@ -136,6 +145,7 @@ export function normalizeExport(parsed: unknown): {
         title: (c.title || "Untitled").slice(0, 200),
         created: c.create_time ?? null,
         messages: linearize(c),
+        sourceId: c.id ?? c.conversation_id ?? null,
       })),
     };
   }
@@ -147,6 +157,7 @@ export function normalizeExport(parsed: unknown): {
         title: (c.name || "Untitled").slice(0, 200),
         created: c.created_at ?? null,
         messages: linearizeClaude(c),
+        sourceId: c.uuid ?? null,
       })),
     };
   }
@@ -371,12 +382,23 @@ export async function importHistory(
 
     try {
       const tags = [source, ...(extraTag ? [extraTag] : [])];
-      const { conversationId } = await engram.createConversation({
+      const { conversationId, existing } = await engram.createConversation({
         title: convo.title,
         agentId: source,
         tags,
-        metadata: { source: `${format}-export`, original_create_time: convo.created },
+        metadata: {
+          source: `${format}-export`,
+          original_create_time: convo.created,
+          // Stable fingerprint → re-imports reuse the same conversation
+          // instead of duplicating it (engram#254).
+          ...(convo.sourceId ? { import_fingerprint: `${format}:${convo.sourceId}` } : {}),
+        },
       });
+      if (existing) {
+        console.log(`  ${dim("↷ already imported")} ${label}`);
+        skipped++;
+        continue;
+      }
       for (let b = 0; b < convo.messages.length; b += STORE_BATCH) {
         await engram.store({
           conversationId,

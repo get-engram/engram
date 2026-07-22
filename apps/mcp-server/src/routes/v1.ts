@@ -5,7 +5,7 @@ import {
   getOrgConversationCount,
 } from "@getengram/db";
 import {
-  createConversation,
+  createConversationDedup,
   getConversation,
   deleteConversation,
   appendMessages,
@@ -92,7 +92,7 @@ v1.post("/conversations", async (c) => {
     );
   }
 
-  const id = await createConversation(
+  const created = await createConversationDedup(
     c.env.DB,
     auth.organizationId,
     parsed.data.title,
@@ -100,16 +100,23 @@ v1.post("/conversations", async (c) => {
     parsed.data.tags,
     parsed.data.metadata as Record<string, unknown>,
   );
+  if (created.existing) {
+    // Idempotent import (engram#254): fingerprint matched — no new row.
+    return c.json(
+      { conversation_id: created.id, existing: true, message_count: created.message_count },
+      200,
+    );
+  }
 
-  await audit(c.env.DB, auth.organizationId, auth.apiKeyId, "conversation.create", "conversation", id, {
+  await audit(c.env.DB, auth.organizationId, auth.apiKeyId, "conversation.create", "conversation", created.id, {
     source: "rest",
   });
   fireWebhooks(c.env.DB, auth.organizationId, "conversation.created", {
-    conversation_id: id,
+    conversation_id: created.id,
     title: parsed.data.title ?? null,
   }).catch(() => {});
 
-  return c.json({ conversation_id: id }, 201);
+  return c.json({ conversation_id: created.id }, 201);
 });
 
 // ---------------------------------------------------------------------------

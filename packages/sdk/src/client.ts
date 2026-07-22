@@ -109,7 +109,19 @@ export class Engram {
 
     const raw = await this.transport.callTool("create_conversation", args);
     const data = JSON.parse(raw);
-    return { conversationId: data.conversation_id };
+    return {
+      conversationId: data.conversation_id,
+      // Present only when metadata.import_fingerprint matched a
+      // previously imported conversation (engram#254).
+      ...(data.existing === true
+        ? {
+            existing: true,
+            ...(typeof data.message_count === "number"
+              ? { messageCount: data.message_count }
+              : {}),
+          }
+        : {}),
+    };
   }
 
   /**

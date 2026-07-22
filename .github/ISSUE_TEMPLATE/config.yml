@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/get-engram/engram/security/policy
+    about: Please report security issues privately via our security policy — not in a public issue.
+  - name: Account & billing support
+    url: https://getengram.app/support
+    about: Questions about your Engram account, plan, or billing.
+  - name: Documentation
+    url: https://getengram.app/docs
+    about: Guides, API reference, and limits.

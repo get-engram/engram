@@ -33,7 +33,8 @@ export function registerDeleteConversation(
       const deleted = await deleteConversation(
         env,
         auth.organizationId,
-        params.conversation_id
+        params.conversation_id,
+        auth
       );
 
       await audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.delete", "conversation", params.conversation_id);

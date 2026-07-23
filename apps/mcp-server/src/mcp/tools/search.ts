@@ -105,6 +105,7 @@ export function registerSearch(
         undefined, // minScore
         undefined, // dedupe
         params.project,
+        auth.seatId, // private-space filter (engram#264)
       );
 
       // When bodies are hidden, return the matching conversations'

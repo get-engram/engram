@@ -31,7 +31,7 @@ export function getApiKeyByHash(db: D1Database, keyHash: string) {
 export function getApiKeyWithOrg(db: D1Database, keyHash: string) {
   return db
     .prepare(
-      `SELECT k.id AS key_id, k.organization_id, k.scopes, o.tier
+      `SELECT k.id AS key_id, k.organization_id, k.scopes, k.seat_id, o.tier
        FROM api_keys k
        JOIN organizations o ON o.id = k.organization_id
        WHERE k.key_hash = ?
@@ -39,7 +39,7 @@ export function getApiKeyWithOrg(db: D1Database, keyHash: string) {
          AND (k.expires_at IS NULL OR k.expires_at > datetime('now'))`
     )
     .bind(keyHash)
-    .first<{ key_id: string; organization_id: string; scopes: string; tier: string }>();
+    .first<{ key_id: string; organization_id: string; scopes: string; seat_id: string | null; tier: string }>();
 }
 
 export function updateApiKeyLastUsed(db: D1Database, id: string) {

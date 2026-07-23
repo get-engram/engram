@@ -21,6 +21,8 @@ import {
 } from "../../services/tier.js";
 import { fireWebhooks } from "../../services/webhooks.js";
 import { checkMilestone } from "../../services/milestones.js";
+import { canAccessConversation } from "../../services/spaces.js";
+import { getConversationById } from "@getengram/db";
 import { audit } from "../../services/audit.js";
 import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
@@ -182,6 +184,21 @@ export function registerAppendMessages(
       const conversationId =
         params.conversation_id ??
         (await getOrCreateDefaultConversation(env.DB, auth.organizationId));
+
+      // Private-space enforcement (engram#264): appending into another
+      // seat's private conversation is refused as not-found.
+      if (params.conversation_id) {
+        const conv = await getConversationById(env.DB, params.conversation_id, auth.organizationId);
+        if (conv && !canAccessConversation(auth, conv as { visibility?: string | null; seat_id?: string | null })) {
+          await releaseStorage(env.DB, auth.organizationId, count);
+          return {
+            content: [
+              { type: "text" as const, text: JSON.stringify({ error: "Conversation not found" }) },
+            ],
+            isError: true,
+          };
+        }
+      }
 
       let messages;
       try {

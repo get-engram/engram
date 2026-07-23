@@ -84,6 +84,7 @@ export async function authMiddleware(
     apiKeyId: row.key_id,
     tier: (row.tier ?? "free") as AuthContext["tier"],
     scopes: parseScopes(row.scopes),
+    seatId: row.seat_id ?? null,
   });
 
   // Update last_used_at non-blocking

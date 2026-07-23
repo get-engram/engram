@@ -27,6 +27,7 @@ import {
 import { fireWebhooks } from "../services/webhooks.js";
 import { audit } from "../services/audit.js";
 import { hasScope, type Scope } from "../mcp/scopes.js";
+import { canAccessConversation } from "../services/spaces.js";
 import { usageMeter } from "../mcp/usage-messaging.js";
 import type { Env, AuthContext } from "../types.js";
 import type { Context } from "hono";
@@ -64,6 +65,7 @@ const createConversationSchema = z.object({
   agent_id: z.string().optional(),
   tags: z.array(z.string()).optional(),
   metadata: z.record(z.unknown()).optional(),
+  visibility: z.enum(["shared", "private"]).optional(),
 });
 
 v1.post("/conversations", async (c) => {
@@ -99,6 +101,7 @@ v1.post("/conversations", async (c) => {
     parsed.data.agent_id,
     parsed.data.tags,
     parsed.data.metadata as Record<string, unknown>,
+    { seatId: auth.seatId, visibility: parsed.data.visibility },
   );
   if (created.existing) {
     // Idempotent import (engram#254): fingerprint matched — no new row.
@@ -152,6 +155,8 @@ v1.get("/conversations", async (c) => {
     tags: tagsParam ? tagsParam.split(",").map((t) => t.trim()).filter(Boolean) : undefined,
     sort,
     order,
+    viewerSeatId: auth.seatId ?? null,
+    filterVisibility: true,
   });
 
   const conversations = (result.results as Array<Record<string, unknown>>).map(
@@ -192,6 +197,10 @@ v1.get("/conversations/:id", async (c) => {
     messageOffset,
   );
   if (!result) return c.json({ error: "conversation_not_found" }, 404);
+  if (!canAccessConversation(auth, result.conversation as { visibility?: string | null; seat_id?: string | null })) {
+    // Private to another seat — indistinguishable from absent (engram#264).
+    return c.json({ error: "conversation_not_found" }, 404);
+  }
 
   // Strip internal fields and honor the org's privacy setting, exactly
   // like the MCP tool.
@@ -227,7 +236,7 @@ v1.delete("/conversations/:id", async (c) => {
   if (!hasScope(auth, "delete")) return scopeError(c, "delete");
 
   const conversationId = c.req.param("id");
-  const deleted = await deleteConversation(c.env, auth.organizationId, conversationId);
+  const deleted = await deleteConversation(c.env, auth.organizationId, conversationId, auth);
 
   await audit(c.env.DB, auth.organizationId, auth.apiKeyId, "conversation.delete", "conversation", conversationId, {
     source: "rest",
@@ -374,6 +383,7 @@ v1.get("/search", async (c) => {
     undefined, // minScore
     undefined, // dedupe
     project,
+    auth.seatId, // private-space filter (engram#264)
   );
   const results = privacy.canReadBodies
     ? raw

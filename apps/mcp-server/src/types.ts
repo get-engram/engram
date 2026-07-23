@@ -29,4 +29,7 @@ export interface AuthContext {
   scopes: Scope[];
   /** True when authenticated via ADMIN_SECRET — grants cross-org visibility. */
   isAdmin?: boolean;
+  /** Seat the API key is bound to (engram#264) — null for owner keys and
+   * OAuth connections. Drives private-memory visibility. */
+  seatId?: string | null;
 }

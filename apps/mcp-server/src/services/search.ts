@@ -59,7 +59,8 @@ export async function searchConversations(
   snippetChars: number = DEFAULT_SNIPPET_CHARS,
   minScore: number = DEFAULT_MIN_SCORE,
   dedupe: boolean = true,
-  project?: string
+  project?: string,
+  viewerSeatId?: string | null
 ): Promise<SearchResult[]> {
   const cappedSnippet = Math.min(
     Math.max(snippetChars, 0),
@@ -178,16 +179,30 @@ export async function searchConversations(
     string,
     { title: string; tags: string[]; updatedAt: string | null }
   >();
+  // Conversations the caller may NOT see (engram#264) — explicit
+  // blocklist so chunks with merely-missing metadata keep the legacy
+  // behavior of passing through.
+  const blockedConvIds = new Set<string>();
 
   if (uniqueConvIds.length > 0) {
     const placeholders = uniqueConvIds.map(() => "?").join(",");
     const rows = await env.DB.prepare(
-      `SELECT id, title, tags, updated_at FROM conversations WHERE id IN (${placeholders}) AND organization_id = ?`
+      `SELECT id, title, tags, updated_at, visibility, seat_id FROM conversations WHERE id IN (${placeholders}) AND organization_id = ?`
     )
       .bind(...uniqueConvIds, organizationId)
-      .all<{ id: string; title: string; tags: string; updated_at: string | null }>();
+      .all<{ id: string; title: string; tags: string; updated_at: string | null; visibility?: string | null; seat_id?: string | null }>();
 
     for (const row of rows.results) {
+      // Private-space enforcement (engram#264): a chunk whose
+      // conversation is private to a different seat is invisible to
+      // this caller.
+      if (
+        (row.visibility ?? "shared") === "private" &&
+        (row.seat_id ?? null) !== (viewerSeatId ?? null)
+      ) {
+        blockedConvIds.add(row.id);
+        continue;
+      }
       convMeta.set(row.id, {
         title: row.title,
         tags: row.tags ? JSON.parse(row.tags) : [],
@@ -204,6 +219,7 @@ export async function searchConversations(
     const chunk = chunkMap.get(chunkId);
     if (!chunk) continue;
     const meta = convMeta.get(chunk.conversation_id);
+    if (blockedConvIds.has(chunk.conversation_id)) continue; // private to another seat (engram#264)
     const titleHit =
       !!meta?.title &&
       terms.some((t) => meta.title.toLowerCase().includes(t));

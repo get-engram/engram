@@ -5,16 +5,18 @@ export function insertConversation(
   title: string | null,
   agentId: string | null,
   tags: string[],
-  metadata: Record<string, unknown>
+  metadata: Record<string, unknown>,
+  seatId: string | null = null,
+  visibility: "shared" | "private" = "shared"
 ) {
   // Insert the row, bump the denormalized org counter (engram#41), and populate
   // the conversation_tags junction index (engram#42) — all atomically.
   const statements = [
     db
       .prepare(
-        "INSERT INTO conversations (id, organization_id, title, agent_id, tags, metadata) VALUES (?, ?, ?, ?, ?, ?)"
+        "INSERT INTO conversations (id, organization_id, title, agent_id, tags, metadata, seat_id, visibility) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
       )
-      .bind(id, organizationId, title, agentId, JSON.stringify(tags), JSON.stringify(metadata)),
+      .bind(id, organizationId, title, agentId, JSON.stringify(tags), JSON.stringify(metadata), seatId, visibility),
     db
       .prepare(
         "UPDATE organizations SET conversation_count = conversation_count + 1 WHERE id = ?"
@@ -70,10 +72,23 @@ export function listConversations(
     tags?: string[];
     sort: string;
     order: string;
+    /** Seat of the caller (engram#264): private conversations belonging
+     * to other seats are hidden. Omit to skip filtering (admin/export). */
+    viewerSeatId?: string | null;
+    filterVisibility?: boolean;
   }
 ) {
   let sql = "SELECT * FROM conversations WHERE organization_id = ?";
   const params: unknown[] = [organizationId];
+
+  if (opts.filterVisibility) {
+    if (opts.viewerSeatId) {
+      sql += " AND (visibility != 'private' OR seat_id = ?)";
+      params.push(opts.viewerSeatId);
+    } else {
+      sql += " AND (visibility != 'private' OR seat_id IS NULL)";
+    }
+  }
 
   if (opts.agentId) {
     sql += " AND agent_id = ?";

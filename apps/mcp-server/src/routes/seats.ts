@@ -88,6 +88,50 @@ seats.post("/:id/accept", async (c) => {
   return c.json({ id: seatId, status: "accepted" });
 });
 
+// Update a seat's role (engram-web#92). Owner isn't assignable — it
+// belongs to the org account itself, not a seat.
+seats.patch("/:id", async (c) => {
+  const auth = c.get("auth");
+  const seatId = c.req.param("id");
+  const body = await c.req.json<{ role?: string }>().catch(() => ({}) as { role?: string });
+  if (body.role !== "admin" && body.role !== "member") {
+    return c.json({ error: "invalid_role", allowed: ["admin", "member"] }, 400);
+  }
+  const result = await c.env.DB.prepare(
+    "UPDATE seats SET role = ? WHERE id = ? AND organization_id = ?",
+  )
+    .bind(body.role, seatId, auth.organizationId)
+    .run();
+  if (result.meta?.changes === 0) return c.json({ error: "seat_not_found" }, 404);
+  return c.json({ id: seatId, role: body.role });
+});
+
+// Re-send an invite (engram#263): mint a fresh single-use token for a
+// still-pending seat. The caller (engram-web) emails the new link.
+seats.post("/:id/resend", async (c) => {
+  const auth = c.get("auth");
+  const seatId = c.req.param("id");
+  const seat = await c.env.DB.prepare(
+    "SELECT id, email, accepted_at FROM seats WHERE id = ? AND organization_id = ?",
+  )
+    .bind(seatId, auth.organizationId)
+    .first<{ id: string; email: string; accepted_at: string | null }>();
+  if (!seat) return c.json({ error: "seat_not_found" }, 404);
+  if (seat.accepted_at) return c.json({ error: "already_accepted" }, 409);
+
+  const tokenBytes = new Uint8Array(24);
+  crypto.getRandomValues(tokenBytes);
+  const inviteToken =
+    "inv_" + Array.from(tokenBytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  await c.env.DB.prepare(
+    "UPDATE seats SET invite_token_hash = ?, invited_at = datetime('now') WHERE id = ?",
+  )
+    .bind(await hashApiKey(inviteToken), seatId)
+    .run();
+
+  return c.json({ id: seatId, email: seat.email, invite_token: inviteToken });
+});
+
 // Remove a seat (and revoke its API keys)
 seats.delete("/:id", async (c) => {
   const auth = c.get("auth");

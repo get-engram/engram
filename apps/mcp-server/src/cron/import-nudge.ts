@@ -4,8 +4,12 @@ import type { Env } from "../types.js";
  * Import-first onboarding, email leg (engram#253): orgs that signed up
  * 1–2 days ago and still have an essentially empty memory (only the
  * seeded welcome note) get one nudge to import their ChatGPT history —
- * the single action that fills their account with value. The 24h–48h
- * window means the daily cron fires it exactly once per org.
+ * the single action that fills their account with value.
+ *
+ * Fires on the 3rd day (72h–96h window = once per org). OpenAI's data
+ * export can take "a few days" to arrive, so a 24h nudge would land
+ * before the user even has their conversations.json — this waits until
+ * the export realistically would have shown up.
  */
 export async function sendImportNudges(env: Env): Promise<number> {
   if (!env.APP_URL) return 0;
@@ -15,8 +19,8 @@ export async function sendImportNudges(env: Env): Promise<number> {
      WHERE deleted_at IS NULL
        AND email IS NOT NULL
        AND messages_stored_total <= 1
-       AND created_at <= datetime('now', '-1 day')
-       AND created_at > datetime('now', '-2 days')
+       AND created_at <= datetime('now', '-3 days')
+       AND created_at > datetime('now', '-4 days')
      LIMIT 100`,
   ).all<{ id: string; name: string; email: string }>();
 

@@ -25,6 +25,10 @@ export function registerCreateConversation(
         agent_id: z.string().optional().describe("Agent identifier (e.g. \"chatgpt\")"),
         tags: z.array(z.string()).optional().describe("Tags for filtering"),
         metadata: z.record(z.unknown()).optional().describe("Arbitrary metadata"),
+        visibility: z
+          .enum(["shared", "private"])
+          .optional()
+          .describe("Team accounts: 'private' keeps this conversation visible only to the seat that created it. Default 'shared' (org-wide)."),
       },
       outputSchema: {
         conversation_id: z.string().describe("The id of the created conversation"),
@@ -82,7 +86,8 @@ export function registerCreateConversation(
         params.title,
         params.agent_id,
         params.tags,
-        params.metadata as Record<string, unknown>
+        params.metadata as Record<string, unknown>,
+        { seatId: auth.seatId, visibility: params.visibility }
       );
       const id = created.id;
 

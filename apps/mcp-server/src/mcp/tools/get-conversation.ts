@@ -3,6 +3,7 @@ import { z } from "zod";
 import { getConversation } from "../../services/conversation.js";
 import { audit } from "../../services/audit.js";
 import { loadPrivacy, PRIVACY_BODIES_NOTICE } from "../../services/privacy.js";
+import { canAccessConversation } from "../../services/spaces.js";
 import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
 
@@ -79,7 +80,11 @@ export function registerGetConversation(
         params.message_offset
       );
 
-      if (!result) {
+      if (
+        !result ||
+        !canAccessConversation(auth, result.conversation as { visibility?: string | null; seat_id?: string | null })
+      ) {
+        // Private to another seat is indistinguishable from absent (engram#264).
         return {
           content: [
             {

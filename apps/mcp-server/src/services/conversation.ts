@@ -26,7 +26,8 @@ import {
 import { generateEmbeddings } from "./embedding.js";
 import { releaseStorage } from "./tier.js";
 import { compressContent, decompressContent } from "../utils/compress.js";
-import type { Env } from "../types.js";
+import type { Env, AuthContext } from "../types.js";
+import { canAccessConversation } from "./spaces.js";
 
 export async function createConversation(
   db: D1Database,
@@ -34,10 +35,11 @@ export async function createConversation(
   title?: string,
   agentId?: string,
   tags?: string[],
-  metadata?: Record<string, unknown>
+  metadata?: Record<string, unknown>,
+  space?: { seatId?: string | null; visibility?: "shared" | "private" }
 ): Promise<string> {
   const created = await createConversationDedup(
-    db, organizationId, title, agentId, tags, metadata,
+    db, organizationId, title, agentId, tags, metadata, space,
   );
   return created.id;
 }
@@ -55,7 +57,8 @@ export async function createConversationDedup(
   title?: string,
   agentId?: string,
   tags?: string[],
-  metadata?: Record<string, unknown>
+  metadata?: Record<string, unknown>,
+  space?: { seatId?: string | null; visibility?: "shared" | "private" }
 ): Promise<{ id: string; existing: boolean; message_count: number }> {
   const fingerprint =
     typeof metadata?.import_fingerprint === "string" && metadata.import_fingerprint
@@ -75,7 +78,9 @@ export async function createConversationDedup(
     title ?? null,
     agentId ?? null,
     tags ?? [],
-    metadata ?? {}
+    metadata ?? {},
+    space?.seatId ?? null,
+    space?.visibility ?? "shared"
   );
   if (fingerprint) {
     await db
@@ -313,10 +318,16 @@ export async function getConversation(
 export async function deleteConversation(
   env: Env,
   organizationId: string,
-  conversationId: string
+  conversationId: string,
+  viewer?: AuthContext
 ): Promise<boolean> {
   const conv = await getConversationById(env.DB, conversationId, organizationId);
   if (!conv) return false;
+  // Private-space enforcement (engram#264): only the owning seat can
+  // delete a private conversation; report it as absent to others.
+  if (viewer && !canAccessConversation(viewer, conv as { visibility?: string | null; seat_id?: string | null })) {
+    return false;
+  }
 
   // Get vectorize IDs to delete from Vectorize
   const chunksResult = await getVectorizeIdsByConversation(

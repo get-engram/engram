@@ -112,7 +112,7 @@ memories.get("/search", async (c) => {
     return c.json({ results: [], total: 0, privacy_notice: PRIVACY_CROSS_CONVERSATION_NOTICE });
   }
 
-  const raw = await searchConversations(c.env, auth.organizationId, query, limit);
+  const raw = await searchConversations(c.env, auth.organizationId, query, limit, undefined, undefined, undefined, undefined, undefined, undefined, auth.seatId);
   const results = privacy.canReadBodies
     ? raw
     : raw.map(({ chunk_text: _c, ...rest }) => rest);

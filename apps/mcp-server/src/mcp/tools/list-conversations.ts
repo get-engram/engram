@@ -82,6 +82,8 @@ export function registerListConversations(
         tags: params.tags,
         sort: params.sort,
         order: params.order,
+        viewerSeatId: auth.seatId ?? null,
+        filterVisibility: true,
       });
 
       const conversations = (result.results as Array<Record<string, unknown>>).map(

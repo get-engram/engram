@@ -20,6 +20,7 @@ import {
   releaseStorage,
 } from "../../services/tier.js";
 import { fireWebhooks } from "../../services/webhooks.js";
+import { checkMilestone } from "../../services/milestones.js";
 import { audit } from "../../services/audit.js";
 import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
@@ -90,6 +91,7 @@ export function registerAppendMessages(
           .optional()
           .describe("Lifetime memory storage for the org (capped tiers only) — memory never expires; it fills up"),
         notice: z.string().optional().describe("Heads-up shown when approaching the plan limit"),
+        milestone: z.string().optional().describe("One-time notice when lifetime storage crosses a threshold — worth relaying to the user"),
         storage_notice: z.string().optional().describe("Heads-up shown when memory storage is nearly full"),
       },
       annotations: {
@@ -234,6 +236,9 @@ export function registerAppendMessages(
       // Coaching keys off lifetime storage — the count that exists on
       // every tier (free has no monthly meter anymore).
       const tip = newUserAppendTip(auth, storageCheck.used ?? tierCheck.used);
+      // One-time storage milestones (engram#256) — ambient proof the
+      // memory is growing; fires once per threshold per org.
+      const milestone = await checkMilestone(env, auth.organizationId, storageCheck.used);
       const payload = {
         conversation_id: conversationId,
         appended: messages.length,
@@ -243,6 +248,7 @@ export function registerAppendMessages(
         ...(storageMeterVal ? { storage: storageMeterVal } : {}),
         ...(notice ? { notice } : {}),
         ...(storageNotice ? { storage_notice: storageNotice } : {}),
+        ...(milestone ? { milestone } : {}),
         ...(tip ? { tip } : {}),
       };
 

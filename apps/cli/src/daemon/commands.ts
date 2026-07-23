@@ -12,6 +12,18 @@ import { join, resolve } from "node:path";
 import { bold, dim, red } from "../output.js";
 import { DaemonDb } from "./db.js";
 import { readStatus, type SyncStatus } from "./status.js";
+import { ALL_ADAPTERS } from "./adapters.js";
+
+/** Render the per-host capture status (engram#261). */
+function printHostStatus(): void {
+  console.log(`${dim("Hosts:")}`);
+  for (const a of ALL_ADAPTERS) {
+    const on = a.available();
+    const mark = on ? "✓" : "·";
+    const state = on ? "capturing" : "not installed";
+    console.log(`  ${mark} ${a.label.padEnd(14)} ${dim(state)}`);
+  }
+}
 
 const ENGRAM_DIR = join(homedir(), ".engram");
 const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
@@ -171,6 +183,8 @@ export async function daemonStatus(): Promise<void> {
     console.log(`${dim("Pending sync:")}      ${stats.pendingMessages} messages`);
     console.log(`${dim("Files tracked:")}     ${stats.trackedFiles}`);
   }
+
+  printHostStatus();
 
   // Show sync health warnings
   const syncStatus = readStatus();

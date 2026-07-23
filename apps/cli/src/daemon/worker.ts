@@ -13,12 +13,12 @@ import { loadConfig, getBaseUrl } from "../config.js";
 import { DaemonDb } from "./db.js";
 import { Watcher } from "./watcher.js";
 import { Syncer } from "./syncer.js";
+import { availableAdapters } from "./adapters.js";
 
 const ENGRAM_DIR = join(homedir(), ".engram");
 const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
 const DB_FILE = join(ENGRAM_DIR, "daemon.db");
 const LOG_FILE = join(ENGRAM_DIR, "daemon.log");
-const CLAUDE_PROJECTS_DIR = join(homedir(), ".claude", "projects");
 
 function log(msg: string): void {
   const ts = new Date().toISOString();
@@ -31,7 +31,6 @@ async function main(): Promise<void> {
   writeFileSync(PID_FILE, String(process.pid));
 
   log(`daemon started (pid ${process.pid})`);
-  log(`watching: ${CLAUDE_PROJECTS_DIR}`);
   log(`database: ${DB_FILE}`);
 
   // Load API key
@@ -62,18 +61,27 @@ async function main(): Promise<void> {
     });
   };
 
-  const watcher = new Watcher(db, onMessages, CLAUDE_PROJECTS_DIR);
+  // One watcher per installed host (engram#261). Hosts that aren't
+  // installed are skipped, so this is safe on any machine.
+  const adapters = availableAdapters();
+  if (adapters.length === 0) {
+    log("no supported hosts detected (Claude Code, Codex). Nothing to watch.");
+  }
+  const watchers = adapters.map((a) => {
+    log(`watching ${a.label}: ${a.watchDir}`);
+    return new Watcher(db, onMessages, a);
+  });
 
   // Start
-  watcher.start();
+  for (const w of watchers) w.start();
   syncer.startFlushLoop();
 
-  log("watching for transcripts...");
+  log(`watching for transcripts across ${watchers.length} host(s)...`);
 
   // Graceful shutdown
   const shutdown = async () => {
     log("shutting down...");
-    watcher.stop();
+    for (const w of watchers) w.stop();
     syncer.stopFlushLoop();
 
     // Final flush

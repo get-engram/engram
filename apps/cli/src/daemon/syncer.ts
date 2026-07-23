@@ -233,14 +233,18 @@ export class Syncer {
     sessionId: string,
     meta: SessionMeta,
   ): Promise<string> {
-    const title = `${meta.projectDir} (${new Date().toISOString().slice(0, 16).replace("T", " ")})`;
+    const host = meta.host ?? "claude-code";
+    const title = `${meta.projectDir || host} (${new Date().toISOString().slice(0, 16).replace("T", " ")})`;
 
     const { conversationId } = await this.client.createConversation({
       title,
-      agentId: "claude-code",
-      tags: ["claude-code", "auto-capture"],
+      // Per-host tagging (engram#261) so captures are attributable and
+      // filterable by source tool.
+      agentId: host,
+      tags: [host, "auto-capture"],
       metadata: {
         sessionId,
+        host,
         projectDir: meta.projectDir,
         cwd: meta.cwd,
         gitBranch: meta.gitBranch,

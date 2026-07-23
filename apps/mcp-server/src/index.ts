@@ -24,6 +24,7 @@ import { purgeDeletedOrganizations } from "./cron/purge-deleted.js";
 import { expireGracePeriods } from "./cron/expire-grace.js";
 import { enforceRetentionPolicies } from "./cron/retention-policy.js";
 import { sendImportNudges } from "./cron/import-nudge.js";
+import { sendWeeklyDigests } from "./cron/weekly-digest.js";
 import { sendDailyReport } from "./services/daily-report.js";
 import { oauth } from "./oauth/router.js";
 import {
@@ -121,6 +122,24 @@ app.use(
 );
 app.route("/signup", signup);
 
+// One-click digest unsubscribe (engram#256) — signed link from the
+// weekly email; no login required. GET so it works from any mail client.
+app.get("/email/unsubscribe", async (c) => {
+  const org = c.req.query("org") ?? "";
+  const sig = c.req.query("sig") ?? "";
+  const secret = (c.env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET;
+  if (!org || !sig || !secret) return c.text("Invalid link.", 400);
+  const { unsubscribeSig } = await import("./cron/weekly-digest.js");
+  const expected = await unsubscribeSig(org, secret);
+  if (sig !== expected) return c.text("Invalid link.", 400);
+  await c.env.DB.prepare("UPDATE organizations SET digest_opt_out = 1 WHERE id = ?")
+    .bind(org)
+    .run();
+  return c.html(
+    "<!doctype html><meta charset=utf-8><title>Unsubscribed</title><body style=\"font-family:sans-serif;max-width:32rem;margin:4rem auto;color:#27272a\"><h1 style=\"font-size:1.4rem\">You're unsubscribed</h1><p>No more weekly digest emails. Account and security emails still arrive when needed.</p><p><a href=\"https://getengram.app\">getengram.app</a></p>",
+  );
+});
+
 // Team invite accept flow (engram#263) — public routes keyed by an
 // unguessable single-use token; POST verifies the invitee's Supabase JWT.
 app.use(
@@ -212,6 +231,11 @@ export default {
     //   13:00 UTC — daily ops report, emailed via engram-web
     if (event.cron === "0 13 * * *") {
       await sendDailyReport(env);
+      // Weekly memory digest (engram#256) — Mondays only.
+      if (new Date(event.scheduledTime).getUTCDay() === 1) {
+        const digests = await sendWeeklyDigests(env);
+        if (digests > 0) console.log(`[cron] Sent ${digests} weekly digest(s)`);
+      }
       return;
     }
     const purged = await purgeDeletedOrganizations(env);

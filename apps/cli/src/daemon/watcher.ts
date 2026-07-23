@@ -1,24 +1,26 @@
 import { watch, type FSWatcher } from "chokidar";
 import { openSync, readSync, closeSync, statSync } from "node:fs";
 import { DaemonDb } from "./db.js";
-import { Parser } from "./parser.js";
-import type { OnMessages } from "./parser.js";
+import type { OnMessages, LineParser, HostAdapter } from "./types.js";
 
 /**
- * Watches ~/.claude/projects/ for JSONL transcript files and feeds new
- * lines to the parser. Uses byte-offset tracking so it never re-reads
- * already-processed content, even after daemon restart.
+ * Watches one host's session directory for JSONL files and feeds new
+ * lines to that host's parser (engram#261). Uses byte-offset tracking so
+ * it never re-reads already-processed content, even after daemon
+ * restart. One Watcher per host adapter.
  */
 export class Watcher {
   private db: DaemonDb;
-  private parser: Parser;
+  private parser: LineParser;
   private fsWatcher: FSWatcher | null = null;
   private watchDir: string;
+  readonly host: string;
 
-  constructor(db: DaemonDb, onMessages: OnMessages, watchDir: string) {
+  constructor(db: DaemonDb, onMessages: OnMessages, adapter: HostAdapter) {
     this.db = db;
-    this.parser = new Parser(onMessages);
-    this.watchDir = watchDir;
+    this.parser = adapter.createParser(onMessages);
+    this.watchDir = adapter.watchDir;
+    this.host = adapter.id;
   }
 
   start(): void {
@@ -37,7 +39,9 @@ export class Watcher {
       persistent: true,
       ignoreInitial: false,
       awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 },
-      depth: 3,
+      // Claude nests ~2 (projects/<proj>/file); Codex nests 4
+      // (sessions/YYYY/MM/DD/file). Cover both (engram#261).
+      depth: 6,
     });
 
     this.fsWatcher.on("add", (path) => this.processFile(path));

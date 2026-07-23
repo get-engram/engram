@@ -1,4 +1,4 @@
-import type { ParsedMessage, SessionMeta } from "./types.js";
+import type { ParsedMessage, SessionMeta, OnMessages, LineParser } from "./types.js";
 
 // Line types we skip entirely
 const SKIP_TYPES = new Set([
@@ -41,12 +41,6 @@ interface PendingAssistant {
   toolUses: { name: string; input: unknown }[];
 }
 
-export type OnMessages = (
-  sessionId: string,
-  meta: SessionMeta,
-  messages: ParsedMessage[],
-) => void;
-
 /**
  * Parses Claude Code JSONL transcript lines into Engram messages.
  *
@@ -55,7 +49,7 @@ export type OnMessages = (
  * accumulate blocks and flush when the message is complete (stop_reason
  * is set) or a new message begins.
  */
-export class Parser {
+export class Parser implements LineParser {
   private pending: PendingAssistant | null = null;
   private lastSessionId: string | null = null;
   private lastMeta: SessionMeta | null = null;
@@ -88,6 +82,7 @@ export class Parser {
       gitBranch: data.gitBranch,
       projectDir,
       version: data.version,
+      host: "claude-code",
     };
     this.lastSessionId = sessionId;
     this.lastMeta = meta;

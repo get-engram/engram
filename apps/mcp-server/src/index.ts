@@ -24,6 +24,7 @@ import { purgeDeletedOrganizations } from "./cron/purge-deleted.js";
 import { expireGracePeriods } from "./cron/expire-grace.js";
 import { enforceRetentionPolicies } from "./cron/retention-policy.js";
 import { sendImportNudges } from "./cron/import-nudge.js";
+import { sendMaxoutNudges } from "./cron/maxout-nudge.js";
 import { sendWeeklyDigests } from "./cron/weekly-digest.js";
 import { sendDailyReport } from "./services/daily-report.js";
 import { oauth } from "./oauth/router.js";
@@ -257,6 +258,11 @@ export default {
     const nudged = await sendImportNudges(env);
     if (nudged > 0) {
       console.log(`[cron] Sent ${nudged} import-nudge email(s)`);
+    }
+    // Maxout upgrade nudge: free orgs that filled their 10k-message memory.
+    const maxout = await sendMaxoutNudges(env);
+    if (maxout > 0) {
+      console.log(`[cron] Sent ${maxout} maxout-nudge email(s)`);
     }
   },
 };

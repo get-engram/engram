@@ -187,6 +187,12 @@ describe("usage bars", () => {
     expect(renderBar(10_000, 10_000)).toBe("[████████████████████] 100%");
     expect(renderBar(20_000, 10_000)).toBe("[████████████████████] 100%");
   });
+
+  it("shows at least one filled segment for any nonzero usage", async () => {
+    const { renderBar } = await import("../commands/usage.js");
+    expect(renderBar(1, 10_000)).toBe("[█░░░░░░░░░░░░░░░░░░░]   0%");
+    expect(renderBar(65, 10_000)).toBe("[█░░░░░░░░░░░░░░░░░░░]   1%");
+  });
 });
 
 describe("import fingerprints (engram#254)", () => {

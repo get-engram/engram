@@ -21,7 +21,9 @@ export function meterBar(used?: number, limit?: number): string | undefined {
     return undefined;
   }
   const pct = Math.min(100, Math.round((used / limit) * 100));
-  const filled = Math.min(10, Math.round(pct / 10));
+  // Any nonzero usage shows at least one filled segment so the bar never
+  // reads as empty (an all-░ bar renders as a blank grey pill in many fonts).
+  const filled = Math.max(used > 0 ? 1 : 0, Math.min(10, Math.round(pct / 10)));
   return `[${"█".repeat(filled)}${"░".repeat(10 - filled)}] ${pct}%`;
 }
 

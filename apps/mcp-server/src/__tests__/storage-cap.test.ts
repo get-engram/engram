@@ -70,6 +70,9 @@ describe("storage messaging", () => {
   it("meterBar renders a 10-segment bar with percentage", () => {
     expect(meterBar(8_200, 10_000)).toBe("[████████░░] 82%");
     expect(meterBar(0, 10_000)).toBe("[░░░░░░░░░░] 0%");
+    // nonzero usage always shows at least one filled segment
+    expect(meterBar(1, 10_000)).toBe("[█░░░░░░░░░] 0%");
+    expect(meterBar(65, 10_000)).toBe("[█░░░░░░░░░] 1%");
     expect(meterBar(10_000, 10_000)).toBe("[██████████] 100%");
     expect(meterBar(15_000, 10_000)).toBe("[██████████] 100%");
     expect(meterBar(5, -1)).toBeUndefined();

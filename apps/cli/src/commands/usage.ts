@@ -6,7 +6,10 @@ const API_URL = process.env.ENGRAM_BASE_URL ?? getBaseUrl();
 /** Render a progress bar like "[████████████░░░░░░░░] 62%". Exported for tests. */
 export function renderBar(used: number, limit: number, width = 20): string {
   const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
-  const filled = Math.min(width, Math.round((pct / 100) * width));
+  // Any nonzero usage shows at least one filled segment so the bar never
+  // reads as empty (an all-░ bar renders as a blank grey pill in many fonts).
+  const minFilled = used > 0 && limit > 0 ? 1 : 0;
+  const filled = Math.max(minFilled, Math.min(width, Math.round((pct / 100) * width)));
   return `[${"█".repeat(filled)}${"░".repeat(width - filled)}] ${String(pct).padStart(3)}%`;
 }
 

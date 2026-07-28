@@ -396,20 +396,42 @@ admin.post("/daily-report/send", async (c) => {
 // every transactional send here; the public /email/open pixel stamps opens.
 // ---------------------------------------------------------------------------
 
-// POST /admin/email-log — record a sent email { id, recipient, type, org_id? }
+// POST /admin/email-log — record a sent email { id, recipient, type, org_id?,
+// sent_at? }. sent_at (ISO "YYYY-MM-DD HH:MM:SS") is for backfilling history
+// from the Hostinger Sent folder; live sends omit it and default to now.
 admin.post("/email-log", async (c) => {
   const body = await c.req
-    .json<{ id?: string; recipient?: string; type?: string; org_id?: string }>()
+    .json<{
+      id?: string;
+      recipient?: string;
+      type?: string;
+      org_id?: string;
+      sent_at?: string;
+    }>()
     .catch(() => ({}) as Record<string, never>);
   if (!body.id || !body.recipient || !body.type) {
     return c.json({ error: "id, recipient, and type are required" }, 400);
   }
+  const sentAt =
+    body.sent_at && /^\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d$/.test(body.sent_at)
+      ? body.sent_at.replace("T", " ")
+      : null;
   await c.env.DB.prepare(
-    "INSERT OR IGNORE INTO email_log (id, org_id, recipient, type) VALUES (?, ?, ?, ?)",
+    "INSERT OR IGNORE INTO email_log (id, org_id, recipient, type, sent_at) VALUES (?, ?, ?, ?, COALESCE(?, datetime('now')))",
   )
-    .bind(body.id, body.org_id ?? null, body.recipient, body.type)
+    .bind(body.id, body.org_id ?? null, body.recipient, body.type, sentAt)
     .run();
   return c.json({ logged: true });
+});
+
+// DELETE /admin/email-log?type= — remove rows of a given type (test cleanup)
+admin.delete("/email-log", async (c) => {
+  const type = c.req.query("type") ?? "";
+  if (!type) return c.json({ error: "type query param required" }, 400);
+  const res = await c.env.DB.prepare("DELETE FROM email_log WHERE type = ?")
+    .bind(type)
+    .run();
+  return c.json({ deleted: res.meta.changes ?? 0 });
 });
 
 // GET /admin/email-log — by-type stats + recent sends for the admin dashboard

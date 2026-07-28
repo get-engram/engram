@@ -299,7 +299,7 @@ admin.get("/users/:id/stripe", async (c) => {
 
   if (org.stripe_customer_id && c.env.STRIPE_SECRET_KEY) {
     const subsRes = await fetch(
-      `https://api.stripe.com/v1/subscriptions?customer=${org.stripe_customer_id}&limit=10`,
+      `https://api.stripe.com/v1/subscriptions?customer=${org.stripe_customer_id}&status=all&limit=10`,
       { headers: { Authorization: `Bearer ${c.env.STRIPE_SECRET_KEY}` } },
     );
     if (subsRes.ok) {
@@ -351,13 +351,13 @@ admin.get("/users/:id/stripe", async (c) => {
 admin.post("/users/:id/sync-stripe", async (c) => {
   const id = c.req.param("id");
   const org = await c.env.DB.prepare(
-    "SELECT id, stripe_customer_id FROM organizations WHERE id = ?"
-  ).bind(id).first<{ id: string; stripe_customer_id: string | null }>();
+    "SELECT id, tier, stripe_customer_id FROM organizations WHERE id = ?"
+  ).bind(id).first<{ id: string; tier: string; stripe_customer_id: string | null }>();
   if (!org) return c.json({ error: "not_found" }, 404);
   if (!org.stripe_customer_id) return c.json({ error: "no_stripe_customer" }, 400);
 
   const subsRes = await fetch(
-    `https://api.stripe.com/v1/subscriptions?customer=${org.stripe_customer_id}&limit=10`,
+    `https://api.stripe.com/v1/subscriptions?customer=${org.stripe_customer_id}&status=all&limit=10`,
     { headers: { Authorization: `Bearer ${c.env.STRIPE_SECRET_KEY}` } },
   );
   if (!subsRes.ok) return c.json({ error: "stripe_api_error" }, 502);
@@ -373,22 +373,26 @@ admin.post("/users/:id/sync-stripe", async (c) => {
 
   const activeSub = subs.data.find((s) => s.status === "active" || s.status === "trialing");
   if (!activeSub) {
-    // No live subscription. If the org was on a paid tier, that's a churn —
-    // stamp churned_at (with Stripe's canceled_at when available) so the
-    // admin shows "cancelled" instead of plain free. Backfills historical
-    // cancellations the webhook never saw (migration 0030 predates them).
-    const canceled = subs.data.find((s) => s.canceled_at);
+    // No live subscription. A canceled sub in the history (status=all) or a
+    // currently-paid tier means this org churned — stamp churned_at (with
+    // Stripe's canceled_at when available, keeping any earlier stamp) so the
+    // admin shows "cancelled" instead of plain free. Backfills cancellations
+    // the webhook never saw, including orgs already downgraded to free.
+    const canceled = subs.data
+      .filter((s) => s.canceled_at)
+      .sort((a, b) => (b.canceled_at ?? 0) - (a.canceled_at ?? 0))[0];
     const churnedAt = canceled?.canceled_at
       ? new Date(canceled.canceled_at * 1000).toISOString().slice(0, 19).replace("T", " ")
       : null;
+    const isChurn = Boolean(churnedAt) || org.tier !== "free";
     await c.env.DB.prepare(
       `UPDATE organizations SET
-         churned_at = CASE WHEN tier != 'free' THEN COALESCE(?, datetime('now')) ELSE churned_at END,
+         churned_at = CASE WHEN ? THEN COALESCE(churned_at, COALESCE(?, datetime('now'))) ELSE churned_at END,
          cancel_at_period_end = 0,
          tier = 'free', stripe_subscription_id = NULL, seat_limit = 1
        WHERE id = ?`
-    ).bind(churnedAt, id).run();
-    return c.json({ synced: true, tier: "free", subscription: null, churned_at: churnedAt });
+    ).bind(isChurn ? 1 : 0, churnedAt, id).run();
+    return c.json({ synced: true, tier: "free", subscription: null, churned_at: isChurn ? (churnedAt ?? "now") : null });
   }
 
   const priceId = activeSub.items?.data?.[0]?.price?.id;

@@ -311,6 +311,10 @@ admin.get("/users/:id/stripe", async (c) => {
           created: number;
           trial_start: number | null;
           trial_end: number | null;
+          cancel_at_period_end: boolean;
+          cancel_at: number | null;
+          canceled_at: number | null;
+          current_period_end: number | null;
         }>;
       };
       const stripeSubs = subs.data.map((s) => ({
@@ -322,6 +326,10 @@ admin.get("/users/:id/stripe", async (c) => {
         created: new Date(s.created * 1000).toISOString(),
         trial_start: s.trial_start ? new Date(s.trial_start * 1000).toISOString() : null,
         trial_end: s.trial_end ? new Date(s.trial_end * 1000).toISOString() : null,
+        cancel_at_period_end: s.cancel_at_period_end,
+        cancel_at: s.cancel_at ? new Date(s.cancel_at * 1000).toISOString() : null,
+        canceled_at: s.canceled_at ? new Date(s.canceled_at * 1000).toISOString() : null,
+        current_period_end: s.current_period_end ? new Date(s.current_period_end * 1000).toISOString() : null,
       }));
       result.stripe = { customer_id: org.stripe_customer_id, subscriptions: stripeSubs };
 
@@ -358,15 +366,29 @@ admin.post("/users/:id/sync-stripe", async (c) => {
     data: Array<{
       id: string; status: string;
       items: { data: Array<{ price: { id: string }; quantity: number }> };
+      cancel_at_period_end: boolean;
+      canceled_at: number | null;
     }>;
   };
 
   const activeSub = subs.data.find((s) => s.status === "active" || s.status === "trialing");
   if (!activeSub) {
+    // No live subscription. If the org was on a paid tier, that's a churn —
+    // stamp churned_at (with Stripe's canceled_at when available) so the
+    // admin shows "cancelled" instead of plain free. Backfills historical
+    // cancellations the webhook never saw (migration 0030 predates them).
+    const canceled = subs.data.find((s) => s.canceled_at);
+    const churnedAt = canceled?.canceled_at
+      ? new Date(canceled.canceled_at * 1000).toISOString().slice(0, 19).replace("T", " ")
+      : null;
     await c.env.DB.prepare(
-      "UPDATE organizations SET tier = 'free', stripe_subscription_id = NULL, seat_limit = 1 WHERE id = ?"
-    ).bind(id).run();
-    return c.json({ synced: true, tier: "free", subscription: null });
+      `UPDATE organizations SET
+         churned_at = CASE WHEN tier != 'free' THEN COALESCE(?, datetime('now')) ELSE churned_at END,
+         cancel_at_period_end = 0,
+         tier = 'free', stripe_subscription_id = NULL, seat_limit = 1
+       WHERE id = ?`
+    ).bind(churnedAt, id).run();
+    return c.json({ synced: true, tier: "free", subscription: null, churned_at: churnedAt });
   }
 
   const priceId = activeSub.items?.data?.[0]?.price?.id;
@@ -376,14 +398,22 @@ admin.post("/users/:id/sync-stripe", async (c) => {
   const seatLimit = tier === "team" ? quantity : 1;
 
   await c.env.DB.prepare(
-    "UPDATE organizations SET tier = ?, stripe_subscription_id = ?, seat_limit = ? WHERE id = ?"
-  ).bind(tier, activeSub.id, seatLimit, id).run();
+    "UPDATE organizations SET tier = ?, stripe_subscription_id = ?, seat_limit = ?, cancel_at_period_end = ?, churned_at = CASE WHEN ? = 0 THEN NULL ELSE churned_at END WHERE id = ?"
+  ).bind(
+    tier,
+    activeSub.id,
+    seatLimit,
+    activeSub.cancel_at_period_end ? 1 : 0,
+    activeSub.cancel_at_period_end ? 1 : 0,
+    id,
+  ).run();
 
   return c.json({
     synced: true,
     tier,
     subscription_id: activeSub.id,
     status: activeSub.status,
+    cancel_at_period_end: activeSub.cancel_at_period_end,
     seat_limit: seatLimit,
   });
 });

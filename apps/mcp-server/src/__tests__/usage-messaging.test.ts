@@ -26,9 +26,9 @@ describe("limitMessage", () => {
     expect(m).toMatch(/sign in/i);
     expect(m).toMatch(/don't try to collect payment/i);
   });
-  it("points API-key users to pricing", () => {
+  it("points API-key users to key login", () => {
     const m = limitMessage({ unit: "messages", tier: "free", limit: 1000, used: 1000, isOAuth: false });
-    expect(m).toContain("getengram.app/pricing");
+    expect(m).toContain("getengram.app/login");
     expect(m).toContain("1000");
   });
 });
@@ -36,7 +36,7 @@ describe("limitMessage", () => {
 describe("approachingLimitNotice", () => {
   it("warns at/above 80% usage", () => {
     expect(approachingLimitNotice({ used: 800, limit: 1000, remaining: 200 }, true)).toMatch(/dashboard/);
-    expect(approachingLimitNotice({ used: 950, limit: 1000, remaining: 50 }, false)).toMatch(/pricing/);
+    expect(approachingLimitNotice({ used: 950, limit: 1000, remaining: 50 }, false)).toMatch(/login/);
   });
   it("stays quiet below 80%", () => {
     expect(approachingLimitNotice({ used: 500, limit: 1000, remaining: 500 }, true)).toBeUndefined();

@@ -45,9 +45,9 @@ describe("storage messaging", () => {
     expect(m).toMatch(/don't try to collect payment/i);
   });
 
-  it("memory-full copy points API callers at pricing", () => {
+  it("memory-full copy points API callers at key login", () => {
     const m = storageFullMessage({ limit: 10_000, isOAuth: false });
-    expect(m).toContain("getengram.app/pricing");
+    expect(m).toContain("getengram.app/login");
     expect(m).toMatch(/delete old conversations/i);
   });
 

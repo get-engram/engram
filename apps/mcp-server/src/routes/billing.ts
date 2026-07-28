@@ -15,6 +15,20 @@ import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
 
+/**
+ * Stamp churned_at when a PAYING org loses its subscription (migration
+ * 0030). Guarded on tier so free orgs bouncing through cancel events don't
+ * get marked; the flag clears again if they later resubscribe.
+ */
+async function markChurned(db: Env["DB"], orgId: string): Promise<void> {
+  await db
+    .prepare(
+      "UPDATE organizations SET churned_at = datetime('now'), cancel_at_period_end = 0 WHERE id = ? AND tier != 'free'",
+    )
+    .bind(orgId)
+    .run();
+}
+
 const billing = new Hono<HonoEnv>();
 
 // POST /api/billing/checkout
@@ -315,12 +329,20 @@ billingWebhook.post("/", async (c) => {
       ) {
         const seatLimit = newTier === "team" ? quantity : 1;
         await setOrganizationTier(c.env.DB, orgId, newTier, subscriptionId, seatLimit);
+        // Track scheduled cancellation ("pro but cancelling" in admin). An
+        // active sub also clears any past churn stamp — they came back.
+        await c.env.DB.prepare(
+          "UPDATE organizations SET cancel_at_period_end = ?, churned_at = CASE WHEN ? = 0 THEN NULL ELSE churned_at END WHERE id = ?",
+        )
+          .bind(obj.cancel_at_period_end ? 1 : 0, obj.cancel_at_period_end ? 1 : 0, orgId)
+          .run();
       } else if (
         status === "canceled" ||
         status === "incomplete_expired" ||
         status === "unpaid" ||
         status === "past_due"
       ) {
+        await markChurned(c.env.DB, orgId);
         await setOrganizationTier(c.env.DB, orgId, "free", null, 1);
       }
       break;
@@ -329,6 +351,7 @@ billingWebhook.post("/", async (c) => {
     case "customer.subscription.deleted": {
       const orgId = await resolveOrgIdFromEvent(c.env, obj);
       if (orgId) {
+        await markChurned(c.env.DB, orgId);
         await setOrganizationTier(c.env.DB, orgId, "free", null, 1);
       }
       break;

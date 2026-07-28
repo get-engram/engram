@@ -141,6 +141,35 @@ app.get("/email/unsubscribe", async (c) => {
   );
 });
 
+// Open-tracking pixel (migration 0029) — referenced from transactional
+// emails. Public by necessity (mail clients fetch it); the id is an
+// unguessable UUID minted at send time, and a miss is a silent no-op.
+// Always returns the 1x1 GIF regardless, so nothing renders as broken.
+const PIXEL_GIF = Uint8Array.from([
+  0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00,
+  0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+  0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
+]);
+app.get("/email/open", async (c) => {
+  const id = c.req.query("id") ?? "";
+  if (/^[0-9a-f-]{36}$/i.test(id)) {
+    try {
+      await c.env.DB.prepare(
+        "UPDATE email_log SET opened_at = datetime('now') WHERE id = ? AND opened_at IS NULL",
+      )
+        .bind(id)
+        .run();
+    } catch {
+      // Table may not exist yet mid-deploy; the pixel must never error.
+    }
+  }
+  return c.body(PIXEL_GIF, 200, {
+    "Content-Type": "image/gif",
+    "Cache-Control": "no-store, max-age=0",
+  });
+});
+
 // Team invite accept flow (engram#263) — public routes keyed by an
 // unguessable single-use token; POST verifies the invitee's Supabase JWT.
 app.use(

@@ -391,6 +391,61 @@ admin.post("/daily-report/send", async (c) => {
   return c.json({ sent: true });
 });
 
+// ---------------------------------------------------------------------------
+// Email observability (migration 0029): engram-web's sendEmail() records
+// every transactional send here; the public /email/open pixel stamps opens.
+// ---------------------------------------------------------------------------
+
+// POST /admin/email-log — record a sent email { id, recipient, type, org_id? }
+admin.post("/email-log", async (c) => {
+  const body = await c.req
+    .json<{ id?: string; recipient?: string; type?: string; org_id?: string }>()
+    .catch(() => ({}) as Record<string, never>);
+  if (!body.id || !body.recipient || !body.type) {
+    return c.json({ error: "id, recipient, and type are required" }, 400);
+  }
+  await c.env.DB.prepare(
+    "INSERT OR IGNORE INTO email_log (id, org_id, recipient, type) VALUES (?, ?, ?, ?)",
+  )
+    .bind(body.id, body.org_id ?? null, body.recipient, body.type)
+    .run();
+  return c.json({ logged: true });
+});
+
+// GET /admin/email-log — by-type stats + recent sends for the admin dashboard
+admin.get("/email-log", async (c) => {
+  const days = Math.min(Number(c.req.query("days") || "30"), 365);
+  const [byType, recent] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT type,
+              COUNT(*) as sent,
+              SUM(CASE WHEN opened_at IS NOT NULL THEN 1 ELSE 0 END) as opened,
+              MAX(sent_at) as last_sent
+       FROM email_log
+       WHERE sent_at >= datetime('now', '-' || ? || ' days')
+       GROUP BY type ORDER BY sent DESC`,
+    )
+      .bind(days)
+      .all<{ type: string; sent: number; opened: number; last_sent: string }>(),
+    c.env.DB.prepare(
+      `SELECT id, org_id, recipient, type, sent_at, opened_at
+       FROM email_log ORDER BY sent_at DESC LIMIT 50`,
+    ).all<{
+      id: string;
+      org_id: string | null;
+      recipient: string;
+      type: string;
+      sent_at: string;
+      opened_at: string | null;
+    }>(),
+  ]);
+  return c.json({
+    days,
+    by_type: byType.results ?? [],
+    recent: recent.results ?? [],
+  });
+});
+
 // GET /admin/audit/:orgId — query audit logs for an organization
 admin.get("/audit/:orgId", async (c) => {
   const orgId = c.req.param("orgId");

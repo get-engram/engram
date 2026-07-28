@@ -13,6 +13,25 @@ type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
 
 const account = new Hono<HonoEnv>();
 
+// GET /api/account — "whoami" for the authenticated key. Lets the web app
+// validate an API key and build a session from it (key-only login for CLI
+// users), and decide whether to prompt for an email.
+account.get("/", async (c) => {
+  const auth = c.get("auth");
+  const org = (await getOrganizationById(c.env.DB, auth.organizationId)) as
+    | { id: string; email: string | null; name: string | null }
+    | null;
+  if (!org) {
+    return c.json({ error: "Organization not found" }, 404);
+  }
+  return c.json({
+    org_id: auth.organizationId,
+    email: org.email ?? null,
+    name: org.name ?? null,
+    tier: auth.tier,
+  });
+});
+
 // PATCH /api/account — update organization settings (email)
 account.patch("/", async (c) => {
   const auth = c.get("auth");

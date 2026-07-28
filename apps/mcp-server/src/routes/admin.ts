@@ -172,6 +172,8 @@ admin.get("/users", async (c) => {
       o.referral_source,
       o.stripe_customer_id,
       o.created_at,
+      o.cancel_at_period_end,
+      o.churned_at,
       COUNT(c.id) as conversations,
       COALESCE(SUM(c.message_count), 0) as total_messages
     FROM organizations o
@@ -190,6 +192,8 @@ admin.get("/users", async (c) => {
       referral_source: string | null;
       stripe_customer_id: string | null;
       created_at: string;
+      cancel_at_period_end: number;
+      churned_at: string | null;
       conversations: number;
       total_messages: number;
     }>();

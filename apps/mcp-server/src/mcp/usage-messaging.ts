@@ -5,6 +5,10 @@
 
 const DASHBOARD = "https://getengram.app/dashboard";
 const PRICING = "https://getengram.app/pricing";
+// API-key/CLI users may have no email on the account — the dashboard's
+// key login ("Sign in with your API key" at /login) is their upgrade path.
+const KEY_LOGIN =
+  "log in at https://getengram.app/login with your API key (choose \"Sign in with your API key\") and upgrade from your dashboard";
 
 export interface UsageMeter {
   used: number;
@@ -61,7 +65,7 @@ export function limitMessage(opts: {
   return (
     `${unit === "messages" ? "Message" : "Conversation"} limit reached ` +
     `(${used ?? "?"}/${limit ?? "?"} this month on the ${tier ?? "free"} plan). ` +
-    `Upgrade at ${PRICING} to continue.`
+    `To continue, ${KEY_LOGIN}.`
   );
 }
 
@@ -87,7 +91,7 @@ export function storageFullMessage(opts: {
   }
   return (
     `Engram's memory is full (${size}). Everything saved stays safe and searchable. ` +
-    `Upgrade at ${PRICING} for more space, or delete old conversations to free room.`
+    `For more space, ${KEY_LOGIN} — Pro is $9/mo for 1,000,000 messages — or delete old conversations to free room.`
   );
 }
 
@@ -103,7 +107,7 @@ export function approachingStorageNotice(
   if (meter.used / meter.limit < 0.8) return undefined;
   const where = isOAuth
     ? `sign in at ${DASHBOARD} with the email you connected and upgrade for more space`
-    : `upgrade at ${PRICING} for more space`;
+    : `${KEY_LOGIN} ($9/mo for 1,000,000 messages)`;
   return (
     `${meter.used.toLocaleString("en-US")}/${meter.limit.toLocaleString("en-US")} messages of memory used ` +
     `(${meter.remaining.toLocaleString("en-US")} left). Nothing ever expires — but to keep saving new ` +
@@ -120,7 +124,7 @@ export function approachingLimitNotice(
   if (meter.used / meter.limit < 0.8) return undefined;
   const where = isOAuth
     ? `sign in at ${DASHBOARD} with the email you connected and upgrade`
-    : `upgrade at ${PRICING}`;
+    : KEY_LOGIN;
   return (
     `${meter.used}/${meter.limit} included messages used this month (${meter.remaining} left). ` +
     `To avoid interruption, ${where}.`

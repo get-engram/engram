@@ -122,7 +122,7 @@ admin.get("/metrics", async (c) => {
   // active subscription items; yearly plans are normalized to monthly.
   // "external" excludes subs whose customer maps to an internal org (the
   // owner's own accounts). Fail-soft: metrics must render without Stripe.
-  const mrr = { total_cents: 0, external_cents: 0, subscriptions: 0 };
+  const mrr = { total_cents: 0, external_cents: 0, subscriptions: 0, external_subscriptions: 0 };
   try {
     if (c.env.STRIPE_SECRET_KEY) {
       const subsRes = await fetch(
@@ -144,7 +144,7 @@ admin.get("/metrics", async (c) => {
         const internalCustomers = new Set(
           (
             await c.env.DB.prepare(
-              "SELECT stripe_customer_id FROM organizations WHERE referral_source = 'internal' AND stripe_customer_id IS NOT NULL",
+              "SELECT stripe_customer_id FROM organizations WHERE stripe_customer_id IS NOT NULL AND (referral_source = 'internal' OR email IN ('maryjanis@yahoo.com', 'debragailinc@gmail.com', 'deb@27c1ub.com'))",
             ).all<{ stripe_customer_id: string }>()
           ).results?.map((r) => r.stripe_customer_id) ?? [],
         );
@@ -161,7 +161,10 @@ admin.get("/metrics", async (c) => {
           }
           mrr.total_cents += Math.round(cents);
           mrr.subscriptions += 1;
-          if (!internalCustomers.has(s.customer)) mrr.external_cents += Math.round(cents);
+          if (!internalCustomers.has(s.customer)) {
+            mrr.external_cents += Math.round(cents);
+            mrr.external_subscriptions += 1;
+          }
         }
       }
     }

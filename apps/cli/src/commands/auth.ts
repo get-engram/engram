@@ -1,6 +1,7 @@
 import { saveConfig, loadConfig } from "../config.js";
 import { green, red } from "../output.js";
 import { Engram } from "@getengram/sdk";
+import { autoEnableCapture } from "../daemon/commands.js";
 
 export async function authLogin(args: string[]): Promise<void> {
   const key = args[0];
@@ -33,6 +34,7 @@ export async function authLogin(args: string[]): Promise<void> {
   console.log(green("✓ Authenticated successfully"));
   console.log(`  Key saved to ~/.engram/config.json`);
   console.log(`  Prefix: ${key.slice(0, 20)}...`);
+  await autoEnableCapture();
 }
 
 export async function authLogout(): Promise<void> {

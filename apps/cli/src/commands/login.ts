@@ -2,6 +2,7 @@ import { createInterface } from "node:readline";
 import { saveConfig, loadConfig, getBaseUrl } from "../config.js";
 import { green, red, dim } from "../output.js";
 import { Engram } from "@getengram/sdk";
+import { autoEnableCapture } from "../daemon/commands.js";
 
 const API_URL = process.env.ENGRAM_BASE_URL ?? getBaseUrl();
 
@@ -88,9 +89,7 @@ export async function signup(): Promise<void> {
   console.log(green("✓ Account created"));
   console.log(`  Organization: ${data.organization_id}`);
   console.log(`  API key saved to ~/.engram/config.json`);
-  console.log(
-    dim("\n  Tip: run 'engram install' to auto-start on login"),
-  );
+  await autoEnableCapture();
   console.log(
     dim("  Tip: run 'engram link <email>' to claim your account for upgrades"),
   );
@@ -176,6 +175,7 @@ export async function login(args: string[] = [], flags: Record<string, string> =
     if (config.apiKey) {
       console.log(green(`✓ Signed in as ${email.trim()}`));
       console.log(`  Using existing API key from ~/.engram/config.json`);
+      await autoEnableCapture();
       return;
     }
     console.error(
@@ -202,4 +202,5 @@ export async function login(args: string[] = [], flags: Record<string, string> =
 
   console.log(green(`✓ Signed in as ${email.trim()}`));
   console.log(`  API key saved to ~/.engram/config.json`);
+  await autoEnableCapture();
 }

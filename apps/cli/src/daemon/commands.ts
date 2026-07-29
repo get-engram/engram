@@ -308,6 +308,41 @@ export async function daemonInstall(): Promise<void> {
   installLaunchd();
 }
 
+/**
+ * Auto-capture is the product default: a successful interactive login
+ * turns the capture daemon on and enables start-at-login, loudly, with a
+ * one-line off switch. Never fatal — login must succeed even if the
+ * daemon can't start. Skipped for scripted logins (no TTY) and when
+ * ENGRAM_NO_AUTOCAPTURE is set.
+ */
+export async function autoEnableCapture(): Promise<void> {
+  if (process.env.ENGRAM_NO_AUTOCAPTURE) return;
+  if (!process.stdin.isTTY) return;
+  if (process.platform !== "darwin" && process.platform !== "linux") return;
+  try {
+    if (!readPid()) {
+      mkdirSync(ENGRAM_DIR, { recursive: true });
+      const logFd = openSync(LOG_FILE, "a");
+      const child = spawn(process.execPath, [getWorkerPath()], {
+        detached: true,
+        stdio: ["ignore", logFd, logFd],
+        env: { ...process.env },
+      });
+      child.unref();
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    if (process.platform === "darwin" && !isLaunchdInstalled()) {
+      installLaunchd();
+    }
+    console.log(
+      `${bold("Auto-capture is on")} — conversations from supported agents on this machine save to your Engram.`,
+    );
+    console.log(dim("  Turn off anytime: engram stop && engram uninstall"));
+  } catch {
+    // Non-fatal by design: capture is a convenience, login is the job.
+  }
+}
+
 export async function daemonUninstall(): Promise<void> {
   uninstallLaunchd();
 }

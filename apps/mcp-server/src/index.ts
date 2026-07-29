@@ -133,9 +133,25 @@ app.get("/email/unsubscribe", async (c) => {
   const { unsubscribeSig } = await import("./cron/weekly-digest.js");
   const expected = await unsubscribeSig(org, secret);
   if (sig !== expected) return c.text("Invalid link.", 400);
-  await c.env.DB.prepare("UPDATE organizations SET digest_opt_out = 1 WHERE id = ?")
+  await c.env.DB.prepare(
+    "UPDATE organizations SET digest_opt_out = 1, digest_opt_out_at = COALESCE(digest_opt_out_at, datetime('now')) WHERE id = ?",
+  )
     .bind(org)
     .run();
+  // Attribute the unsubscribe to the email that (almost certainly) contained
+  // the link they clicked: the most recent send to this org. Approximate but
+  // link-format-free — nothing needs threading through the senders.
+  try {
+    await c.env.DB.prepare(
+      `UPDATE email_log SET unsubscribed_at = datetime('now')
+       WHERE id = (SELECT id FROM email_log WHERE org_id = ? ORDER BY sent_at DESC LIMIT 1)
+         AND unsubscribed_at IS NULL`,
+    )
+      .bind(org)
+      .run();
+  } catch {
+    // email_log may predate migration 0031 mid-deploy; the opt-out already stuck.
+  }
   return c.html(
     "<!doctype html><meta charset=utf-8><title>Unsubscribed</title><body style=\"font-family:sans-serif;max-width:32rem;margin:4rem auto;color:#27272a\"><h1 style=\"font-size:1.4rem\">You're unsubscribed</h1><p>No more weekly digest emails. Account and security emails still arrive when needed.</p><p><a href=\"https://getengram.app\">getengram.app</a></p>",
   );

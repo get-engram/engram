@@ -530,18 +530,25 @@ admin.delete("/email-log", async (c) => {
 // GET /admin/email-log — by-type stats + recent sends for the admin dashboard
 admin.get("/email-log", async (c) => {
   const days = Math.min(Number(c.req.query("days") || "30"), 365);
-  const [byType, recent] = await Promise.all([
+  const [byType, recent, unsub, unsubCount] = await Promise.all([
     c.env.DB.prepare(
       `SELECT type,
               COUNT(*) as sent,
               SUM(CASE WHEN opened_at IS NOT NULL THEN 1 ELSE 0 END) as opened,
+              SUM(CASE WHEN unsubscribed_at IS NOT NULL THEN 1 ELSE 0 END) as unsubscribed,
               MAX(sent_at) as last_sent
        FROM email_log
        WHERE sent_at >= datetime('now', '-' || ? || ' days')
        GROUP BY type ORDER BY sent DESC`,
     )
       .bind(days)
-      .all<{ type: string; sent: number; opened: number; last_sent: string }>(),
+      .all<{
+        type: string;
+        sent: number;
+        opened: number;
+        unsubscribed: number;
+        last_sent: string;
+      }>(),
     c.env.DB.prepare(
       `SELECT id, org_id, recipient, type, sent_at, opened_at
        FROM email_log ORDER BY sent_at DESC LIMIT 50`,
@@ -553,11 +560,23 @@ admin.get("/email-log", async (c) => {
       sent_at: string;
       opened_at: string | null;
     }>(),
+    // Who opted out of lifecycle email, newest first. digest_opt_out_at is
+    // null for opt-outs that predate migration 0031 — they sort last.
+    c.env.DB.prepare(
+      `SELECT name, email, digest_opt_out_at
+       FROM organizations WHERE digest_opt_out = 1
+       ORDER BY digest_opt_out_at IS NULL, digest_opt_out_at DESC LIMIT 20`,
+    ).all<{ name: string; email: string | null; digest_opt_out_at: string | null }>(),
+    c.env.DB.prepare(
+      "SELECT COUNT(*) as n FROM organizations WHERE digest_opt_out = 1",
+    ).first<{ n: number }>(),
   ]);
   return c.json({
     days,
     by_type: byType.results ?? [],
     recent: recent.results ?? [],
+    unsubscribed_orgs: unsubCount?.n ?? 0,
+    recent_unsubscribes: unsub.results ?? [],
   });
 });
 

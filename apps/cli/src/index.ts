@@ -15,6 +15,7 @@ import { search } from "./commands/search.js";
 import { log as showLog } from "./commands/log.js";
 import { importHistory } from "./commands/import.js";
 import { daemonStart, daemonStop, daemonStatus, daemonInstall, daemonUninstall } from "./daemon/index.js";
+import { autoEnableCapture } from "./daemon/commands.js";
 import { upgrade } from "./commands/upgrade.js";
 import { usage as showUsage } from "./commands/usage.js";
 import { vaultKeygen, vaultStatus, loadVaultKey, vaultSet, vaultGet, vaultList, vaultDelete } from "./commands/vault.js";
@@ -203,6 +204,17 @@ async function main(): Promise<void> {
   const { command, args, flags } = parseArgs(raw);
   const cmd = command.join(" ");
 
+  // Capture is the product default: any authenticated interactive use of
+  // the CLI ensures the daemon is running (unless the user explicitly ran
+  // stop/uninstall — autoEnableCapture respects config.autocapture="off").
+  // Runs after the command so its output never interleaves; skipped for
+  // daemon-management and auth commands, which handle capture themselves.
+  const CAPTURE_EXEMPT = new Set([
+    "help", "version", "start", "stop", "restart", "install", "uninstall",
+    "status", "log", "signup", "login", "link", "auth login", "auth logout",
+  ]);
+  const ensureCaptureAfter = !CAPTURE_EXEMPT.has(cmd);
+
   try {
     switch (cmd) {
       case "help":
@@ -363,6 +375,10 @@ async function main(): Promise<void> {
       console.error("An unexpected error occurred");
     }
     process.exit(1);
+  }
+
+  if (ensureCaptureAfter) {
+    await autoEnableCapture();
   }
 }
 

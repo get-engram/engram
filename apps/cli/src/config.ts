@@ -8,6 +8,9 @@ const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 interface Config {
   apiKey?: string;
   baseUrl?: string;
+  /** "off" = the user explicitly stopped capture; the CLI must not
+   *  resurrect the daemon until they run start/install again. */
+  autocapture?: "on" | "off";
 }
 
 export async function loadConfig(): Promise<Config> {

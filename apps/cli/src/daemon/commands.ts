@@ -11,7 +11,6 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { bold, dim, red } from "../output.js";
 import { loadConfig, saveConfig } from "../config.js";
-import { DaemonDb } from "./db.js";
 import { readStatus, type SyncStatus } from "./status.js";
 import { ALL_ADAPTERS } from "./adapters.js";
 
@@ -168,6 +167,22 @@ export async function daemonStop(): Promise<void> {
   try { unlinkSync(PID_FILE); } catch { /* ignore */ }
 }
 
+/** Print local capture stats; never let a broken native module crash status. */
+async function printDbStats(): Promise<void> {
+  if (!existsSync(DB_FILE)) return;
+  try {
+    const { DaemonDb } = await import("./db.js");
+    const db = new DaemonDb(DB_FILE);
+    const stats = db.getStats();
+    db.close();
+    console.log(`${dim("Sessions captured:")} ${stats.sessionsMapped}`);
+    console.log(`${dim("Pending sync:")}      ${stats.pendingMessages} messages`);
+    console.log(`${dim("Files tracked:")}     ${stats.trackedFiles}`);
+  } catch {
+    console.log(dim("Local capture DB unreadable (native module mismatch?) — the daemon rebuilds it on start."));
+  }
+}
+
 export async function daemonStatus(): Promise<void> {
   const pid = readPid();
 
@@ -175,27 +190,13 @@ export async function daemonStatus(): Promise<void> {
     console.log(`${bold("Status:")} stopped`);
 
     // Still show DB stats if available
-    if (existsSync(DB_FILE)) {
-      const db = new DaemonDb(DB_FILE);
-      const stats = db.getStats();
-      db.close();
-      console.log(`${dim("Sessions captured:")} ${stats.sessionsMapped}`);
-      console.log(`${dim("Pending sync:")}      ${stats.pendingMessages} messages`);
-      console.log(`${dim("Files tracked:")}     ${stats.trackedFiles}`);
-    }
+    await printDbStats();
     return;
   }
 
   console.log(`${bold("Status:")} running (pid ${pid})`);
 
-  if (existsSync(DB_FILE)) {
-    const db = new DaemonDb(DB_FILE);
-    const stats = db.getStats();
-    db.close();
-    console.log(`${dim("Sessions captured:")} ${stats.sessionsMapped}`);
-    console.log(`${dim("Pending sync:")}      ${stats.pendingMessages} messages`);
-    console.log(`${dim("Files tracked:")}     ${stats.trackedFiles}`);
-  }
+  await printDbStats();
 
   printHostStatus();
 

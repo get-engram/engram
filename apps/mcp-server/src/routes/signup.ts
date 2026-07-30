@@ -209,6 +209,103 @@ signup.post("/link", async (c) => {
   return c.json({ linked: true, organization_id: keyRow.organization_id, email });
 });
 
+// POST /signup/set-password — give a CLI-born account a web login.
+// Auth: Engram API key Bearer. Body: { password }. Requires the org to
+// already have an email (engram link). Creates the Supabase user through
+// the same public signup endpoint the web form uses, so the email-based
+// org lookup in /signup logs the browser session into THIS org. If
+// Supabase requires email confirmation, the password works after the
+// user clicks the verification link.
+signup.post("/set-password", async (c) => {
+  const authHeader = c.req.header("authorization") ?? "";
+  const token = authHeader.replace(/^Bearer\s+/i, "");
+  if (!token || !token.startsWith("engram_sk_live_")) {
+    return c.json({ error: "unauthorized", message: "Missing or invalid API key" }, 401);
+  }
+  const { hashApiKey } = await import("@getengram/shared");
+  const keyHash = await hashApiKey(token);
+  const keyRow = await c.env.DB.prepare(
+    "SELECT k.organization_id FROM api_keys k WHERE k.key_hash = ?",
+  )
+    .bind(keyHash)
+    .first<{ organization_id: string }>();
+  if (!keyRow) {
+    return c.json({ error: "unauthorized", message: "Invalid API key" }, 401);
+  }
+
+  const org = await c.env.DB.prepare(
+    "SELECT email FROM organizations WHERE id = ?",
+  )
+    .bind(keyRow.organization_id)
+    .first<{ email: string | null }>();
+  if (!org?.email) {
+    return c.json(
+      { error: "no_email", message: "Link an email first: engram link <email>" },
+      400,
+    );
+  }
+
+  const body = await c.req
+    .json<{ password?: string }>()
+    .catch(() => ({}) as { password?: string });
+  const password = body.password ?? "";
+  if (password.length < 8) {
+    return c.json(
+      { error: "weak_password", message: "Password must be at least 8 characters" },
+      400,
+    );
+  }
+
+  const supabaseUrl = c.env.SUPABASE_URL;
+  const supabaseAnonKey = c.env.SUPABASE_ANON_KEY;
+  if (!supabaseUrl || !supabaseAnonKey) {
+    return c.json(
+      { error: "server_misconfigured", message: "Supabase is not configured" },
+      500,
+    );
+  }
+
+  const res = await fetch(`${supabaseUrl}/auth/v1/signup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", apikey: supabaseAnonKey },
+    body: JSON.stringify({ email: org.email, password }),
+  });
+  const j = (await res.json().catch(() => ({}))) as {
+    msg?: string;
+    error_description?: string;
+    session?: unknown;
+    user?: { identities?: unknown[] };
+  };
+  if (!res.ok) {
+    const msg = j.msg || j.error_description || "";
+    if (/already registered/i.test(msg)) {
+      return c.json(
+        {
+          error: "password_exists",
+          message:
+            "This email already has a web login. Sign in at getengram.app/login (or use password reset there).",
+        },
+        409,
+      );
+    }
+    return c.json({ error: "auth_failed", message: msg || `Supabase error ${res.status}` }, 400);
+  }
+  // Supabase obfuscates existing users when confirmations are on: 200 with
+  // an identity-less user instead of an error.
+  if (j.user && Array.isArray(j.user.identities) && j.user.identities.length === 0) {
+    return c.json(
+      {
+        error: "password_exists",
+        message:
+          "This email already has a web login. Sign in at getengram.app/login (or use password reset there).",
+      },
+      409,
+    );
+  }
+
+  return c.json({ ok: true, confirmation_required: !j.session, email: org.email });
+});
+
 // POST /signup/login — authenticate with email + password, return API key.
 // Handles Supabase auth server-side so the CLI doesn't need credentials.
 signup.post("/login", async (c) => {

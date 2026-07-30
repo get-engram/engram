@@ -3,7 +3,7 @@
 import { Engram } from "@getengram/sdk";
 import { loadConfig, getBaseUrl } from "./config.js";
 import { authLogin, authLogout, authStatus } from "./commands/auth.js";
-import { signup, login, link } from "./commands/login.js";
+import { signup, login, link, whoami } from "./commands/login.js";
 import {
   listConversations,
   createConversation,
@@ -26,7 +26,7 @@ const VERSION = "0.3.4";
 const TOP_COMMANDS = new Set([
   "help", "version", "store", "append", "search", "find", "convs",
   "start", "stop", "status", "install", "uninstall", "log",
-  "signup", "login", "link", "upgrade", "import",
+  "signup", "login", "link", "whoami", "upgrade", "import",
 ]);
 // Commands that take 2 words (group + subcommand)
 const GROUP_COMMANDS = new Set(["auth", "conversations", "conv", "daemon", "vault"]);
@@ -123,6 +123,7 @@ ${bold("COMMANDS")}
   ${bold("signup")}                   Create a free account instantly
   ${bold("login")}                    Sign in with email + password
   ${bold("link")}                     Link email to your account for dashboard access
+  ${bold("whoami")}                   Show which account this machine is using
 
   All auth commands accept ${dim("--email")} and ${dim("--password")} flags for non-interactive (agent) usage.
 
@@ -222,6 +223,11 @@ async function main(): Promise<void> {
 
       case "link":
         await link(args, flags);
+        break;
+
+      case "whoami":
+      case "auth whoami":
+        await whoami();
         break;
 
       case "auth login":

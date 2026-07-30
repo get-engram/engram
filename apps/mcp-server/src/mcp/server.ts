@@ -40,13 +40,33 @@ Either way, once they've done one real save, offer these four starting actions i
 - Images and screenshots: Engram stores text. Write out what the image shows or means (names, facts, quotes), then store that text.
 - Skip trivial chatter (greetings, acknowledgements). Storage is verbatim and searchable by meaning.`;
 
+// Secrets guidance differs by connection kind: OAuth connectors can't see
+// the vault tools (app marketplaces prohibit credential collection), which
+// previously read as "Engram has no vault" — models then either refused or,
+// worse, saved secrets into searchable memory. Both variants make the vault's
+// existence explicit and keep secrets out of append_messages.
+const VAULT_INSTRUCTIONS_SHARED = `
+
+SECRETS — Engram includes a zero-knowledge encrypted vault, separate from memory. Memory (append_messages) is searchable, cloud-synced text that resurfaces in future context — NEVER store passwords, API keys, tokens, or government IDs there, even if the user asks; offer the vault instead.`;
+
+const VAULT_INSTRUCTIONS_OAUTH = `${VAULT_INSTRUCTIONS_SHARED}
+When the user wants to save a secret ("save my API key", "add this to my vault"): this connector cannot access the vault (platform rules prohibit collecting credentials here), but the vault EXISTS — tell them to run \`engram vault set <NAME>\` with the Engram CLI, which encrypts the value on their machine (AES-256-GCM) before upload; the server never sees plaintext. Setup: getengram.app/docs.`;
+
+const VAULT_INSTRUCTIONS_FIRST_PARTY = `${VAULT_INSTRUCTIONS_SHARED}
+When the user wants to save a secret, use the vault tools (vault_set / vault_get / vault_list / resolve_vault). Values must be encrypted client-side with the user's vault key (from \`engram vault keygen\`) before calling vault_set — the server only stores ciphertext. If you don't hold the vault key, direct the user to \`engram vault set <NAME>\` in the CLI, which handles encryption locally.`;
+
 export function createMcpServer(env: Env, auth: AuthContext): McpServer {
+  const instructions =
+    SERVER_INSTRUCTIONS +
+    (isExternalOAuthClient(auth)
+      ? VAULT_INSTRUCTIONS_OAUTH
+      : VAULT_INSTRUCTIONS_FIRST_PARTY);
   const server = new McpServer(
     {
       name: "Engram",
       version: "0.1.0",
     },
-    { instructions: SERVER_INSTRUCTIONS },
+    { instructions },
   );
 
   // Core memory tools — available to every client (incl. OAuth-connected

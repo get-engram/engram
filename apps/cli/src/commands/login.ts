@@ -1,6 +1,6 @@
 import { createInterface } from "node:readline";
 import { saveConfig, loadConfig, getBaseUrl } from "../config.js";
-import { green, red, dim } from "../output.js";
+import { green, red, dim, bold } from "../output.js";
 import { Engram } from "@getengram/sdk";
 import { autoEnableCapture } from "../daemon/commands.js";
 
@@ -144,7 +144,88 @@ export async function link(args: string[] = [], flags: Record<string, string> = 
   }
 
   console.log(green(`✓ Account linked to ${email.trim()}`));
-  console.log(`  You can now sign in at getengram.app/login`);
+
+  // Offer a web password so getengram.app/login works with more than the
+  // API key. --password makes it non-interactive for agents.
+  let password = flags.password || "";
+  if (!password && process.stdin.isTTY) {
+    const answer = await prompt("Create a password for web login? [y/N] ");
+    if (/^y(es)?$/i.test(answer.trim())) {
+      password = await prompt("Password (min 8 chars): ", true);
+    }
+  }
+  if (password) {
+    await setWebPassword(apiKey, password);
+  } else {
+    console.log(`  You can sign in at getengram.app/login with your API key`);
+  }
+}
+
+/** POST /signup/set-password — create the Supabase login for this org. */
+async function setWebPassword(apiKey: string, password: string): Promise<void> {
+  const res = await fetch(`${API_URL}/signup/set-password`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ password }),
+  });
+  const j = (await res.json().catch(() => ({}))) as {
+    error?: string;
+    message?: string;
+    confirmation_required?: boolean;
+    email?: string;
+  };
+  if (!res.ok) {
+    console.error(red(j.message || `Failed to set password (${res.status})`));
+    return; // non-fatal: the link itself succeeded
+  }
+  console.log(green("✓ Password set"));
+  if (j.confirmation_required) {
+    console.log(`  Check ${j.email} for a confirmation link, then sign in at getengram.app/login`);
+  } else {
+    console.log(`  Sign in at getengram.app/login`);
+  }
+}
+
+/**
+ * `engram whoami` — which account is this machine using?
+ * Shows the org, email (or anonymous), and tier for the active API key.
+ */
+export async function whoami(): Promise<void> {
+  const config = await loadConfig();
+  const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
+  if (!apiKey) {
+    console.log("Not authenticated.");
+    console.log("\nRun: engram login   (or engram auth login <api-key>)");
+    process.exit(1);
+  }
+
+  const res = await fetch(`${API_URL}/api/account`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  if (!res.ok) {
+    console.error(red(`Could not fetch account (${res.status}). Check your API key.`));
+    process.exit(1);
+  }
+  const acct = (await res.json()) as {
+    org_id: string;
+    email: string | null;
+    name: string | null;
+    tier: string;
+  };
+  const source = process.env.ENGRAM_API_KEY ? "ENGRAM_API_KEY env var" : "~/.engram/config.json";
+
+  console.log(`${bold(acct.name ?? acct.org_id)} ${dim(`(${acct.tier})`)}`);
+  if (acct.email) {
+    console.log(`  Email: ${acct.email}`);
+  } else {
+    console.log(`  Email: ${dim("none — anonymous account")}`);
+    console.log(dim("  Add one (enables web login + billing): engram link <email>"));
+  }
+  console.log(`  Org:   ${acct.org_id}`);
+  console.log(`  Key:   ${apiKey.slice(0, 20)}... ${dim(`(${source})`)}`);
 }
 
 /**

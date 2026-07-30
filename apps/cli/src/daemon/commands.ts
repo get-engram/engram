@@ -10,6 +10,7 @@ import {
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { bold, dim, red } from "../output.js";
+import { loadConfig, saveConfig } from "../config.js";
 import { DaemonDb } from "./db.js";
 import { readStatus, type SyncStatus } from "./status.js";
 import { ALL_ADAPTERS } from "./adapters.js";
@@ -88,6 +89,7 @@ export async function daemonStart(
   _args: string[],
   flags: Record<string, string>,
 ): Promise<void> {
+  await recordCaptureIntent("on");
   const existing = readPid();
   if (existing) {
     console.log(`Daemon already running (pid ${existing})`);
@@ -137,7 +139,18 @@ export async function daemonStart(
   }
 }
 
+async function recordCaptureIntent(v: "on" | "off"): Promise<void> {
+  try {
+    const config = await loadConfig();
+    config.autocapture = v;
+    await saveConfig(config);
+  } catch {
+    // config write failures never block daemon management
+  }
+}
+
 export async function daemonStop(): Promise<void> {
+  await recordCaptureIntent("off");
   const pid = readPid();
   if (!pid) {
     console.log("Daemon is not running.");
@@ -305,6 +318,7 @@ function uninstallLaunchd(): void {
 }
 
 export async function daemonInstall(): Promise<void> {
+  await recordCaptureIntent("on");
   installLaunchd();
 }
 
@@ -320,6 +334,9 @@ export async function autoEnableCapture(): Promise<void> {
   if (!process.stdin.isTTY) return;
   if (process.platform !== "darwin" && process.platform !== "linux") return;
   try {
+    const config = await loadConfig();
+    if (config.autocapture === "off") return; // user said stop; respect it
+    if (!(process.env.ENGRAM_API_KEY ?? config.apiKey)) return; // nothing to capture into
     if (!readPid()) {
       mkdirSync(ENGRAM_DIR, { recursive: true });
       const logFd = openSync(LOG_FILE, "a");
@@ -344,5 +361,6 @@ export async function autoEnableCapture(): Promise<void> {
 }
 
 export async function daemonUninstall(): Promise<void> {
+  await recordCaptureIntent("off");
   uninstallLaunchd();
 }

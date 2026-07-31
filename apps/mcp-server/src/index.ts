@@ -276,11 +276,21 @@ export default {
     //   03:00 UTC — GDPR purge of soft-deleted orgs
     //   13:00 UTC — daily ops report, emailed via engram-web
     if (event.cron === "0 13 * * *") {
-      await sendDailyReport(env);
+      // Isolated so a report failure can't swallow the Monday digests —
+      // and vice versa. Failures land in the worker logs with context.
+      try {
+        await sendDailyReport(env);
+      } catch (err) {
+        console.error(`[cron] daily report FAILED: ${err instanceof Error ? err.message : err}`);
+      }
       // Weekly memory digest (engram#256) — Mondays only.
       if (new Date(event.scheduledTime).getUTCDay() === 1) {
-        const digests = await sendWeeklyDigests(env);
-        if (digests > 0) console.log(`[cron] Sent ${digests} weekly digest(s)`);
+        try {
+          const digests = await sendWeeklyDigests(env);
+          if (digests > 0) console.log(`[cron] Sent ${digests} weekly digest(s)`);
+        } catch (err) {
+          console.error(`[cron] weekly digests FAILED: ${err instanceof Error ? err.message : err}`);
+        }
       }
       return;
     }

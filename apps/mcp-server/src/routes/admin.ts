@@ -196,6 +196,14 @@ admin.get("/metrics", async (c) => {
       messages: totals?.messages ?? 0,
       chunks: dbSize?.chunks ?? 0,
       api_keys: dbSize?.api_keys ?? 0,
+      // Physical D1 size vs the 10 GB per-database cap — watch this as
+      // messages grow. null if the platform rejects the pragma.
+      db_bytes: await c.env.DB.prepare(
+        "SELECT page_count * page_size AS bytes FROM pragma_page_count(), pragma_page_size()",
+      )
+        .first<{ bytes: number }>()
+        .then((r) => r?.bytes ?? null)
+        .catch(() => null),
     },
     today_signups: todaySignups?.results ?? [],
   });

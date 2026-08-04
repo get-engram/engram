@@ -25,6 +25,9 @@ export interface DailyReport {
     }>;
   };
   referrals_all_time: Record<string, number>;
+  /** Emails of team/enterprise orgs — engram-web flags support-inbox mail
+   *  from these as PRIORITY (only paid team tiers get priority support). */
+  priority_support_emails: string[];
   top_orgs_7d: Array<{
     email: string | null;
     name: string;
@@ -48,6 +51,7 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
     newSignups,
     referrals,
     topOrgs,
+    teamEmails,
   ] = await Promise.all([
     db
       .prepare(
@@ -105,6 +109,11 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
          GROUP BY o.id ORDER BY messages_7d DESC LIMIT 5`,
       )
       .all<{ email: string | null; name: string; tier: string; messages_7d: number }>(),
+    db
+      .prepare(
+        "SELECT email FROM organizations WHERE tier IN ('team','enterprise') AND email IS NOT NULL AND deleted_at IS NULL",
+      )
+      .all<{ email: string }>(),
   ]);
 
   const byTier: Record<string, number> = {};
@@ -130,6 +139,7 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
       new_signups: newSignups.results ?? [],
     },
     referrals_all_time: refs,
+    priority_support_emails: (teamEmails.results ?? []).map((r) => r.email.toLowerCase()),
     top_orgs_7d: topOrgs.results ?? [],
   };
 }

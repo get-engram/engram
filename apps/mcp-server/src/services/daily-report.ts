@@ -59,7 +59,13 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
         "SELECT COUNT(*) AS n FROM organizations WHERE deleted_at IS NULL AND stripe_subscription_id IS NOT NULL",
       )
       .first<{ n: number }>(),
-    db.prepare("SELECT COUNT(*) AS n FROM messages").first<{ n: number }>(),
+    // Total messages via the maintained per-conversation counter (3.1k rows),
+    // NOT COUNT(*) over the 3.2M-row messages table — that full scan grows
+    // every day and was timing the worker out (the report stopped sending
+    // around Aug 4). This mirrors how /admin/metrics stays fast.
+    db
+      .prepare("SELECT COALESCE(SUM(message_count), 0) AS n FROM conversations")
+      .first<{ n: number }>(),
     db.prepare("SELECT COUNT(*) AS n FROM conversations").first<{ n: number }>(),
     db
       .prepare(

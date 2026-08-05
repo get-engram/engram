@@ -70,3 +70,29 @@ export function getMessagesBySequenceRange(
     .bind(conversationId, organizationId, startSeq, endSeq)
     .all();
 }
+
+export function getMessageById(
+  db: D1Database,
+  messageId: string,
+  organizationId: string
+) {
+  return db
+    .prepare("SELECT * FROM messages WHERE id = ? AND organization_id = ?")
+    .bind(messageId, organizationId)
+    .first();
+}
+
+export function updateMessageContent(
+  db: D1Database,
+  messageId: string,
+  organizationId: string,
+  content: string,
+  contentEncoding: string | null
+) {
+  return db
+    .prepare(
+      "UPDATE messages SET content = ?, content_encoding = ? WHERE id = ? AND organization_id = ?"
+    )
+    .bind(content, contentEncoding, messageId, organizationId)
+    .run();
+}

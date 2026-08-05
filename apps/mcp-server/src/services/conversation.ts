@@ -22,6 +22,11 @@ import {
   insertChunks,
   getVectorizeIdsByConversation,
   insertVaultEntries,
+  getMessageById,
+  updateMessageContent,
+  getMessagesBySequenceRange,
+  getChunksOverlappingSequence,
+  deleteChunksByIds,
 } from "@getengram/db";
 import { generateEmbeddings } from "./embedding.js";
 import { releaseStorage } from "./tier.js";
@@ -313,6 +318,174 @@ export async function getConversation(
   ) as Message[];
 
   return { conversation, messages };
+}
+
+/**
+ * Update one message's content in place (engram: update API — requested by
+ * the community Obsidian plugin). The edit goes through the same redaction
+ * + compression pipeline as append, then the search index is rebuilt for
+ * exactly the chunk window the message participates in: overlapping chunks
+ * are deleted (D1 + FTS + Vectorize) and re-chunked from the fresh message
+ * contents, so recall stays consistent with what's stored. Reindexing is
+ * best-effort like append — on failure the edit is saved and search
+ * catches up on the next successful index.
+ *
+ * Returns the updated message, or null if the conversation/message doesn't
+ * exist (or the viewer can't access a private conversation).
+ */
+export async function updateMessage(
+  env: Env,
+  organizationId: string,
+  conversationId: string,
+  messageId: string,
+  newContent: string,
+  viewer?: AuthContext
+): Promise<Message | null> {
+  const conv = await getConversationById(env.DB, conversationId, organizationId);
+  if (!conv) return null;
+  if (
+    viewer &&
+    !canAccessConversation(
+      viewer,
+      conv as { visibility?: string | null; seat_id?: string | null }
+    )
+  ) {
+    return null;
+  }
+
+  const existing = (await getMessageById(env.DB, messageId, organizationId)) as
+    | (Record<string, unknown> & { conversation_id: string; sequence: number })
+    | null;
+  if (!existing || existing.conversation_id !== conversationId) return null;
+
+  // Same hygiene as append: redact, then compress for storage.
+  const candidate: Message = {
+    id: existing.id as string,
+    conversation_id: conversationId,
+    organization_id: organizationId,
+    role: existing.role as Message["role"],
+    content: newContent,
+    tool_call_id: (existing.tool_call_id as string | null) ?? null,
+    tool_name: (existing.tool_name as string | null) ?? null,
+    sequence: existing.sequence,
+    metadata: JSON.parse((existing.metadata as string) || "{}"),
+    created_at: existing.created_at as string,
+  };
+  const { messages: redacted, totalRedactions } = redactMessages([candidate]);
+  if (totalRedactions > 0) {
+    console.log(
+      `[redact] Scrubbed ${totalRedactions} sensitive pattern(s) from edit of ${messageId}`
+    );
+  }
+  const updated = redacted[0];
+  const compressed = await compressContent(updated.content);
+  await updateMessageContent(
+    env.DB,
+    messageId,
+    organizationId,
+    compressed.content,
+    compressed.encoding
+  );
+
+  // Rebuild the affected slice of the search index. Chunk boundaries are
+  // per-append-batch, so re-chunking just the window spanned by the
+  // invalidated chunks can't shift neighbours.
+  try {
+    const overlapping = await getChunksOverlappingSequence(
+      env.DB,
+      conversationId,
+      organizationId,
+      existing.sequence
+    );
+    const old = overlapping.results ?? [];
+    const startSeq = old.length
+      ? Math.min(...old.map((c) => c.start_sequence))
+      : existing.sequence;
+    const endSeq = old.length
+      ? Math.max(...old.map((c) => c.end_sequence))
+      : existing.sequence;
+
+    const windowResult = await getMessagesBySequenceRange(
+      env.DB,
+      conversationId,
+      organizationId,
+      startSeq,
+      endSeq
+    );
+    const windowMessages = (await Promise.all(
+      (windowResult.results as Array<Record<string, unknown>>).map(
+        async (m) => ({
+          ...m,
+          content: await decompressContent(
+            m.content as string,
+            m.content_encoding as string | null
+          ),
+          metadata: JSON.parse((m.metadata as string) || "{}"),
+        })
+      )
+    )) as Message[];
+
+    const chunks = chunkMessages(windowMessages);
+    const texts = chunks.map((c) => c.text);
+    const embeddings = texts.length
+      ? await generateEmbeddings(env.AI, texts)
+      : [];
+
+    if (old.length > 0) {
+      await env.VECTORIZE.deleteByIds(old.map((c) => c.vectorize_id));
+      await deleteChunksByIds(
+        env.DB,
+        old.map((c) => c.id),
+        organizationId
+      );
+    }
+
+    if (chunks.length > 0) {
+      const chunkRecords = chunks.map((chunk, i) => ({
+        id: generateId("chk"),
+        conversationId,
+        organizationId,
+        chunkText: chunk.text,
+        chunkSummary: summarizeChunk(chunk.text),
+        startSequence: chunk.startSequence,
+        endSequence: chunk.endSequence,
+        vectorizeId: generateId("chk"),
+        embedding: embeddings[i],
+      }));
+      await insertChunks(
+        env.DB,
+        chunkRecords.map((c) => ({
+          id: c.id,
+          conversationId: c.conversationId,
+          organizationId: c.organizationId,
+          chunkText: c.chunkText,
+          chunkSummary: c.chunkSummary,
+          startSequence: c.startSequence,
+          endSequence: c.endSequence,
+          vectorizeId: c.vectorizeId,
+        }))
+      );
+      await env.VECTORIZE.upsert(
+        chunkRecords.map((c) => ({
+          id: c.vectorizeId,
+          values: c.embedding,
+          metadata: {
+            organization_id: organizationId,
+            conversation_id: conversationId,
+            start_sequence: c.startSequence,
+            end_sequence: c.endSequence,
+          },
+        }))
+      );
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[index] Failed to reindex after edit of ${messageId}: ${msg}`
+    );
+  }
+
+  return updated;
 }
 
 export async function deleteConversation(

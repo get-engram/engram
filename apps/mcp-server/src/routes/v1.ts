@@ -9,6 +9,7 @@ import {
   getConversation,
   deleteConversation,
   appendMessages,
+  updateMessage,
   getOrCreateDefaultConversation,
 } from "../services/conversation.js";
 import {
@@ -346,6 +347,63 @@ v1.post("/messages", async (c) => {
     message_ids: messages.map((m) => m.id),
     ...(meter ? { usage: meter } : {}),
     ...(storageMeter ? { storage: storageMeter } : {}),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PATCH /api/v1/conversations/:id/messages/:messageId — update a message
+// in place (REST-first, no MCP mirror yet — requested by the community
+// Obsidian plugin). Same redaction pipeline as append; the affected
+// search-index window is rebuilt so recall matches what's stored.
+// ---------------------------------------------------------------------------
+
+const updateMessageSchema = z.object({
+  content: z.string().min(1).max(1_000_000),
+});
+
+v1.patch("/conversations/:id/messages/:messageId", async (c) => {
+  const auth = c.get("auth");
+  if (!hasScope(auth, "write")) return scopeError(c, "write");
+
+  const conversationId = c.req.param("id");
+  const messageId = c.req.param("messageId");
+  const parsed = updateMessageSchema.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) {
+    return c.json(
+      { error: "invalid_request", message: "content (non-empty string) is required" },
+      400,
+    );
+  }
+
+  const updated = await updateMessage(
+    c.env,
+    auth.organizationId,
+    conversationId,
+    messageId,
+    parsed.data.content,
+    auth,
+  );
+  if (!updated) {
+    return c.json({ error: "not_found", message: "Conversation or message not found" }, 404);
+  }
+
+  await audit(c.env.DB, auth.organizationId, auth.apiKeyId, "message.update", "message", messageId, {
+    conversation_id: conversationId,
+  });
+  fireWebhooks(c.env.DB, auth.organizationId, "message.updated", {
+    conversation_id: conversationId,
+    message_id: messageId,
+  });
+
+  return c.json({
+    updated: true,
+    message: {
+      id: updated.id,
+      conversation_id: updated.conversation_id,
+      role: updated.role,
+      content: updated.content,
+      sequence: updated.sequence,
+    },
   });
 });
 

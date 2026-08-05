@@ -9,6 +9,7 @@ export type AuditAction =
   | "conversation.delete"
   | "conversation.retention_purge"
   | "messages.append"
+  | "message.update"
   | "account.update_email"
   | "account.delete"
   | "account.restore"

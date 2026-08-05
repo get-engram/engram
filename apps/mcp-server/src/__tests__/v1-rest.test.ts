@@ -216,3 +216,100 @@ describe("meterApiRequest middleware", () => {
     expect(waited.length).toBe(0);
   });
 });
+
+describe("REST v1 — update message (PATCH)", () => {
+  it("requires the write scope", async () => {
+    const db = createMockD1();
+    const env = createMockEnv(db);
+    const app = createApp("org_upd", ["read"]);
+    const res = await app.request(
+      "/api/v1/conversations/conv_x/messages/msg_x",
+      { method: "PATCH", body: JSON.stringify({ content: "hi" }), headers: { "Content-Type": "application/json" } },
+      env,
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("404s for a missing conversation", async () => {
+    const db = createMockD1();
+    const env = createMockEnv(db);
+    await insertOrganization(db, "org_upd2", "Upd Org");
+    const app = createApp("org_upd2");
+    const res = await app.request(
+      "/api/v1/conversations/conv_missing/messages/msg_x",
+      { method: "PATCH", body: JSON.stringify({ content: "hi" }), headers: { "Content-Type": "application/json" } },
+      env,
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("edits a message in place and returns the redacted content", async () => {
+    const db = createMockD1();
+    const env = createMockEnv(db);
+    await insertOrganization(db, "org_upd3", "Upd Org 3");
+    // Enterprise tier skips the atomic storage gate — the mock D1 doesn't
+    // emulate UPDATE…RETURNING, and this test targets the edit path, not
+    // the storage gate (covered in tier tests).
+    const app = new Hono<HonoEnv>();
+    app.use("*", async (c, next) => {
+      c.set("auth", {
+        organizationId: "org_upd3",
+        apiKeyId: "key_test",
+        scopes: ["read", "write", "search", "delete"] as Scope[],
+        tier: "enterprise" as const,
+      });
+      await next();
+    });
+    app.route("/api/v1", v1);
+
+    const create = await app.request(
+      "/api/v1/conversations",
+      { method: "POST", body: JSON.stringify({ title: "Edit me" }), headers: { "Content-Type": "application/json" } },
+      env,
+    );
+    const { conversation_id: convId } = (await create.json()) as {
+      conversation_id: string;
+    };
+
+    const append = await app.request(
+      "/api/v1/messages",
+      {
+        method: "POST",
+        body: JSON.stringify({ conversation_id: convId, messages: [{ role: "user", content: "the old wording" }] }),
+        headers: { "Content-Type": "application/json" },
+      },
+      env,
+    );
+    expect(append.status).toBe(200);
+    const { message_ids } = (await append.json()) as { message_ids: string[] };
+
+    const patch = await app.request(
+      `/api/v1/conversations/${convId}/messages/${message_ids[0]}`,
+      { method: "PATCH", body: JSON.stringify({ content: "the corrected wording" }), headers: { "Content-Type": "application/json" } },
+      env,
+    );
+    expect(patch.status).toBe(200);
+    const body = (await patch.json()) as { updated: boolean; message: { content: string; id: string } };
+    expect(body.updated).toBe(true);
+    expect(body.message.id).toBe(message_ids[0]);
+    expect(body.message.content).toBe("the corrected wording");
+
+    // No read-back here: the hand-rolled mock D1 doesn't emulate the
+    // ORDER BY/LIMIT SELECT that message listing uses. The PATCH response
+    // above is produced after the real redact→compress→UPDATE pipeline
+    // ran, which is the behavior under test.
+  });
+
+  it("rejects an empty content body", async () => {
+    const db = createMockD1();
+    const env = createMockEnv(db);
+    await insertOrganization(db, "org_upd4", "Upd Org 4");
+    const app = createApp("org_upd4");
+    const res = await app.request(
+      "/api/v1/conversations/conv_x/messages/msg_x",
+      { method: "PATCH", body: JSON.stringify({ content: "" }), headers: { "Content-Type": "application/json" } },
+      env,
+    );
+    expect(res.status).toBe(400);
+  });
+});

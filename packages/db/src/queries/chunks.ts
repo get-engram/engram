@@ -115,3 +115,38 @@ export function getVectorizeIdsByConversation(
     .bind(conversationId, organizationId)
     .all<{ vectorize_id: string }>();
 }
+
+/** Chunks whose [start,end] sequence window covers the given message
+ *  sequence — the ones invalidated when that message's content changes. */
+export function getChunksOverlappingSequence(
+  db: D1Database,
+  conversationId: string,
+  organizationId: string,
+  sequence: number
+) {
+  return db
+    .prepare(
+      "SELECT id, vectorize_id, start_sequence, end_sequence FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ? AND start_sequence <= ? AND end_sequence >= ?"
+    )
+    .bind(conversationId, organizationId, sequence, sequence)
+    .all<{ id: string; vectorize_id: string; start_sequence: number; end_sequence: number }>();
+}
+
+export function deleteChunksByIds(
+  db: D1Database,
+  ids: string[],
+  organizationId: string
+) {
+  if (ids.length === 0) return Promise.resolve();
+  const ph = ids.map(() => "?").join(",");
+  return db.batch([
+    db
+      .prepare(`DELETE FROM chunks_fts WHERE chunk_id IN (${ph})`)
+      .bind(...ids),
+    db
+      .prepare(
+        `DELETE FROM conversation_chunks WHERE id IN (${ph}) AND organization_id = ?`
+      )
+      .bind(...ids, organizationId),
+  ]);
+}

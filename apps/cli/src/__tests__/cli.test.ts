@@ -219,3 +219,52 @@ describe("import fingerprints (engram#254)", () => {
     expect(conversations[0].sourceId).toBe("u-1");
   });
 });
+
+describe("share-link import (extractSharedConversation)", () => {
+  const CONVO = {
+    title: "Rescued chat",
+    conversation_id: "abc-123",
+    current_node: "n2",
+    mapping: {
+      n1: { id: "n1", parent: null, message: { author: { role: "user" }, content: { content_type: "text", parts: ["hello"] } } },
+      n2: { id: "n2", parent: "n1", message: { author: { role: "assistant" }, content: { content_type: "text", parts: ["hi there"] } } },
+    },
+  };
+
+  it("finds the conversation in a JSON script tag", async () => {
+    const { extractSharedConversation } = await import("../commands/import.js");
+    const html = `<html><head><script id="__NEXT_DATA__" type="application/json">${JSON.stringify({ props: { pageProps: { serverResponse: { data: CONVO } } } })}</script></head><body></body></html>`;
+    const found = extractSharedConversation(html);
+    expect(found?.title).toBe("Rescued chat");
+    expect(Object.keys(found?.mapping ?? {})).toHaveLength(2);
+  });
+
+  it("finds the conversation in an inline __remixContext assignment", async () => {
+    const { extractSharedConversation } = await import("../commands/import.js");
+    const html = `<script>window.__remixContext = ${JSON.stringify({ state: { loaderData: { route: { serverResponse: CONVO } } } })};</script>`;
+    const found = extractSharedConversation(html);
+    expect(found?.conversation_id).toBe("abc-123");
+  });
+
+  it("returns null when no conversation JSON is present", async () => {
+    const { extractSharedConversation } = await import("../commands/import.js");
+    expect(extractSharedConversation("<html><body>nothing here</body></html>")).toBeNull();
+  });
+
+  it("linearizes the extracted conversation like an export", async () => {
+    const { extractSharedConversation, normalizeExport } = await import("../commands/import.js");
+    const html = `<script type="application/json">${JSON.stringify({ data: CONVO })}</script>`;
+    const convo = extractSharedConversation(html)!;
+    const { format, conversations } = normalizeExport([convo]);
+    expect(format).toBe("chatgpt");
+    expect(conversations[0].messages.map((m) => m.content)).toEqual(["hello", "hi there"]);
+  });
+
+  it("recognizes share URLs and not other input", async () => {
+    const { SHARE_URL_RE } = await import("../commands/import.js");
+    expect(SHARE_URL_RE.test("https://chatgpt.com/share/e6a1c9e2-1234-4abc-9def-aaaa00001111")).toBe(true);
+    expect(SHARE_URL_RE.test("https://chat.openai.com/share/e6a1c9e2")).toBe(true);
+    expect(SHARE_URL_RE.test("conversations.json")).toBe(false);
+    expect(SHARE_URL_RE.test("https://example.com/share/x")).toBe(false);
+  });
+});

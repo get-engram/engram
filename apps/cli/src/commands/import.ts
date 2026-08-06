@@ -126,6 +126,132 @@ export function linearizeClaude(convo: ClaudeConversation): MessageInput[] {
 }
 
 /** Detect the export format and normalize every conversation. */
+// --- ChatGPT share-link import (engram: conversation-full rescue) ---
+// When ChatGPT declares a conversation full it also stops the connector
+// from saving — the share link becomes the only way the content gets out.
+// `engram import <share-url>` fetches the public share page, digs the
+// embedded conversation JSON out of it, and funnels it through the same
+// pipeline as an export-file import.
+
+export const SHARE_URL_RE =
+  /^https?:\/\/(chatgpt\.com|chat\.openai\.com)\/share\/([A-Za-z0-9-]+)/;
+
+/** Balanced-brace scan starting at an opening brace, string/escape aware. */
+function scanBalanced(s: string, start: number): string | null {
+  if (s[start] !== "{") return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (esc) { esc = false; continue; }
+    if (inStr) {
+      if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return s.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+/** Deep-search parsed JSON for the first object shaped like a ChatGPT
+ *  conversation: a `mapping` whose nodes carry `message` entries. */
+function findConversation(x: unknown, depth: number): ChatConversation | null {
+  if (!x || typeof x !== "object" || depth > 14) return null;
+  const o = x as Record<string, unknown>;
+  if (o.mapping && typeof o.mapping === "object" && !Array.isArray(o.mapping)) {
+    const nodes = Object.values(o.mapping as Record<string, unknown>);
+    if (
+      nodes.length > 0 &&
+      nodes.some((n) => n !== null && typeof n === "object" && "message" in (n as object))
+    ) {
+      return o as ChatConversation;
+    }
+  }
+  for (const v of Array.isArray(x) ? x : Object.values(o)) {
+    const found = findConversation(v, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Pull the embedded conversation out of a share page's HTML. Tries every
+ *  JSON <script> blob, then `window.__remixContext`-style inline
+ *  assignments. Returns null when nothing parses — the caller points the
+ *  user at the export-file fallback. Exported for tests. */
+export function extractSharedConversation(html: string): ChatConversation | null {
+  const candidates: unknown[] = [];
+  for (const m of html.matchAll(
+    /<script[^>]*type="application\/json"[^>]*>([\s\S]*?)<\/script>/g,
+  )) {
+    try {
+      candidates.push(JSON.parse(m[1]));
+    } catch {
+      // not JSON — skip
+    }
+  }
+  for (const marker of ["__remixContext", "__NEXT_DATA__", "streamController.enqueue"]) {
+    let idx = html.indexOf(marker);
+    while (idx !== -1) {
+      const braceAt = html.indexOf("{", idx);
+      if (braceAt === -1) break;
+      const blob = scanBalanced(html, braceAt);
+      if (blob) {
+        try {
+          candidates.push(JSON.parse(blob));
+        } catch {
+          // partial/escaped blob — skip
+        }
+      }
+      idx = html.indexOf(marker, idx + marker.length);
+    }
+  }
+  for (const c of candidates) {
+    const found = findConversation(c, 0);
+    if (found) return found;
+  }
+  return null;
+}
+
+export async function fetchSharedConversation(url: string): Promise<ChatConversation> {
+  const m = url.match(SHARE_URL_RE);
+  if (!m) throw new Error("Not a ChatGPT share link");
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) engram-cli",
+      Accept: "text/html",
+    },
+    redirect: "follow",
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!res.ok) {
+    throw new Error(
+      `Share page returned ${res.status}` +
+        (res.status === 404
+          ? " — the link may have been deleted, made private, or never published"
+          : ""),
+    );
+  }
+  const convo = extractSharedConversation(await res.text());
+  if (!convo) {
+    throw new Error(
+      "Couldn't find the conversation in the share page — ChatGPT may have changed its page format.\n" +
+        "Fallback: ChatGPT Settings → Data controls → Export data, then: engram import conversations.json",
+    );
+  }
+  // Idempotent re-imports: if the conversation JSON carries no id, the
+  // share-link id stands in as the fingerprint.
+  if (!convo.id && !convo.conversation_id) convo.conversation_id = `share-${m[2]}`;
+  return convo;
+}
+
 export function normalizeExport(parsed: unknown): {
   format: SourceFormat;
   conversations: NormalizedConversation[];
@@ -289,7 +415,7 @@ export async function importHistory(
 ): Promise<void> {
   const file = args[0];
   if (!file) {
-    console.error("Usage: engram import <conversations.json> [options]");
+    console.error("Usage: engram import <conversations.json | chatgpt-share-link> [options]");
     console.error("\nOptions:");
     console.error("  --dry-run        Parse and report counts without writing");
     console.error("  --limit <n>      Import only the first <n> conversations");
@@ -301,6 +427,10 @@ export async function importHistory(
       "\nGet the file from ChatGPT (Settings → Data controls → Export data) or",
     );
     console.error("Claude (Settings → Account → Export data). Format is auto-detected.");
+    console.error(
+      "\nOr rescue a single conversation via its share link (ChatGPT → Share → Copy link):",
+    );
+    console.error("  engram import https://chatgpt.com/share/<id>");
     process.exit(1);
   }
 
@@ -308,20 +438,29 @@ export async function importHistory(
   const limit = flags.limit ? parseInt(flags.limit, 10) : Infinity;
   const extraTag = flags.tag;
 
-  let raw: string;
-  try {
-    raw = await readFile(file, "utf-8");
-  } catch {
-    console.error(`Could not read ${file}`);
-    process.exit(1);
-  }
-
   let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    console.error("Not valid JSON. Point at conversations.json from your export.");
-    process.exit(1);
+  if (SHARE_URL_RE.test(file)) {
+    console.log(dim("Fetching shared conversation..."));
+    try {
+      parsed = [await fetchSharedConversation(file)];
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  } else {
+    let raw: string;
+    try {
+      raw = await readFile(file, "utf-8");
+    } catch {
+      console.error(`Could not read ${file}`);
+      process.exit(1);
+    }
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      console.error("Not valid JSON. Point at conversations.json from your export.");
+      process.exit(1);
+    }
   }
 
   const { format, conversations } = normalizeExport(parsed);

@@ -580,6 +580,48 @@ admin.get("/email-log", async (c) => {
   });
 });
 
+// GET /admin/stripe-customer/:customerId — read-only Stripe peek for
+// billing forensics (subscriptions incl. trial/pause state, recent
+// invoices, whether a card is on file). The Stripe key lives only in the
+// worker, so the dashboard/CLI can't query Stripe directly; this is the
+// admin's window. Never mutates.
+admin.get("/stripe-customer/:customerId", async (c) => {
+  const key = c.env.STRIPE_SECRET_KEY;
+  if (!key) return c.json({ error: "stripe_not_configured" }, 500);
+  const cust = c.req.param("customerId");
+  const H = { Authorization: `Bearer ${key}` };
+  const [subsRes, invRes, pmRes] = await Promise.all([
+    fetch(`https://api.stripe.com/v1/subscriptions?customer=${cust}&status=all&limit=10`, { headers: H }),
+    fetch(`https://api.stripe.com/v1/invoices?customer=${cust}&limit=10`, { headers: H }),
+    fetch(`https://api.stripe.com/v1/payment_methods?customer=${cust}&type=card&limit=5`, { headers: H }),
+  ]);
+  const subs = (await subsRes.json()) as { data?: Array<Record<string, unknown>> };
+  const invoices = (await invRes.json()) as { data?: Array<Record<string, unknown>> };
+  const pms = (await pmRes.json()) as { data?: Array<Record<string, unknown>> };
+  return c.json({
+    subscriptions: (subs.data ?? []).map((s) => ({
+      id: s.id,
+      status: s.status,
+      cancel_at_period_end: s.cancel_at_period_end,
+      trial_start: s.trial_start,
+      trial_end: s.trial_end,
+      pause_collection: s.pause_collection ?? null,
+      current_period_end: s.current_period_end,
+      items: ((s.items as { data?: Array<{ price?: { unit_amount?: number; recurring?: { interval?: string } } }> })?.data ?? []).map(
+        (i) => ({ unit_amount: i.price?.unit_amount, interval: i.price?.recurring?.interval }),
+      ),
+    })),
+    invoices: (invoices.data ?? []).map((i) => ({
+      id: i.id,
+      status: i.status,
+      amount_due: i.amount_due,
+      amount_paid: i.amount_paid,
+      created: i.created,
+    })),
+    cards_on_file: (pms.data ?? []).length,
+  });
+});
+
 // GET /admin/audit/:orgId — query audit logs for an organization
 admin.get("/audit/:orgId", async (c) => {
   const orgId = c.req.param("orgId");

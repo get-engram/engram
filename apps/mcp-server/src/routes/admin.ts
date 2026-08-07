@@ -422,6 +422,7 @@ admin.post("/users/:id/sync-stripe", async (c) => {
       id: string; status: string;
       items: { data: Array<{ price: { id: string }; quantity: number }> };
       cancel_at_period_end: boolean;
+      cancel_at: number | null;
       canceled_at: number | null;
     }>;
   };
@@ -456,14 +457,17 @@ admin.post("/users/:id/sync-stripe", async (c) => {
   if (priceId === c.env.STRIPE_PRICE_ID_TEAM) tier = "team";
   const seatLimit = tier === "team" ? quantity : 1;
 
+  // Both of Stripe's scheduled-cancel mechanisms count (see billing.ts
+  // webhook note): the bool AND the cancel_at timestamp.
+  const cancelling = Boolean(activeSub.cancel_at_period_end) || activeSub.cancel_at != null;
   await c.env.DB.prepare(
     "UPDATE organizations SET tier = ?, stripe_subscription_id = ?, seat_limit = ?, cancel_at_period_end = ?, churned_at = CASE WHEN ? = 0 THEN NULL ELSE churned_at END WHERE id = ?"
   ).bind(
     tier,
     activeSub.id,
     seatLimit,
-    activeSub.cancel_at_period_end ? 1 : 0,
-    activeSub.cancel_at_period_end ? 1 : 0,
+    cancelling ? 1 : 0,
+    cancelling ? 1 : 0,
     id,
   ).run();
 
@@ -472,7 +476,8 @@ admin.post("/users/:id/sync-stripe", async (c) => {
     tier,
     subscription_id: activeSub.id,
     status: activeSub.status,
-    cancel_at_period_end: activeSub.cancel_at_period_end,
+    cancel_at_period_end: cancelling,
+    cancel_at: activeSub.cancel_at ? new Date(activeSub.cancel_at * 1000).toISOString() : null,
     seat_limit: seatLimit,
   });
 });

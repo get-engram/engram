@@ -331,10 +331,16 @@ billingWebhook.post("/", async (c) => {
         await setOrganizationTier(c.env.DB, orgId, newTier, subscriptionId, seatLimit);
         // Track scheduled cancellation ("pro but cancelling" in admin). An
         // active sub also clears any past churn stamp — they came back.
+        // Stripe records a scheduled cancel two ways: cancel_at_period_end
+        // (bool) or cancel_at (timestamp, e.g. portal "cancel on <date>").
+        // Reading only the bool missed real cancellations (anar3nata,
+        // 2026-08 — dashboard showed "Cancels Aug 15", admin showed
+        // healthy).
+        const cancelling = Boolean(obj.cancel_at_period_end) || obj.cancel_at != null;
         await c.env.DB.prepare(
           "UPDATE organizations SET cancel_at_period_end = ?, churned_at = CASE WHEN ? = 0 THEN NULL ELSE churned_at END WHERE id = ?",
         )
-          .bind(obj.cancel_at_period_end ? 1 : 0, obj.cancel_at_period_end ? 1 : 0, orgId)
+          .bind(cancelling ? 1 : 0, cancelling ? 1 : 0, orgId)
           .run();
       } else if (
         status === "canceled" ||

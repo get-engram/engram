@@ -336,7 +336,7 @@ billingWebhook.post("/", async (c) => {
         // Reading only the bool missed real cancellations (anar3nata,
         // 2026-08 — dashboard showed "Cancels Aug 15", admin showed
         // healthy).
-        const cancelling = Boolean(obj.cancel_at_period_end) || obj.cancel_at != null;
+        const cancelling = Boolean(obj.cancel_at_period_end) || (typeof obj.cancel_at === "number" && obj.cancel_at > 0);
         await c.env.DB.prepare(
           "UPDATE organizations SET cancel_at_period_end = ?, churned_at = CASE WHEN ? = 0 THEN NULL ELSE churned_at END WHERE id = ?",
         )

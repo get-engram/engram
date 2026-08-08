@@ -611,6 +611,8 @@ admin.get("/stripe-customer/:customerId", async (c) => {
       trial_start: s.trial_start,
       trial_end: s.trial_end,
       pause_collection: s.pause_collection ?? null,
+      canceled_at: s.canceled_at ?? null,
+      cancellation_details: s.cancellation_details ?? null,
       current_period_end: s.current_period_end,
       items: ((s.items as { data?: Array<{ price?: { unit_amount?: number; recurring?: { interval?: string } } }> })?.data ?? []).map(
         (i) => ({ unit_amount: i.price?.unit_amount, interval: i.price?.recurring?.interval }),

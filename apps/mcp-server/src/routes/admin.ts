@@ -459,7 +459,7 @@ admin.post("/users/:id/sync-stripe", async (c) => {
 
   // Both of Stripe's scheduled-cancel mechanisms count (see billing.ts
   // webhook note): the bool AND the cancel_at timestamp.
-  const cancelling = Boolean(activeSub.cancel_at_period_end) || activeSub.cancel_at != null;
+  const cancelling = Boolean(activeSub.cancel_at_period_end) || (typeof activeSub.cancel_at === "number" && activeSub.cancel_at > 0);
   await c.env.DB.prepare(
     "UPDATE organizations SET tier = ?, stripe_subscription_id = ?, seat_limit = ?, cancel_at_period_end = ?, churned_at = CASE WHEN ? = 0 THEN NULL ELSE churned_at END WHERE id = ?"
   ).bind(

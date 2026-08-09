@@ -44,7 +44,7 @@ Runs entirely on Cloudflare. Fast, private, per-account isolated.
 ## Tweet 6 (CTA)
 Add Engram in ChatGPT: Settings → Apps & Connectors → Engram.
 
-Free tier (1,000 msgs/mo). Open source.
+Free tier (10,000 messages, no monthly cap). Source-available (BSL 1.1).
 
 → https://getengram.app
 

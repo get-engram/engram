@@ -10,7 +10,7 @@ Engram gives your AI agents persistent memory. Every conversation you have with 
 
 Install the CLI via Homebrew or npm, start the background daemon, and it auto-captures your Claude Code transcripts with zero friction. Engram runs as an MCP server on Cloudflare Workers, so your agent can store and recall context natively — no copy-pasting, no manual notes.
 
-Engram is open source (MIT), GDPR compliant, and has a free tier to get started. Self-host it or use the hosted version at getengram.app.
+Engram is source-available: server & CLI under BSL 1.1 (self-host for your own use; converts to Apache 2.0 in 2030), SDK under MPL-2.0. GDPR compliant, with a free tier to get started. Use the hosted version at getengram.app, or self-host your own instance.
 
 ## Maker Comment
 
@@ -20,7 +20,7 @@ I tried keeping notes, pasting things into docs, even saving transcripts manuall
 
 So Engram captures your full conversations automatically and makes them searchable via semantic search. Your agent can query its own history through MCP. The first time Claude Code pulled up a decision we'd made three sessions ago without me prompting it, it felt like a genuine step change in how useful these tools are.
 
-It's MIT licensed and open source. Would love your feedback — especially if you're using Claude Code or Cursor heavily and have felt this same pain.
+It's source-available: server & CLI under BSL 1.1 (self-host for your own use; converts to Apache 2.0 in 2030), SDK under MPL-2.0. Would love your feedback — especially if you're using Claude Code or Cursor heavily and have felt this same pain.
 
 ## Topics/Tags
 

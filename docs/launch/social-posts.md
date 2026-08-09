@@ -98,7 +98,7 @@ Protocol-wise, it's standard MCP over HTTP with SSE transport. Any agent or clie
 
 **CLI:** `npm i -g @getengram/cli` (includes a daemon for auto-capturing Claude Code sessions)
 
-If you don't want to self-host, there's a managed version at https://getengram.app with a free tier (1,000 msgs/mo).
+If you don't want to self-host, there's a managed version at https://getengram.app with a free tier (10,000 messages, no monthly cap).
 
 Happy to answer questions about the architecture or MCP integration. PRs welcome.
 

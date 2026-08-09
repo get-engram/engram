@@ -104,4 +104,13 @@ Each `append_messages` call is 1 Worker request. Each `search` is 1 request. At 
 
 ## Rate Limiting
 
-Rate limiting is not yet implemented in the Engram MVP. It is planned for Phase 2. For self-hosted instances, Cloudflare's platform limits serve as a natural rate limit.
+Requests are rate limited per organization with a token bucket. Limits scale by plan:
+
+| Plan | Requests per minute |
+|------|--------------------|
+| Free | 30 |
+| Pro | 120 |
+| Team | 300 |
+| Enterprise | 600 |
+
+Every response includes an `X-RateLimit-Limit` header. When you exceed the limit, the request returns `429 Too Many Requests` with a `retry_after` of 60 seconds. Billing endpoints are exempt. For self-hosted instances, Cloudflare's platform limits also apply.

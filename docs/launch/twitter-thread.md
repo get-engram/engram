@@ -71,6 +71,6 @@ Entire stack runs on Cloudflare. Zero servers.
 Engram is live now. Free tier to get started.
 
 Try it: https://getengram.app
-SDK + CLI are MIT licensed: https://github.com/get-engram/engram
+SDK is MPL-2.0, CLI is BSL-1.1: https://github.com/get-engram/engram
 
 Your agents should remember. Now they can.

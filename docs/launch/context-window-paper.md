@@ -234,7 +234,7 @@ The context window problem is not a model limitation that will be solved by bigg
 
 Store everything. Search when you need it. Let the conversation be the knowledge base.
 
-Engram is open source under the MIT license: [github.com/get-engram/engram](https://github.com/get-engram/engram)
+Engram is source-available: server & CLI under BSL 1.1 (self-host for your own use; converts to Apache 2.0 in 2030), SDK under MPL-2.0: [github.com/get-engram/engram](https://github.com/get-engram/engram)
 
 ---
 

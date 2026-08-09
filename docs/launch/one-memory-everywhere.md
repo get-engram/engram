@@ -56,4 +56,4 @@ Then just work. Save something in one place, recall it in another. One memory, e
 
 ---
 
-*Engram is open source (MIT) and available hosted at [getengram.app](https://getengram.app) or self-hosted. Persistent, verbatim, searchable memory for every AI you use.*
+*Engram is source-available: server & CLI under BSL 1.1 (self-host for your own use; converts to Apache 2.0 in 2030), SDK under MPL-2.0. Available hosted at [getengram.app](https://getengram.app) or self-hosted. Persistent, verbatim, searchable memory for every AI you use.*

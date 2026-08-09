@@ -25,7 +25,7 @@ Under the hood it's stored verbatim (no lossy summarization), chunked, and embed
 
 Connect in ChatGPT: Plugin directory → install Engram (OAuth, no key to paste). Free tier is 10,000 messages of memory — never expires; Pro is $9/mo.
 
-Source is BSL-1.1; the SDK + CLI are MIT: https://github.com/get-engram/engram
+Source is BSL-1.1 (server & CLI); the SDK is MPL-2.0: https://github.com/get-engram/engram
 Site: https://getengram.app
 
 I'd love feedback — especially: what context do you find yourself re-explaining to your AI tools the most? And would "one memory across all of them" actually change how you work, or is per-tool memory enough?
@@ -33,6 +33,6 @@ I'd love feedback — especially: what context do you find yourself re-explainin
 ---
 
 ## Accuracy notes
-- BSL-1.1 (product) / MIT (SDK+CLI). Free tier 1,000 msgs/mo. $9 Pro.
+- BSL-1.1 (server & CLI) / MPL-2.0 (SDK). Free tier 10,000 messages, no monthly cap. $9 Pro.
 - Do NOT claim ChatGPT auto-records everything — it's save-on-request + import.
 - OK to say "ChatGPT app" now that it's live in the directory.

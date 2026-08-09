@@ -152,4 +152,4 @@ If you're building with AI agents and tired of re-explaining your codebase every
 
 ---
 
-*Engram is open source under the MIT license. Contributions welcome.*
+*Engram is source-available: server & CLI under BSL 1.1 (self-host for your own use; converts to Apache 2.0 in 2030), SDK under MPL-2.0. Contributions welcome.*

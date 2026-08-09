@@ -42,7 +42,7 @@ CLAUDE.md is great for static instructions. But it's a flat file -- no semantic 
 - MCP-native -- works with Claude Code, Claude Desktop, Cursor, Windsurf, Zed
 - Verbatim storage -- no summarization, no lossy extraction
 - Semantic search powered by vector embeddings
-- Free tier available, the SDK and CLI are MIT licensed
+- Free tier available; the SDK is MPL-2.0, CLI is BSL-1.1
 - Self-hostable on Cloudflare (free tier covers it)
 
 Website: https://getengram.app

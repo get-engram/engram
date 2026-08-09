@@ -4,7 +4,7 @@
 
 ### What is Engram?
 
-Engram is a memory service for AI agents. It stores complete, uncompressed conversation transcripts and makes them searchable via semantic search. It's accessible through the Model Context Protocol (MCP).
+Engram is a memory service for AI agents. It stores complete, verbatim conversation transcripts and makes them searchable via semantic search. It's accessible through the Model Context Protocol (MCP).
 
 ### How is Engram different from Mem0, Zep, or Supermemory?
 
@@ -76,7 +76,7 @@ The MCP transport uses Streamable HTTP, which supports server-sent events. Howev
 
 ### Can I use Engram without MCP?
 
-Not yet. The current MVP only exposes MCP tools. A REST API is planned for Phase 2.
+Yes. Every memory operation is also available as a plain REST API under `/api/v1` — same behavior, same API key — on every plan. Use it from backends, scripts, and anywhere an MCP client isn't practical. See the [API reference](./api-reference.md#rest-api).
 
 ### How do I protect secrets and credentials in my conversations?
 

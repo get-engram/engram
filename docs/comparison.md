@@ -11,7 +11,7 @@ How Engram differs from other agent memory solutions.
 | Data loss | None — full transcript preserved | Details lost in extraction | Details lost in summarization | Context lost in extraction |
 | Protocol | MCP (native) | REST API | REST API | REST API |
 | Search | Semantic (vector) | Semantic | Semantic + graph | Semantic |
-| Self-hostable | Yes (Cloudflare) | Yes | Yes | Yes |
+| Self-hostable | Yes — source-available (BSL 1.1) | Yes | Yes | Yes |
 | Infrastructure | Cloudflare (D1 + Vectorize + Workers AI) | Postgres + Qdrant + OpenAI | Postgres + embeddings | Various |
 | Embedding cost | Free (Workers AI) | OpenAI API cost | Varies | Varies |
 

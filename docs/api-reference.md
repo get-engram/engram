@@ -1,6 +1,6 @@
 # API Reference
 
-Engram exposes 11 tools via the Model Context Protocol (MCP). All tools are accessed through the `/mcp` endpoint using Streamable HTTP transport.
+Engram exposes 7 core memory tools via the Model Context Protocol (MCP), plus vault and subscription tools on API-key surfaces. All tools are accessed through the `/mcp` endpoint using Streamable HTTP transport.
 
 All requests require an `Authorization: Bearer engram_sk_live_...` header.
 

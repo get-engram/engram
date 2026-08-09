@@ -1,6 +1,6 @@
 # Reddit r/LocalLLaMA Draft
 
-**Title:** Engram: self-hostable memory service for AI agents -- MCP-native, runs on Cloudflare free tier, SDK/CLI are MIT
+**Title:** Engram: self-hostable memory service for AI agents -- MCP-native, runs on Cloudflare free tier, SDK is MPL-2.0 / CLI is BSL-1.1
 
 ---
 
@@ -8,7 +8,7 @@ I've been building a memory layer for AI agents called Engram. The core idea: st
 
 **Why I'm posting here:**
 
-The SDK and CLI are MIT licensed, the server is self-hostable on Cloudflare's free tier, and it uses the Model Context Protocol (MCP) which means it works with any MCP-compatible client. If you're running local models through an MCP-compatible interface, this gives them persistent memory.
+The SDK is MPL-2.0 and the CLI is BSL-1.1, the server is self-hostable on Cloudflare's free tier, and it uses the Model Context Protocol (MCP) which means it works with any MCP-compatible client. If you're running local models through an MCP-compatible interface, this gives them persistent memory.
 
 **Self-hosting:**
 

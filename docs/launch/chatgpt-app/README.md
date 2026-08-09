@@ -14,7 +14,7 @@ Copy-paste-ready launch posts for **Engram now being live in the ChatGPT App Dir
 
 ## Accuracy checklist
 
-- Product/repo license is **BSL-1.1**; the SDK + CLI are **MIT**.
+- Server & CLI are **BSL-1.1**; the SDK is **MPL-2.0**.
 - Free tier = **10,000 messages of memory, never expires**. Pro = **$9/mo** (1,000,000 messages of memory).
 - You **can** now say "available in the ChatGPT App Directory" (it's live).
 - Don't claim a Homebrew tap until `engram` is actually on homebrew-core (#36).

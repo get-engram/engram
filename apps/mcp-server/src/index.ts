@@ -25,6 +25,7 @@ import { expireGracePeriods } from "./cron/expire-grace.js";
 import { enforceRetentionPolicies } from "./cron/retention-policy.js";
 import { sendImportNudges } from "./cron/import-nudge.js";
 import { sendMaxoutNudges } from "./cron/maxout-nudge.js";
+import { sendActivationNudges } from "./cron/activation-nudge.js";
 import { sendWeeklyDigests } from "./cron/weekly-digest.js";
 import { sendDailyReport } from "./services/daily-report.js";
 import { oauth } from "./oauth/router.js";
@@ -318,6 +319,12 @@ export default {
     const maxout = await sendMaxoutNudges(env);
     if (maxout > 0) {
       console.log(`[cron] Sent ${maxout} maxout-nudge email(s)`);
+    }
+    // Activation nudge: dormant orgs (signed up 7d ago, still empty) — one
+    // email showing them the "aha" so a paid-for signup doesn't stall.
+    const activated = await sendActivationNudges(env);
+    if (activated > 0) {
+      console.log(`[cron] Sent ${activated} activation-nudge email(s)`);
     }
   },
 };

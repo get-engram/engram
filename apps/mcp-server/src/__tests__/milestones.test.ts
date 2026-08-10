@@ -37,3 +37,13 @@ describe("unsubscribeSig", () => {
     expect(a).toMatch(/^[0-9a-f]{64}$/);
   });
 });
+
+describe("sendActivationNudges", () => {
+  it("no-ops without APP_URL (guard)", async () => {
+    const { sendActivationNudges } = await import("../cron/activation-nudge.js");
+    const env = createMockEnv(createMockD1()) as unknown as Env;
+    // createMockEnv leaves APP_URL undefined → must return 0, send nothing
+    const sent = await sendActivationNudges({ ...env, APP_URL: undefined } as unknown as Env);
+    expect(sent).toBe(0);
+  });
+})

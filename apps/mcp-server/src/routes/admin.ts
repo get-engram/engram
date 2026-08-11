@@ -735,6 +735,90 @@ admin.get("/content-sizing", async (c) => {
   });
 });
 
+// GET /admin/content-sizing-v2 — stratified re-measure. The head/tail sample
+// in v1 missed the imported-history rowid range, so this samples evenly across
+// the WHOLE rowid span (default 16 buckets x 2000 rows) for an unbiased avg,
+// and directly measures the FTS shadow tables: chunks_fts_content.c0 (the
+// stored copy of chunk_text) and chunks_fts_data.block (the inverted index).
+// Read-only.
+admin.get("/content-sizing-v2", async (c) => {
+  const buckets = Math.min(40, Math.max(4, parseInt(c.req.query("buckets") ?? "16", 10)));
+  const per = Math.min(5000, Math.max(500, parseInt(c.req.query("per") ?? "2000", 10)));
+  const GB = 1024 * 1024 * 1024;
+
+  const stratifiedAvg = async (table: string, col: string) => {
+    const mm = await c.env.DB.prepare(
+      `SELECT MIN(rowid) AS mn, MAX(rowid) AS mx FROM ${table}`,
+    ).first<{ mn: number | null; mx: number | null }>();
+    const mn = mm?.mn ?? 0;
+    const mx = mm?.mx ?? 0;
+    if (mx <= mn) return 0;
+    let weighted = 0;
+    let total = 0;
+    for (let k = 0; k < buckets; k++) {
+      const off = mn + Math.floor((k * (mx - mn)) / buckets);
+      const r = await c.env.DB.prepare(
+        `SELECT AVG(LENGTH(CAST(${col} AS BLOB))) AS a, COUNT(*) AS n
+         FROM (SELECT ${col} FROM ${table} WHERE rowid >= ? LIMIT ?)`,
+      )
+        .bind(off, per)
+        .first<{ a: number | null; n: number }>();
+      if (r?.a != null && r.n > 0) {
+        weighted += r.a * r.n;
+        total += r.n;
+      }
+    }
+    return total ? weighted / total : 0;
+  };
+
+  const sumBytes = async (table: string, col: string) => {
+    try {
+      const r = await c.env.DB.prepare(
+        `SELECT SUM(LENGTH(CAST(${col} AS BLOB))) AS b FROM ${table}`,
+      ).first<{ b: number | null }>();
+      return r?.b ?? 0;
+    } catch {
+      return -1;
+    }
+  };
+
+  const msgCount =
+    (
+      await c.env.DB.prepare(
+        "SELECT COALESCE(SUM(message_count),0) AS n FROM conversations",
+      ).first<{ n: number }>()
+    )?.n ?? 0;
+  const chunkCount =
+    (
+      await c.env.DB.prepare(
+        "SELECT COUNT(*) AS n FROM conversation_chunks",
+      ).first<{ n: number }>()
+    )?.n ?? 0;
+
+  const contentAvg = await stratifiedAvg("messages", "content");
+  const chunkAvg = await stratifiedAvg("conversation_chunks", "chunk_text");
+  const ftsContentCopy = await sumBytes("chunks_fts_content", "c0");
+  const ftsIndexData = await sumBytes("chunks_fts_data", "block");
+
+  const gb = (n: number) => (n < 0 ? "n/a" : +(n / GB).toFixed(2));
+
+  return c.json({
+    buckets,
+    per,
+    counts: { messages: msgCount, chunks: chunkCount },
+    avg_bytes: {
+      messages_content: Math.round(contentAvg),
+      chunk_text: Math.round(chunkAvg),
+    },
+    est_gb: {
+      messages_content: gb(contentAvg * msgCount),
+      chunk_text: gb(chunkAvg * chunkCount),
+      fts_content_copy: gb(ftsContentCopy),
+      fts_index_data: gb(ftsIndexData),
+    },
+  });
+});
+
 // GET /admin/db-stats — real page-level D1 size + free space, plus per-table
 // byte sizes when dbstat is available. freelist_bytes is the actual headroom
 // for new writes (freed pages new inserts reuse); size_bytes vs the 10 GB cap

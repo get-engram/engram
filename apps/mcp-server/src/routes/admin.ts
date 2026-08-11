@@ -683,8 +683,8 @@ admin.get("/content-sizing", async (c) => {
   // conversation_chunks.chunk_text + summary.
   const ctHead = await sampleAvg("conversation_chunks", "chunk_text", "ASC");
   const ctTail = await sampleAvg("conversation_chunks", "chunk_text", "DESC");
-  const sHead = await sampleAvg("conversation_chunks", "summary", "ASC");
-  const sTail = await sampleAvg("conversation_chunks", "summary", "DESC");
+  const sHead = await sampleAvg("conversation_chunks", "chunk_summary", "ASC");
+  const sTail = await sampleAvg("conversation_chunks", "chunk_summary", "DESC");
   // gzip adoption in the tail (recent writes).
   const gz = await c.env.DB.prepare(
     `SELECT SUM(CASE WHEN content_encoding='gzip+base64' THEN 1 ELSE 0 END) AS gz,

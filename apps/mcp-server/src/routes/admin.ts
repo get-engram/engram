@@ -629,6 +629,46 @@ admin.get("/stripe-customer/:customerId", async (c) => {
   });
 });
 
+// POST /admin/reclaim-space?scope=logs|fts — EMERGENCY: free D1 space at the
+// 10 GB cap WITHOUT deleting any user data. scope=logs clears audit_log +
+// old email_log (pure observability). scope=fts additionally empties the
+// chunks_fts keyword index (derived from conversation_chunks; search falls
+// back to semantic/vector until rebuilt). Never touches messages,
+// conversations, orgs, chunks, or the vault. DELETEs free pages that new
+// writes reuse, so this restores writes even when the DB is at max size.
+admin.post("/reclaim-space", async (c) => {
+  const scope = c.req.query("scope") ?? "logs";
+  const result: Record<string, unknown> = { scope };
+  // audit_log — pure observability, safe to wipe entirely.
+  try {
+    const r = await c.env.DB.prepare("DELETE FROM audit_log").run();
+    result.audit_log_deleted = r.meta?.changes ?? 0;
+  } catch (e) {
+    result.audit_log_error = e instanceof Error ? e.message : String(e);
+  }
+  // email_log — keep the last 7 days for the admin section, drop the rest.
+  try {
+    const r = await c.env.DB
+      .prepare("DELETE FROM email_log WHERE sent_at < datetime('now','-7 days')")
+      .run();
+    result.email_log_deleted = r.meta?.changes ?? 0;
+  } catch (e) {
+    result.email_log_error = e instanceof Error ? e.message : String(e);
+  }
+  if (scope === "fts") {
+    // The FTS5 keyword index duplicates chunk_text. Emptying it frees that
+    // duplicate; semantic (vector) search still works, and the index is
+    // rebuildable from conversation_chunks. No user data lost.
+    try {
+      const r = await c.env.DB.prepare("DELETE FROM chunks_fts").run();
+      result.chunks_fts_deleted = r.meta?.changes ?? 0;
+    } catch (e) {
+      result.chunks_fts_error = e instanceof Error ? e.message : String(e);
+    }
+  }
+  return c.json({ reclaimed: true, ...result });
+});
+
 // GET /admin/audit/:orgId — query audit logs for an organization
 admin.get("/audit/:orgId", async (c) => {
   const orgId = c.req.param("orgId");

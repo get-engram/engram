@@ -636,6 +636,91 @@ admin.get("/stripe-customer/:customerId", async (c) => {
 // back to semantic/vector until rebuilt). Never touches messages,
 // conversations, orgs, chunks, or the vault. DELETEs free pages that new
 // writes reuse, so this restores writes even when the DB is at max size.
+// GET /admin/content-sizing — Phase 0 of the R2 migration: estimate how many
+// bytes each big column really occupies in D1, WITHOUT scanning all 3.4M rows
+// (a full SUM would read ~all content pages and blow D1's query budget). We
+// sample head+tail of each table for average byte size, then multiply by the
+// exact row counts (message count comes from the denormalized
+// conversations.message_count, like /metrics). LENGTH(CAST(x AS BLOB)) gives
+// true UTF-8 byte length (content is base64-of-gzip in a TEXT column).
+// Read-only; changes nothing.
+admin.get("/content-sizing", async (c) => {
+  const SAMPLE = 10000;
+  const sampleAvg = async (
+    table: string,
+    col: string,
+    order: "ASC" | "DESC",
+  ) => {
+    const row = await c.env.DB.prepare(
+      `SELECT AVG(LENGTH(CAST(${col} AS BLOB))) AS avg_bytes,
+              COUNT(*) AS n
+       FROM (SELECT ${col} FROM ${table} ORDER BY rowid ${order} LIMIT ?)`,
+    )
+      .bind(SAMPLE)
+      .first<{ avg_bytes: number | null; n: number }>();
+    return { avg: row?.avg_bytes ?? 0, n: row?.n ?? 0 };
+  };
+
+  // Exact counts (both cheap: denormalized sum + a COUNT that /metrics already runs).
+  const msgCount =
+    (
+      await c.env.DB.prepare(
+        "SELECT COALESCE(SUM(message_count),0) AS n FROM conversations",
+      ).first<{ n: number }>()
+    )?.n ?? 0;
+  const chunkCount =
+    (
+      await c.env.DB.prepare(
+        "SELECT COUNT(*) AS n FROM conversation_chunks",
+      ).first<{ n: number }>()
+    )?.n ?? 0;
+
+  // messages.content — head + tail average, blended.
+  const cHead = await sampleAvg("messages", "content", "ASC");
+  const cTail = await sampleAvg("messages", "content", "DESC");
+  const mHead = await sampleAvg("messages", "metadata", "ASC");
+  const mTail = await sampleAvg("messages", "metadata", "DESC");
+  // conversation_chunks.chunk_text + summary.
+  const ctHead = await sampleAvg("conversation_chunks", "chunk_text", "ASC");
+  const ctTail = await sampleAvg("conversation_chunks", "chunk_text", "DESC");
+  const sHead = await sampleAvg("conversation_chunks", "summary", "ASC");
+  const sTail = await sampleAvg("conversation_chunks", "summary", "DESC");
+  // gzip adoption in the tail (recent writes).
+  const gz = await c.env.DB.prepare(
+    `SELECT SUM(CASE WHEN content_encoding='gzip+base64' THEN 1 ELSE 0 END) AS gz,
+            COUNT(*) AS n
+     FROM (SELECT content_encoding FROM messages ORDER BY rowid DESC LIMIT ?)`,
+  )
+    .bind(SAMPLE)
+    .first<{ gz: number; n: number }>();
+
+  const blend = (a: { avg: number }, b: { avg: number }) => (a.avg + b.avg) / 2;
+  const contentAvg = blend(cHead, cTail);
+  const metaAvg = blend(mHead, mTail);
+  const chunkAvg = blend(ctHead, ctTail);
+  const summaryAvg = blend(sHead, sTail);
+  const GB = 1024 * 1024 * 1024;
+
+  return c.json({
+    sample_size_per_end: SAMPLE,
+    messages: {
+      count: msgCount,
+      content_avg_bytes_head: Math.round(cHead.avg),
+      content_avg_bytes_tail: Math.round(cTail.avg),
+      content_est_gb: +((contentAvg * msgCount) / GB).toFixed(2),
+      metadata_est_gb: +((metaAvg * msgCount) / GB).toFixed(2),
+      tail_gzip_pct: gz && gz.n ? Math.round((100 * (gz.gz ?? 0)) / gz.n) : 0,
+    },
+    conversation_chunks: {
+      count: chunkCount,
+      chunk_text_avg_bytes_head: Math.round(ctHead.avg),
+      chunk_text_avg_bytes_tail: Math.round(ctTail.avg),
+      chunk_text_est_gb: +((chunkAvg * chunkCount) / GB).toFixed(2),
+      summary_est_gb: +((summaryAvg * chunkCount) / GB).toFixed(2),
+    },
+  });
+});
+
 // GET /admin/db-stats — real page-level D1 size + free space, plus per-table
 // byte sizes when dbstat is available. freelist_bytes is the actual headroom
 // for new writes (freed pages new inserts reuse); size_bytes vs the 10 GB cap

@@ -701,8 +701,22 @@ admin.get("/content-sizing", async (c) => {
   const summaryAvg = blend(sHead, sTail);
   const GB = 1024 * 1024 * 1024;
 
+  // FTS5 index bulk lives in the chunks_fts_data shadow table (segment blobs).
+  // This is the redundant third copy of the text + the inverted index.
+  let ftsDataBytes = 0;
+  try {
+    const f = await c.env.DB.prepare(
+      "SELECT SUM(LENGTH(CAST(block AS BLOB))) AS bytes FROM chunks_fts_data",
+    ).first<{ bytes: number | null }>();
+    ftsDataBytes = f?.bytes ?? 0;
+  } catch (e) {
+    ftsDataBytes = -1;
+  }
+  const GB2 = 1024 * 1024 * 1024;
+
   return c.json({
     sample_size_per_end: SAMPLE,
+    chunks_fts_est_gb: ftsDataBytes < 0 ? "error" : +(ftsDataBytes / GB2).toFixed(2),
     messages: {
       count: msgCount,
       content_avg_bytes_head: Math.round(cHead.avg),

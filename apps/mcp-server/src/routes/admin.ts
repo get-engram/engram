@@ -867,6 +867,46 @@ admin.get("/search-coverage", async (c) => {
   });
 });
 
+// GET /admin/search-coverage-v2 — TRUE per-message coverage. Samples messages
+// evenly across the whole table and checks whether each one's sequence actually
+// falls inside a chunk range in its conversation (catches interior gaps the
+// max-end metric misses). Read-only.
+admin.get("/search-coverage-v2", async (c) => {
+  const buckets = Math.min(24, Math.max(4, parseInt(c.req.query("buckets") ?? "12", 10)));
+  const per = Math.min(3000, Math.max(500, parseInt(c.req.query("per") ?? "1500", 10)));
+  const mm = await c.env.DB.prepare(
+    "SELECT MIN(rowid) AS mn, MAX(rowid) AS mx FROM messages",
+  ).first<{ mn: number | null; mx: number | null }>();
+  const mn = mm?.mn ?? 0;
+  const mx = mm?.mx ?? 0;
+  let sampled = 0;
+  let covered = 0;
+  for (let k = 0; k < buckets && mx > mn; k++) {
+    const off = mn + Math.floor((k * (mx - mn)) / buckets);
+    const r = await c.env.DB.prepare(
+      `SELECT COUNT(*) AS n,
+              COALESCE(SUM(CASE WHEN EXISTS(
+                 SELECT 1 FROM conversation_chunks cc
+                 WHERE cc.conversation_id = m.conversation_id
+                   AND cc.start_sequence <= m.sequence
+                   AND cc.end_sequence   >= m.sequence
+              ) THEN 1 ELSE 0 END), 0) AS cov
+       FROM (SELECT conversation_id, sequence FROM messages WHERE rowid >= ? LIMIT ?) m`,
+    )
+      .bind(off, per)
+      .first<{ n: number; cov: number }>();
+    sampled += r?.n ?? 0;
+    covered += r?.cov ?? 0;
+  }
+  const pct = sampled ? +((100 * covered) / sampled).toFixed(1) : 0;
+  return c.json({
+    sampled_messages: sampled,
+    covered_messages: covered,
+    pct_searchable_true: pct,
+    pct_unsearchable_true: sampled ? +(100 - pct).toFixed(1) : 0,
+  });
+});
+
 // GET /admin/db-stats — real page-level D1 size + free space, plus per-table
 // byte sizes when dbstat is available. freelist_bytes is the actual headroom
 // for new writes (freed pages new inserts reuse); size_bytes vs the 10 GB cap

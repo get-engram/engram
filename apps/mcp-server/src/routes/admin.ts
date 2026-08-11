@@ -819,6 +819,54 @@ admin.get("/content-sizing-v2", async (c) => {
   });
 });
 
+// GET /admin/search-coverage — how much stored verbatim is actually
+// searchable. Indexing (chunk+embed) is best-effort with no backfill, so
+// messages whose append hit an embedding rate-limit are stored but never
+// indexed. This measures: (a) conversations with ZERO chunks, and (b) the
+// partial gap — messages whose sequence falls beyond the last chunk's
+// end_sequence in conversations that were only partly indexed. Read-only.
+admin.get("/search-coverage", async (c) => {
+  const totals = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS convs, COALESCE(SUM(message_count),0) AS msgs FROM conversations WHERE message_count > 0",
+  ).first<{ convs: number; msgs: number }>();
+
+  // Per-conversation chunk coverage (max end_sequence reached, chunk count).
+  const cov = await c.env.DB.prepare(
+    `SELECT
+        COALESCE(SUM(c.message_count), 0) AS total_msgs,
+        COALESCE(SUM(CASE WHEN g.max_end IS NULL THEN c.message_count ELSE 0 END), 0) AS msgs_zero_chunks,
+        COALESCE(SUM(CASE WHEN g.max_end IS NOT NULL AND (c.message_count - 1) > g.max_end
+                          THEN (c.message_count - 1 - g.max_end) ELSE 0 END), 0) AS msgs_beyond_last_chunk,
+        COALESCE(SUM(CASE WHEN g.max_end IS NULL THEN 1 ELSE 0 END), 0) AS convs_zero_chunks
+     FROM conversations c
+     LEFT JOIN (
+        SELECT conversation_id, MAX(end_sequence) AS max_end, COUNT(*) AS n
+        FROM conversation_chunks GROUP BY conversation_id
+     ) g ON g.conversation_id = c.id
+     WHERE c.message_count > 0`,
+  ).first<{ total_msgs: number; msgs_zero_chunks: number; msgs_beyond_last_chunk: number; convs_zero_chunks: number }>();
+
+  const total = cov?.total_msgs ?? 0;
+  const zero = cov?.msgs_zero_chunks ?? 0;
+  const beyond = cov?.msgs_beyond_last_chunk ?? 0;
+  const unsearchable = zero + beyond;
+  const searchable = Math.max(0, total - unsearchable);
+
+  return c.json({
+    conversations_total: totals?.convs ?? 0,
+    conversations_zero_chunks: cov?.convs_zero_chunks ?? 0,
+    messages_total: total,
+    unsearchable: {
+      in_zero_chunk_convs: zero,
+      beyond_last_chunk_in_partial_convs: beyond,
+      total: unsearchable,
+    },
+    messages_searchable_est: searchable,
+    pct_searchable: total ? +((100 * searchable) / total).toFixed(1) : 0,
+    pct_unsearchable: total ? +((100 * unsearchable) / total).toFixed(1) : 0,
+  });
+});
+
 // GET /admin/db-stats — real page-level D1 size + free space, plus per-table
 // byte sizes when dbstat is available. freelist_bytes is the actual headroom
 // for new writes (freed pages new inserts reuse); size_bytes vs the 10 GB cap

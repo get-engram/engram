@@ -636,6 +636,40 @@ admin.get("/stripe-customer/:customerId", async (c) => {
 // back to semantic/vector until rebuilt). Never touches messages,
 // conversations, orgs, chunks, or the vault. DELETEs free pages that new
 // writes reuse, so this restores writes even when the DB is at max size.
+// GET /admin/db-stats — real page-level D1 size + free space, plus per-table
+// byte sizes when dbstat is available. freelist_bytes is the actual headroom
+// for new writes (freed pages new inserts reuse); size_bytes vs the 10 GB cap
+// is how close we are to re-wedging. Read-only; safe to call anytime.
+admin.get("/db-stats", async (c) => {
+  const out: Record<string, unknown> = {};
+  try {
+    const pc = await c.env.DB.prepare("PRAGMA page_count").first<{ page_count: number }>();
+    const ps = await c.env.DB.prepare("PRAGMA page_size").first<{ page_size: number }>();
+    const fl = await c.env.DB.prepare("PRAGMA freelist_count").first<{ freelist_count: number }>();
+    const pageCount = pc?.page_count ?? 0;
+    const pageSize = ps?.page_size ?? 0;
+    const freelist = fl?.freelist_count ?? 0;
+    out.page_size = pageSize;
+    out.page_count = pageCount;
+    out.size_bytes = pageCount * pageSize;
+    out.freelist_pages = freelist;
+    out.freelist_bytes = freelist * pageSize;
+    out.cap_bytes = 10 * 1024 * 1024 * 1024;
+  } catch (e) {
+    out.pragma_error = e instanceof Error ? e.message : String(e);
+  }
+  // Per-table sizes (best effort — dbstat may not be compiled in).
+  try {
+    const t = await c.env.DB.prepare(
+      "SELECT name, SUM(pgsize) AS bytes FROM dbstat GROUP BY name ORDER BY bytes DESC",
+    ).all<{ name: string; bytes: number }>();
+    out.tables = t.results ?? [];
+  } catch (e) {
+    out.dbstat_error = e instanceof Error ? e.message : String(e);
+  }
+  return c.json(out);
+});
+
 admin.post("/reclaim-space", async (c) => {
   const scope = c.req.query("scope") ?? "logs";
   const result: Record<string, unknown> = { scope };

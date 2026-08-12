@@ -11,28 +11,40 @@ export function insertChunks(
     vectorizeId: string;
   }>
 ) {
-  const stmts = chunks.flatMap((c) => [
-    db
-      .prepare(
-        "INSERT INTO conversation_chunks (id, conversation_id, organization_id, chunk_text, chunk_summary, start_sequence, end_sequence, vectorize_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-      )
-      .bind(
-        c.id,
-        c.conversationId,
-        c.organizationId,
-        c.chunkText,
-        c.chunkSummary,
-        c.startSequence,
-        c.endSequence,
-        c.vectorizeId
-      ),
-    // Dual-write into FTS5 index for keyword search
-    db
-      .prepare(
-        "INSERT INTO chunks_fts(chunk_text, chunk_id, organization_id) VALUES (?, ?, ?)"
-      )
-      .bind(c.chunkText, c.id, c.organizationId),
-  ]);
+  if (chunks.length === 0) return Promise.resolve();
+  // Idempotent by chunk id: with deterministic ids (see chunkId()), re-indexing
+  // the same window must upsert, not duplicate or PK-conflict. chunks_fts has no
+  // unique key and chunk_id is UNINDEXED (a per-row delete would full-scan the
+  // whole FTS on every append), so we clear all prior FTS rows for this batch's
+  // ids in ONE delete up front, then INSERT OR REPLACE each chunk row and write
+  // its fresh FTS row. All in one D1 batch/transaction.
+  const ids = chunks.map((c) => c.id);
+  const ph = ids.map(() => "?").join(",");
+  const stmts = [
+    db.prepare(`DELETE FROM chunks_fts WHERE chunk_id IN (${ph})`).bind(...ids),
+    ...chunks.flatMap((c) => [
+      db
+        .prepare(
+          "INSERT OR REPLACE INTO conversation_chunks (id, conversation_id, organization_id, chunk_text, chunk_summary, start_sequence, end_sequence, vectorize_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(
+          c.id,
+          c.conversationId,
+          c.organizationId,
+          c.chunkText,
+          c.chunkSummary,
+          c.startSequence,
+          c.endSequence,
+          c.vectorizeId
+        ),
+      // Dual-write into FTS5 index for keyword search
+      db
+        .prepare(
+          "INSERT INTO chunks_fts(chunk_text, chunk_id, organization_id) VALUES (?, ?, ?)"
+        )
+        .bind(c.chunkText, c.id, c.organizationId),
+    ]),
+  ];
   return db.batch(stmts);
 }
 

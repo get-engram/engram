@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { chunkMessages, estimateTokens, summarizeChunk } from "../utils/chunk.js";
+import { chunkMessages, chunkId, estimateTokens, summarizeChunk } from "../utils/chunk.js";
 import type { Message } from "../types/index.js";
 
 const MAX_CHARS = 480 * 4; // mirrors MAX_TOKENS * CHARS_PER_TOKEN in chunk.ts
@@ -200,5 +200,52 @@ describe("chunkMessages", () => {
         "[assistant]: First sentence here. " + "x".repeat(300);
       expect(summarizeChunk(text)).toBe("First sentence here.");
     });
+  });
+});
+
+describe("deterministic chunk identity", () => {
+  it("assigns index 0 to ordinary (uniquely-ranged) windows", () => {
+    const messages = Array.from({ length: 8 }, (_, i) =>
+      makeMessage(i + 1, i % 2 ? "assistant" : "user", `msg ${i + 1}`)
+    );
+    const chunks = chunkMessages(messages);
+    // overlapping windows all have distinct [start,end] -> every index is 0
+    expect(chunks.every((c) => c.index === 0)).toBe(true);
+  });
+
+  it("disambiguates pieces of one oversized message with 0,1,2…", () => {
+    // A single message far over the embedding budget is hard-split into
+    // pieces that all share the same [start,end]=[1,1]; they must get
+    // distinct indices so their ids don't collide.
+    const huge = "x".repeat(MAX_CHARS * 3 + 10);
+    const chunks = chunkMessages([makeMessage(1, "user", huge)]);
+    expect(chunks.length).toBeGreaterThan(1);
+    const sameRange = chunks.filter(
+      (c) => c.startSequence === 1 && c.endSequence === 1
+    );
+    expect(sameRange.map((c) => c.index)).toEqual(
+      sameRange.map((_, i) => i)
+    );
+  });
+
+  it("chunkId is stable for the same inputs and unique across pieces", () => {
+    const a = chunkId("conv_abc", 1, 5, 0);
+    const b = chunkId("conv_abc", 1, 5, 0);
+    expect(a).toBe(b); // deterministic -> re-index is an upsert
+    expect(a).not.toBe(chunkId("conv_abc", 1, 5, 1)); // piece disambiguation
+    expect(a).not.toBe(chunkId("conv_abc", 4, 8, 0)); // different window
+    expect(a).not.toBe(chunkId("conv_xyz", 1, 5, 0)); // different conversation
+  });
+
+  it("produces one id per chunk with no collisions across a conversation", () => {
+    const messages = Array.from({ length: 40 }, (_, i) =>
+      makeMessage(i + 1, i % 2 ? "assistant" : "user", `message number ${i}`)
+    );
+    const chunks = chunkMessages(messages);
+    const ids = chunks.map((c) =>
+      chunkId("conv_test", c.startSequence, c.endSequence, c.index)
+    );
+    expect(new Set(ids).size).toBe(ids.length); // all unique
+    expect(ids.every((id) => id.length <= 64)).toBe(true); // Vectorize id limit
   });
 });

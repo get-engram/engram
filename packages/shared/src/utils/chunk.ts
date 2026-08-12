@@ -15,6 +15,30 @@ export interface ChunkResult {
   text: string;
   startSequence: number;
   endSequence: number;
+  /**
+   * Disambiguator for chunks that share the same [startSequence, endSequence]
+   * (an oversized message hard-split into pieces). 0 for ordinary windows.
+   * Combined with the conversation id + sequence range it forms a STABLE,
+   * collision-free identity so re-indexing the same content upserts instead of
+   * duplicating. Assigned by chunkMessages(); see chunkId().
+   */
+  index: number;
+}
+
+/**
+ * Deterministic, collision-free id for a chunk. Same (conversation, sequence
+ * range, piece index) always yields the same id, so re-indexing is a pure
+ * upsert (no duplicate rows/vectors on retry or backfill). Used for BOTH the
+ * D1 chunk row id and the Vectorize vector id. Stays well under Vectorize's
+ * 64-byte id limit (conv ids are fixed-length; sequences are integers).
+ */
+export function chunkId(
+  conversationId: string,
+  startSequence: number,
+  endSequence: number,
+  index: number,
+): string {
+  return `chk_${conversationId}_${startSequence}_${endSequence}_${index}`;
 }
 
 export interface ChunkOptions {
@@ -80,6 +104,7 @@ function splitOversized(parts: Part[], warn: (m: string) => void): ChunkResult[]
       text: buf.map((p) => p.text).join("\n"),
       startSequence: buf[0].seq,
       endSequence: buf[buf.length - 1].seq,
+      index: 0, // corrected by the per-(start,end) pass in chunkMessages
     });
     buf = [];
     bufChars = 0;
@@ -98,6 +123,7 @@ function splitOversized(parts: Part[], warn: (m: string) => void): ChunkResult[]
           text: part.text.slice(j, j + MAX_CHARS),
           startSequence: part.seq,
           endSequence: part.seq,
+          index: 0, // corrected by the per-(start,end) pass in chunkMessages
         });
       }
       continue;
@@ -136,6 +162,7 @@ export function chunkMessages(
         text,
         startSequence: window[0].sequence,
         endSequence: window[window.length - 1].sequence,
+        index: 0, // corrected by the per-(start,end) pass below
       });
     } else {
       // Window overflows the embedding context — split it so nothing is
@@ -145,6 +172,18 @@ export function chunkMessages(
 
     // If window didn't fill, we've reached the end
     if (window.length < WINDOW_SIZE) break;
+  }
+
+  // Assign a stable disambiguator to chunks that share a [start,end] range
+  // (only happens when an oversized message is hard-split). Ordinary windows
+  // have unique ranges and keep index 0. This makes chunkId() collision-free
+  // and deterministic across re-indexing runs.
+  const seen = new Map<string, number>();
+  for (const ch of chunks) {
+    const key = `${ch.startSequence}:${ch.endSequence}`;
+    const idx = seen.get(key) ?? 0;
+    ch.index = idx;
+    seen.set(key, idx + 1);
   }
 
   return chunks;

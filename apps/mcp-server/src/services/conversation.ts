@@ -1,6 +1,7 @@
 import {
   generateId,
   chunkMessages,
+  chunkId,
   summarizeChunk,
   redactMessages,
   type MessageInput,
@@ -219,16 +220,23 @@ export async function appendMessages(
 
       // Prepare chunk records with vectorize IDs
       const chunkRecords = chunks.map((chunk, i) => {
-        const vectorizeId = generateId("chk");
+        // Deterministic id -> re-indexing the same window is a pure upsert,
+        // never a duplicate. Same value for the row id and the vector id.
+        const cid = chunkId(
+          conversationId,
+          chunk.startSequence,
+          chunk.endSequence,
+          chunk.index,
+        );
         return {
-          id: generateId("chk"),
+          id: cid,
           conversationId,
           organizationId,
           chunkText: chunk.text,
           chunkSummary: summarizeChunk(chunk.text),
           startSequence: chunk.startSequence,
           endSequence: chunk.endSequence,
-          vectorizeId,
+          vectorizeId: cid,
           embedding: embeddings[i],
         };
       });
@@ -441,17 +449,25 @@ export async function updateMessage(
     }
 
     if (chunks.length > 0) {
-      const chunkRecords = chunks.map((chunk, i) => ({
-        id: generateId("chk"),
-        conversationId,
-        organizationId,
-        chunkText: chunk.text,
-        chunkSummary: summarizeChunk(chunk.text),
-        startSequence: chunk.startSequence,
-        endSequence: chunk.endSequence,
-        vectorizeId: generateId("chk"),
-        embedding: embeddings[i],
-      }));
+      const chunkRecords = chunks.map((chunk, i) => {
+        const cid = chunkId(
+          conversationId,
+          chunk.startSequence,
+          chunk.endSequence,
+          chunk.index,
+        );
+        return {
+          id: cid,
+          conversationId,
+          organizationId,
+          chunkText: chunk.text,
+          chunkSummary: summarizeChunk(chunk.text),
+          startSequence: chunk.startSequence,
+          endSequence: chunk.endSequence,
+          vectorizeId: cid,
+          embedding: embeddings[i],
+        };
+      });
       await insertChunks(
         env.DB,
         chunkRecords.map((c) => ({

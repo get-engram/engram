@@ -907,6 +907,72 @@ admin.get("/search-coverage-v2", async (c) => {
   });
 });
 
+// POST /admin/backfill-content-to-r2?after=<rowid>&batch=150 — move legacy
+// inline message content out of D1 into R2 (the permanent fix for the 10GB
+// cap). Per row: PUT the existing stored bytes to R2, read them back and
+// compare, and ONLY THEN shrink the D1 row (content=\'\', content_encoding=
+// \'r2:<orig>\'). Verify-before-swap => content is never lost. Resumable via
+// the rowid cursor; idempotent (only touches non-r2 rows). Each shrinking
+// UPDATE frees D1 pages, so running this also un-wedges a full database.
+admin.post("/backfill-content-to-r2", async (c) => {
+  const batch = Math.min(500, Math.max(1, parseInt(c.req.query("batch") ?? "150", 10)));
+  const after = parseInt(c.req.query("after") ?? "0", 10);
+
+  const rows = await c.env.DB.prepare(
+    `SELECT rowid AS rid, id, content, content_encoding FROM messages
+     WHERE rowid > ? AND content != \'\'
+       AND (content_encoding IS NULL OR content_encoding NOT LIKE \'r2:%\')
+     ORDER BY rowid LIMIT ?`,
+  )
+    .bind(after, batch)
+    .all<{ rid: number; id: string; content: string; content_encoding: string | null }>();
+
+  const list = rows.results ?? [];
+  let verified = 0;
+  let verifyFailed = 0;
+  let putFailed = 0;
+  const toSwap: Array<{ id: string; enc: string }> = [];
+
+  for (const r of list) {
+    const key = `content/${r.id}`;
+    try {
+      await c.env.CONTENT.put(key, r.content);
+      const back = await c.env.CONTENT.get(key);
+      const text = back ? await back.text() : null;
+      if (text === r.content) {
+        toSwap.push({ id: r.id, enc: `r2:${r.content_encoding ?? "raw"}` });
+        verified++;
+      } else {
+        verifyFailed++; // leave inline — do not swap unverified content
+      }
+    } catch {
+      putFailed++; // R2 write failed — leave inline, retry next pass
+    }
+  }
+
+  if (toSwap.length > 0) {
+    await c.env.DB.batch(
+      toSwap.map((sw) =>
+        c.env.DB
+          .prepare("UPDATE messages SET content = \'\', content_encoding = ? WHERE id = ?")
+          .bind(sw.enc, sw.id),
+      ),
+    );
+  }
+
+  const maxRid = list.length ? list[list.length - 1].rid : after;
+  return c.json({
+    batch,
+    after,
+    processed: list.length,
+    verified_and_swapped: verified,
+    verify_failed: verifyFailed,
+    put_failed: putFailed,
+    next_after: maxRid,
+    done: list.length === 0,
+  });
+});
+
 // GET /admin/db-stats — real page-level D1 size + free space, plus per-table
 // byte sizes when dbstat is available. freelist_bytes is the actual headroom
 // for new writes (freed pages new inserts reuse); size_bytes vs the 10 GB cap

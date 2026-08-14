@@ -19,6 +19,12 @@ database_name = "engram-db"
 database_id = "fcf57f81-8d26-4288-aee5-11c42d6ca0d5"
 migrations_dir = "../../packages/db/migrations"
 
+# Verbatim message content lives here (unbounded), keyed by message id. D1
+# holds only metadata + a pointer, so it never hits the 10 GB cap again.
+[[r2_buckets]]
+binding = "CONTENT"
+bucket_name = "engram-content"
+
 [[vectorize]]
 binding = "VECTORIZE"
 index_name = "engram-vectors"

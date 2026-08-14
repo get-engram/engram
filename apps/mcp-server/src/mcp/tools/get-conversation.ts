@@ -73,7 +73,7 @@ export function registerGetConversation(
       await audit(env.DB, auth.organizationId, auth.apiKeyId, "conversation.read", "conversation", params.conversation_id);
 
       const result = await getConversation(
-        env.DB,
+        env,
         auth.organizationId,
         params.conversation_id,
         params.message_limit,

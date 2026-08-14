@@ -191,7 +191,7 @@ v1.get("/conversations/:id", async (c) => {
   });
 
   const result = await getConversation(
-    c.env.DB,
+    c.env,
     auth.organizationId,
     conversationId,
     messageLimit,

@@ -4,7 +4,7 @@ import {
   listConversations,
   getMessagesByConversation,
 } from "@getengram/db";
-import { decompressContent } from "../utils/compress.js";
+import { loadContent } from "../services/content-store.js";
 import { audit } from "../services/audit.js";
 import type { Env, AuthContext } from "../types.js";
 
@@ -46,10 +46,11 @@ dataExport.get("/", async (c) => {
     const messages = await Promise.all(
       (msgResult.results as Array<Record<string, unknown>>).map(async (m) => ({
         role: m.role,
-        content: await decompressContent(
-          m.content as string,
-          m.content_encoding as string | null,
-        ),
+        content: await loadContent(c.env, {
+          id: m.id as string,
+          content: m.content as string,
+          content_encoding: m.content_encoding as string | null,
+        }),
         sequence: m.sequence,
         created_at: m.created_at,
         ...(m.tool_name ? { tool_name: m.tool_name } : {}),

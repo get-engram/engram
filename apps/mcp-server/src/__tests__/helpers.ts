@@ -196,8 +196,25 @@ export function createMockD1(): D1Database {
 }
 
 export function createMockEnv(db: D1Database) {
+  // In-memory R2 mock so content write-then-read round-trips in tests.
+  const r2store = new Map<string, string>();
   return {
     DB: db,
+    CONTENT: {
+      put: vi.fn(async (key: string, val: unknown) => {
+        r2store.set(key, typeof val === "string" ? val : String(val));
+        return {};
+      }),
+      get: vi.fn(async (key: string) => {
+        const v = r2store.get(key);
+        return v == null ? null : { text: async () => v };
+      }),
+      delete: vi.fn(async (key: string) => {
+        r2store.delete(key);
+      }),
+      head: vi.fn(async () => null),
+      list: vi.fn(async () => ({ objects: [] })),
+    } as unknown as R2Bucket,
     AI: {
       run: vi.fn(async () => ({
         data: [[0.1, 0.2, 0.3]], // minimal fake embedding

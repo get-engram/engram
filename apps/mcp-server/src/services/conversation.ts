@@ -31,7 +31,7 @@ import {
 } from "@getengram/db";
 import { generateEmbeddings } from "./embedding.js";
 import { releaseStorage } from "./tier.js";
-import { compressContent, decompressContent } from "../utils/compress.js";
+import { storeContent, loadContent } from "./content-store.js";
 import type { Env, AuthContext } from "../types.js";
 import { canAccessConversation } from "./spaces.js";
 
@@ -160,12 +160,13 @@ export async function appendMessages(
     console.log(`[redact] Scrubbed ${totalRedactions} sensitive pattern(s) from ${conversationId}`);
   }
 
-  // Compress message content for storage
-  const compressed = await Promise.all(
-    redacted.map((m) => compressContent(m.content))
+  // Store verbatim content in R2 (D1 keeps only a pointer), falling back to
+  // inline D1 if R2 is unavailable so content is never lost.
+  const stored = await Promise.all(
+    redacted.map((m) => storeContent(env, m.id, m.content))
   );
 
-  // Insert messages with compressed content
+  // Insert message rows (content lives in R2; D1 row carries the pointer)
   await insertMessages(
     env.DB,
     redacted.map((m, i) => ({
@@ -173,8 +174,8 @@ export async function appendMessages(
       conversationId: m.conversation_id,
       organizationId: m.organization_id,
       role: m.role,
-      content: compressed[i].content,
-      contentEncoding: compressed[i].encoding,
+      content: stored[i].content,
+      contentEncoding: stored[i].encoding,
       toolCallId: m.tool_call_id,
       toolName: m.tool_name,
       sequence: m.sequence,
@@ -282,13 +283,13 @@ export async function appendMessages(
 }
 
 export async function getConversation(
-  db: D1Database,
+  env: Env,
   organizationId: string,
   conversationId: string,
   messageLimit: number,
   messageOffset: number
 ): Promise<{ conversation: Conversation; messages: Message[] } | null> {
-  const conv = await getConversationById(db, conversationId, organizationId);
+  const conv = await getConversationById(env.DB, conversationId, organizationId);
   if (!conv) return null;
 
   const raw = conv as Record<string, unknown>;
@@ -305,22 +306,23 @@ export async function getConversation(
   };
 
   const msgsResult = await getMessagesByConversation(
-    db,
+    env.DB,
     conversationId,
     organizationId,
     messageLimit,
     messageOffset
   );
 
-  // Decompress message content in parallel
+  // Load message content (from R2 or legacy inline) in parallel
   const rawMessages = msgsResult.results as Array<Record<string, unknown>>;
   const messages = await Promise.all(
     rawMessages.map(async (m) => ({
       ...m,
-      content: await decompressContent(
-        m.content as string,
-        m.content_encoding as string | null
-      ),
+      content: await loadContent(env, {
+        id: m.id as string,
+        content: m.content as string,
+        content_encoding: m.content_encoding as string | null,
+      }),
       metadata: JSON.parse((m.metadata as string) || "{}"),
     }))
   ) as Message[];
@@ -386,13 +388,14 @@ export async function updateMessage(
     );
   }
   const updated = redacted[0];
-  const compressed = await compressContent(updated.content);
+  // Overwrite the R2 object for this message (same key) — falls back to inline.
+  const stored = await storeContent(env, messageId, updated.content);
   await updateMessageContent(
     env.DB,
     messageId,
     organizationId,
-    compressed.content,
-    compressed.encoding
+    stored.content,
+    stored.encoding
   );
 
   // Rebuild the affected slice of the search index. Chunk boundaries are
@@ -424,10 +427,11 @@ export async function updateMessage(
       (windowResult.results as Array<Record<string, unknown>>).map(
         async (m) => ({
           ...m,
-          content: await decompressContent(
-            m.content as string,
-            m.content_encoding as string | null
-          ),
+          content: await loadContent(env, {
+            id: m.id as string,
+            content: m.content as string,
+            content_encoding: m.content_encoding as string | null,
+          }),
           metadata: JSON.parse((m.metadata as string) || "{}"),
         })
       )

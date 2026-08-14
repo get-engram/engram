@@ -6,12 +6,15 @@ import {
   getOrCreateDefaultConversation,
 } from "../services/conversation.js";
 import { insertOrganization, insertConversation as dbInsertConversation } from "@getengram/db";
+import type { Env } from "../types.js";
 
 describe("Conversation service", () => {
   let db: D1Database;
+  let env: Env;
 
   beforeAll(async () => {
     db = createMockD1();
+    env = createMockEnv(db) as unknown as Env;
     await insertOrganization(db, "org_svc", "Svc Org");
   });
 
@@ -29,14 +32,14 @@ describe("Conversation service", () => {
 
   describe("getConversation", () => {
     it("returns null for non-existent conversation", async () => {
-      const result = await getConversation(db, "org_svc", "conv_fake", 100, 0);
+      const result = await getConversation(env, "org_svc", "conv_fake", 100, 0);
       expect(result).toBeNull();
     });
 
     it("returns conversation with messages", async () => {
       // Create via the service to populate the mock
       const convId = await createConversation(db, "org_svc", "Get Test");
-      const result = await getConversation(db, "org_svc", convId, 100, 0);
+      const result = await getConversation(env, "org_svc", convId, 100, 0);
       expect(result).not.toBeNull();
       expect(result!.conversation.id).toBe(convId);
     });

@@ -113,25 +113,6 @@ jobs:
       - name: Build workspace packages
         run: pnpm -F @getengram/shared -F @getengram/db build
 
-      # Verbatim message content lives in R2 (D1 stays metadata + index only).
-      # Idempotent: create-if-absent so the binding in wrangler.toml always
-      # resolves. Safe to run every deploy.
-      - name: Ensure R2 content bucket exists
-        working-directory: apps/mcp-server
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set +e
-          OUT=$(npx wrangler r2 bucket create engram-content 2>&1)
-          CODE=$?
-          echo "$OUT"
-          # Tolerate "already exists"; fail loudly on any other error (e.g. R2 not enabled).
-          if [ $CODE -ne 0 ] && ! echo "$OUT" | grep -qiE "already (exists|owned)"; then
-            echo "::error::R2 bucket create failed — is R2 enabled and the API token scoped for R2?"
-            exit 1
-          fi
-
       - name: Run D1 migrations
         working-directory: apps/mcp-server
         env:

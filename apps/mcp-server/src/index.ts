@@ -27,6 +27,7 @@ import { sendImportNudges } from "./cron/import-nudge.js";
 import { sendMaxoutNudges } from "./cron/maxout-nudge.js";
 import { sendActivationNudges } from "./cron/activation-nudge.js";
 import { drainContentToR2 } from "./cron/drain-content.js";
+export { DrainerDO } from "./services/drainer-do.js";
 import { sendWeeklyDigests } from "./cron/weekly-digest.js";
 import { sendDailyReport } from "./services/daily-report.js";
 import { oauth } from "./oauth/router.js";

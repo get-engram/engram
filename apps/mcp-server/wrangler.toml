@@ -29,6 +29,13 @@ bucket_name = "engram-content"
 binding = "VECTORIZE"
 index_name = "engram-vectors"
 
+# Self service-binding — lets the drain cron fan out to parallel sub-invocations
+# of this same worker (each with its own subrequest/connection budget) without
+# going over the public internet.
+[[services]]
+binding = "SELF"
+service = "engram-mcp-server"
+
 [ai]
 binding = "AI"
 

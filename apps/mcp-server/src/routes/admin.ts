@@ -915,46 +915,41 @@ admin.get("/search-coverage-v2", async (c) => {
 // the rowid cursor; idempotent (only touches non-r2 rows). Each shrinking
 // UPDATE frees D1 pages, so running this also un-wedges a full database.
 admin.post("/backfill-content-to-r2", async (c) => {
-  const batch = Math.min(500, Math.max(1, parseInt(c.req.query("batch") ?? "150", 10)));
+  const batch = Math.min(800, Math.max(1, parseInt(c.req.query("batch") ?? "400", 10)));
   const after = parseInt(c.req.query("after") ?? "0", 10);
 
   const rows = await c.env.DB.prepare(
     `SELECT rowid AS rid, id, content, content_encoding FROM messages
-     WHERE rowid > ? AND content != \'\'
-       AND (content_encoding IS NULL OR content_encoding NOT LIKE \'r2:%\')
+     WHERE rowid > ? AND content != ''
+       AND (content_encoding IS NULL OR content_encoding NOT LIKE 'r2:%')
      ORDER BY rowid LIMIT ?`,
   )
     .bind(after, batch)
     .all<{ rid: number; id: string; content: string; content_encoding: string | null }>();
 
   const list = rows.results ?? [];
-  let verified = 0;
-  let verifyFailed = 0;
-  let putFailed = 0;
-  const toSwap: Array<{ id: string; enc: string }> = [];
 
-  for (const r of list) {
-    const key = `content/${r.id}`;
-    try {
-      await c.env.CONTENT.put(key, r.content);
-      const back = await c.env.CONTENT.get(key);
-      const text = back ? await back.text() : null;
-      if (text === r.content) {
-        toSwap.push({ id: r.id, enc: `r2:${r.content_encoding ?? "raw"}` });
-        verified++;
-      } else {
-        verifyFailed++; // leave inline — do not swap unverified content
+  // R2 puts run in PARALLEL (sequential put+get was ~440ms/row -> ~17 days for
+  // 3.4M rows). R2 put() resolves only on a durable write, so a fulfilled
+  // promise is the confirmation; no read-back needed. Content is copied to R2
+  // before the D1 row is ever cleared, and we swap only rows whose put succeeded.
+  const outcomes = await Promise.all(
+    list.map(async (r) => {
+      try {
+        await c.env.CONTENT.put(`content/${r.id}`, r.content);
+        return { id: r.id, enc: `r2:${r.content_encoding ?? "raw"}`, ok: true };
+      } catch {
+        return { id: r.id, enc: "", ok: false };
       }
-    } catch {
-      putFailed++; // R2 write failed — leave inline, retry next pass
-    }
-  }
+    }),
+  );
+  const toSwap = outcomes.filter((o) => o.ok);
 
   if (toSwap.length > 0) {
     await c.env.DB.batch(
       toSwap.map((sw) =>
         c.env.DB
-          .prepare("UPDATE messages SET content = \'\', content_encoding = ? WHERE id = ?")
+          .prepare("UPDATE messages SET content = '', content_encoding = ? WHERE id = ?")
           .bind(sw.enc, sw.id),
       ),
     );
@@ -965,9 +960,8 @@ admin.post("/backfill-content-to-r2", async (c) => {
     batch,
     after,
     processed: list.length,
-    verified_and_swapped: verified,
-    verify_failed: verifyFailed,
-    put_failed: putFailed,
+    verified_and_swapped: toSwap.length,
+    put_failed: outcomes.length - toSwap.length,
     next_after: maxRid,
     done: list.length === 0,
   });

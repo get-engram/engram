@@ -26,6 +26,7 @@ import { enforceRetentionPolicies } from "./cron/retention-policy.js";
 import { sendImportNudges } from "./cron/import-nudge.js";
 import { sendMaxoutNudges } from "./cron/maxout-nudge.js";
 import { sendActivationNudges } from "./cron/activation-nudge.js";
+import { drainContentToR2 } from "./cron/drain-content.js";
 import { sendWeeklyDigests } from "./cron/weekly-digest.js";
 import { sendDailyReport } from "./services/daily-report.js";
 import { oauth } from "./oauth/router.js";
@@ -273,9 +274,21 @@ app.route("/api/v1", v1);
 export default {
   fetch: app.fetch,
   async scheduled(event: ScheduledEvent, env: Env, _ctx: ExecutionContext) {
-    // Two daily crons (see wrangler.toml [triggers]):
+    // Crons (see wrangler.toml [triggers]):
+    //   * * * * *  — drain legacy inline content D1 -> R2 (no-op once done)
     //   03:00 UTC — GDPR purge of soft-deleted orgs
     //   13:00 UTC — daily ops report, emailed via engram-web
+    if (event.cron === "* * * * *") {
+      // MUST return here — falling through would run the daily purge/nudge
+      // branch every minute.
+      try {
+        const moved = await drainContentToR2(env);
+        if (moved > 0) console.log(`[drain] moved ${moved} message(s) to R2`);
+      } catch (err) {
+        console.error(`[drain] FAILED: ${err instanceof Error ? err.message : err}`);
+      }
+      return;
+    }
     if (event.cron === "0 13 * * *") {
       // Isolated so a report failure can't swallow the Monday digests —
       // and vice versa. Failures land in the worker logs with context.

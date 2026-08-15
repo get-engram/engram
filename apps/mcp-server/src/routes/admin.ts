@@ -973,6 +973,45 @@ admin.post("/backfill-content-to-r2", async (c) => {
   });
 });
 
+// POST /admin/backfill-drain?after=0 — self-continuing drain. Processes one
+// backfill batch, then (via waitUntil) fetches itself with the next cursor,
+// chaining on Cloudflare until done — no external driver needed. Retries the
+// same cursor on a transient error; a decrementing hop cap prevents runaways.
+admin.post("/backfill-drain", async (c) => {
+  const after = parseInt(c.req.query("after") ?? "0", 10);
+  const hops = parseInt(c.req.query("hops") ?? "20000", 10);
+  const origin = new URL(c.req.url).origin;
+  const auth = c.req.header("Authorization") ?? "";
+  const hdr = { Authorization: auth, "User-Agent": "engram-drain/1.0" };
+
+  let j: Record<string, unknown> = {};
+  let nextAfter = after;
+  let stop = false;
+  try {
+    const r = await fetch(
+      `${origin}/admin/backfill-content-to-r2?after=${after}&batch=400`,
+      { method: "POST", headers: hdr },
+    );
+    j = (await r.json()) as Record<string, unknown>;
+    if (j.done === true || (j.processed as number ?? 0) === 0) stop = true;
+    else nextAfter = j.next_after as number;
+  } catch (e) {
+    j = { error: e instanceof Error ? e.message : String(e) };
+    nextAfter = after; // retry same cursor on transient error
+  }
+
+  const more = !stop && hops > 1;
+  if (more) {
+    c.executionCtx.waitUntil(
+      fetch(`${origin}/admin/backfill-drain?after=${nextAfter}&hops=${hops - 1}`, {
+        method: "POST",
+        headers: hdr,
+      }),
+    );
+  }
+  return c.json({ chaining: more, hops_left: hops - 1, ...j });
+});
+
 // GET /admin/db-stats — real page-level D1 size + free space, plus per-table
 // byte sizes when dbstat is available. freelist_bytes is the actual headroom
 // for new writes (freed pages new inserts reuse); size_bytes vs the 10 GB cap

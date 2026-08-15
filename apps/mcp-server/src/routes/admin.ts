@@ -1007,6 +1007,49 @@ admin.post("/backfill-drain", async (c) => {
   return c.json({ chaining: more, hops_left: hops - 1, ...j });
 });
 
+// Drain fleet control — POST /admin/drain-do/start|stop, GET /admin/drain-do/status.
+// 10 DrainerDO instances, each draining its own rowid window via alarms
+// (true parallel, fully serverless). Idempotent with everything else.
+const DRAIN_FLEET = 10;
+const DRAIN_SPAN = 4_000_000;
+admin.post("/drain-do/start", async (c) => {
+  const step = Math.floor(DRAIN_SPAN / DRAIN_FLEET);
+  const results = await Promise.all(
+    Array.from({ length: DRAIN_FLEET }, (_, i) => {
+      const stub = c.env.DRAINER.get(c.env.DRAINER.idFromName(`drainer-${i}`));
+      return stub
+        .fetch("https://do/start", {
+          method: "POST",
+          body: JSON.stringify({ start: i * step, end: (i + 1) * step }),
+        })
+        .then((r) => r.json());
+    }),
+  );
+  return c.json({ fleet: DRAIN_FLEET, results });
+});
+admin.post("/drain-do/stop", async (c) => {
+  const results = await Promise.all(
+    Array.from({ length: DRAIN_FLEET }, (_, i) =>
+      c.env.DRAINER.get(c.env.DRAINER.idFromName(`drainer-${i}`))
+        .fetch("https://do/stop", { method: "POST" })
+        .then((r) => r.json()),
+    ),
+  );
+  return c.json({ stopped: true, results });
+});
+admin.get("/drain-do/status", async (c) => {
+  const results = await Promise.all(
+    Array.from({ length: DRAIN_FLEET }, (_, i) =>
+      c.env.DRAINER.get(c.env.DRAINER.idFromName(`drainer-${i}`))
+        .fetch("https://do/status")
+        .then((r) => r.json()),
+    ),
+  );
+  const totalMoved = results.reduce((a: number, r) => a + ((r as {moved?:number}).moved ?? 0), 0);
+  const activeCount = results.filter((r) => (r as {active?:boolean}).active).length;
+  return c.json({ active: activeCount, total_moved: totalMoved, workers: results });
+});
+
 // GET /admin/db-stats — real page-level D1 size + free space, plus per-table
 // byte sizes when dbstat is available. freelist_bytes is the actual headroom
 // for new writes (freed pages new inserts reuse); size_bytes vs the 10 GB cap

@@ -974,6 +974,7 @@ admin.post("/backfill-content-to-r2", async (c) => {
 admin.post("/backfill-drain", async (c) => {
   const after = parseInt(c.req.query("after") ?? "0", 10);
   const hops = parseInt(c.req.query("hops") ?? "20000", 10);
+  const batch = Math.min(200, Math.max(20, parseInt(c.req.query("batch") ?? "120", 10)));
   const origin = new URL(c.req.url).origin;
   const auth = c.req.header("Authorization") ?? "";
   const hdr = { Authorization: auth, "User-Agent": "engram-drain/1.0" };
@@ -983,7 +984,7 @@ admin.post("/backfill-drain", async (c) => {
   let stop = false;
   try {
     const r = await fetch(
-      `${origin}/admin/backfill-content-to-r2?after=${after}&batch=400`,
+      `${origin}/admin/backfill-content-to-r2?after=${after}&batch=${batch}`,
       { method: "POST", headers: hdr },
     );
     j = (await r.json()) as Record<string, unknown>;
@@ -997,7 +998,7 @@ admin.post("/backfill-drain", async (c) => {
   const more = !stop && hops > 1;
   if (more) {
     c.executionCtx.waitUntil(
-      fetch(`${origin}/admin/backfill-drain?after=${nextAfter}&hops=${hops - 1}`, {
+      fetch(`${origin}/admin/backfill-drain?after=${nextAfter}&hops=${hops - 1}&batch=${batch}`, {
         method: "POST",
         headers: hdr,
       }),

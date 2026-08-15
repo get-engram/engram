@@ -3,6 +3,7 @@ export interface Env {
   CONTENT: R2Bucket;
   VECTORIZE: VectorizeIndex;
   SELF: Fetcher;
+  DRAINER: DurableObjectNamespace;
   AI: Ai;
   // Stripe (wrangler secrets)
   STRIPE_SECRET_KEY: string;

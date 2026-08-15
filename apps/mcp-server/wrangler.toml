@@ -36,6 +36,16 @@ index_name = "engram-vectors"
 binding = "SELF"
 service = "engram-mcp-server"
 
+# Drain fleet — Durable Objects whose alarm invocations drain legacy content
+# D1 -> R2 in true parallel, entirely serverless.
+[[durable_objects.bindings]]
+name = "DRAINER"
+class_name = "DrainerDO"
+
+[[migrations]]
+tag = "v1-drainer"
+new_sqlite_classes = ["DrainerDO"]
+
 [ai]
 binding = "AI"
 

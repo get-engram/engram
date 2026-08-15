@@ -2,6 +2,7 @@ export interface Env {
   DB: D1Database;
   CONTENT: R2Bucket;
   VECTORIZE: VectorizeIndex;
+  SELF: Fetcher;
   AI: Ai;
   // Stripe (wrangler secrets)
   STRIPE_SECRET_KEY: string;

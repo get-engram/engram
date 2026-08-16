@@ -25,6 +25,7 @@ import {
   insertOrganizationWithEmail,
 } from "@getengram/db";
 import { verifySupabaseJwt } from "../utils/jwt.js";
+import { seedWelcomeConversation } from "../routes/signup.js";
 import { DEFAULT_SCOPE, originOf } from "./metadata.js";
 import type { Env } from "../types.js";
 
@@ -273,6 +274,31 @@ oauth.post("/authorize/approve", async (c) => {
     // "Cursor", "Claude Desktop") — lowercase, fallback to "oauth".
     const ref = (client.client_name || "oauth").toLowerCase().replace(/\s+/g, "-");
     await insertOrganizationWithEmail(c.env.DB, orgId, email.split("@")[0], email, ref);
+    // Activation parity with /signup (engram#onboarding): connector-directory
+    // users never see the dashboard, so this is their only welcome. Seed the
+    // getting-started note (their first search hits something real) and fire
+    // the welcome email with the save->recall script. Both best-effort —
+    // OAuth must never fail because of onboarding extras.
+    try {
+      await seedWelcomeConversation(c.env.DB, orgId);
+    } catch (err) {
+      console.error(`[oauth] welcome seed failed for ${orgId}: ${err instanceof Error ? err.message : err}`);
+    }
+    const adminSecret = (c.env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET;
+    if (c.env.APP_URL && adminSecret) {
+      c.executionCtx.waitUntil(
+        fetch(`${c.env.APP_URL}/api/email/welcome`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${adminSecret}`,
+          },
+          body: JSON.stringify({ to: email, name: email.split("@")[0] }),
+        }).catch((err) =>
+          console.error(`[oauth] welcome email failed for ${orgId}: ${err instanceof Error ? err.message : err}`),
+        ),
+      );
+    }
   }
 
   const scope = body.scope || DEFAULT_SCOPE;

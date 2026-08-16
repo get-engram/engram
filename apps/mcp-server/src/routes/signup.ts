@@ -31,7 +31,7 @@ That's it. Three steps. Your AI now has memory that persists across sessions, pr
 
 Try it now — have a conversation about something you're working on, then say "remember this." Tomorrow, ask about it and watch the magic happen.`;
 
-async function seedWelcomeConversation(db: D1Database, orgId: string): Promise<void> {
+export async function seedWelcomeConversation(db: D1Database, orgId: string): Promise<void> {
   const convId = generateId("conv");
   const msgId = generateId("msg");
   const now = new Date().toISOString();

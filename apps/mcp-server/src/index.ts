@@ -27,6 +27,7 @@ import { sendImportNudges } from "./cron/import-nudge.js";
 import { sendMaxoutNudges } from "./cron/maxout-nudge.js";
 import { sendActivationNudges } from "./cron/activation-nudge.js";
 import { drainContentToR2 } from "./cron/drain-content.js";
+import { reconcileStripeToD1 } from "./cron/reconcile-stripe.js";
 export { DrainerDO } from "./services/drainer-do.js";
 import { sendWeeklyDigests } from "./cron/weekly-digest.js";
 import { sendDailyReport } from "./services/daily-report.js";
@@ -282,6 +283,19 @@ export default {
     if (event.cron === "* * * * *") {
       // MUST return here — falling through would run the daily purge/nudge
       // branch every minute.
+      // Every 10th minute: reconcile D1 tier/cancel state against live Stripe
+      // so a missed/late webhook (e.g. today's upgrade not showing, or a
+      // cancellation the webhook dropped) self-heals. Safe fleet-wide — the
+      // shared sync logic never downgrades on an empty Stripe result.
+      if (new Date(event.scheduledTime).getUTCMinutes() % 10 === 0) {
+        try {
+          const { checked, changed, errors } = await reconcileStripeToD1(env);
+          if (changed > 0 || errors > 0)
+            console.log(`[reconcile] ${changed}/${checked} tier(s) updated, ${errors} error(s)`);
+        } catch (err) {
+          console.error(`[reconcile] FAILED: ${err instanceof Error ? err.message : err}`);
+        }
+      }
       try {
         const moved = await drainContentToR2(env);
         if (moved > 0) console.log(`[drain] moved ${moved} message(s) to R2`);

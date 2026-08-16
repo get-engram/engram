@@ -29,6 +29,39 @@ async function markChurned(db: Env["DB"], orgId: string): Promise<void> {
     .run();
 }
 
+/**
+ * Churn + downgrade an org to free, but ONLY when the terminating Stripe event
+ * is about the org's CURRENT subscription. Stripe does not guarantee event
+ * ordering: a superseded old sub's late `canceled`/`deleted` can arrive after
+ * the new sub's `active` and would otherwise nuke a live payer to "cancelled".
+ * Returns false (no-op) when the event is for a stale/foreign subscription.
+ */
+async function churnIfCurrentSub(
+  db: Env["DB"],
+  orgId: string,
+  eventSubscriptionId: string | null | undefined,
+): Promise<boolean> {
+  const org = await db
+    .prepare("SELECT stripe_subscription_id, grace_ends_at FROM organizations WHERE id = ?")
+    .bind(orgId)
+    .first<{ stripe_subscription_id: string | null; grace_ends_at: string | null }>();
+  const current = org?.stripe_subscription_id;
+  if (current && eventSubscriptionId && current !== eventSubscriptionId) {
+    // Terminating event is for an old/superseded sub — the org already moved
+    // on to a different live subscription. Ignore.
+    return false;
+  }
+  // An admin grant-pro / comp still inside its grace window is operator-managed
+  // — a stray Stripe terminal event must not revert it.
+  const grace = org?.grace_ends_at;
+  if (grace && Date.parse(grace.replace(" ", "T") + "Z") > Date.now()) {
+    return false;
+  }
+  await markChurned(db, orgId);
+  await setOrganizationTier(db, orgId, "free", null, 1);
+  return true;
+}
+
 const billing = new Hono<HonoEnv>();
 
 // POST /api/billing/checkout
@@ -348,8 +381,9 @@ billingWebhook.post("/", async (c) => {
         status === "unpaid" ||
         status === "past_due"
       ) {
-        await markChurned(c.env.DB, orgId);
-        await setOrganizationTier(c.env.DB, orgId, "free", null, 1);
+        // Only downgrade if this event is for the org's current sub (guards
+        // against out-of-order events from a superseded subscription).
+        await churnIfCurrentSub(c.env.DB, orgId, subscriptionId);
       }
       break;
     }
@@ -357,8 +391,7 @@ billingWebhook.post("/", async (c) => {
     case "customer.subscription.deleted": {
       const orgId = await resolveOrgIdFromEvent(c.env, obj);
       if (orgId) {
-        await markChurned(c.env.DB, orgId);
-        await setOrganizationTier(c.env.DB, orgId, "free", null, 1);
+        await churnIfCurrentSub(c.env.DB, orgId, obj.id as string);
       }
       break;
     }

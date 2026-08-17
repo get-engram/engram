@@ -145,7 +145,7 @@ admin.get("/metrics", async (c) => {
         const internalCustomers = new Set(
           (
             await c.env.DB.prepare(
-              "SELECT stripe_customer_id FROM organizations WHERE stripe_customer_id IS NOT NULL AND (referral_source = 'internal' OR email IN ('maryjanis@yahoo.com', 'debragailinc@gmail.com', 'deb@27c1ub.com'))",
+              "SELECT stripe_customer_id FROM organizations WHERE stripe_customer_id IS NOT NULL AND (referral_source = 'internal' OR email IN ('maryjanis@yahoo.com', 'debragailinc@gmail.com', 'deb@27c1ub.com', 'pressingivory@yahoo.com'))",
             ).all<{ stripe_customer_id: string }>()
           ).results?.map((r) => r.stripe_customer_id) ?? [],
         );
@@ -328,6 +328,68 @@ admin.post("/users/:id/grant-pro", async (c) => {
   ).bind(id).first<{ tier: string; grace_ends_at: string }>();
 
   return c.json({ granted: true, id, tier: "pro", grace_ends_at: org?.grace_ends_at });
+});
+
+// ---------------------------------------------------------------------------
+// POST /admin/comp-internal — cancel Stripe subscriptions for the owner's OWN
+// accounts (referral_source='internal' or the known founder emails) and comp
+// them so they keep their current tier. Removes self-payments from real
+// revenue AND stops the actual charges. ?dry_run=1 lists what would happen
+// without changing anything (Stripe or D1). Keep the email list in sync with
+// the external-MRR exclusion in GET /admin/metrics.
+// ---------------------------------------------------------------------------
+const INTERNAL_FOUNDER_EMAILS = [
+  "maryjanis@yahoo.com",
+  "debragailinc@gmail.com",
+  "deb@27c1ub.com",
+  "pressingivory@yahoo.com",
+];
+admin.post("/comp-internal", async (c) => {
+  const dryRun = c.req.query("dry_run") === "1" || c.req.query("dry_run") === "true";
+  if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: "no_stripe_key" }, 500);
+
+  const placeholders = INTERNAL_FOUNDER_EMAILS.map(() => "?").join(",");
+  const orgs = await c.env.DB.prepare(
+    `SELECT id, email, tier, stripe_customer_id FROM organizations
+     WHERE stripe_customer_id IS NOT NULL AND deleted_at IS NULL
+       AND (referral_source = 'internal' OR email IN (${placeholders}))`,
+  ).bind(...INTERNAL_FOUNDER_EMAILS).all<{ id: string; email: string | null; tier: string; stripe_customer_id: string }>();
+
+  const out: Array<Record<string, unknown>> = [];
+  for (const org of orgs.results ?? []) {
+    // Active subscriptions for this customer.
+    const subsRes = await fetch(
+      `https://api.stripe.com/v1/subscriptions?customer=${org.stripe_customer_id}&status=active&limit=10`,
+      { headers: { Authorization: `Bearer ${c.env.STRIPE_SECRET_KEY}` } },
+    );
+    const subs = subsRes.ok ? ((await subsRes.json()) as { data: Array<{ id: string; items: { data: Array<{ price?: { unit_amount?: number | null } }> } }> }).data : [];
+    const subIds = subs.map((s) => s.id);
+
+    if (!dryRun && subIds.length) {
+      // Comp FIRST: a far-future grace makes both the cancellation webhook
+      // (churnIfCurrentSub) and the reconcile cron skip this org, so it keeps
+      // its current tier after the sub is gone.
+      await c.env.DB.prepare(
+        "UPDATE organizations SET grace_ends_at = datetime('now', '+100 years'), cancel_at_period_end = 0 WHERE id = ?",
+      ).bind(org.id).run();
+      // Then cancel each active subscription immediately.
+      for (const sid of subIds) {
+        await fetch(`https://api.stripe.com/v1/subscriptions/${sid}`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${c.env.STRIPE_SECRET_KEY}` },
+        });
+      }
+    }
+    out.push({
+      org_id: org.id,
+      email: org.email,
+      tier: org.tier,
+      customer: org.stripe_customer_id,
+      active_subscriptions: subIds,
+      action: dryRun ? "would_cancel_and_comp" : (subIds.length ? "canceled_and_comped" : "no_active_sub"),
+    });
+  }
+  return c.json({ dry_run: dryRun, orgs_matched: out.length, orgs: out });
 });
 
 // ---------------------------------------------------------------------------

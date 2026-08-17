@@ -145,7 +145,9 @@ admin.get("/metrics", async (c) => {
         const internalCustomers = new Set(
           (
             await c.env.DB.prepare(
-              "SELECT stripe_customer_id FROM organizations WHERE stripe_customer_id IS NOT NULL AND (referral_source = 'internal' OR email IN ('maryjanis@yahoo.com', 'debragailinc@gmail.com', 'deb@27c1ub.com', 'pressingivory@yahoo.com'))",
+              // Owner's own accounts are tagged referral_source='internal'
+              // (see POST /admin/comp-internal). No personal emails in code.
+              "SELECT stripe_customer_id FROM organizations WHERE stripe_customer_id IS NOT NULL AND referral_source = 'internal'",
             ).all<{ stripe_customer_id: string }>()
           ).results?.map((r) => r.stripe_customer_id) ?? [],
         );
@@ -332,47 +334,43 @@ admin.post("/users/:id/grant-pro", async (c) => {
 
 // ---------------------------------------------------------------------------
 // POST /admin/comp-internal — cancel Stripe subscriptions for the owner's OWN
-// accounts (referral_source='internal' or the known founder emails) and comp
-// them so they keep their current tier. Removes self-payments from real
-// revenue AND stops the actual charges. ?dry_run=1 lists what would happen
-// without changing anything (Stripe or D1). Keep the email list in sync with
-// the external-MRR exclusion in GET /admin/metrics.
+// accounts and comp them so they keep their current tier (stops self-charges,
+// removes them from real revenue). Target orgs are those already tagged
+// referral_source='internal', PLUS any emails passed in the request body — the
+// personal emails are supplied at call time and never stored in the repo.
+// On execute it also tags each matched org referral_source='internal' so the
+// external-MRR exclusion stays data-driven. ?dry_run=1 previews without change.
 // ---------------------------------------------------------------------------
-const INTERNAL_FOUNDER_EMAILS = [
-  "maryjanis@yahoo.com",
-  "debragailinc@gmail.com",
-  "deb@27c1ub.com",
-  "pressingivory@yahoo.com",
-];
 admin.post("/comp-internal", async (c) => {
   const dryRun = c.req.query("dry_run") === "1" || c.req.query("dry_run") === "true";
   if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: "no_stripe_key" }, 500);
 
-  const placeholders = INTERNAL_FOUNDER_EMAILS.map(() => "?").join(",");
+  const body = await c.req.json<{ emails?: string[] }>().catch(() => ({}) as { emails?: string[] });
+  const emails = (body.emails ?? []).filter((e) => typeof e === "string" && e.includes("@"));
+  const emailClause = emails.length ? ` OR email IN (${emails.map(() => "?").join(",")})` : "";
+
   const orgs = await c.env.DB.prepare(
     `SELECT id, email, tier, stripe_customer_id FROM organizations
      WHERE stripe_customer_id IS NOT NULL AND deleted_at IS NULL
-       AND (referral_source = 'internal' OR email IN (${placeholders}))`,
-  ).bind(...INTERNAL_FOUNDER_EMAILS).all<{ id: string; email: string | null; tier: string; stripe_customer_id: string }>();
+       AND (referral_source = 'internal'${emailClause})`,
+  ).bind(...emails).all<{ id: string; email: string | null; tier: string; stripe_customer_id: string }>();
 
   const out: Array<Record<string, unknown>> = [];
   for (const org of orgs.results ?? []) {
-    // Active subscriptions for this customer.
     const subsRes = await fetch(
       `https://api.stripe.com/v1/subscriptions?customer=${org.stripe_customer_id}&status=active&limit=10`,
       { headers: { Authorization: `Bearer ${c.env.STRIPE_SECRET_KEY}` } },
     );
-    const subs = subsRes.ok ? ((await subsRes.json()) as { data: Array<{ id: string; items: { data: Array<{ price?: { unit_amount?: number | null } }> } }> }).data : [];
+    const subs = subsRes.ok ? ((await subsRes.json()) as { data: Array<{ id: string }> }).data : [];
     const subIds = subs.map((s) => s.id);
 
-    if (!dryRun && subIds.length) {
-      // Comp FIRST: a far-future grace makes both the cancellation webhook
-      // (churnIfCurrentSub) and the reconcile cron skip this org, so it keeps
-      // its current tier after the sub is gone.
+    if (!dryRun) {
+      // Tag internal (data-driven external-MRR exclusion, no emails in code) +
+      // far-future grace so the cancellation webhook and reconcile cron keep
+      // the tier after the sub is gone.
       await c.env.DB.prepare(
-        "UPDATE organizations SET grace_ends_at = datetime('now', '+100 years'), cancel_at_period_end = 0 WHERE id = ?",
+        "UPDATE organizations SET referral_source = 'internal', grace_ends_at = datetime('now', '+100 years'), cancel_at_period_end = 0 WHERE id = ?",
       ).bind(org.id).run();
-      // Then cancel each active subscription immediately.
       for (const sid of subIds) {
         await fetch(`https://api.stripe.com/v1/subscriptions/${sid}`, {
           method: "DELETE",
@@ -386,7 +384,7 @@ admin.post("/comp-internal", async (c) => {
       tier: org.tier,
       customer: org.stripe_customer_id,
       active_subscriptions: subIds,
-      action: dryRun ? "would_cancel_and_comp" : (subIds.length ? "canceled_and_comped" : "no_active_sub"),
+      action: dryRun ? "would_cancel_and_comp" : (subIds.length ? "canceled_and_comped" : "tagged_internal_no_sub"),
     });
   }
   return c.json({ dry_run: dryRun, orgs_matched: out.length, orgs: out });

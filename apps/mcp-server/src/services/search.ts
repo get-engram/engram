@@ -267,8 +267,13 @@ export async function searchConversations(
     });
   }
 
-  // Deduplicate: keep only the highest-scoring chunk per conversation
-  if (dedupe) {
+  // Deduplicate: keep only the highest-scoring chunk per conversation — this
+  // gives cross-conversation searches diversity (one hit per conversation).
+  // But when the search is SCOPED to a single conversation, dedupe-by-
+  // conversation can only ever return one chunk, starving the caller (an AI
+  // drilling into one memory) of the rest of the relevant thread. Skip it when
+  // a conversation_id filter is active so scoped search returns the top-k.
+  if (dedupe && !conversationId) {
     const seen = new Set<string>();
     results = results.filter((r) => {
       if (seen.has(r.conversation_id)) return false;

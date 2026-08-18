@@ -7,6 +7,7 @@ import {
   PRIVACY_CROSS_CONVERSATION_NOTICE,
 } from "../../services/privacy.js";
 import { hasScope, scopeError } from "../scopes.js";
+import { firstRunActivation } from "../coaching.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerListConversations(
@@ -94,17 +95,22 @@ export function registerListConversations(
         }),
       );
 
+      // First-run forcing function: a fresh connector's probe often lands
+      // here — carry the activation script so the model drives the first save.
+      const activation = await firstRunActivation(env, auth);
+      const payload = {
+        conversations,
+        total: conversations.length,
+        ...(activation ? { activation } : {}),
+      };
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify({
-              conversations,
-              total: conversations.length,
-            }),
+            text: JSON.stringify(payload),
           },
         ],
-        structuredContent: { conversations, total: conversations.length },
+        structuredContent: payload,
       };
     }
   );

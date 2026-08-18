@@ -5,6 +5,7 @@ import { getUsage, getOrganizationById, getStorageUsed } from "@getengram/db";
 import { storageLimitFor } from "../../services/tier.js";
 import { usageMeter, meterBar } from "../usage-messaging.js";
 import { isExternalOAuthClient } from "../auth-kind.js";
+import { firstRunActivationForCount } from "../coaching.js";
 import type { Env, AuthContext } from "../../types.js";
 
 /**
@@ -72,6 +73,7 @@ export function registerMemoryStatus(
         : "getengram.app/pricing";
 
       const monthlyMeter = usageMeter(monthlyUsed, monthlyLimit);
+      const activation = firstRunActivationForCount(auth, storageUsed);
       const payload = {
         tier: auth.tier,
         storage: {
@@ -96,6 +98,10 @@ export function registerMemoryStatus(
           storageLimit > 0
             ? `Memory never expires — deleting conversations frees space. More room: upgrade at ${upgradeAt}.`
             : "Memory never expires. This plan has unlimited storage.",
+        // First-run forcing function — the server instructions tell clients to
+        // call memory_status first; the RESULT itself carries the activation
+        // script for brand-new accounts (storageUsed known here, no extra query).
+        ...(activation ? { activation } : {}),
       };
 
       return {

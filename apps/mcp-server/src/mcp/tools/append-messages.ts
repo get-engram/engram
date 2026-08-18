@@ -5,7 +5,7 @@ import {
   getOrCreateDefaultConversation,
 } from "../../services/conversation.js";
 import { isExternalOAuthClient } from "../auth-kind.js";
-import { newUserAppendTip } from "../coaching.js";
+import { newUserAppendTip, firstSaveCelebration } from "../coaching.js";
 import {
   usageMeter,
   meterBar,
@@ -252,7 +252,17 @@ export function registerAppendMessages(
 
       // Coaching keys off lifetime storage — the count that exists on
       // every tier (free has no monthly meter anymore).
-      const tip = newUserAppendTip(auth, storageCheck.used ?? tierCheck.used);
+      // storageCheck.used is POST-increment; subtract this batch to know what
+      // the account held before. <=1 before (just the seeded welcome note)
+      // means THIS is the account's first real save — the single highest-value
+      // teaching moment, so it gets a distinct line over the generic tip.
+      const usedBefore =
+        typeof storageCheck.used === "number"
+          ? storageCheck.used - count
+          : undefined;
+      const tip =
+        firstSaveCelebration(auth, usedBefore) ??
+        newUserAppendTip(auth, storageCheck.used ?? tierCheck.used);
       // One-time storage milestones (engram#256) — ambient proof the
       // memory is growing; fires once per threshold per org.
       const milestone = await checkMilestone(env, auth.organizationId, storageCheck.used);

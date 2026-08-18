@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { searchEmptyTip, newUserAppendTip } from "../mcp/coaching.js";
+import {
+  searchEmptyTip,
+  newUserAppendTip,
+  firstRunActivationForCount,
+  firstSaveCelebration,
+} from "../mcp/coaching.js";
 import type { AuthContext } from "../types.js";
 
 const oauthAuth = {
@@ -25,5 +30,23 @@ describe("coaching tips", () => {
     expect(newUserAppendTip(oauthAuth, 500)).toBeUndefined();
     expect(newUserAppendTip(oauthAuth, undefined)).toBeUndefined();
     expect(newUserAppendTip(keyAuth, 3)).toBeUndefined();
+  });
+
+  it("first-run activation fires only while the account holds nothing beyond the welcome note", () => {
+    // 0 = truly empty, 1 = only the auto-seeded welcome note → activate.
+    expect(firstRunActivationForCount(oauthAuth, 0)).toMatch(/append_messages/);
+    expect(firstRunActivationForCount(oauthAuth, 1)).toMatch(/brand-new chat/i);
+    // 2+ = the user has saved something real → silent forever.
+    expect(firstRunActivationForCount(oauthAuth, 2)).toBeUndefined();
+    // Never for API-key/SDK callers (their agents self-drive).
+    expect(firstRunActivationForCount(keyAuth, 0)).toBeUndefined();
+  });
+
+  it("first-save celebration fires exactly once — when the pre-append count was <= the welcome note", () => {
+    expect(firstSaveCelebration(oauthAuth, 0)).toMatch(/FIRST saved memory/);
+    expect(firstSaveCelebration(oauthAuth, 1)).toMatch(/what do you remember about me/i);
+    expect(firstSaveCelebration(oauthAuth, 2)).toBeUndefined();
+    expect(firstSaveCelebration(oauthAuth, undefined)).toBeUndefined();
+    expect(firstSaveCelebration(keyAuth, 0)).toBeUndefined();
   });
 });

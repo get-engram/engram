@@ -9,7 +9,7 @@ import {
   PRIVACY_CROSS_CONVERSATION_NOTICE,
 } from "../../services/privacy.js";
 import { hasScope, scopeError } from "../scopes.js";
-import { searchEmptyTip } from "../coaching.js";
+import { searchEmptyTip, firstRunActivation } from "../coaching.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerSearch(
@@ -122,11 +122,16 @@ export function registerSearch(
       });
 
       const emptyTip = results.length === 0 ? searchEmptyTip(auth) : undefined;
+      // First-run forcing function: a brand-new account's searches only ever
+      // hit the seeded welcome note, so the empty-tip never fires — attach the
+      // activation script instead so the model drives the first save now.
+      const activation = await firstRunActivation(env, auth);
       const payload = {
         results,
         total: results.length,
         ...(privacy.canReadBodies ? {} : { privacy_notice: PRIVACY_BODIES_NOTICE }),
         ...(emptyTip ? { tip: emptyTip } : {}),
+        ...(activation ? { activation } : {}),
       };
 
       return {

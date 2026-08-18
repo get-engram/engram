@@ -58,4 +58,4 @@ zone_name = "getengram.app"
 # 03:00 GDPR purge of soft-deleted orgs; 13:00 daily ops report (built
 # here, emailed by engram-web /api/reports/daily).
 [triggers]
-crons = ["* * * * *", "0 3 * * *", "0 13 * * *"]
+crons = ["*/10 * * * *", "0 3 * * *", "0 13 * * *"]

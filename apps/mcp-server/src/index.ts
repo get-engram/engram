@@ -26,7 +26,6 @@ import { enforceRetentionPolicies } from "./cron/retention-policy.js";
 import { sendImportNudges } from "./cron/import-nudge.js";
 import { sendMaxoutNudges } from "./cron/maxout-nudge.js";
 import { sendActivationNudges } from "./cron/activation-nudge.js";
-import { drainContentToR2 } from "./cron/drain-content.js";
 import { reconcileStripeToD1 } from "./cron/reconcile-stripe.js";
 export { DrainerDO } from "./services/drainer-do.js";
 import { sendWeeklyDigests } from "./cron/weekly-digest.js";
@@ -277,30 +276,30 @@ export default {
   fetch: app.fetch,
   async scheduled(event: ScheduledEvent, env: Env, _ctx: ExecutionContext) {
     // Crons (see wrangler.toml [triggers]):
-    //   * * * * *  — drain legacy inline content D1 -> R2 (no-op once done)
+    //   */10 * * * * — Stripe->D1 tier reconcile (self-heals missed webhooks)
     //   03:00 UTC — GDPR purge of soft-deleted orgs
     //   13:00 UTC — daily ops report, emailed via engram-web
-    if (event.cron === "* * * * *") {
+    if (event.cron === "*/10 * * * *") {
       // MUST return here — falling through would run the daily purge/nudge
-      // branch every minute.
-      // Every 10th minute: reconcile D1 tier/cancel state against live Stripe
-      // so a missed/late webhook (e.g. today's upgrade not showing, or a
-      // cancellation the webhook dropped) self-heals. Safe fleet-wide — the
-      // shared sync logic never downgrades on an empty Stripe result.
-      if (new Date(event.scheduledTime).getUTCMinutes() % 10 === 0) {
-        try {
-          const { checked, changed, errors } = await reconcileStripeToD1(env);
-          if (changed > 0 || errors > 0)
-            console.log(`[reconcile] ${changed}/${checked} tier(s) updated, ${errors} error(s)`);
-        } catch (err) {
-          console.error(`[reconcile] FAILED: ${err instanceof Error ? err.message : err}`);
-        }
-      }
+      // branch every tick.
+      // Reconcile D1 tier/cancel state against live Stripe so a missed/late
+      // webhook (an upgrade not showing, a dropped cancellation) self-heals.
+      // Safe fleet-wide — the shared sync logic never downgrades on an empty
+      // Stripe result.
+      //
+      // NOTE: the content->R2 drain cron used to live here on a per-minute
+      // trigger. The drain COMPLETED (messages_content: 0 bytes inline) but
+      // the tick kept fanning out 10 parallel sub-invocations that scanned the
+      // 3.4M-row messages table every minute to find nothing — chronic D1
+      // load that contributed to "D1 overloaded" (7429) incidents. Removed;
+      // /admin/backfill-content-to-r2 and the DrainerDO remain for on-demand
+      // use if inline content ever reappears.
       try {
-        const moved = await drainContentToR2(env);
-        if (moved > 0) console.log(`[drain] moved ${moved} message(s) to R2`);
+        const { checked, changed, errors } = await reconcileStripeToD1(env);
+        if (changed > 0 || errors > 0)
+          console.log(`[reconcile] ${changed}/${checked} tier(s) updated, ${errors} error(s)`);
       } catch (err) {
-        console.error(`[drain] FAILED: ${err instanceof Error ? err.message : err}`);
+        console.error(`[reconcile] FAILED: ${err instanceof Error ? err.message : err}`);
       }
       return;
     }

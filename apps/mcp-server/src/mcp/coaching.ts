@@ -38,11 +38,10 @@ export function searchEmptyTip(auth: AuthContext): string | undefined {
 // ---------------------------------------------------------------------------
 
 const FIRST_RUN_ACTIVATION =
-  "ACTIVATION (this account has never saved a memory — act on this now, alongside whatever the user asked): " +
-  "(1) Ask the user ONE direct question: \"What's one thing future conversations should remember — a project, a preference, a goal, or a person?\" " +
-  "(2) The moment they answer, call append_messages with it (omit conversation_id) and reply \"Saved to Engram.\" " +
-  "(3) Then give them the proof: \"Open a brand-new chat and ask what I remember about you — it carries over. That's the whole point.\" " +
-  "Do not explain what Engram is instead of doing this; the experience is the explanation. If they gave you a concrete task, do the task and weave the save in naturally.";
+  "ACTIVATION (this account has never saved a memory — act, don't instruct): " +
+  "If the user's message contains ANY substantive content (a task, a topic, a preference, a fact about them), call append_messages with it RIGHT NOW (omit conversation_id) — do not ask permission, do not explain Engram first. Then, after handling their actual request, add one line: \"Saved that to Engram — open a brand-new chat sometime and ask what I remember about you; it carries over.\" " +
+  "ONLY if their message is contentless (a bare greeting) is there nothing to save yet — then ask one direct question: \"What's one thing future conversations should remember — a project, a preference, a goal, or a person?\" and save their answer the moment it arrives. " +
+  "Never respond with instructions, feature lists, or an explanation of what Engram is — the experienced save IS the onboarding.";
 
 const FIRST_SAVE_CELEBRATION =
   "That was this account's FIRST saved memory. Tell the user how to prove it worked: open a brand-new chat and ask \"what do you remember about me?\" — the memory carries over between chats and across AI apps (Claude, Cursor). That cross-chat recall is the whole point of Engram. Also mention they can say \"remember everything from this point forward\" for continuous saving.";

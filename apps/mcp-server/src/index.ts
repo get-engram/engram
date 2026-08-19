@@ -294,6 +294,18 @@ export default {
       // load that contributed to "D1 overloaded" (7429) incidents. Removed;
       // /admin/backfill-content-to-r2 and the DrainerDO remain for on-demand
       // use if inline content ever reappears.
+      // D1 latency early-warning: time one indexed point-read. Sustained
+      // multi-second latency preceded the Aug 2026 "D1 overloaded" (7429)
+      // incident by hours — this makes it visible in the worker logs while
+      // it is still just "slow". (Trend also lands in the daily report.)
+      try {
+        const t0 = Date.now();
+        await env.DB.prepare("SELECT id FROM organizations LIMIT 1").first();
+        const ms = Date.now() - t0;
+        if (ms > 3000) console.error(`[d1-latency] WARNING: probe took ${ms}ms (>3s) — D1 under pressure`);
+      } catch (err) {
+        console.error(`[d1-latency] probe FAILED: ${err instanceof Error ? err.message : err}`);
+      }
       try {
         const { checked, changed, errors } = await reconcileStripeToD1(env);
         if (changed > 0 || errors > 0)

@@ -25,6 +25,10 @@ export interface DailyReport {
     }>;
   };
   referrals_all_time: Record<string, number>;
+  /** Milliseconds for a simple indexed D1 point-read at report time. Normal is
+   *  <500ms; sustained values in the seconds mean D1 is under pressure (see
+   *  the Aug 2026 "D1 overloaded" incident) and is the early-warning signal. */
+  d1_latency_ms?: number;
   /** Emails of team/enterprise orgs — engram-web flags support-inbox mail
    *  from these as PRIORITY (only paid team tiers get priority support). */
   priority_support_emails: string[];
@@ -38,6 +42,13 @@ export interface DailyReport {
 
 export async function buildDailyReport(env: Env): Promise<DailyReport> {
   const db = env.DB;
+
+  // D1 health probe: time one simple indexed point-read BEFORE the heavy
+  // batch below, so the number reflects baseline latency, not contention
+  // with our own report queries.
+  const probeStart = Date.now();
+  await db.prepare("SELECT id FROM organizations LIMIT 1").first();
+  const d1LatencyMs = Date.now() - probeStart;
 
   const [
     tiers,
@@ -139,6 +150,7 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
       new_signups: newSignups.results ?? [],
     },
     referrals_all_time: refs,
+    d1_latency_ms: d1LatencyMs,
     priority_support_emails: (teamEmails.results ?? []).map((r) => r.email.toLowerCase()),
     top_orgs_7d: topOrgs.results ?? [],
   };

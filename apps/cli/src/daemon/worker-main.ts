@@ -43,6 +43,11 @@ async function main(): Promise<void> {
   const client = new Engram({
     apiKey,
     baseUrl: process.env.ENGRAM_BASE_URL ?? config.baseUrl ?? getBaseUrl(),
+    // Appends of large transcript batches do real work server-side (per-
+    // message R2 writes, chunking, embedding, indexing) — the SDK's default
+    // 30s timeout aborted them mid-flight and wedged the queue in a retry
+    // loop. The daemon is a background process; it can afford to wait.
+    timeout: 120_000,
   });
 
   const db = new DaemonDb(DB_FILE);

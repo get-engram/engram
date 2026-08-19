@@ -3,7 +3,15 @@ import { DaemonDb } from "./db.js";
 import { recordSuccess, recordFailure, classifyError } from "./status.js";
 import type { ParsedMessage, SessionMeta, PendingRow } from "./types.js";
 
-const BATCH_SIZE = 200;
+// Claude Code transcript messages can be enormous (tool output dumps), and
+// the server does per-message work on append (R2 write, chunk, embed, index).
+// 200-message batches reliably exceeded the request timeout and wedged the
+// queue in a retry loop — same batch, same timeout, forever. Small batches
+// with a byte budget keep every request comfortably inside the timeout; the
+// halve-on-failure fallback (see flushConversation) resolves any batch that
+// still can't make it through, down to one message at a time.
+const BATCH_SIZE = 25;
+const BATCH_BYTE_BUDGET = 256 * 1024;
 const FLUSH_INTERVAL_MS = 2_000;
 const CONCURRENCY = 5;
 
@@ -169,16 +177,38 @@ export class Syncer {
     }
   }
 
+  /** Per-conversation reduced batch size after a failed send (halves down to
+   *  1 so even a single pathological message eventually goes alone; restored
+   *  to the full batch on the next success). */
+  private batchOverride = new Map<string, number>();
+
   private async flushConversation(conversationId: string): Promise<void> {
     while (true) {
-      const rows = this.db.dequeue(conversationId, BATCH_SIZE);
+      const limit = this.batchOverride.get(conversationId) ?? BATCH_SIZE;
+      let rows = this.db.dequeue(conversationId, limit);
       if (rows.length === 0) break;
+
+      // Byte budget: transcript messages vary wildly in size — trim the batch
+      // so its total content stays inside the budget. Always send at least
+      // one row, however large (the server accepts it; it just needs time).
+      let bytes = 0;
+      let take = 0;
+      for (const r of rows) {
+        bytes += r.content.length;
+        take++;
+        if (bytes > BATCH_BYTE_BUDGET && take > 1) {
+          take--;
+          break;
+        }
+      }
+      rows = rows.slice(0, take);
 
       const messages = rows.map(rowToMessage);
 
       try {
         await this.client.store({ conversationId, messages });
         this.db.markSent(rows.map((r) => r.id));
+        this.batchOverride.delete(conversationId);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
 
@@ -197,8 +227,18 @@ export class Syncer {
           return;
         }
 
-        // Rate limit or network — leave in queue for next cycle
-        console.error(`[engram] send failed (will retry): ${msg}`);
+        // Rate limit or network/timeout — leave in queue for next cycle, but
+        // halve this conversation's batch so an oversized batch self-resolves
+        // instead of retrying the identical payload forever.
+        if (rows.length > 1) {
+          const next = Math.max(1, Math.floor(rows.length / 2));
+          this.batchOverride.set(conversationId, next);
+          console.error(
+            `[engram] send failed (will retry with batch ${next}): ${msg}`,
+          );
+        } else {
+          console.error(`[engram] send failed (will retry): ${msg}`);
+        }
         recordFailure(msg, errType, this.db.getPendingCount());
         return;
       }

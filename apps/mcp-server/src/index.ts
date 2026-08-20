@@ -26,6 +26,7 @@ import { enforceRetentionPolicies } from "./cron/retention-policy.js";
 import { sendImportNudges } from "./cron/import-nudge.js";
 import { sendMaxoutNudges } from "./cron/maxout-nudge.js";
 import { sendActivationNudges } from "./cron/activation-nudge.js";
+import { sendRecallNudges } from "./cron/recall-nudge.js";
 import { reconcileStripeToD1 } from "./cron/reconcile-stripe.js";
 export { DrainerDO } from "./services/drainer-do.js";
 import { sendWeeklyDigests } from "./cron/weekly-digest.js";
@@ -373,6 +374,12 @@ export default {
     const activated = await sendActivationNudges(env);
     if (activated > 0) {
       console.log(`[cron] Sent ${activated} activation-nudge email(s)`);
+    }
+    // Recall nudge: saved a real memory but never had a search return a hit —
+    // the funnel's biggest measured leak (177 saved vs 50 recalled, 2026-08).
+    const recalled = await sendRecallNudges(env);
+    if (recalled > 0) {
+      console.log(`[cron] Sent ${recalled} recall-nudge email(s)`);
     }
   },
 };

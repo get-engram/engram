@@ -44,7 +44,9 @@ describe("coaching tips", () => {
 
   it("first-save celebration fires exactly once — when the pre-append count was <= the welcome note", () => {
     expect(firstSaveCelebration(oauthAuth, 0)).toMatch(/FIRST saved memory/);
-    expect(firstSaveCelebration(oauthAuth, 1)).toMatch(/what do you remember about me/i);
+    // must instruct an immediate proof-by-search, not just a description
+    expect(firstSaveCelebration(oauthAuth, 0)).toMatch(/`search`/);
+    expect(firstSaveCelebration(oauthAuth, 1)).toMatch(/brand-new chat/i);
     expect(firstSaveCelebration(oauthAuth, 2)).toBeUndefined();
     expect(firstSaveCelebration(oauthAuth, undefined)).toBeUndefined();
     expect(firstSaveCelebration(keyAuth, 0)).toBeUndefined();

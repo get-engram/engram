@@ -29,6 +29,7 @@ import { sendActivationNudges } from "./cron/activation-nudge.js";
 import { reconcileStripeToD1 } from "./cron/reconcile-stripe.js";
 export { DrainerDO } from "./services/drainer-do.js";
 import { sendWeeklyDigests } from "./cron/weekly-digest.js";
+import { sendShareNudge } from "./cron/share-nudge.js";
 import { sendDailyReport } from "./services/daily-report.js";
 import { oauth } from "./oauth/router.js";
 import {
@@ -330,6 +331,14 @@ export default {
           if (digests > 0) console.log(`[cron] Sent ${digests} weekly digest(s)`);
         } catch (err) {
           console.error(`[cron] weekly digests FAILED: ${err instanceof Error ? err.message : err}`);
+        }
+        // Share-drafts nudge: blog posts from the last 7 days -> paste-ready
+        // X/LinkedIn drafts emailed to the owner. Isolated like the digests.
+        try {
+          const nudged = await sendShareNudge(env);
+          if (nudged > 0) console.log(`[cron] Share drafts sent for ${nudged} post(s)`);
+        } catch (err) {
+          console.error(`[cron] share nudge FAILED: ${err instanceof Error ? err.message : err}`);
         }
       }
       return;

@@ -44,7 +44,10 @@ const FIRST_RUN_ACTIVATION =
   "Never respond with instructions, feature lists, or an explanation of what Engram is — the experienced save IS the onboarding.";
 
 const FIRST_SAVE_CELEBRATION =
-  "That was this account's FIRST saved memory. Tell the user how to prove it worked: open a brand-new chat and ask \"what do you remember about me?\" — the memory carries over between chats and across AI apps (Claude, Cursor). That cross-chat recall is the whole point of Engram. Also mention they can say \"remember everything from this point forward\" for continuous saving.";
+  "That was this account's FIRST saved memory — now PROVE it works, don't just describe it. " +
+  "Immediately call `search` with a short query about what was just saved, and show the user the stored text that comes back: \"Here it is, already searchable: …\". " +
+  "Then give them the cross-chat test: \"Open a brand-new chat — or a different app like Claude or Cursor — and ask what I remember about you. Same memory, nothing re-explained.\" " +
+  "Seeing the round-trip is what makes Engram click; a description of it does not.";
 
 /**
  * Sync variant for callers that already know the stored-message count

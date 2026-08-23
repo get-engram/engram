@@ -310,6 +310,13 @@ admin.get("/users", async (c) => {
       o.created_at,
       o.cancel_at_period_end,
       o.churned_at,
+      -- The counter that ACTUALLY gates saving (and drives the maxout nudge).
+      -- total_messages below is derived from conversation counts and can
+      -- disagree with it — surfacing both makes that drift visible instead of
+      -- silently misreporting who is at the storage cap.
+      o.messages_stored_total,
+      o.maxout_nudged_at,
+      o.digest_opt_out,
       COUNT(c.id) as conversations,
       COALESCE(SUM(c.message_count), 0) as total_messages
     FROM organizations o

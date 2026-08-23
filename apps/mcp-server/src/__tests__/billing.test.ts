@@ -490,7 +490,12 @@ describe("webhook: customer.subscription.updated", () => {
     expect(res.status).toBe(200);
   });
 
-  it("downgrades to free when subscription is past_due", async () => {
+  // past_due means a renewal charge failed and Stripe is still retrying —
+  // the customer intends to pay, so the plan is NOT revoked mid-dunning.
+  // Stripe escalates to unpaid/canceled when retries are exhausted; those
+  // churn (see the tests below). The mock D1 doesn't apply UPDATEs, so this
+  // asserts the handler accepts the event without erroring.
+  it("accepts past_due without churning (dunning, not cancellation)", async () => {
     const db = createMockD1();
     const env = createBillingEnv(db);
     await insertOrganizationWithEmail(db, "org_pastdue", "PastDue Org", "pastdue@example.com");

@@ -378,11 +378,18 @@ billingWebhook.post("/", async (c) => {
       } else if (
         status === "canceled" ||
         status === "incomplete_expired" ||
-        status === "unpaid" ||
-        status === "past_due"
+        status === "unpaid"
       ) {
         // Only downgrade if this event is for the org's current sub (guards
         // against out-of-order events from a superseded subscription).
+        //
+        // NOTE: `past_due` is deliberately NOT in this list. It means a
+        // renewal charge failed and Stripe is still retrying (dunning runs for
+        // weeks and usually recovers) — the customer intends to pay and
+        // yanking their plan mid-retry is both wrong and a good way to lose
+        // them. Stripe escalates to `unpaid` or `canceled` when dunning is
+        // exhausted, and those DO churn here. Observed: a paying customer's
+        // card bounced and they were instantly downgraded to free.
         await churnIfCurrentSub(c.env.DB, orgId, subscriptionId);
       }
       break;

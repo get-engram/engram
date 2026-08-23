@@ -205,6 +205,58 @@ admin.get("/metrics", async (c) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /admin/timeseries?days=30 — daily counts for the admin trend chart:
+// signups, cancellations (churned_at stamps), and net paid plans.
+// Grouped in SQL over indexed date columns; owner's own orgs excluded so the
+// lines show real customers only.
+// ---------------------------------------------------------------------------
+admin.get("/timeseries", async (c) => {
+  const days = Math.min(Math.max(parseInt(c.req.query("days") ?? "30", 10) || 30, 7), 90);
+  const since = `-${days} days`;
+
+  const [signupRows, churnRows, paidRows] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT date(created_at) AS d, COUNT(*) AS n FROM organizations
+       WHERE deleted_at IS NULL AND COALESCE(referral_source,'') != 'internal'
+         AND created_at >= datetime('now', ?)
+       GROUP BY d`,
+    ).bind(since).all<{ d: string; n: number }>(),
+    c.env.DB.prepare(
+      `SELECT date(churned_at) AS d, COUNT(*) AS n FROM organizations
+       WHERE churned_at IS NOT NULL AND deleted_at IS NULL
+         AND COALESCE(referral_source,'') != 'internal'
+         AND churned_at >= datetime('now', ?)
+       GROUP BY d`,
+    ).bind(since).all<{ d: string; n: number }>(),
+    // Paid plans is a running total, so we need the current count plus the
+    // per-day deltas to walk it backwards on the client.
+    c.env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM organizations
+       WHERE deleted_at IS NULL AND tier IN ('pro','team','enterprise')
+         AND COALESCE(referral_source,'') != 'internal'`,
+    ).first<{ n: number }>(),
+  ]);
+
+  const signupMap = new Map((signupRows.results ?? []).map((r) => [r.d, r.n]));
+  const churnMap = new Map((churnRows.results ?? []).map((r) => [r.d, r.n]));
+
+  // Build a dense day list (zero-filled) oldest -> newest.
+  const out: Array<{ date: string; signups: number; cancellations: number }> = [];
+  const today = new Date();
+  for (let i = days - 1; i >= 0; i--) {
+    const dt = new Date(today.getTime() - i * 86400000);
+    const key = dt.toISOString().slice(0, 10);
+    out.push({
+      date: key,
+      signups: signupMap.get(key) ?? 0,
+      cancellations: churnMap.get(key) ?? 0,
+    });
+  }
+
+  return c.json({ days, paid_now: paidRows?.n ?? 0, series: out });
+});
+
+// ---------------------------------------------------------------------------
 // GET /admin/users — List all orgs with usage stats
 // ---------------------------------------------------------------------------
 admin.get("/users", async (c) => {

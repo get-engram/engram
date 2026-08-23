@@ -123,7 +123,18 @@ admin.get("/metrics", async (c) => {
   // active subscription items; yearly plans are normalized to monthly.
   // "external" excludes subs whose customer maps to an internal org (the
   // owner's own accounts). Fail-soft: metrics must render without Stripe.
-  const mrr = { total_cents: 0, external_cents: 0, subscriptions: 0, external_subscriptions: 0 };
+  // at_risk_* = subscriptions still 'active' in Stripe but already scheduled to
+  // cancel (cancel_at_period_end / cancel_at). They pay this period and then
+  // stop, so counting them in headline MRR overstates recurring revenue —
+  // external_cents is the honest "committed" number to lead with.
+  const mrr = {
+    total_cents: 0,
+    external_cents: 0,
+    subscriptions: 0,
+    external_subscriptions: 0,
+    at_risk_cents: 0,
+    at_risk_subscriptions: 0,
+  };
   try {
     if (c.env.STRIPE_SECRET_KEY) {
       const subsRes = await fetch(
@@ -134,6 +145,8 @@ admin.get("/metrics", async (c) => {
         const subs = (await subsRes.json()) as {
           data: Array<{
             customer: string;
+            cancel_at_period_end?: boolean;
+            cancel_at?: number | null;
             items: {
               data: Array<{
                 quantity?: number;
@@ -167,6 +180,14 @@ admin.get("/metrics", async (c) => {
           if (!internalCustomers.has(s.customer)) {
             mrr.external_cents += Math.round(cents);
             mrr.external_subscriptions += 1;
+            // Both of Stripe's scheduled-cancel mechanisms count.
+            const cancelling =
+              Boolean(s.cancel_at_period_end) ||
+              (typeof s.cancel_at === "number" && s.cancel_at > 0);
+            if (cancelling) {
+              mrr.at_risk_cents += Math.round(cents);
+              mrr.at_risk_subscriptions += 1;
+            }
           }
         }
       }

@@ -578,6 +578,36 @@ admin.post("/daily-report/send", async (c) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /admin/nudges/run?type=maxout|activation|recall|import — fire a
+// lifecycle nudge on demand instead of waiting for the 03:00 UTC cron.
+// Runs the same function the cron runs, so the per-org "already nudged" stamp
+// is applied exactly as usual — a manual run can't cause a duplicate send
+// later. Useful when someone hits the storage cap hours after the daily pass.
+// ---------------------------------------------------------------------------
+admin.post("/nudges/run", async (c) => {
+  const type = c.req.query("type") ?? "maxout";
+  const runners: Record<string, (env: Env) => Promise<number>> = {
+    maxout: (env) => import("../cron/maxout-nudge.js").then((m) => m.sendMaxoutNudges(env)),
+    activation: (env) => import("../cron/activation-nudge.js").then((m) => m.sendActivationNudges(env)),
+    recall: (env) => import("../cron/recall-nudge.js").then((m) => m.sendRecallNudges(env)),
+    import: (env) => import("../cron/import-nudge.js").then((m) => m.sendImportNudges(env)),
+  };
+  const run = runners[type];
+  if (!run) {
+    return c.json({ error: "unknown_type", allowed: Object.keys(runners) }, 400);
+  }
+  try {
+    const sent = await run(c.env);
+    return c.json({ type, sent });
+  } catch (err) {
+    return c.json(
+      { type, error: "run_failed", message: err instanceof Error ? err.message : String(err) },
+      500,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Email observability (migration 0029): engram-web's sendEmail() records
 // every transactional send here; the public /email/open pixel stamps opens.
 // ---------------------------------------------------------------------------

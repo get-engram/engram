@@ -283,7 +283,12 @@ admin.get("/timeseries", async (c) => {
 admin.get("/users", async (c) => {
   const sort = c.req.query("sort") || "created_at";
   const order = c.req.query("order") === "asc" ? "ASC" : "DESC";
-  const limit = Math.min(Number(c.req.query("limit") || "100"), 500);
+  // 500 was too low to pull the whole base in one call once signups passed it,
+  // which silently truncated ad-hoc analysis (segment percentages computed on
+  // the newest 500 skew heavily toward not-yet-activated accounts). 5,000 is
+  // comfortably above current scale while still bounding the response; page
+  // with `offset` beyond that.
+  const limit = Math.min(Number(c.req.query("limit") || "100"), 5000);
   const offset = Number(c.req.query("offset") || "0");
 
   const allowedSort: Record<string, string> = {
@@ -333,11 +338,16 @@ admin.get("/users", async (c) => {
     "SELECT COUNT(*) as count FROM organizations WHERE deleted_at IS NULL"
   ).first<{ count: number }>();
 
+  const returned = (result.results ?? []).length;
+  const totalCount = total?.count ?? 0;
   return c.json({
     users: result.results,
-    total: total?.count ?? 0,
+    total: totalCount,
     limit,
     offset,
+    // Explicit so a truncated page can't be mistaken for the whole base —
+    // that silently skewed segment analysis when the cap was 500.
+    has_more: offset + returned < totalCount,
   });
 });
 

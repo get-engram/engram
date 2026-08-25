@@ -138,6 +138,69 @@ MIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF2PbnGMh
     expect(text).toBe(`here ${R} end`);
   });
 
+  // --- Underscore-prefixed tokens (regression) ---
+  //
+  // `_` is a word character, so a leading \b never fires between the prefix
+  // and the secret body. Every `<prefix>_<secret>` token whose prefix wasn't
+  // explicitly enumerated used to pass through the generic net untouched.
+
+  it("redacts a Vercel token by its explicit prefix pattern", () => {
+    // Carrier text avoids the words token/key/secret so SECRET_ASSIGNMENT
+    // doesn't swallow the line first — this asserts the vcp_ pattern itself.
+    // Synthetic value with the real shape (vcp_ + 55 alphanumeric chars);
+    // never use a live token here, GitHub push protection rejects it.
+    const { text, redactionCount } = redact(
+      "use vcp_0FakeVercelTokenForTestsOnly000000000000000000000000000 here"
+    );
+    expect(text).toBe(`use ${R} here`);
+    expect(redactionCount).toBe(1);
+  });
+
+  it("redacts a short Vercel token the generic net would miss", () => {
+    // 24 chars after the prefix — below BASE64_TOKEN's 40-char floor, so
+    // only the explicit vcp_ pattern can catch it.
+    const { text } = redact("use vcp_aB3dE6fG9hJ2kL5mN8pQ1rS4 here");
+    expect(text).toBe(`use ${R} here`);
+  });
+
+  it("redacts an unknown underscore-prefixed token via the generic net", () => {
+    // Deliberately a prefix that is NOT in PROVIDER_KEYS — the generic
+    // high-entropy net is the only thing that can catch it.
+    const body = "aB3".repeat(17); // 51 chars, no underscores
+    const { text } = redact(`key=zzunknownvendor_${body}`);
+    expect(text).not.toContain(body);
+  });
+
+  it("redacts an underscore-prefixed hex token via the generic net", () => {
+    const hex = "deadbeef".repeat(5); // 40 hex chars
+    const { text } = redact(`somevendor_${hex}`);
+    expect(text).not.toContain(hex);
+  });
+
+  it("still redacts dash-prefixed tokens (never regressed)", () => {
+    const body = "aB3".repeat(17);
+    const { text } = redact(`x-${body}`);
+    expect(text).not.toContain(body);
+  });
+
+  it("does not match a high-entropy run embedded mid-identifier", () => {
+    // Preceded by an alphanumeric character, so it is part of a longer
+    // word rather than a delimited token — same protection \b gave us.
+    const hex = "a".repeat(32);
+    const input = `z${hex}z`;
+    const { text, redactionCount } = redact(input);
+    expect(text).toBe(input);
+    expect(redactionCount).toBe(0);
+  });
+
+  it("does not redact ordinary snake_case identifiers or paths", () => {
+    const input =
+      "messages_stored_total, packages/shared/src/utils/redact.ts, conversation_chunks";
+    const { text, redactionCount } = redact(input);
+    expect(text).toBe(input);
+    expect(redactionCount).toBe(0);
+  });
+
   // --- Multiple patterns ---
 
   it("redacts multiple secrets in one string", () => {

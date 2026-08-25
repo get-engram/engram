@@ -2,9 +2,22 @@ const REDACTED = "[REDACTED]";
 
 // --- Pattern definitions ---
 
-// Generic high-entropy tokens: hex ≥32 chars, base64-ish ≥40 chars
-const HEX_TOKEN = /\b[0-9a-fA-F]{32,}\b/g;
-const BASE64_TOKEN = /\b[A-Za-z0-9+/]{40,}={0,2}\b/g;
+// Generic high-entropy tokens: hex ≥32 chars, base64-ish ≥40 chars.
+//
+// These deliberately do NOT use \b as the leading boundary. `_` is a word
+// character, so \b never fires between an underscore and the run that
+// follows it — which means a `<prefix>_<secret>` token (the convention most
+// vendors use: vcp_, dop_v1_, neon_, fly_, …) had its entire secret body
+// skipped by the generic net unless the exact prefix was enumerated in
+// PROVIDER_KEYS below. A `-` prefix was never affected, since `-` is a
+// non-word character and \b fires normally there.
+//
+// Using an explicit "not preceded/followed by a character from this
+// alphabet" lookaround keeps the original mid-word protection (a hex run
+// inside a longer alphanumeric string still won't match) while letting `_`
+// and other separators act as token delimiters.
+const HEX_TOKEN = /(?<![A-Za-z0-9])[0-9a-fA-F]{32,}(?![A-Za-z0-9])/g;
+const BASE64_TOKEN = /(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/])/g;
 
 // Provider API keys — each has a distinctive prefix
 const PROVIDER_KEYS = [
@@ -27,6 +40,10 @@ const PROVIDER_KEYS = [
   /\bxox[bpras]-[A-Za-z0-9-]{10,}\b/g,
   // npm
   /\bnpm_[A-Za-z0-9]{30,}\b/g,
+  // Vercel (account/access tokens). Older Vercel tokens are bare 24-char
+  // alphanumeric strings with no prefix — those are indistinguishable from
+  // ordinary identifiers and are not matched here.
+  /\bvcp_[A-Za-z0-9]{20,}\b/g,
   // Sendgrid
   /\bSG\.[A-Za-z0-9_-]{22,}\.[A-Za-z0-9_-]{22,}\b/g,
   // Twilio

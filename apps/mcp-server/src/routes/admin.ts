@@ -9,6 +9,22 @@ type AdminEnv = { Bindings: Env };
 
 export const admin = new Hono<AdminEnv>();
 
+/**
+ * The admin dashboard reports days in the operator's timezone, not UTC.
+ *
+ * Timestamps are stored in UTC; SQLite's bare `date('now')` is also UTC, so
+ * "today" used to roll over at 18:00 local. Between 6pm and midnight the
+ * board showed "0 signups today" while people were signing up during the
+ * operator's actual day.
+ *
+ * Mexico abolished DST in October 2022, so America/Mexico_City is a fixed
+ * UTC-6 year-round and a constant offset is exact — no tz database needed
+ * (D1/SQLite has no timezone support beyond fixed modifiers anyway). If the
+ * operator ever moves to a zone that observes DST, this must become a real
+ * timezone conversion rather than a fixed offset.
+ */
+const ADMIN_TZ_OFFSET = "-6 hours";
+
 // ---------------------------------------------------------------------------
 // GET /admin/metrics — Business metrics dashboard
 // ---------------------------------------------------------------------------
@@ -61,7 +77,8 @@ admin.get("/metrics", async (c) => {
     c.env.DB.prepare(`
       SELECT id, name, email, tier, referral_source, created_at
       FROM organizations
-      WHERE date(created_at) = date('now') AND deleted_at IS NULL
+      WHERE date(created_at, '${ADMIN_TZ_OFFSET}') = date('now', '${ADMIN_TZ_OFFSET}')
+        AND deleted_at IS NULL
       ORDER BY created_at DESC
     `).all<{ id: string; name: string; email: string | null; tier: string; referral_source: string | null; created_at: string }>(),
 
@@ -237,13 +254,13 @@ admin.get("/timeseries", async (c) => {
 
   const [signupRows, churnRows, paidRows] = await Promise.all([
     c.env.DB.prepare(
-      `SELECT date(created_at) AS d, COUNT(*) AS n FROM organizations
+      `SELECT date(created_at, '${ADMIN_TZ_OFFSET}') AS d, COUNT(*) AS n FROM organizations
        WHERE deleted_at IS NULL AND COALESCE(referral_source,'') != 'internal'
          AND created_at >= datetime('now', ?)
        GROUP BY d`,
     ).bind(since).all<{ d: string; n: number }>(),
     c.env.DB.prepare(
-      `SELECT date(churned_at) AS d, COUNT(*) AS n FROM organizations
+      `SELECT date(churned_at, '${ADMIN_TZ_OFFSET}') AS d, COUNT(*) AS n FROM organizations
        WHERE churned_at IS NOT NULL AND deleted_at IS NULL
          AND COALESCE(referral_source,'') != 'internal'
          AND churned_at >= datetime('now', ?)
@@ -263,7 +280,10 @@ admin.get("/timeseries", async (c) => {
 
   // Build a dense day list (zero-filled) oldest -> newest.
   const out: Array<{ date: string; signups: number; cancellations: number }> = [];
-  const today = new Date();
+  // Day keys must be built on the SAME boundary the SQL grouped on
+  // (ADMIN_TZ_OFFSET), or every bucket misses and the chart zero-fills.
+  const TZ_SHIFT_MS = 6 * 3600 * 1000; // UTC-6, see ADMIN_TZ_OFFSET
+  const today = new Date(Date.now() - TZ_SHIFT_MS);
   for (let i = days - 1; i >= 0; i--) {
     const dt = new Date(today.getTime() - i * 86400000);
     const key = dt.toISOString().slice(0, 10);

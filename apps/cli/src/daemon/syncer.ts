@@ -1,6 +1,7 @@
 import type { Engram } from "@getengram/sdk";
 import { DaemonDb } from "./db.js";
 import { recordSuccess, recordFailure, classifyError } from "./status.js";
+import { parseStorageFullError } from "../storage-error.js";
 import type { ParsedMessage, SessionMeta, PendingRow } from "./types.js";
 
 // Claude Code transcript messages can be enormous (tool output dumps), and
@@ -166,7 +167,7 @@ export class Syncer {
             return;
           }
           const errType = classifyError(msg);
-          if (errType === "billing") {
+          if (errType === "billing" || errType === "storage_full") {
             this.enterBillingBackoff(msg);
             return;
           }
@@ -222,7 +223,7 @@ export class Syncer {
 
         // Billing / limit errors — exponential backoff
         const errType = classifyError(msg);
-        if (errType === "billing") {
+        if (errType === "billing" || errType === "storage_full") {
           this.enterBillingBackoff(msg);
           return;
         }
@@ -245,7 +246,16 @@ export class Syncer {
     }
   }
 
-  /** Enter billing backoff — escalates each time: 5min → 15min → 1hr */
+  /**
+   * Enter billing backoff — escalates each time: 5min → 15min → 1hr.
+   *
+   * A full memory is separated out here. It arrives as a 402 like any other
+   * billing error, but retrying can never clear it on its own: it needs an
+   * upgrade or deleted conversations. It gets its own status state (so the
+   * CLI can say "memory is full" rather than "plan limit reached") and its
+   * used/limit numbers are carried through, so the banner can name them
+   * even when the machine is offline.
+   */
   private enterBillingBackoff(msg: string): void {
     const delay = BILLING_BACKOFF_MS[
       Math.min(this.billingBackoffStep, BILLING_BACKOFF_MS.length - 1)
@@ -253,7 +263,20 @@ export class Syncer {
     this.billingBackoffUntil = Date.now() + delay;
     this.billingBackoffStep++;
 
+    const storageFull = parseStorageFullError(msg);
     const mins = Math.round(delay / 60_000);
+    if (storageFull) {
+      console.error(
+        `[engram] memory full (${storageFull.used ?? "?"}/${storageFull.limit ?? "?"}), ` +
+          `pausing sync ${mins}m — new captures stay queued until space is freed`,
+      );
+      recordFailure(msg, "storage_full", this.db.getPendingCount(), {
+        used: storageFull.used,
+        limit: storageFull.limit,
+      });
+      return;
+    }
+
     console.error(
       `[engram] billing limit hit, backing off ${mins}m (attempt ${this.billingBackoffStep}): ${msg}`,
     );

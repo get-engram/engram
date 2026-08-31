@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createRequire } from "node:module";
 import { Engram } from "@getengram/sdk";
 import { loadConfig, getBaseUrl } from "./config.js";
 import { authLogin, authLogout, authStatus } from "./commands/auth.js";
@@ -19,9 +20,23 @@ import { autoEnableCapture } from "./daemon/commands.js";
 import { upgrade } from "./commands/upgrade.js";
 import { usage as showUsage } from "./commands/usage.js";
 import { vaultKeygen, vaultStatus, loadVaultKey, vaultSet, vaultGet, vaultList, vaultDelete } from "./commands/vault.js";
-import { bold, dim } from "./output.js";
+import { bold, dim, red } from "./output.js";
+import { readStatus, syncErrorSummary } from "./daemon/status.js";
 
-const VERSION = "0.3.4";
+// Read from package.json rather than duplicated here. The previous hardcoded
+// constant had drifted to 0.3.4 while the package shipped 0.5.1, so
+// `engram version` — the first thing anyone reports in a bug — was wrong for
+// two releases. npm always includes package.json in the tarball, and dist/
+// sits directly under the package root, so this resolves both from the repo
+// and from a global install.
+const VERSION: string = (() => {
+  try {
+    const require = createRequire(import.meta.url);
+    return (require("../package.json") as { version?: string }).version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
 
 // Commands that take 1 word
 const TOP_COMMANDS = new Set([
@@ -183,6 +198,31 @@ ${dim(`v${VERSION} — https://getengram.app`)}
 `);
 }
 
+/**
+ * Print a one-time banner if the background sync daemon is stuck in a state
+ * the user has to resolve. Goes to stderr, never stdout, so `--json` output
+ * stays machine-parseable.
+ *
+ * Only the two states a human must act on are surfaced. Transient trouble
+ * (network, rate limits, 5xx) resolves itself and would just be noise on
+ * every command.
+ */
+function printSyncBanner(): void {
+  try {
+    const s = readStatus();
+    if (s.error_type !== "storage_full" && s.error_type !== "auth") return;
+    const queued =
+      s.pending_messages > 0
+        ? ` ${s.pending_messages.toLocaleString("en-US")} message${s.pending_messages === 1 ? "" : "s"} waiting locally.`
+        : "";
+    console.error(red(bold("engram:")) + ` ${syncErrorSummary(s.error_type, s.storage)}${queued}`);
+    console.error(dim("  (run 'engram status' for details)"));
+    console.error("");
+  } catch {
+    // Never let a status-file problem block the command the user asked for.
+  }
+}
+
 async function main(): Promise<void> {
   const raw = process.argv.slice(2);
 
@@ -214,6 +254,14 @@ async function main(): Promise<void> {
     "status", "log", "signup", "login", "link", "auth login", "auth logout",
   ]);
   const ensureCaptureAfter = !CAPTURE_EXEMPT.has(cmd);
+
+  // The daemon is headless, so a full memory would otherwise only ever be
+  // visible in ~/.engram/daemon.log. Surface it on the next interactive
+  // command instead — this is the moment the user is actually looking.
+  // `status` and `usage` print their own detail, so skip the banner there.
+  if (cmd !== "status" && cmd !== "usage") {
+    printSyncBanner();
+  }
 
   try {
     switch (cmd) {

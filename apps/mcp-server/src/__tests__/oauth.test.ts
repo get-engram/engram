@@ -305,13 +305,77 @@ describe("Token endpoint — refresh_token grant", () => {
     const second = (await refreshed.json()) as { refresh_token: string };
     expect(second.refresh_token).not.toBe(first.refresh_token);
 
-    // Reuse the now-rotated token — reuse detection kicks in.
-    const reuse = await app.fetch(
+    // Immediate reuse is a RACE, not an attack: the client most likely never
+    // received the successor (dropped response, retry, second process on the
+    // same credential store). Inside the grace window it gets a usable pair
+    // instead of having its whole chain revoked.
+    const race = await app.fetch(
       form({ grant_type: "refresh_token", client_id: clientId, refresh_token: first.refresh_token }),
       env,
     );
-    expect(reuse.status).toBe(400);
-    expect(((await reuse.json()) as { error_description: string }).error_description).toMatch(/reuse/i);
+    expect(race.status).toBe(200);
+    const raced = (await race.json()) as { refresh_token: string; access_token: string };
+    expect(raced.refresh_token).not.toBe(first.refresh_token);
+    expect(raced.refresh_token).not.toBe(second.refresh_token);
+
+    // Critically, the successor issued to the OTHER caller still works —
+    // neither client is signed out. This is the regression that mattered:
+    // 80 chain revocations across 54 orgs came from failing this case.
+    const other = await app.fetch(
+      form({ grant_type: "refresh_token", client_id: clientId, refresh_token: second.refresh_token }),
+      env,
+    );
+    expect(other.status).toBe(200);
+  });
+
+  it("still revokes the chain when a rotated token is replayed after the grace window", async () => {
+    const db = createOAuthD1();
+    const env = createOAuthEnv(db);
+    const clientId = await registerClient(env);
+    const { verifier, challenge } = await pkcePair();
+    const code = await getAuthCode(env, clientId, challenge);
+
+    const first = (await (
+      await app.fetch(
+        form({
+          grant_type: "authorization_code",
+          client_id: clientId,
+          code,
+          redirect_uri: REDIRECT,
+          code_verifier: verifier,
+        }),
+        env,
+      )
+    ).json()) as { refresh_token: string };
+
+    const second = (await (
+      await app.fetch(
+        form({ grant_type: "refresh_token", client_id: clientId, refresh_token: first.refresh_token }),
+        env,
+      )
+    ).json()) as { refresh_token: string };
+
+    // Age the rotation past the grace window. Replay now looks like theft,
+    // not a dropped response, so the security behaviour must be unchanged.
+    const anHourAgo = new Date(Date.now() - 3_600_000).toISOString().slice(0, 19).replace("T", " ");
+    await db
+      .prepare("UPDATE oauth_refresh_tokens SET revoked_at = ? WHERE rotated_to IS NOT NULL")
+      .bind(anHourAgo)
+      .run();
+
+    const replay = await app.fetch(
+      form({ grant_type: "refresh_token", client_id: clientId, refresh_token: first.refresh_token }),
+      env,
+    );
+    expect(replay.status).toBe(400);
+    expect(((await replay.json()) as { error_description: string }).error_description).toMatch(/reuse/i);
+
+    // ...and the whole chain is dead, including the successor.
+    const afterRevoke = await app.fetch(
+      form({ grant_type: "refresh_token", client_id: clientId, refresh_token: second.refresh_token }),
+      env,
+    );
+    expect(afterRevoke.status).toBe(400);
   });
 });
 

@@ -96,3 +96,37 @@ export function updateMessageContent(
     .bind(content, contentEncoding, messageId, organizationId)
     .run();
 }
+
+/**
+ * Ids of R2-backed messages in a conversation, for purging their bodies
+ * from the content bucket before the D1 rows are deleted.
+ *
+ * Only `r2:*` rows have an object; legacy inline content lives in the D1
+ * column and goes away with the row. Order matters at the call site: read
+ * these BEFORE deleting from D1, or the keys become unrecoverable.
+ */
+export function getR2MessageIdsByConversation(
+  db: D1Database,
+  conversationId: string,
+  organizationId: string
+) {
+  return db
+    .prepare(
+      "SELECT id FROM messages WHERE conversation_id = ? AND organization_id = ? AND content_encoding LIKE 'r2:%'"
+    )
+    .bind(conversationId, organizationId)
+    .all<{ id: string }>();
+}
+
+/** Same, for every message in an organization (hard-purge after account deletion). */
+export function getR2MessageIdsByOrganization(
+  db: D1Database,
+  organizationId: string
+) {
+  return db
+    .prepare(
+      "SELECT id FROM messages WHERE organization_id = ? AND content_encoding LIKE 'r2:%'"
+    )
+    .bind(organizationId)
+    .all<{ id: string }>();
+}

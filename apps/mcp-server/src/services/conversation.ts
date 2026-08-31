@@ -28,10 +28,11 @@ import {
   getMessagesBySequenceRange,
   getChunksOverlappingSequence,
   deleteChunksByIds,
+  getR2MessageIdsByConversation,
 } from "@getengram/db";
 import { generateEmbeddings } from "./embedding.js";
 import { releaseStorage } from "./tier.js";
-import { storeContent, loadContent } from "./content-store.js";
+import { storeContent, deleteContent, loadContent } from "./content-store.js";
 import type { Env, AuthContext } from "../types.js";
 import { canAccessConversation } from "./spaces.js";
 
@@ -530,6 +531,23 @@ export async function deleteConversation(
   );
   const vectorizeIds = chunksResult.results.map((r) => r.vectorize_id);
 
+  // Order matters, in both directions.
+  //
+  // R2 must go before D1: the message ids ARE the R2 keys, so once the rows
+  // are deleted the objects can never be found again — they would sit in the
+  // bucket forever, after we told the user the conversation was deleted.
+  //
+  // R2 must also go before Vectorize: deleteContent throws on failure so the
+  // caller can abort, and aborting is only clean while nothing else has been
+  // destroyed. Purging vectors first would leave a conversation that still
+  // exists but has silently stopped being searchable.
+  const r2Ids = await getR2MessageIdsByConversation(
+    env.DB,
+    conversationId,
+    organizationId
+  );
+  const purged = await deleteContent(env, r2Ids.results.map((r) => r.id));
+
   // Delete from Vectorize
   if (vectorizeIds.length > 0) {
     await env.VECTORIZE.deleteByIds(vectorizeIds);
@@ -537,6 +555,10 @@ export async function deleteConversation(
 
   // Delete from D1 (cascading: chunks, messages, conversation)
   await deleteConversationById(env.DB, conversationId, organizationId);
+
+  if (purged > 0) {
+    console.log(`[delete] purged ${purged} R2 object(s) for conversation ${conversationId}`);
+  }
 
   // Deleting frees storage (engram#275) — memory never expires on its
   // own, but the user can always make room.

@@ -35,6 +35,31 @@ const ACCESS_TTL_SECONDS = 60 * 60; // 1 hour
 const REFRESH_TTL_SECONDS = 60 * 60 * 24 * 60; // 60 days
 const CODE_TTL_SECONDS = 60 * 10; // 10 minutes
 
+/**
+ * Window after a rotation in which re-presenting the OLD refresh token is
+ * treated as a benign race rather than a replay attack.
+ *
+ * Without this, the single most common failure is self-inflicted: the client
+ * sends a refresh, the server rotates and replies, and the response is lost
+ * in transit. The client never learns the successor, retries with the token
+ * it still holds, and strict reuse detection revokes the entire chain —
+ * silently signing the user out of a connector that was working seconds ago.
+ *
+ * Measured before this fix: 80 chain revocations across 54 organizations
+ * between 2026-07-13 and 2026-08-31, one user kicked 9 times.
+ *
+ * Kept short so a genuinely stolen token stays useless: rotation still
+ * happens on every refresh, and reuse outside this window is still treated
+ * as a compromised chain.
+ */
+const REFRESH_REUSE_GRACE_SECONDS = 60;
+
+/** Parse a SQLite `datetime('now')` string (UTC, no zone marker) to epoch ms. */
+function sqliteDateTimeToMs(value: string | null | undefined): number {
+  if (!value) return NaN;
+  return Date.parse(value.replace(" ", "T") + "Z");
+}
+
 const BROWSER_ORIGINS = [
   "https://getengram.app",
   "https://www.getengram.app",
@@ -451,11 +476,61 @@ async function handleRefreshTokenGrant(
   if (!row || row.client_id !== clientId) {
     return c.json({ error: "invalid_grant", error_description: "Unknown refresh token" }, 400);
   }
-  // Reuse detection: an already-rotated or revoked token means the chain is
-  // compromised — revoke everything for this client+org.
+  // Reuse detection. An already-rotated or revoked token is EITHER a replay
+  // attack OR a client that never received the successor (dropped response,
+  // retry, a second process sharing the same credential store). Those look
+  // identical here, so the rotation age is used to separate them.
   if (row.rotated_to || row.revoked_at) {
-    await revokeRefreshTokenChain(c.env.DB, row.client_id, row.organization_id);
-    return c.json({ error: "invalid_grant", error_description: "Refresh token reuse detected" }, 400);
+    const rotatedAgeMs = Date.now() - sqliteDateTimeToMs(row.revoked_at);
+    const withinGrace =
+      Boolean(row.rotated_to) &&
+      Number.isFinite(rotatedAgeMs) &&
+      rotatedAgeMs >= 0 &&
+      rotatedAgeMs < REFRESH_REUSE_GRACE_SECONDS * 1000;
+
+    if (!withinGrace) {
+      console.warn(
+        `[oauth] refresh reuse outside grace — revoking chain for org=${row.organization_id} ` +
+          `client=${clientId} rotated_age_ms=${Number.isFinite(rotatedAgeMs) ? rotatedAgeMs : "unknown"}`,
+      );
+      await revokeRefreshTokenChain(c.env.DB, row.client_id, row.organization_id);
+      return c.json({ error: "invalid_grant", error_description: "Refresh token reuse detected" }, 400);
+    }
+
+    // Benign race. Issue a fresh pair WITHOUT re-rotating this row: its
+    // existing `rotated_to` still points at the successor the other caller
+    // received, so both callers end up holding a usable token and neither is
+    // signed out. Deliberately not idempotent — only hashes are stored, so
+    // the original successor cannot be replayed.
+    console.info(
+      `[oauth] refresh reuse within ${REFRESH_REUSE_GRACE_SECONDS}s grace — treating as race, ` +
+        `org=${row.organization_id} client=${clientId} rotated_age_ms=${rotatedAgeMs}`,
+    );
+    const raceRefresh = generateRefreshToken();
+    const raceAccess = generateAccessToken();
+    await insertAccessToken(
+      c.env.DB,
+      await hashApiKey(raceAccess),
+      clientId,
+      row.organization_id,
+      row.scope,
+      expiryFromNow(ACCESS_TTL_SECONDS),
+    );
+    await insertRefreshToken(
+      c.env.DB,
+      await hashApiKey(raceRefresh),
+      clientId,
+      row.organization_id,
+      row.scope,
+      expiryFromNow(REFRESH_TTL_SECONDS),
+    );
+    return c.json({
+      access_token: raceAccess,
+      token_type: "Bearer",
+      expires_in: ACCESS_TTL_SECONDS,
+      refresh_token: raceRefresh,
+      scope: row.scope,
+    });
   }
   if (sqliteDateTime(new Date()) > row.expires_at) {
     return c.json({ error: "invalid_grant", error_description: "Refresh token expired" }, 400);

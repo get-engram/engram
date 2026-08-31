@@ -1,5 +1,6 @@
 import { loadConfig, getBaseUrl } from "../config.js";
 import { bold, dim, red, json as printJson } from "../output.js";
+import { readStatus } from "../daemon/status.js";
 
 const API_URL = process.env.ENGRAM_BASE_URL ?? getBaseUrl();
 
@@ -79,8 +80,23 @@ export async function usage(
   if (data.storage && data.storage.limit > 0) {
     const pct = data.storage.used / data.storage.limit;
     if (pct >= 1) {
-      console.log(dim("  Memory is full — nothing expires, but new saves are paused."));
-      console.log(dim("  Free space by deleting conversations, or upgrade: engram upgrade\n"));
+      // Not dim: this is the one state where the product has silently
+      // stopped doing its job, and it needs to read that way.
+      console.log(red(bold("  Memory is full — new saves are paused.")));
+      console.log("  Nothing already saved expires or is lost.");
+
+      // Background captures keep queueing locally while capped. Left
+      // unsaid, auto-capture looks like it's still working.
+      const queued = readStatus().pending_messages;
+      if (queued > 0) {
+        console.log(
+          red(
+            `  ${fmt(queued)} captured message${queued === 1 ? "" : "s"} ` +
+              `waiting on this machine — they will not be saved until you free space.`,
+          ),
+        );
+      }
+      console.log("  Free space by deleting conversations, or upgrade: engram upgrade\n");
     } else if (pct >= 0.8) {
       console.log(dim("  Heads up: memory is over 80% full. More room: engram upgrade\n"));
     }

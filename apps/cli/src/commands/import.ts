@@ -4,6 +4,11 @@ import { Engram, type MessageInput } from "@getengram/sdk";
 import { loadConfig, getBaseUrl } from "../config.js";
 import { green, dim, bold } from "../output.js";
 
+import { parseStorageFullError } from "../storage-error.js";
+// Re-exported for backwards compatibility: this parser moved to a shared module
+// so the sync daemon can use it without importing this command.
+export { parseStorageFullError, type StorageFullError } from "../storage-error.js";
+
 /**
  * Import a ChatGPT or Claude data export into Engram. The format is
  * auto-detected from the file.
@@ -331,36 +336,6 @@ export function storageWarning(
   );
 }
 
-/**
- * Parse an SDK error message as the server's `storage_full` payload. The
- * MCP tool returns it as an isError JSON body, which the SDK surfaces
- * verbatim as the Error message. Returns null for anything else.
- */
-export function parseStorageFullError(raw: string): {
-  message: string;
-  used?: number;
-  limit?: number;
-  upgrade_url?: string;
-} | null {
-  try {
-    const parsed = JSON.parse(raw) as {
-      error?: string;
-      message?: string;
-      used?: number;
-      limit?: number;
-      upgrade_url?: string;
-    };
-    if (parsed?.error !== "storage_full") return null;
-    return {
-      message: parsed.message || "Engram's memory is full.",
-      used: parsed.used,
-      limit: parsed.limit,
-      upgrade_url: parsed.upgrade_url,
-    };
-  } catch {
-    return null;
-  }
-}
 
 /** Fetch lifetime storage usage; returns null on any failure (never blocks the import). */
 async function fetchStorageUsage(): Promise<StorageUsage | null> {

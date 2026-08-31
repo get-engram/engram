@@ -70,3 +70,35 @@ export async function loadContent(
   // Legacy inline content (or short raw content).
   return decompressContent(msg.content, enc);
 }
+
+/**
+ * Permanently remove message bodies from R2.
+ *
+ * Deletion previously stopped at D1 and Vectorize, so the verbatim text
+ * survived in R2 forever — invisible to the owner but still stored by us,
+ * which contradicts the erasure commitment in the published DPA.
+ *
+ * Only "r2:*"-encoded messages have an object; legacy inline rows carry
+ * their content in D1 and are removed by the D1 delete itself. Passing ids
+ * with no object is harmless (R2 delete is idempotent), but filtering keeps
+ * the batches small and the logging honest.
+ *
+ * THROWS on failure, deliberately. A silent failure here means telling a
+ * user their data is gone while it is not — the caller must be able to
+ * abort the D1 delete, because once the rows are gone the R2 keys can no
+ * longer be enumerated and the objects are unreachable garbage.
+ */
+export async function deleteContent(
+  env: Env,
+  messageIds: string[],
+): Promise<number> {
+  if (messageIds.length === 0) return 0;
+  let deleted = 0;
+  // R2 accepts up to 1000 keys per delete call.
+  for (let i = 0; i < messageIds.length; i += 1000) {
+    const batch = messageIds.slice(i, i + 1000).map(r2Key);
+    await env.CONTENT.delete(batch);
+    deleted += batch.length;
+  }
+  return deleted;
+}

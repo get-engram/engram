@@ -199,6 +199,17 @@ export function createMockEnv(db: D1Database) {
   // In-memory R2 mock so content write-then-read round-trips in tests.
   const r2store = new Map<string, string>();
   return {
+    // Exposed so tests can assert what is actually left in the bucket,
+    // rather than trusting that delete was called.
+    __r2store: r2store,
+    // Bindings no test exercises, present so the returned object is a
+    // complete Env. Without them, callers that spread this and cast to Env
+    // (billing.test.ts, seats.test.ts) rely on TypeScript's comparability
+    // rule tolerating three missing fields — which it stops doing as soon
+    // as the rest of the shape gets closer to the real types.
+    SELF: {} as Fetcher,
+    DRAINER: {} as DurableObjectNamespace,
+    SUPABASE_ANON_KEY: "test-anon-key",
     DB: db,
     CONTENT: {
       put: vi.fn(async (key: string, val: unknown) => {
@@ -209,8 +220,10 @@ export function createMockEnv(db: D1Database) {
         const v = r2store.get(key);
         return v == null ? null : { text: async () => v };
       }),
-      delete: vi.fn(async (key: string) => {
-        r2store.delete(key);
+      // Real R2 delete accepts a single key OR an array of up to 1000.
+      // The mock must too, or batched deletes silently no-op in tests.
+      delete: vi.fn(async (key: string | string[]) => {
+        for (const k of Array.isArray(key) ? key : [key]) r2store.delete(k);
       }),
       head: vi.fn(async () => null),
       list: vi.fn(async () => ({ objects: [] })),

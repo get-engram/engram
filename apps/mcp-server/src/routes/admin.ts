@@ -4,6 +4,7 @@ import { compressContent, ENCODING_GZIP } from "../utils/compress.js";
 import type { Env } from "../types.js";
 import { sendDailyReport } from "../services/daily-report.js";
 import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
+import { ftsRowid, orgFtsToken } from "@getengram/db";
 
 type AdminEnv = { Bindings: Env };
 
@@ -1059,6 +1060,62 @@ admin.get("/search-coverage-v2", async (c) => {
 // \'r2:<orig>\'). Verify-before-swap => content is never lost. Resumable via
 // the rowid cursor; idempotent (only touches non-r2 rows). Each shrinking
 // UPDATE frees D1 pages, so running this also un-wedges a full database.
+// ---------------------------------------------------------------------------
+// POST /admin/backfill-fts?batch=500&after=<rowid> — populate the contentless
+// chunks_fts_v2 index (migration 0035) from conversation_chunks, and stamp
+// each chunk's fts_rowid so search can join back to it.
+//
+// Cursor-paged over conversation_chunks.rowid, idempotent (re-running a batch
+// overwrites the same FTS rowids), and safe to run while the old chunks_fts
+// still exists — nothing reads v2 until the deploy that switches the queries.
+// ---------------------------------------------------------------------------
+admin.post("/backfill-fts", async (c) => {
+  const batch = Math.min(1000, Math.max(1, parseInt(c.req.query("batch") ?? "500", 10)));
+  const after = parseInt(c.req.query("after") ?? "0", 10);
+
+  const rows = await c.env.DB.prepare(
+    `SELECT rowid AS rid, id, organization_id, chunk_text
+       FROM conversation_chunks
+      WHERE rowid > ? AND fts_rowid IS NULL
+      ORDER BY rowid LIMIT ?`,
+  )
+    .bind(after, batch)
+    .all<{ rid: number; id: string; organization_id: string; chunk_text: string }>();
+
+  const list = rows.results ?? [];
+  if (list.length === 0) {
+    return c.json({ done: true, indexed: 0, next_after: after });
+  }
+
+  const stmts = list.flatMap((r) => {
+    const rid = ftsRowid(r.id);
+    return [
+      // Clear any prior entry first: a re-run must overwrite, not duplicate
+      // the terms for this chunk.
+      c.env.DB.prepare("DELETE FROM chunks_fts_v2 WHERE rowid = ?").bind(rid),
+      c.env.DB.prepare(
+        "INSERT INTO chunks_fts_v2(rowid, chunk_text, org) VALUES (?, ?, ?)",
+      ).bind(rid, r.chunk_text, orgFtsToken(r.organization_id)),
+      // Stamped LAST in the batch so a partial failure leaves fts_rowid NULL
+      // and the row is simply picked up again on the next run.
+      c.env.DB.prepare("UPDATE conversation_chunks SET fts_rowid = ? WHERE id = ?").bind(
+        rid,
+        r.id,
+      ),
+    ];
+  });
+
+  await c.env.DB.batch(stmts);
+
+  const nextAfter = list[list.length - 1].rid;
+  return c.json({
+    done: false,
+    indexed: list.length,
+    next_after: nextAfter,
+    hint: `POST /admin/backfill-fts?batch=${batch}&after=${nextAfter}`,
+  });
+});
+
 admin.post("/backfill-content-to-r2", async (c) => {
   const batch = Math.min(800, Math.max(1, parseInt(c.req.query("batch") ?? "400", 10)));
   const after = parseInt(c.req.query("after") ?? "0", 10);

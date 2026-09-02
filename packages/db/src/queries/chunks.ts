@@ -83,6 +83,21 @@ export function getChunksByIds(
     .all();
 }
 
+/**
+ * Keyword search over the contentless FTS5 index.
+ *
+ * Ranking uses bm25(chunks_fts_v2, 1.0, 0.0) rather than the bare `rank`
+ * shorthand. `rank` scores ALL indexed columns, and `org` is a real indexed
+ * column here (it has to be, so the MATCH can scope by it). Since every
+ * document in an org carries the same org token, its BM25 contribution varies
+ * only with document length — which quietly reweights results toward short
+ * chunks regardless of their relevance to the user's actual query.
+ *
+ * Measured against the old standalone index before this was added: identical
+ * result SETS (6,928 = 6,928, zero on either side alone for a sample term) but
+ * near-zero overlap in the top 20. Zeroing the org column's weight restored
+ * 20/20, 19/20, 19/20 agreement on the same queries.
+ */
 export function searchChunksFts(
   db: D1Database,
   query: string,
@@ -94,25 +109,25 @@ export function searchChunksFts(
   if (conversationId) {
     return db
       .prepare(
-        `SELECT c.id AS chunk_id, f.rank AS rank
+        `SELECT c.id AS chunk_id, bm25(chunks_fts_v2, 1.0, 0.0) AS rank
            FROM chunks_fts_v2 f
            JOIN conversation_chunks c ON c.fts_rowid = f.rowid
           WHERE chunks_fts_v2 MATCH ?
             AND c.organization_id = ?
             AND c.conversation_id = ?
-          ORDER BY f.rank LIMIT ?`
+          ORDER BY bm25(chunks_fts_v2, 1.0, 0.0) LIMIT ?`
       )
       .bind(ftsMatch(query, organizationId), organizationId, conversationId, limit)
       .all<{ chunk_id: string; rank: number }>();
   }
   return db
     .prepare(
-      `SELECT c.id AS chunk_id, f.rank AS rank
+      `SELECT c.id AS chunk_id, bm25(chunks_fts_v2, 1.0, 0.0) AS rank
          FROM chunks_fts_v2 f
          JOIN conversation_chunks c ON c.fts_rowid = f.rowid
         WHERE chunks_fts_v2 MATCH ?
           AND c.organization_id = ?
-        ORDER BY f.rank LIMIT ?`
+        ORDER BY bm25(chunks_fts_v2, 1.0, 0.0) LIMIT ?`
     )
     .bind(ftsMatch(query, organizationId), organizationId, limit)
     .all<{ chunk_id: string; rank: number }>();

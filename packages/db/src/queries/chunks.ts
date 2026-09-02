@@ -1,3 +1,5 @@
+import { ftsRowid, orgFtsToken, ftsMatch } from "./fts-keys.js";
+
 export function insertChunks(
   db: D1Database,
   chunks: Array<{
@@ -20,12 +22,17 @@ export function insertChunks(
   // its fresh FTS row. All in one D1 batch/transaction.
   const ids = chunks.map((c) => c.id);
   const ph = ids.map(() => "?").join(",");
+  const rowids = chunks.map((c) => ftsRowid(c.id));
+  const rph = rowids.map(() => "?").join(",");
   const stmts = [
-    db.prepare(`DELETE FROM chunks_fts WHERE chunk_id IN (${ph})`).bind(...ids),
+    // Contentless FTS deletes by rowid alone (contentless_delete=1), so the
+    // old text is not needed to clear a stale entry — which is what keeps
+    // this working once chunk text moves to R2.
+    db.prepare(`DELETE FROM chunks_fts_v2 WHERE rowid IN (${rph})`).bind(...rowids),
     ...chunks.flatMap((c) => [
       db
         .prepare(
-          "INSERT OR REPLACE INTO conversation_chunks (id, conversation_id, organization_id, chunk_text, chunk_summary, start_sequence, end_sequence, vectorize_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT OR REPLACE INTO conversation_chunks (id, conversation_id, organization_id, chunk_text, chunk_summary, start_sequence, end_sequence, vectorize_id, fts_rowid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(
           c.id,
@@ -35,14 +42,16 @@ export function insertChunks(
           c.chunkSummary,
           c.startSequence,
           c.endSequence,
-          c.vectorizeId
+          c.vectorizeId,
+          ftsRowid(c.id)
         ),
-      // Dual-write into FTS5 index for keyword search
+      // Dual-write into the FTS5 index for keyword search. The rowid is
+      // derived from the chunk id so this is an idempotent overwrite.
       db
         .prepare(
-          "INSERT INTO chunks_fts(chunk_text, chunk_id, organization_id) VALUES (?, ?, ?)"
+          "INSERT INTO chunks_fts_v2(rowid, chunk_text, org) VALUES (?, ?, ?)"
         )
-        .bind(c.chunkText, c.id, c.organizationId),
+        .bind(ftsRowid(c.id), c.chunkText, orgFtsToken(c.organizationId)),
     ]),
   ];
   return db.batch(stmts);
@@ -85,21 +94,27 @@ export function searchChunksFts(
   if (conversationId) {
     return db
       .prepare(
-        `SELECT chunk_id, rank FROM chunks_fts
-         WHERE chunks_fts MATCH ? AND organization_id = ?
-           AND chunk_id IN (SELECT id FROM conversation_chunks WHERE conversation_id = ?)
-         ORDER BY rank LIMIT ?`
+        `SELECT c.id AS chunk_id, f.rank AS rank
+           FROM chunks_fts_v2 f
+           JOIN conversation_chunks c ON c.fts_rowid = f.rowid
+          WHERE chunks_fts_v2 MATCH ?
+            AND c.organization_id = ?
+            AND c.conversation_id = ?
+          ORDER BY f.rank LIMIT ?`
       )
-      .bind(query, organizationId, conversationId, limit)
+      .bind(ftsMatch(query, organizationId), organizationId, conversationId, limit)
       .all<{ chunk_id: string; rank: number }>();
   }
   return db
     .prepare(
-      `SELECT chunk_id, rank FROM chunks_fts
-       WHERE chunks_fts MATCH ? AND organization_id = ?
-       ORDER BY rank LIMIT ?`
+      `SELECT c.id AS chunk_id, f.rank AS rank
+         FROM chunks_fts_v2 f
+         JOIN conversation_chunks c ON c.fts_rowid = f.rowid
+        WHERE chunks_fts_v2 MATCH ?
+          AND c.organization_id = ?
+        ORDER BY f.rank LIMIT ?`
     )
-    .bind(query, organizationId, limit)
+    .bind(ftsMatch(query, organizationId), organizationId, limit)
     .all<{ chunk_id: string; rank: number }>();
 }
 
@@ -110,7 +125,7 @@ export function deleteChunksFts(
 ) {
   return db
     .prepare(
-      "DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ?)"
+      "DELETE FROM chunks_fts_v2 WHERE rowid IN (SELECT fts_rowid FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ? AND fts_rowid IS NOT NULL)"
     )
     .bind(conversationId, organizationId);
 }
@@ -153,8 +168,10 @@ export function deleteChunksByIds(
   const ph = ids.map(() => "?").join(",");
   return db.batch([
     db
-      .prepare(`DELETE FROM chunks_fts WHERE chunk_id IN (${ph})`)
-      .bind(...ids),
+      .prepare(
+        `DELETE FROM chunks_fts_v2 WHERE rowid IN (${ids.map(() => "?").join(",")})`
+      )
+      .bind(...ids.map(ftsRowid)),
     db
       .prepare(
         `DELETE FROM conversation_chunks WHERE id IN (${ph}) AND organization_id = ?`

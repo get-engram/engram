@@ -121,6 +121,32 @@ export interface VaultEntryInput {
   secret_type: string;
 }
 
+/**
+ * Maintenance write freeze.
+ *
+ * Set WRITES_FROZEN=1 to reject writes for the length of a maintenance
+ * window. Used for operations that must not race with concurrent inserts —
+ * notably rebuilding the messages table to reclaim freed pages (#383), where
+ * a row written mid-copy would be silently dropped by the table swap.
+ *
+ * Freezing rather than reconciling afterwards is a deliberate choice: it is
+ * the only approach that is zero-loss *by construction* rather than by
+ * getting a delta query right. The rebuild takes minutes, and the CLI daemon
+ * already queues locally and retries on failure, so for the largest writers
+ * this degrades to a pause rather than an error.
+ *
+ * Reads, search and recall stay fully available throughout.
+ */
+export function assertWritesEnabled(env: Env): void {
+  if (env.WRITES_FROZEN === "1") {
+    throw new Error(
+      "Engram is paused for a few minutes of scheduled maintenance. " +
+        "Nothing already saved is affected, and nothing is lost — retry shortly, " +
+        "or let your client retry automatically.",
+    );
+  }
+}
+
 export async function appendMessages(
   env: Env,
   organizationId: string,
@@ -128,6 +154,8 @@ export async function appendMessages(
   messageInputs: MessageInput[],
   vaultEntries?: VaultEntryInput[]
 ): Promise<Message[]> {
+  assertWritesEnabled(env);
+
   // Verify conversation exists and belongs to org
   const conv = await getConversationById(env.DB, conversationId, organizationId);
   if (!conv) {

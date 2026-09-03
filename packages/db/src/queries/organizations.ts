@@ -129,7 +129,7 @@ export function deleteOrganizationById(db: D1Database, id: string) {
   return db.batch([
     // FTS delete must come before chunks (subquery references conversation_chunks)
     db.prepare(
-      "DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM conversation_chunks WHERE organization_id = ?)",
+      "DELETE FROM chunks_fts_v2 WHERE rowid IN (SELECT fts_rowid FROM conversation_chunks WHERE organization_id = ? AND fts_rowid IS NOT NULL)",
     ).bind(id),
     // CASCADE handles the rest, but explicit deletes are safer for ordering
     db.prepare("DELETE FROM conversation_chunks WHERE organization_id = ?").bind(id),

@@ -1306,11 +1306,15 @@ admin.post("/reclaim-space", async (c) => {
     result.email_log_error = e instanceof Error ? e.message : String(e);
   }
   if (scope === "fts") {
-    // The FTS5 keyword index duplicates chunk_text. Emptying it frees that
-    // duplicate; semantic (vector) search still works, and the index is
-    // rebuildable from conversation_chunks. No user data lost.
+    // Emergency space lever. Since migration 0035 the index is contentless,
+    // so this no longer frees a duplicate copy of chunk_text (there isn't
+    // one) — it frees the ~660MB index itself. Keyword search degrades to
+    // semantic-only until POST /admin/backfill-fts rebuilds it, and
+    // fts_rowid stamps must be cleared too or the backfill will skip every
+    // row it already marked. No user data is lost either way.
     try {
-      const r = await c.env.DB.prepare("DELETE FROM chunks_fts").run();
+      await c.env.DB.prepare("UPDATE conversation_chunks SET fts_rowid = NULL").run();
+      const r = await c.env.DB.prepare("DELETE FROM chunks_fts_v2").run();
       result.chunks_fts_deleted = r.meta?.changes ?? 0;
     } catch (e) {
       result.chunks_fts_error = e instanceof Error ? e.message : String(e);

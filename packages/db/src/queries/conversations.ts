@@ -148,8 +148,10 @@ export function getOrgConversationCount(db: D1Database, organizationId: string) 
 
 export function deleteConversationById(db: D1Database, id: string, organizationId: string) {
   return db.batch([
-    // FTS delete must come before chunks delete (subquery references conversation_chunks)
-    db.prepare("DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ?)").bind(id, organizationId),
+    // FTS delete must come before chunks delete (subquery references conversation_chunks).
+    // Targets chunks_fts_v2 by rowid — the contentless index (migration 0035)
+    // cannot be addressed by chunk_id, and the old chunks_fts is being dropped.
+    db.prepare("DELETE FROM chunks_fts_v2 WHERE rowid IN (SELECT fts_rowid FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ? AND fts_rowid IS NOT NULL)").bind(id, organizationId),
     db.prepare("DELETE FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),
     db.prepare("DELETE FROM messages WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),
     db.prepare("DELETE FROM conversation_tags WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),

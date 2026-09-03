@@ -1,0 +1,33 @@
+-- Drop the original standalone FTS5 index, superseded by the contentless
+-- chunks_fts_v2 created in 0035.
+--
+-- This is the step that actually reclaims the space. Migration 0035 added the
+-- new index without removing the old one, so BOTH have been resident:
+--
+--   chunks_fts_content   836 MB   duplicate copy of every chunk's text
+--   chunks_fts_data      306 MB   the old index
+--   chunks_fts_v2_data   659 MB   the new index
+--
+-- which pushed the database to 9.02 GB against a 10 GB cap. Keeping the old
+-- index that long was deliberate: it was the rollback path while the new one
+-- was verified, and it earned its keep by exposing a ranking regression that
+-- comparison against it caught (see #400).
+--
+-- Verification completed before this migration was written:
+--   * recall identical -- 6,928 = 6,928 matching chunks for a sample term,
+--     with zero on either side alone
+--   * ranking restored to 20/20, 19/20, 19/20 top-20 agreement after #400
+--   * live searches through the deployed worker return relevant results
+--   * every code reference to chunks_fts repointed to chunks_fts_v2 (#402),
+--     which MUST be deployed before this runs -- deleteConversationById and
+--     deleteOrganizationById used the old table inside db.batch(), so a
+--     missing table would have failed the whole batch and broken deletion
+--     rather than degrading it.
+--
+-- DROP TABLE on an FTS5 virtual table removes its shadow tables
+-- (_data, _idx, _content, _docsize, _config) together.
+--
+-- Expect this to be slow, and possibly to report a 7429 timeout while having
+-- succeeded -- exactly what 0035 did on this database. If it reports failure,
+-- check whether the table is actually gone before retrying.
+DROP TABLE IF EXISTS chunks_fts;

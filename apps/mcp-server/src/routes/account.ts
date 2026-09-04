@@ -13,22 +13,39 @@ type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
 
 const account = new Hono<HonoEnv>();
 
+const GRACE_PERIOD_DAYS = 30;
+
+/** When the purge cron will hard-delete a soft-deleted org, as an ISO string.
+ *  D1 stores datetimes as "YYYY-MM-DD HH:MM:SS" in UTC with no zone marker,
+ *  so the T/Z are added before parsing — without them this parses as local
+ *  time and the deadline shown to the user drifts by the offset. */
+function purgeAt(deletedAt: string): string {
+  const ms = Date.parse(`${deletedAt.replace(" ", "T")}Z`);
+  return new Date(ms + GRACE_PERIOD_DAYS * 86400_000).toISOString();
+}
+
 // GET /api/account — "whoami" for the authenticated key. Lets the web app
 // validate an API key and build a session from it (key-only login for CLI
 // users), and decide whether to prompt for an email.
 account.get("/", async (c) => {
   const auth = c.get("auth");
   const org = (await getOrganizationById(c.env.DB, auth.organizationId)) as
-    | { id: string; email: string | null; name: string | null }
+    | { id: string; email: string | null; name: string | null; deleted_at: string | null }
     | null;
   if (!org) {
     return c.json({ error: "Organization not found" }, 404);
   }
+  // A soft-deleted org still authenticates on purpose — that is what keeps
+  // POST /api/account/restore reachable during the grace period. Reporting
+  // deleted_at here is what lets a client show the pending deletion and the
+  // undo path after a reload, instead of only in the tab that requested it.
   return c.json({
     org_id: auth.organizationId,
     email: org.email ?? null,
     name: org.name ?? null,
     tier: auth.tier,
+    deleted_at: org.deleted_at ?? null,
+    purge_at: org.deleted_at ? purgeAt(org.deleted_at) : null,
   });
 });
 
@@ -68,7 +85,7 @@ account.delete("/", async (c) => {
   return c.json({
     deleted: true,
     organization_id: orgId,
-    grace_period_days: 30,
+    grace_period_days: GRACE_PERIOD_DAYS,
     message: "Account scheduled for deletion. Data will be permanently removed after 30 days. Call POST /api/account/restore to undo.",
     affected_records: {
       conversations: stats?.conversations ?? 0,

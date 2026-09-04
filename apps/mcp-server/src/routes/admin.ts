@@ -4,6 +4,7 @@ import { compressContent, ENCODING_GZIP } from "../utils/compress.js";
 import type { Env } from "../types.js";
 import { sendDailyReport } from "../services/daily-report.js";
 import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
+import { computeMrr } from "../services/mrr.js";
 import { ftsRowid, orgFtsToken } from "@getengram/db";
 
 type AdminEnv = { Bindings: Env };
@@ -137,82 +138,9 @@ admin.get("/metrics", async (c) => {
     referralMap[row.source] = row.count;
   }
 
-  // MRR — live from Stripe (real amounts, not hardcoded tier prices). Sums
-  // active subscription items; yearly plans are normalized to monthly.
-  // "external" excludes subs whose customer maps to an internal org (the
-  // owner's own accounts). Fail-soft: metrics must render without Stripe.
-  // at_risk_* = subscriptions still 'active' in Stripe but already scheduled to
-  // cancel (cancel_at_period_end / cancel_at). They pay this period and then
-  // stop, so counting them in headline MRR overstates recurring revenue —
-  // external_cents is the honest "committed" number to lead with.
-  const mrr = {
-    total_cents: 0,
-    external_cents: 0,
-    subscriptions: 0,
-    external_subscriptions: 0,
-    at_risk_cents: 0,
-    at_risk_subscriptions: 0,
-  };
-  try {
-    if (c.env.STRIPE_SECRET_KEY) {
-      const subsRes = await fetch(
-        "https://api.stripe.com/v1/subscriptions?status=active&limit=100",
-        { headers: { Authorization: `Bearer ${c.env.STRIPE_SECRET_KEY}` } },
-      );
-      if (subsRes.ok) {
-        const subs = (await subsRes.json()) as {
-          data: Array<{
-            customer: string;
-            cancel_at_period_end?: boolean;
-            cancel_at?: number | null;
-            items: {
-              data: Array<{
-                quantity?: number;
-                price?: { unit_amount?: number | null; recurring?: { interval?: string; interval_count?: number } };
-              }>;
-            };
-          }>;
-        };
-        const internalCustomers = new Set(
-          (
-            await c.env.DB.prepare(
-              // Owner's own accounts are tagged referral_source='internal'
-              // (see POST /admin/comp-internal). No personal emails in code.
-              "SELECT stripe_customer_id FROM organizations WHERE stripe_customer_id IS NOT NULL AND referral_source = 'internal'",
-            ).all<{ stripe_customer_id: string }>()
-          ).results?.map((r) => r.stripe_customer_id) ?? [],
-        );
-        for (const s of subs.data) {
-          let cents = 0;
-          for (const item of s.items?.data ?? []) {
-            const unit = item.price?.unit_amount ?? 0;
-            const qty = item.quantity ?? 1;
-            const interval = item.price?.recurring?.interval ?? "month";
-            const count = item.price?.recurring?.interval_count ?? 1;
-            const monthly =
-              interval === "year" ? (unit * qty) / (12 * count) : (unit * qty) / count;
-            cents += monthly;
-          }
-          mrr.total_cents += Math.round(cents);
-          mrr.subscriptions += 1;
-          if (!internalCustomers.has(s.customer)) {
-            mrr.external_cents += Math.round(cents);
-            mrr.external_subscriptions += 1;
-            // Both of Stripe's scheduled-cancel mechanisms count.
-            const cancelling =
-              Boolean(s.cancel_at_period_end) ||
-              (typeof s.cancel_at === "number" && s.cancel_at > 0);
-            if (cancelling) {
-              mrr.at_risk_cents += Math.round(cents);
-              mrr.at_risk_subscriptions += 1;
-            }
-          }
-        }
-      }
-    }
-  } catch {
-    // leave zeros — the dashboard treats 0 subs as "unavailable"
-  }
+  // Live MRR from Stripe. Shared with the daily report so the email and the
+  // dashboard cannot drift apart — see services/mrr.ts for the at-risk logic.
+  const mrr = await computeMrr(c.env);
 
   return c.json({
     mrr,

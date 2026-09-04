@@ -2,6 +2,7 @@
 // emailed by engram-web (which owns SMTP). The scheduled handler POSTs the
 // JSON to `${APP_URL}/api/reports/daily` authenticated with ADMIN_SECRET.
 import type { Env } from "../types.js";
+import { computeMrr, committedCents, committedSubscriptions } from "./mrr.js";
 
 export interface DailyReport {
   generated_at: string;
@@ -32,12 +33,18 @@ export interface DailyReport {
   /** Emails of team/enterprise orgs — engram-web flags support-inbox mail
    *  from these as PRIORITY (only paid team tiers get priority support). */
   priority_support_emails: string[];
-  top_orgs_7d: Array<{
-    email: string | null;
-    name: string;
-    tier: string;
-    messages_7d: number;
-  }>;
+  /** Live revenue from Stripe, same source as the admin dashboard.
+   *  Replaces the old top_orgs_7d "biggest users by message count" list —
+   *  message volume tracked neither revenue nor engagement (the heaviest
+   *  storers were frequently the ones who had never run a search). */
+  revenue: {
+    /** External minus already-cancelling: what will still be here next month. */
+    committed_cents: number;
+    committed_subscriptions: number;
+    at_risk_cents: number;
+    at_risk_subscriptions: number;
+    external_cents: number;
+  };
 }
 
 export async function buildDailyReport(env: Env): Promise<DailyReport> {
@@ -61,7 +68,6 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
     activeOrgs24,
     newSignups,
     referrals,
-    topOrgs,
     teamEmails,
   ] = await Promise.all([
     db
@@ -114,18 +120,15 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
       .all<{ ref: string; n: number }>(),
     db
       .prepare(
-        `SELECT o.email, o.name, o.tier, COUNT(m.id) AS messages_7d
-         FROM messages m JOIN organizations o ON o.id = m.organization_id
-         WHERE m.created_at >= datetime('now','-7 day') AND o.deleted_at IS NULL
-         GROUP BY o.id ORDER BY messages_7d DESC LIMIT 5`,
-      )
-      .all<{ email: string | null; name: string; tier: string; messages_7d: number }>(),
-    db
-      .prepare(
         "SELECT email FROM organizations WHERE tier IN ('team','enterprise') AND email IS NOT NULL AND deleted_at IS NULL",
       )
       .all<{ email: string }>(),
   ]);
+
+  // Fetched after the DB batch rather than inside it — it is an HTTP call to
+  // Stripe, not a D1 query, and must not fail the whole report if Stripe is
+  // down (computeMrr returns zeros on failure).
+  const mrr = await computeMrr(env);
 
   const byTier: Record<string, number> = {};
   for (const r of tiers.results ?? []) byTier[r.tier] = r.n;
@@ -152,7 +155,16 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
     referrals_all_time: refs,
     d1_latency_ms: d1LatencyMs,
     priority_support_emails: (teamEmails.results ?? []).map((r) => r.email.toLowerCase()),
-    top_orgs_7d: topOrgs.results ?? [],
+    // Revenue, from the same source the admin dashboard uses. Leads with
+    // committed (external minus already-cancelling) because that is the
+    // number that will still be here next month.
+    revenue: {
+      committed_cents: committedCents(mrr),
+      committed_subscriptions: committedSubscriptions(mrr),
+      at_risk_cents: mrr.at_risk_cents,
+      at_risk_subscriptions: mrr.at_risk_subscriptions,
+      external_cents: mrr.external_cents,
+    },
   };
 }
 

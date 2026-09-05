@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { requestCountry } from "../utils/geo.js";
 import {
   generateId,
   generateApiKeyRaw,
@@ -109,7 +110,7 @@ signup.post("/", async (c) => {
   } else {
     orgId = generateId("org");
     const orgName = email.split("@")[0];
-    await insertOrganizationWithEmail(c.env.DB, orgId, orgName, email, ref);
+    await insertOrganizationWithEmail(c.env.DB, orgId, orgName, email, ref, requestCountry(c.req.raw));
     await seedWelcomeConversation(c.env.DB, orgId);
     created = true;
   }
@@ -142,7 +143,7 @@ signup.post("/anonymous", async (c) => {
   const ref = body.ref || body.referral_source || "cli";
   const orgId = generateId("org");
   const orgName = `anon-${orgId.slice(4, 12)}`;
-  await insertOrganization(c.env.DB, orgId, orgName, ref);
+  await insertOrganization(c.env.DB, orgId, orgName, ref, requestCountry(c.req.raw));
   await seedWelcomeConversation(c.env.DB, orgId);
 
   const keyId = generateId("key");

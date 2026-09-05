@@ -1,0 +1,10 @@
+{
+  "name": "engram",
+  "description": "Persistent, searchable memory for Claude. Stores conversations verbatim and retrieves them by meaning.",
+  "version": "0.1.0",
+  "author": { "name": "Get Engram Inc", "url": "https://getengram.app" },
+  "homepage": "https://getengram.app",
+  "repository": "https://github.com/get-engram/engram",
+  "license": "MIT",
+  "keywords": ["memory", "search", "mcp", "context", "recall"]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "engram",
+  "owner": {
+    "name": "Get Engram Inc",
+    "url": "https://getengram.app"
+  },
+  "plugins": [
+    {
+      "name": "engram",
+      "source": "./plugins/engram",
+      "description": "Persistent, searchable memory for Claude. Stores conversations verbatim and retrieves them by meaning.",
+      "version": "0.1.0",
+      "category": "productivity"
+    }
+  ]
+}

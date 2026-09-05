@@ -11,6 +11,7 @@ import { usage } from "./routes/usage.js";
 import { signup } from "./routes/signup.js";
 import { billing, billingSession, billingWebhook } from "./routes/billing.js";
 import { admin } from "./routes/admin.js";
+import { mergeOrgs } from "./routes/merge-orgs.js";
 import { dashboardHtml } from "./routes/admin-dashboard.js";
 import { account } from "./routes/account.js";
 import { privacy } from "./routes/privacy.js";
@@ -241,6 +242,8 @@ app.use("/admin/*", async (c, next) => {
   await next();
 });
 app.route("/admin", admin);
+// Same "/admin/*" ADMIN_SECRET middleware above guards this router too.
+app.route("/admin", mergeOrgs);
 
 // REST API routes (all require auth). CORS runs before the auth middleware
 // so preflight OPTIONS requests succeed without a bearer token.

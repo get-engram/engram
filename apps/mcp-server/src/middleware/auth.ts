@@ -1,7 +1,9 @@
 import type { Context, Next } from "hono";
+import { requestCountry } from "../utils/geo.js";
 import { hashApiKey } from "@getengram/shared";
 import {
   getApiKeyWithOrg,
+  touchOrganizationCountry,
   updateApiKeyLastUsed,
   getAccessTokenWithOrg,
 } from "@getengram/db";
@@ -89,6 +91,17 @@ export async function authMiddleware(
 
   // Update last_used_at non-blocking
   c.executionCtx.waitUntil(updateApiKeyLastUsed(c.env.DB, row.key_id));
+
+  // Backfill the org's country on first sight. Writes only where country IS
+  // NULL, so this is a no-op for everyone already stamped and costs one cheap
+  // indexed UPDATE once per account. It is how accounts created before the
+  // column existed acquire one — there is no way to derive it retroactively.
+  const country = requestCountry(c.req.raw);
+  if (country) {
+    c.executionCtx.waitUntil(
+      touchOrganizationCountry(c.env.DB, row.organization_id, country).catch(() => {}),
+    );
+  }
 
   await next();
 }

@@ -1,7 +1,13 @@
-export function insertOrganization(db: D1Database, id: string, name: string, referralSource?: string) {
+export function insertOrganization(
+  db: D1Database,
+  id: string,
+  name: string,
+  referralSource?: string,
+  country?: string | null,
+) {
   return db
-    .prepare("INSERT INTO organizations (id, name, referral_source) VALUES (?, ?, ?)")
-    .bind(id, name, referralSource ?? null)
+    .prepare("INSERT INTO organizations (id, name, referral_source, country) VALUES (?, ?, ?, ?)")
+    .bind(id, name, referralSource ?? null, country ?? null)
     .run();
 }
 
@@ -18,10 +24,35 @@ export function insertOrganizationWithEmail(
   name: string,
   email: string,
   referralSource?: string,
+  country?: string | null,
 ) {
   return db
-    .prepare("INSERT INTO organizations (id, name, email, referral_source) VALUES (?, ?, ?, ?)")
-    .bind(id, name, email, referralSource ?? null)
+    .prepare(
+      "INSERT INTO organizations (id, name, email, referral_source, country) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(id, name, email, referralSource ?? null, country ?? null)
+    .run();
+}
+
+/**
+ * Fill in an organization's country the first time we see a request from it.
+ *
+ * Only ever writes when country IS NULL, which does two things: it backfills
+ * accounts created before the column existed, and it makes the value "where
+ * this account signed up from" rather than "where they last happened to be" —
+ * a stable attribute that does not flicker when someone travels or uses a VPN.
+ *
+ * The WHERE clause means the common case (already set) writes no rows, so this
+ * is cheap to call on every authenticated request.
+ */
+export function touchOrganizationCountry(
+  db: D1Database,
+  id: string,
+  country: string,
+) {
+  return db
+    .prepare("UPDATE organizations SET country = ? WHERE id = ? AND country IS NULL")
+    .bind(country, id)
     .run();
 }
 

@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { requestCountry } from "../utils/geo.js";
 import { cors } from "hono/cors";
 import {
   generateAccessToken,
@@ -298,7 +299,7 @@ oauth.post("/authorize/approve", async (c) => {
     // Derive referral source from the OAuth client name (e.g. "ChatGPT",
     // "Cursor", "Claude Desktop") — lowercase, fallback to "oauth".
     const ref = (client.client_name || "oauth").toLowerCase().replace(/\s+/g, "-");
-    await insertOrganizationWithEmail(c.env.DB, orgId, email.split("@")[0], email, ref);
+    await insertOrganizationWithEmail(c.env.DB, orgId, email.split("@")[0], email, ref, requestCountry(c.req.raw));
     // Activation parity with /signup (engram#onboarding): connector-directory
     // users never see the dashboard, so this is their only welcome. Seed the
     // getting-started note (their first search hits something real) and fire

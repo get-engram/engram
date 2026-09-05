@@ -245,6 +245,10 @@ admin.get("/users", async (c) => {
     total_messages: "total_messages",
     conversations: "conversations",
     email: "o.email",
+    // Without this the Country header renders as sortable but silently falls
+    // back to created_at — the allowlist is what makes the sort real.
+    country: "o.country",
+    referral_source: "o.referral_source",
   };
   const sortCol = allowedSort[sort] ?? "o.created_at";
 
@@ -255,6 +259,7 @@ admin.get("/users", async (c) => {
       o.email,
       o.tier,
       o.referral_source,
+      o.country,
       o.stripe_customer_id,
       o.created_at,
       o.cancel_at_period_end,
@@ -282,6 +287,7 @@ admin.get("/users", async (c) => {
       email: string | null;
       tier: string;
       referral_source: string | null;
+      country: string | null;
       stripe_customer_id: string | null;
       created_at: string;
       cancel_at_period_end: number;

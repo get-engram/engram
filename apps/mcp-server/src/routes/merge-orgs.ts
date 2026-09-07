@@ -40,8 +40,9 @@ type HonoEnv = { Bindings: Env; Variables: Record<string, never> };
 
 const mergeOrgs = new Hono<HonoEnv>();
 
-/** Vectorize getByIds/upsert are capped well below this; stay conservative. */
-const VECTOR_BATCH = 100;
+/** Vectorize getByIds rejects payloads over 20 ids (VECTOR_GET_ERROR 40007,
+ *  hit in production on a 45-chunk conversation). 20 exactly. */
+const VECTOR_BATCH = 20;
 /** D1 bound-parameter ceiling is ~100; keep id lists under it. */
 const ID_BATCH = 90;
 
@@ -80,10 +81,17 @@ async function moveConversation(
   // --- 1. chunks -----------------------------------------------------------
   // Read before repointing: we need chunk_text and fts_rowid to rebuild the
   // FTS entries, and the contentless index cannot give the text back.
+  // Selected by conversation under EITHER org, not just the source. This is
+  // what makes a retry after a mid-conversation failure safe: if a previous
+  // attempt died after repointing the chunks but before rewriting Vectorize
+  // metadata (exactly what the 40007 batch-size failure did), the chunks are
+  // already on the target org — a source-only filter would find nothing,
+  // silently skip the vector rewrite, and strand those memories outside
+  // semantic search forever.
   const chunkRows = await env.DB.prepare(
-    "SELECT id, fts_rowid, chunk_text FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ?",
+    "SELECT id, fts_rowid, chunk_text FROM conversation_chunks WHERE conversation_id = ? AND organization_id IN (?, ?)",
   )
-    .bind(conversationId, fromOrg)
+    .bind(conversationId, fromOrg, toOrg)
     .all<{ id: string; fts_rowid: number | null; chunk_text: string }>();
   const chunks = chunkRows.results ?? [];
 

@@ -89,10 +89,10 @@ async function moveConversation(
   // silently skip the vector rewrite, and strand those memories outside
   // semantic search forever.
   const chunkRows = await env.DB.prepare(
-    "SELECT id, fts_rowid, chunk_text FROM conversation_chunks WHERE conversation_id = ? AND organization_id IN (?, ?)",
+    "SELECT id, vectorize_id, fts_rowid, chunk_text FROM conversation_chunks WHERE conversation_id = ? AND organization_id IN (?, ?)",
   )
     .bind(conversationId, fromOrg, toOrg)
-    .all<{ id: string; fts_rowid: number | null; chunk_text: string }>();
+    .all<{ id: string; vectorize_id: string | null; fts_rowid: number | null; chunk_text: string }>();
   const chunks = chunkRows.results ?? [];
 
   if (chunks.length > 0) {
@@ -134,7 +134,13 @@ async function moveConversation(
   // Workers AI spend, and the vectors stay bit-identical.
   let vectors = 0;
   for (const batch of chunkArray(chunks, VECTOR_BATCH)) {
-    const ids = batch.map((c) => c.id);
+    // vectorize_id, NOT the chunk id. Both are chk_-prefixed, which made the
+    // original mistake invisible: getByIds(chunk ids) matched nothing, so
+    // every "successful" merge silently rewrote zero vectors and the moved
+    // memories dropped out of semantic search. A zero here is now a real
+    // signal, not the normal case.
+    const ids = batch.map((c) => c.vectorize_id).filter((v): v is string => !!v);
+    if (ids.length === 0) continue;
     const existing = await env.VECTORIZE.getByIds(ids);
     if (existing.length === 0) continue;
     await env.VECTORIZE.upsert(
@@ -184,8 +190,8 @@ async function moveConversation(
 mergeOrgs.post("/merge-orgs", async (c) => {
   const dryRun = c.req.query("dry_run") === "1" || c.req.query("dry_run") === "true";
   const body = await c.req
-    .json<{ from_email?: string; to_email?: string; limit?: number }>()
-    .catch(() => ({}) as { from_email?: string; to_email?: string; limit?: number });
+    .json<{ from_email?: string; to_email?: string; limit?: number; conversation_ids?: string[] }>()
+    .catch(() => ({}) as { from_email?: string; to_email?: string; limit?: number; conversation_ids?: string[] });
 
   const fromEmail = body.from_email?.trim();
   const toEmail = body.to_email?.trim();
@@ -205,12 +211,23 @@ mergeOrgs.post("/merge-orgs", async (c) => {
 
   // Everything still sitting on the source org. Re-read every call, so this
   // doubles as the resume cursor and the completion check.
-  const pending = await c.env.DB.prepare(
-    "SELECT id FROM conversations WHERE organization_id = ? ORDER BY created_at",
-  )
-    .bind(from.id)
-    .all<{ id: string }>();
-  const pendingIds = (pending.results ?? []).map((r) => r.id);
+  // Normal mode scans what still sits on the source org. `conversation_ids`
+  // overrides that with an explicit list — the repair path for conversations
+  // a buggy earlier run already moved (headers on the target org, so the
+  // scan can no longer see them) that need their FTS/vector steps re-run.
+  // Every step is idempotent, so re-processing a healthy conversation is a
+  // no-op rather than a double-move.
+  let pendingIds: string[];
+  if (Array.isArray(body.conversation_ids) && body.conversation_ids.length > 0) {
+    pendingIds = body.conversation_ids.filter((x): x is string => typeof x === "string");
+  } else {
+    const pending = await c.env.DB.prepare(
+      "SELECT id FROM conversations WHERE organization_id = ? ORDER BY created_at",
+    )
+      .bind(from.id)
+      .all<{ id: string }>();
+    pendingIds = (pending.results ?? []).map((r) => r.id);
+  }
 
   const totals = await c.env.DB.prepare(
     "SELECT (SELECT COUNT(*) FROM messages WHERE organization_id = ?) AS messages, (SELECT COUNT(*) FROM conversation_chunks WHERE organization_id = ?) AS chunks",

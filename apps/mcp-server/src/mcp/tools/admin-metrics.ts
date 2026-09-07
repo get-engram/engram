@@ -29,6 +29,18 @@ export function registerAdminMetrics(
     "admin_metrics",
     "Business metrics dashboard — signups, active users, tier breakdown, storage stats. Requires admin authentication.",
     {},
+    {
+      // Anthropic's connector directory requires every tool to carry these,
+      // and an unannotated tool is a documented rejection reason. This one is
+      // only registered when auth.isAdmin, so a reviewer connecting over OAuth
+      // never sees it — annotated anyway so the rule holds if that gate ever
+      // moves.
+      title: "Admin metrics",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async () => {
       const denied = adminGuard(auth);
       if (denied) return denied;

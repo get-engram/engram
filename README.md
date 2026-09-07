@@ -10,8 +10,38 @@ Engram is an MCP-native memory server that stores complete, uncompressed convers
 
 ## Quick start
 
-1. **Sign up** at [getengram.app](https://getengram.app/signup) and get your API key
-2. **Add to your MCP config** (Claude Desktop, Claude Code, Cursor, etc.):
+### Claude Code
+
+```
+/plugin marketplace add get-engram/engram
+/plugin install engram@engram
+```
+
+Restart Claude Code and approve access in the browser. There is no API key to
+copy and no config file to edit — the server implements the MCP authorization
+flow (RFC 9728 / 8414 / 7591, PKCE), so the client discovers it, registers
+itself, and signs you in. A free account is created as part of signing in.
+
+The plugin also ships a skill that tells Claude when to search memory and what
+is worth saving, so context accumulates without being asked.
+
+### Any other MCP client
+
+Point it at the remote server and let OAuth handle access:
+
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "type": "http",
+      "url": "https://mcp.getengram.app/mcp"
+    }
+  }
+}
+```
+
+For a client that cannot do OAuth, [sign up](https://getengram.app/signup) for
+an API key and run the server locally instead:
 
 ```json
 {
@@ -26,8 +56,6 @@ Engram is an MCP-native memory server that stores complete, uncompressed convers
   }
 }
 ```
-
-3. **Start using it.** Your agent now has persistent memory.
 
 ## How it works
 

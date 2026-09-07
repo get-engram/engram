@@ -40,22 +40,23 @@ Point it at the remote server and let OAuth handle access:
 }
 ```
 
-For a client that cannot do OAuth, [sign up](https://getengram.app/signup) for
-an API key and run the server locally instead:
+For a client that only speaks stdio, bridge to the remote server with
+[mcp-remote](https://www.npmjs.com/package/mcp-remote) — it drives the same
+browser OAuth flow, so there is still no key to copy:
 
 ```json
 {
   "mcpServers": {
     "engram": {
       "command": "npx",
-      "args": ["-y", "@getengram/cli@latest", "mcp"],
-      "env": {
-        "ENGRAM_API_KEY": "engram_sk_live_..."
-      }
+      "args": ["-y", "mcp-remote", "https://mcp.getengram.app/mcp"]
     }
   }
 }
 ```
+
+(An older version of this README suggested `npx @getengram/cli mcp`; the CLI
+has no such command and that configuration never worked.)
 
 ## How it works
 

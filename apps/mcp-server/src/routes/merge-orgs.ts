@@ -136,15 +136,24 @@ async function moveConversation(
   for (const batch of chunkArray(chunks, VECTOR_BATCH)) {
     const ids = batch.map((c) => c.id);
     const existing = await env.VECTORIZE.getByIds(ids);
-    if (existing.length === 0) continue;
+    // Skip vectors a previous attempt already rewrote. This is what lets a
+    // 5,000-chunk conversation complete across several attempts: each one
+    // needs ~300 upsert calls, more than Vectorize's rate window allows in a
+    // single request, and without this filter every retry restarted from
+    // zero and hit the same 40041 at the same depth — the giants could never
+    // finish. With it, every attempt makes durable forward progress.
+    const todo = existing.filter(
+      (v) => (v.metadata as { organization_id?: string } | undefined)?.organization_id !== toOrg,
+    );
+    if (todo.length === 0) continue;
     await env.VECTORIZE.upsert(
-      existing.map((v) => ({
+      todo.map((v) => ({
         id: v.id,
         values: v.values,
         metadata: { ...(v.metadata ?? {}), organization_id: toOrg },
       })),
     );
-    vectors += existing.length;
+    vectors += todo.length;
   }
 
   // --- 4. messages ---------------------------------------------------------

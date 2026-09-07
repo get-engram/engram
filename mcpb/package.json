@@ -1,0 +1,10 @@
+{
+  "name": "engram-mcpb",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Engram desktop extension bundle for Claude Desktop",
+  "main": "server/index.js",
+  "dependencies": {
+    "mcp-remote": "^0.1.29"
+  }
+}

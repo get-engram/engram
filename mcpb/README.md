@@ -34,6 +34,12 @@ anything else in Claude. Full policy: https://getengram.app/privacy
 - Retention: until you delete it; account deletion purges within 30 days
 - Contact: hello@getengram.app
 
+## License
+
+The extension in this directory is MIT licensed (see LICENSE). The Engram
+server it connects to is a separate hosted service; the wider repository
+carries its own license.
+
 ## Build (maintainers)
 
 ```

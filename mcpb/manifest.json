@@ -6,7 +6,7 @@
   "description": "Persistent, searchable memory for Claude. Stores conversations verbatim and retrieves them by meaning.",
   "long_description": "Engram gives Claude a memory that persists across conversations. Everything you choose to save is stored verbatim \u2014 never summarized or compressed \u2014 and retrieved by semantic meaning. The same memory is shared with ChatGPT, Cursor, Claude Code and any other MCP client you connect, so something you told one assistant is findable from all of them. Signing in creates a free account with 10,000 messages of memory that never expire.",
   "author": {
-    "name": "Get Engram Inc",
+    "name": "Engram AI Inc",
     "url": "https://github.com/get-engram"
   },
   "homepage": "https://getengram.app",

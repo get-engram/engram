@@ -144,4 +144,4 @@ The free tier is enough to see if it's useful for your workflow. I'd love to hea
 
 ---
 
-*[Engram](https://getengram.app) is built by [Get Engram Inc](https://github.com/get-engram). Questions? hello@getengram.app*
+*[Engram](https://getengram.app) is built by [Engram AI Inc](https://github.com/get-engram). Questions? hello@getengram.app*

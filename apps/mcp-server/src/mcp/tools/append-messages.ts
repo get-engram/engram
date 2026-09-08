@@ -36,12 +36,12 @@ export function registerAppendMessages(
     "append_messages",
     {
       description:
-        "Store messages in Engram memory, verbatim and automatically chunked + embedded for search. Pass the relevant messages from the CURRENT conversation. conversation_id is OPTIONAL: omit it to append to the user's default memory (recommended for general 'remember this' requests) — never ask the user for an id. Pass a conversation_id (from create_conversation) only when you want to group a specific topic. The response returns the conversation_id used. Note: you can only store messages from the current conversation — you cannot fetch a user's past or external chat history; for bulk history, tell them to export their data and run `engram import`. Never store secrets here (passwords, API keys, tokens, government IDs) — Engram has a separate zero-knowledge encrypted vault for those; see the SECRETS section of the server instructions. Optionally accepts client-encrypted vault entries for secrets detected client-side.",
+        "Store messages in Engram memory, verbatim and automatically chunked + embedded for search. conversation_id is optional: omit it to append to the user's default memory, or set it to group messages under a specific conversation. The response returns the conversation_id used. Stores only the messages passed in — this tool cannot fetch past or external chat history (bulk import of exported history is available separately via the Engram CLI). Not for secrets (passwords, API keys, tokens, government IDs): stored text is searchable and resurfaces in future context; Engram provides a separate zero-knowledge encrypted vault for credentials. Optionally accepts client-encrypted vault entries.",
       inputSchema: {
       conversation_id: z
         .string()
         .optional()
-        .describe("Optional. Omit to use the default memory; or pass one from create_conversation to group a topic. Never ask the user for it."),
+        .describe("Optional. Omit to append to the user's default memory; set to group messages under a specific conversation."),
       messages: z
         .array(
           z.object({

@@ -6,6 +6,7 @@ import { registerGetConversation } from "./tools/get-conversation.js";
 import { registerListConversations } from "./tools/list-conversations.js";
 import { registerDeleteConversation } from "./tools/delete-conversation.js";
 import { registerMemoryStatus } from "./tools/memory-status.js";
+import { registerWhoami } from "./tools/whoami.js";
 import { registerResolveVault } from "./tools/resolve-vault.js";
 import { registerVaultSet } from "./tools/vault-set.js";
 import { registerVaultGet } from "./tools/vault-get.js";
@@ -74,6 +75,7 @@ export function createMcpServer(env: Env, auth: AuthContext): McpServer {
   registerListConversations(server, env, auth);
   registerDeleteConversation(server, env, auth);
   registerMemoryStatus(server, env, auth);
+  registerWhoami(server, env, auth);
 
   // First-party-only tools. External OAuth clients (auth.apiKeyId is
   // "oauth:<client_id>") get the memory-only surface: the secrets vault

@@ -22,7 +22,7 @@ export function registerMemoryStatus(
     "memory_status",
     {
       description:
-        "Show how full the user's Engram memory is: lifetime storage used vs their plan's capacity, with a ready-to-display progress bar. ALSO call this once at the START of a new chat: if storage.used is 1 or less the account is brand-new — immediately invite the user to save one thing worth remembering (a project, preference, or goal), store their answer with append_messages, then run search for it and show the result so they see recall work live in this same chat. Otherwise, call it when the user asks how much memory/space they have or about their plan usage. Show the bar line to the user verbatim.",
+        "Show how full the user's Engram memory is: lifetime storage used vs the plan's capacity, plus a monthly meter on plans that have one. Returns a ready-to-display progress bar string.",
       inputSchema: {},
       outputSchema: {
         tier: z.string(),

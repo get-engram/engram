@@ -19,7 +19,7 @@ export function registerCreateConversation(
     "create_conversation",
     {
       description:
-        "Create a new conversation and return its conversation_id. Call this yourself to obtain an id before appending — the id is yours to generate and reuse; never ask the user to provide one. Create one conversation per session/topic and reuse its id for all subsequent append_messages calls.",
+        "Create a new conversation and return its conversation_id, used to group subsequently appended messages under one topic.",
       inputSchema: {
         title: z.string().optional().describe("Title for the conversation"),
         agent_id: z.string().optional().describe("Agent identifier (e.g. \"chatgpt\")"),

@@ -2,7 +2,7 @@
 
 **Engram is the memory that follows you across every AI. Save something in ChatGPT, recall it in Claude or Cursor.**
 
-*Published July 8, 2026 · Get Engram Inc*
+*Published July 8, 2026 · Engram AI Inc*
 
 ---
 

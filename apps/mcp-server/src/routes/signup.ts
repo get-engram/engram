@@ -32,6 +32,23 @@ That's it. Three steps. Your AI now has memory that persists across sessions, pr
 
 Try it now — have a conversation about something you're working on, then say "remember this." Tomorrow, ask about it and watch the magic happen.`;
 
+const WELCOME_TAGS = ["welcome", "getting-started"];
+
+/**
+ * Seed the welcome conversation.
+ *
+ * This writes the conversation and message rows directly rather than going
+ * through createConversation/appendMessages, so it has to reproduce the
+ * invariants those maintain by hand: the denormalized org counters
+ * (engram#41) and the conversation_tags junction index (engram#42).
+ *
+ * It previously maintained none of them, which left every org that ever
+ * signed up off by exactly one message and one conversation —
+ * `messages_stored_total` is the lifetime storage cap (engram#275), i.e.
+ * the billing gate, so it silently under-enforced and disagreed with what
+ * memory_status reported. Everything is in one batch so the counters can
+ * never diverge from the rows again.
+ */
 export async function seedWelcomeConversation(db: D1Database, orgId: string): Promise<void> {
   const convId = generateId("conv");
   const msgId = generateId("msg");
@@ -39,10 +56,20 @@ export async function seedWelcomeConversation(db: D1Database, orgId: string): Pr
   await db.batch([
     db.prepare(
       "INSERT INTO conversations (id, organization_id, title, agent_id, tags, metadata, message_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)"
-    ).bind(convId, orgId, "Welcome to Engram", "engram", '["welcome","getting-started"]', '{"system":true,"type":"welcome"}', now, now),
+    ).bind(convId, orgId, "Welcome to Engram", "engram", JSON.stringify(WELCOME_TAGS), '{"system":true,"type":"welcome"}', now, now),
     db.prepare(
       "INSERT INTO messages (id, conversation_id, organization_id, role, content, sequence, metadata, created_at) VALUES (?, ?, ?, 'assistant', ?, 0, '{}', ?)"
     ).bind(msgId, convId, orgId, WELCOME_MESSAGE, now),
+    // No cap check: this is signup, the org is empty, and one message fits
+    // inside every tier's ceiling.
+    db.prepare(
+      "UPDATE organizations SET conversation_count = conversation_count + 1, messages_stored_total = messages_stored_total + 1 WHERE id = ?"
+    ).bind(orgId),
+    ...WELCOME_TAGS.map((tag) =>
+      db.prepare(
+        "INSERT OR IGNORE INTO conversation_tags (conversation_id, organization_id, tag) VALUES (?, ?, ?)"
+      ).bind(convId, orgId, tag),
+    ),
   ]);
 }
 

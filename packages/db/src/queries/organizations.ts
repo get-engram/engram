@@ -167,6 +167,11 @@ export function deleteOrganizationById(db: D1Database, id: string) {
     db.prepare("DELETE FROM messages WHERE organization_id = ?").bind(id),
     db.prepare("DELETE FROM conversation_tags WHERE organization_id = ?").bind(id),
     db.prepare("DELETE FROM conversations WHERE organization_id = ?").bind(id),
+    // email_log has no FK (its org_id predates the constraint), so the
+    // cascade never touches it — without this line a purged org left its
+    // recipient email addresses behind, which is exactly the personal data
+    // an erasure request is about. Every other org-linked table cascades.
+    db.prepare("DELETE FROM email_log WHERE org_id = ?").bind(id),
     db.prepare("DELETE FROM organizations WHERE id = ?").bind(id),
   ]);
 }

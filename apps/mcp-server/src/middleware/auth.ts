@@ -11,6 +11,21 @@ import { originOf, wwwAuthenticate } from "../oauth/metadata.js";
 import { ALL_SCOPES, parseScopes, oauthScopeToInternal } from "../mcp/scopes.js";
 import type { Env, AuthContext } from "../types.js";
 
+/** Constant-time string compare, so the admin-secret check doesn't leak the
+ *  secret's length or a matching prefix through response-timing. Compares a
+ *  fixed number of bytes regardless of where (or whether) they differ. */
+function timingSafeEqual(a: string, b: string): boolean {
+  const enc = new TextEncoder();
+  const ab = enc.encode(a);
+  const bb = enc.encode(b);
+  // Fold length into the result rather than early-returning on it.
+  let diff = ab.length ^ bb.length;
+  for (let i = 0; i < ab.length; i++) {
+    diff |= ab[i] ^ (bb[i] ?? 0);
+  }
+  return diff === 0;
+}
+
 export async function authMiddleware(
   c: Context<{ Bindings: Env; Variables: { auth: AuthContext } }>,
   next: Next
@@ -31,7 +46,7 @@ export async function authMiddleware(
 
   // Admin access via ADMIN_SECRET — cross-org visibility for the business owner.
   const adminSecret = (c.env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET;
-  if (adminSecret && token === adminSecret) {
+  if (adminSecret && timingSafeEqual(token, adminSecret)) {
     c.set("auth", {
       organizationId: "admin",
       apiKeyId: "admin",

@@ -33,6 +33,7 @@ const PROVIDER_KEYS: RegExp[] = [
   /\bsk-ant-[A-Za-z0-9_-]{20,}\b/g,
   /\bAKIA[0-9A-Z]{16}\b/g,
   /\bASIA[0-9A-Z]{16}\b/g,
+  /\bAIza[0-9A-Za-z_-]{35}\b/g,
   /\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b/g,
   /\b[rs]k_(test|live)_[A-Za-z0-9]{10,}\b/g,
   /\bcfk_[A-Za-z0-9]{30,}\b/g,

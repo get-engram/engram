@@ -59,14 +59,20 @@ export function insertChunks(
 
 export function getChunksByVectorizeIds(
   db: D1Database,
-  vectorizeIds: string[]
+  vectorizeIds: string[],
+  organizationId: string,
 ) {
+  // Defense in depth: scope hydration to the org, mirroring the FTS path's
+  // `c.organization_id = ?` guarantee. Vector matches are already gated by the
+  // Vectorize metadata filter, so this is a second, SQL-level fence — if that
+  // metadata filter ever regressed or a vector's org metadata diverged from
+  // its D1 row, verbatim chunk_text still could not cross tenants.
   const placeholders = vectorizeIds.map(() => "?").join(",");
   return db
     .prepare(
-      `SELECT * FROM conversation_chunks WHERE vectorize_id IN (${placeholders})`
+      `SELECT * FROM conversation_chunks WHERE vectorize_id IN (${placeholders}) AND organization_id = ?`
     )
-    .bind(...vectorizeIds)
+    .bind(...vectorizeIds, organizationId)
     .all();
 }
 

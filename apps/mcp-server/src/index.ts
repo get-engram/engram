@@ -71,7 +71,25 @@ app.onError((err, c) => {
   if (err instanceof HTTPException) {
     return err.getResponse();
   }
-  console.error(`[error] ${c.req.method} ${c.req.path}: ${err.message}`);
+  // Transient D1 pressure (the "D1 overloaded" 7429 class, busy/timeout/
+  // dropped-connection) is not a bug — it's back-pressure. Returning a blanket
+  // 500 turned one hot D1 period into a full API outage with nothing telling
+  // the client to slow down; a 503 + Retry-After lets callers (the CLI already
+  // backs off on it) retry instead of hammering a struggling database.
+  const msg = err.message || "";
+  const transient =
+    /overloaded|SQLITE_BUSY|Network connection lost|timed out|connection reset|storage.*(unavailable|busy)/i.test(
+      msg,
+    );
+  if (transient) {
+    console.error(`[error] ${c.req.method} ${c.req.path}: transient D1 — ${msg}`);
+    c.header("Retry-After", "2");
+    return c.json(
+      { error: "service_unavailable", message: "The service is briefly overloaded. Retry shortly." },
+      503,
+    );
+  }
+  console.error(`[error] ${c.req.method} ${c.req.path}: ${msg}`);
   return c.json(
     { error: "internal_error", message: "An internal error occurred." },
     500,

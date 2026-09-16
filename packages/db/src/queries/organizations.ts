@@ -156,6 +156,22 @@ export function getVectorizeIdsByOrganization(
     .all<{ vectorize_id: string }>();
 }
 
+/** One rowid-cursored page of an org's vector ids — same streaming purpose as
+ *  getR2MessageIdsByOrganizationPage, for the GDPR purge's Vectorize deletes. */
+export function getVectorizeIdsByOrganizationPage(
+  db: D1Database,
+  organizationId: string,
+  afterRowid: number,
+  limit: number,
+) {
+  return db
+    .prepare(
+      "SELECT rowid AS rid, vectorize_id FROM conversation_chunks WHERE organization_id = ? AND rowid > ? ORDER BY rowid LIMIT ?",
+    )
+    .bind(organizationId, afterRowid, limit)
+    .all<{ rid: number; vectorize_id: string }>();
+}
+
 export function deleteOrganizationById(db: D1Database, id: string) {
   return db.batch([
     // FTS delete must come before chunks (subquery references conversation_chunks)
@@ -192,11 +208,15 @@ export function restoreOrganization(db: D1Database, id: string) {
     .run();
 }
 
-export function getExpiredOrganizations(db: D1Database) {
+export function getExpiredOrganizations(db: D1Database, limit = 50) {
+  // Bounded per run: a large backlog is worked down over successive nightly
+  // runs rather than attempted all at once, so the purge can't blow the
+  // worker's CPU/time budget on a bad night and strand everything.
   return db
     .prepare(
-      "SELECT id FROM organizations WHERE deleted_at IS NOT NULL AND deleted_at < datetime('now', '-30 days')",
+      "SELECT id FROM organizations WHERE deleted_at IS NOT NULL AND deleted_at < datetime('now', '-30 days') ORDER BY deleted_at LIMIT ?",
     )
+    .bind(limit)
     .all<{ id: string }>();
 }
 

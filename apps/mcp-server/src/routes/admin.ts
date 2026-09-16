@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { getAuditLogs, revokeApiKeysByOrg, clearOAuthTokensByOrg } from "@getengram/db";
+import { getAuditLogs, revokeApiKeysByOrg, clearOAuthTokensByOrg, reconcileOrgCounters } from "@getengram/db";
 import { compressContent, ENCODING_GZIP } from "../utils/compress.js";
 import { audit } from "../services/audit.js";
 import type { Env } from "../types.js";
@@ -348,6 +348,21 @@ admin.patch("/users/:id", async (c) => {
   }
 
   return c.json({ error: "invalid_tier" }, 400);
+});
+
+// ---------------------------------------------------------------------------
+// POST /admin/users/:id/reconcile-counters — heal a drifted org
+// Recompute messages_stored_total + conversation_count from the actual rows.
+// Fixes pre-existing drift (e.g. the ~75k undercount an org-merge left behind)
+// without waiting for another merge to run.
+// ---------------------------------------------------------------------------
+admin.post("/users/:id/reconcile-counters", async (c) => {
+  const id = c.req.param("id");
+  await reconcileOrgCounters(c.env.DB, id);
+  const row = await c.env.DB.prepare(
+    "SELECT messages_stored_total, conversation_count FROM organizations WHERE id = ?",
+  ).bind(id).first<{ messages_stored_total: number; conversation_count: number }>();
+  return c.json({ reconciled: true, id, ...row });
 });
 
 // ---------------------------------------------------------------------------

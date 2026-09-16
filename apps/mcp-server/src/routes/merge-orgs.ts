@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { orgFtsToken } from "@getengram/db";
+import { orgFtsToken, reconcileOrgCounters } from "@getengram/db";
 import type { Env } from "../types.js";
 
 /**
@@ -276,6 +276,15 @@ mergeOrgs.post("/merge-orgs", async (c) => {
       console.error(`[merge-orgs] conversation ${id} FAILED: ${err}`);
     }
   }
+
+  // Reconcile BOTH orgs' denormalized counters from the actual rows. The move
+  // above relocates messages and conversations but doesn't touch
+  // messages_stored_total / conversation_count, so without this the source org
+  // stays overstated and the destination understated (the cause of a merged
+  // org's ~75k message undercount). COUNT-based, so it's exact and idempotent
+  // across the multi-call merge.
+  await reconcileOrgCounters(c.env.DB, from.id);
+  await reconcileOrgCounters(c.env.DB, to.id);
 
   return c.json({
     from: from.id,

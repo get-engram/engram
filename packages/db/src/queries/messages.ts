@@ -184,3 +184,20 @@ export function getR2MessageIdsByOrganization(
     .bind(organizationId)
     .all<{ id: string }>();
 }
+
+/** One rowid-cursored page of an org's R2-backed message ids. Lets the GDPR
+ *  purge stream a multi-million-message org's R2 keys instead of loading them
+ *  all into the 128MB isolate at once (which would OOM the whole purge run). */
+export function getR2MessageIdsByOrganizationPage(
+  db: D1Database,
+  organizationId: string,
+  afterRowid: number,
+  limit: number,
+) {
+  return db
+    .prepare(
+      "SELECT rowid AS rid, id FROM messages WHERE organization_id = ? AND content_encoding LIKE 'r2:%' AND rowid > ? ORDER BY rowid LIMIT ?",
+    )
+    .bind(organizationId, afterRowid, limit)
+    .all<{ rid: number; id: string }>();
+}

@@ -8,7 +8,7 @@ import {
   getAccessTokenWithOrg,
 } from "@getengram/db";
 import { originOf, wwwAuthenticate } from "../oauth/metadata.js";
-import { ALL_SCOPES, parseScopes } from "../mcp/scopes.js";
+import { ALL_SCOPES, parseScopes, oauthScopeToInternal } from "../mcp/scopes.js";
 import type { Env, AuthContext } from "../types.js";
 
 export async function authMiddleware(
@@ -55,9 +55,11 @@ export async function authMiddleware(
       organizationId: row.organization_id,
       apiKeyId: `oauth:${row.client_id}`,
       tier: (row.tier ?? "free") as AuthContext["tier"],
-      // OAuth connections get the full memory scope set; their tool surface
-      // is already narrowed elsewhere (isExternalOAuthClient).
-      scopes: [...ALL_SCOPES],
+      // Grant only what the user consented to (engram:read / engram:write),
+      // mapped to internal scopes — and NEVER delete, which is not in the
+      // OAuth vocabulary. Previously every OAuth token got the full set, so a
+      // read-only consent could write and delete.
+      scopes: oauthScopeToInternal(row.scope),
     });
     await next();
     return;

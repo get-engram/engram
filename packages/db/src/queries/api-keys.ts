@@ -78,3 +78,17 @@ export function revokeApiKeysBySeat(db: D1Database, seatId: string) {
     .bind(seatId)
     .run();
 }
+
+/**
+ * Revoke ALL of an org's API keys at once. Used on the admin/compliance
+ * deletion paths so a "deleted" account's keys stop authenticating
+ * immediately — the auth join deliberately does NOT check deleted_at (that
+ * would break the self-service /restore path, which re-authenticates with the
+ * same key), so cutting access on those paths has to be an explicit revoke.
+ */
+export function revokeApiKeysByOrg(db: D1Database, organizationId: string) {
+  return db
+    .prepare("UPDATE api_keys SET revoked_at = datetime('now') WHERE organization_id = ? AND revoked_at IS NULL")
+    .bind(organizationId)
+    .run();
+}

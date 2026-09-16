@@ -25,6 +25,39 @@ export function hasScope(auth: AuthContext, scope: Scope): boolean {
   return auth.scopes.includes(scope);
 }
 
+/**
+ * Map an OAuth token's stored scope string to internal scopes.
+ *
+ * The OAuth vocabulary is only `engram:read` and `engram:write` (metadata.ts
+ * OAUTH_SCOPES), and that's what the consent screen shows the user. But auth
+ * used to grant every OAuth token the full internal set [read, write, search,
+ * delete] — so a read-only consent silently permitted writes AND deletes, and
+ * NO connector's consent ever mentioned deletion at all. This maps the granted
+ * OAuth scopes to internal ones and, deliberately, never grants `delete`:
+ * destroying memory is not in the vocabulary a connector was authorized for
+ * (users delete via the dashboard or an API key instead).
+ *
+ * `engram:read` implies both read and search (reading your memory is
+ * searching it). A legacy/garbled scope maps to read+search+write — the prior
+ * behavior minus the delete over-grant — so existing connectors keep working
+ * rather than being locked out.
+ */
+export function oauthScopeToInternal(scope: string | null | undefined): Scope[] {
+  const tokens = (scope ?? "").split(/[\s,]+/).filter(Boolean);
+  const out = new Set<Scope>();
+  for (const t of tokens) {
+    if (t === "engram:read") {
+      out.add("read");
+      out.add("search");
+    } else if (t === "engram:write") {
+      out.add("write");
+    }
+    // Any other token (including a hypothetical delete scope) is ignored.
+  }
+  if (out.size === 0) return ["read", "search", "write"];
+  return [...out];
+}
+
 /** Standard MCP error result when a key lacks a required scope. */
 export function scopeError(scope: Scope) {
   return {

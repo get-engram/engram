@@ -123,7 +123,7 @@ export async function searchConversations(
 
   const [vectorChunksResult, ftsChunksResult] = await Promise.all([
     vectorizeIds.length > 0
-      ? getChunksByVectorizeIds(env.DB, vectorizeIds)
+      ? getChunksByVectorizeIds(env.DB, vectorizeIds, organizationId)
       : { results: [] },
     ftsChunkIds.length > 0
       ? getChunksByIds(env.DB, ftsChunkIds)

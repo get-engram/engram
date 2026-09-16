@@ -28,6 +28,9 @@ const PROVIDER_KEYS = [
   // AWS
   /\bAKIA[0-9A-Z]{16}\b/g,
   /\bASIA[0-9A-Z]{16}\b/g,
+  // Google / Gemini API keys (AIza + 35 chars) — a notable prior gap given
+  // Engram's own users connect Gemini clients.
+  /\bAIza[0-9A-Za-z_-]{35}\b/g,
   // GitHub
   /\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b/g,
   // Stripe

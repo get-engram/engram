@@ -18,6 +18,13 @@ describe("redact", () => {
     expect(text).toBe(`key: ${R}`);
   });
 
+  it("redacts Google/Gemini API keys", () => {
+    const { text, redactionCount } = redact("GEMINI_API_KEY=AIzaSyA1234567890abcdefghijklmnopqrstuvw");
+    expect(text).toContain(R);
+    expect(text).not.toContain("AIzaSy");
+    expect(redactionCount).toBeGreaterThanOrEqual(1);
+  });
+
   it("redacts AWS access keys", () => {
     const { text } = redact("aws_key = AKIAIOSFODNN7EXAMPLE");
     expect(text).toBe(`aws_key = ${R}`);

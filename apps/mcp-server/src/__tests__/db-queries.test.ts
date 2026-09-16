@@ -196,8 +196,8 @@ describe("Chunk queries", () => {
     expect(db.batch).toHaveBeenCalled();
   });
 
-  it("gets chunks by vectorize IDs", async () => {
-    const result = await getChunksByVectorizeIds(db, ["vec_1", "vec_2"]);
+  it("gets chunks by vectorize IDs (org-scoped)", async () => {
+    const result = await getChunksByVectorizeIds(db, ["vec_1", "vec_2"], orgId);
     expect(result.results).toBeDefined();
   });
 

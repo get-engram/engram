@@ -7,7 +7,6 @@ import {
   updateApiKeyLastUsed,
   getAccessTokenWithOrg,
 } from "@getengram/db";
-import { audit } from "../services/audit.js";
 import { originOf, wwwAuthenticate } from "../oauth/metadata.js";
 import { ALL_SCOPES, parseScopes } from "../mcp/scopes.js";
 import type { Env, AuthContext } from "../types.js";
@@ -74,9 +73,12 @@ export async function authMiddleware(
   const row = await getApiKeyWithOrg(c.env.DB, keyHash);
 
   if (!row) {
-    await audit(c.env.DB, "unknown", null, "auth.failure", undefined, undefined, {
-      reason: "invalid_key",
-    });
+    // Do NOT write an audit_log row here. It is not attributable to any org
+    // (there is no valid key), and a spray of invalid keys would otherwise
+    // write one D1 row per request into the shared audit_log — unbounded
+    // growth and a cheap amplification against the shared database. A console
+    // line is enough to spot a spray in the logs without a durable write.
+    console.warn("[auth] invalid api key rejected");
     challenge();
     return c.json({ error: "Invalid API key" }, 401);
   }

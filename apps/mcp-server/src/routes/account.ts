@@ -71,6 +71,18 @@ account.delete("/", async (c) => {
   const auth = c.get("auth");
   const orgId = auth.organizationId;
 
+  // Owner-only. A seat-bound (Team member) key must not be able to delete the
+  // whole organization. seatId is null for owner keys and set for member keys
+  // (engram#264). The `seats.role` column exists for finer RBAC but is not yet
+  // plumbed into auth; until it is, owner-vs-seat is the enforceable boundary,
+  // and it is the one that matters for a destructive org-level action.
+  if (auth.seatId) {
+    return c.json(
+      { error: "forbidden", message: "Only the organization owner can delete the account." },
+      403,
+    );
+  }
+
   const org = await getOrganizationById(c.env.DB, orgId);
   if (!org) {
     return c.json({ error: "Organization not found" }, 404);
@@ -99,6 +111,14 @@ account.delete("/", async (c) => {
 account.post("/restore", async (c) => {
   const auth = c.get("auth");
   const orgId = auth.organizationId;
+
+  // Owner-only, same as delete — a member key must not control the org lifecycle.
+  if (auth.seatId) {
+    return c.json(
+      { error: "forbidden", message: "Only the organization owner can restore the account." },
+      403,
+    );
+  }
 
   const org = (await getOrganizationById(c.env.DB, orgId)) as Record<string, unknown> | null;
   if (!org) {

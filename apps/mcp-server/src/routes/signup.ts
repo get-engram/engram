@@ -17,6 +17,7 @@ import {
 import { TIER_LIMITS, type Tier } from "@getengram/shared";
 import type { Env } from "../types.js";
 import { verifySupabaseJwt } from "../utils/jwt.js";
+import { ipThrottle } from "../middleware/ip-throttle.js";
 
 const WELCOME_MESSAGE = `Welcome to Engram — your AI's long-term memory.
 
@@ -164,8 +165,12 @@ signup.post("/", async (c) => {
 
 // POST /signup/anonymous — mint an org + API key with no auth required.
 // This powers `engram signup` from the CLI, letting AI agents self-provision
-// accounts without any human interaction.
-signup.post("/anonymous", async (c) => {
+// accounts without any human interaction. Because it is unauthenticated AND
+// creates rows (org + key + welcome conversation), it is the sharpest abuse
+// surface on the server: throttle it per IP so it can't be looped into
+// thousands of orgs. Generous enough for real CLI use (a person provisions a
+// handful of accounts), tight enough to stop a mint loop.
+signup.post("/anonymous", ipThrottle({ limit: 10, windowMs: 60_000, bucket: "signup-anon" }), async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const ref = body.ref || body.referral_source || "cli";
   const orgId = generateId("org");

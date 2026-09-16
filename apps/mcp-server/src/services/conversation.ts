@@ -16,9 +16,8 @@ import {
   getDefaultConversationId,
   DEFAULT_CONVERSATION_TAG,
   listConversations as dbListConversations,
-  updateConversationMessageCount,
   deleteConversationById,
-  insertMessages,
+  insertMessagesWithCount,
   getMessagesByConversation,
   getMaxSequence,
   insertChunks,
@@ -222,8 +221,10 @@ export async function appendMessages(
     redacted.map((m) => storeContent(env, m.id, m.content))
   );
 
-  // Insert message rows (content lives in R2; D1 row carries the pointer)
-  await insertMessages(
+  // Insert message rows (content lives in R2; D1 row carries the pointer) AND
+  // bump the conversation's message_count in the SAME atomic batch, so the
+  // count can never drift from the actual rows.
+  await insertMessagesWithCount(
     env.DB,
     redacted.map((m, i) => ({
       id: m.id,
@@ -236,7 +237,8 @@ export async function appendMessages(
       toolName: m.tool_name,
       sequence: m.sequence,
       metadata: m.metadata,
-    }))
+    })),
+    conversationId,
   );
 
   // Store client-encrypted vault entries (zero-knowledge — server never decrypts)
@@ -259,8 +261,7 @@ export async function appendMessages(
     );
   }
 
-  // Update conversation message count
-  await updateConversationMessageCount(env.DB, conversationId, redacted.length);
+  // (message_count was bumped atomically with the inserts above.)
 
   // Chunk the redacted messages for embedding.
   // Indexing (embeddings + vectorize) is best-effort — if it fails, messages

@@ -269,3 +269,25 @@ export function getStorageUsed(db: D1Database, organizationId: string) {
     .bind(organizationId)
     .first<{ messages_stored_total: number }>();
 }
+
+/**
+ * Recompute an org's denormalized counters from the actual rows. The counters
+ * (messages_stored_total, conversation_count) are maintained incrementally, so
+ * any operation that moves rows without touching them drifts the counters —
+ * most sharply org-merge, which relocated messages and conversations between
+ * orgs but never adjusted either side's totals (that's how a merged org ended
+ * up ~75k messages undercounted). Setting them to the live COUNT is exact and
+ * idempotent, so it both fixes a merge and heals pre-existing drift. Safe to
+ * call repeatedly and safe to wire into a periodic reconcile.
+ */
+export function reconcileOrgCounters(db: D1Database, organizationId: string) {
+  return db
+    .prepare(
+      `UPDATE organizations SET
+         messages_stored_total = (SELECT COUNT(*) FROM messages WHERE organization_id = ?),
+         conversation_count = (SELECT COUNT(*) FROM conversations WHERE organization_id = ?)
+       WHERE id = ?`,
+    )
+    .bind(organizationId, organizationId, organizationId)
+    .run();
+}

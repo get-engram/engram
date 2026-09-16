@@ -4,6 +4,7 @@ import {
   chunkId,
   summarizeChunk,
   redactMessages,
+  MAX_MESSAGE_CONTENT_CHARS,
   type MessageInput,
   type Message,
   type Conversation,
@@ -147,6 +148,30 @@ export function assertWritesEnabled(env: Env): void {
   }
 }
 
+/**
+ * Bound single-message content by TRUNCATING, not rejecting. This caps
+ * worst-case stored bytes (a free org's 10k-message cap x this ceiling is the
+ * storage ceiling) without wedging the CLI sync daemon, which cannot split one
+ * oversized message and would otherwise re-send and re-fail the same row
+ * forever. A visible marker keeps it honest — the reader sees the memory was
+ * clipped rather than silently altered. Enormous single messages are
+ * tool-output dumps (Claude Code), where the tail is the least useful part;
+ * the request still succeeds and every other message is stored verbatim.
+ * Exported for direct testing.
+ */
+export function boundMessageContent(messageInputs: MessageInput[]): MessageInput[] {
+  return messageInputs.map((m) =>
+    m.content.length > MAX_MESSAGE_CONTENT_CHARS
+      ? {
+          ...m,
+          content:
+            m.content.slice(0, MAX_MESSAGE_CONTENT_CHARS) +
+            `\n\n…[truncated: message exceeded ${MAX_MESSAGE_CONTENT_CHARS.toLocaleString()} characters]`,
+        }
+      : m,
+  );
+}
+
 export async function appendMessages(
   env: Env,
   organizationId: string,
@@ -155,6 +180,8 @@ export async function appendMessages(
   vaultEntries?: VaultEntryInput[]
 ): Promise<Message[]> {
   assertWritesEnabled(env);
+
+  messageInputs = boundMessageContent(messageInputs);
 
   // Verify conversation exists and belongs to org
   const conv = await getConversationById(env.DB, conversationId, organizationId);

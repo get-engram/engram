@@ -8,6 +8,21 @@ export const DEFAULT_SEARCH_LIMIT = 10;
 export const DEFAULT_MESSAGE_LIMIT = 100;
 export const DEFAULT_CONVERSATION_LIMIT = 20;
 
+// Hard byte-ish caps enforced at every write boundary. The storage quota
+// counts MESSAGES, not bytes, so without these a single caller could push
+// unbounded content into the shared D1 while still reading as "sub-cap" — the
+// path by which one free org reached ~17x its message cap in stored volume.
+// Chars, not bytes, because it's what Zod can enforce cheaply; ~100k chars is
+// a generous ceiling for a single conversation turn (far above any real chat
+// message) while bounding worst-case row size.
+export const MAX_MESSAGE_CONTENT_CHARS = 100_000;
+// Serialized metadata is stored verbatim too; bound it so it can't be used to
+// smuggle unbounded content past the content cap.
+export const MAX_MESSAGE_METADATA_CHARS = 16_000;
+// Longest accepted search query. An unbounded query is a cost/latency/DoS
+// surface against the shared FTS index.
+export const MAX_SEARCH_QUERY_CHARS = 4_096;
+
 // Tier definitions
 export type Tier = "free" | "pro" | "team" | "enterprise";
 

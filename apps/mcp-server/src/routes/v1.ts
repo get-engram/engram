@@ -30,6 +30,11 @@ import { audit } from "../services/audit.js";
 import { hasScope, type Scope } from "../mcp/scopes.js";
 import { canAccessConversation } from "../services/spaces.js";
 import { usageMeter } from "../mcp/usage-messaging.js";
+import {
+  MAX_MESSAGES_PER_APPEND,
+  MAX_MESSAGE_METADATA_CHARS,
+  MAX_SEARCH_QUERY_CHARS,
+} from "@getengram/shared";
 import type { Env, AuthContext } from "../types.js";
 import type { Context } from "hono";
 
@@ -257,13 +262,21 @@ const appendSchema = z.object({
     .array(
       z.object({
         role: z.enum(["user", "assistant", "system", "tool"]),
+        // Content is truncated server-side (see appendMessages), not rejected,
+        // so a large single message never wedges CLI sync. Metadata is capped.
         content: z.string(),
         tool_call_id: z.string().optional(),
         tool_name: z.string().optional(),
-        metadata: z.record(z.unknown()).optional(),
+        metadata: z
+          .record(z.unknown())
+          .refine((m) => JSON.stringify(m).length <= MAX_MESSAGE_METADATA_CHARS, {
+            message: `metadata exceeds ${MAX_MESSAGE_METADATA_CHARS} serialized characters`,
+          })
+          .optional(),
       }),
     )
-    .min(1),
+    .min(1)
+    .max(MAX_MESSAGES_PER_APPEND),
 });
 
 v1.post("/messages", async (c) => {
@@ -417,6 +430,14 @@ v1.get("/search", async (c) => {
 
   const query = c.req.query("q")?.trim();
   if (!query) return c.json({ error: "missing_query" }, 400);
+  // Bound query length — an unbounded query is a cost/latency/DoS surface
+  // against the shared FTS index.
+  if (query.length > MAX_SEARCH_QUERY_CHARS) {
+    return c.json(
+      { error: "query_too_long", message: `Search query exceeds ${MAX_SEARCH_QUERY_CHARS} characters.` },
+      400,
+    );
+  }
   const limit = Math.min(Math.max(Number(c.req.query("limit") ?? "5") || 5, 1), 20);
   const conversationId = c.req.query("conversation_id") || undefined;
   const tagsParam = c.req.query("tags");

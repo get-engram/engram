@@ -7,6 +7,22 @@ type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
 
 const seats = new Hono<HonoEnv>();
 
+// Owner-only guard for seat administration. A seat-bound (Team member) key has
+// a non-null seatId; the owner key has null (engram#264). Members must not be
+// able to invite, remove, re-invite, or re-role other members — only accept
+// their own invite (below) and list. Returns a 403 Response to short-circuit,
+// or null to proceed. The `seats.role` column will refine this to owner+admin
+// once it's plumbed into AuthContext; owner-only is the safe floor until then.
+function ownerOnly(auth: AuthContext): Response | null {
+  if (auth.seatId) {
+    return Response.json(
+      { error: "forbidden", message: "Only the organization owner can manage seats." },
+      { status: 403 },
+    );
+  }
+  return null;
+}
+
 // List seats
 seats.get("/", async (c) => {
   const auth = c.get("auth");
@@ -17,7 +33,9 @@ seats.get("/", async (c) => {
 // Invite a seat
 seats.post("/", async (c) => {
   const auth = c.get("auth");
-  const body = await c.req.json<{ email: string; role?: string }>();
+  const denied = ownerOnly(auth);
+  if (denied) return denied;
+  const body = await c.req.json<{ email: string; role?: string }>().catch(() => ({}) as { email?: string; role?: string });
 
   if (!body.email) {
     return c.json({ error: "Email is required" }, 400);
@@ -92,6 +110,8 @@ seats.post("/:id/accept", async (c) => {
 // belongs to the org account itself, not a seat.
 seats.patch("/:id", async (c) => {
   const auth = c.get("auth");
+  const denied = ownerOnly(auth);
+  if (denied) return denied;
   const seatId = c.req.param("id");
   const body = await c.req.json<{ role?: string }>().catch(() => ({}) as { role?: string });
   if (body.role !== "admin" && body.role !== "member") {
@@ -110,6 +130,8 @@ seats.patch("/:id", async (c) => {
 // still-pending seat. The caller (engram-web) emails the new link.
 seats.post("/:id/resend", async (c) => {
   const auth = c.get("auth");
+  const denied = ownerOnly(auth);
+  if (denied) return denied;
   const seatId = c.req.param("id");
   const seat = await c.env.DB.prepare(
     "SELECT id, email, accepted_at FROM seats WHERE id = ? AND organization_id = ?",
@@ -135,7 +157,18 @@ seats.post("/:id/resend", async (c) => {
 // Remove a seat (and revoke its API keys)
 seats.delete("/:id", async (c) => {
   const auth = c.get("auth");
+  const denied = ownerOnly(auth);
+  if (denied) return denied;
   const seatId = c.req.param("id");
+  // Verify the seat belongs to the caller's org BEFORE deleting. Seat ids are
+  // globally unique, so deleteSeat/revokeApiKeysBySeat by bare id would let an
+  // owner remove another tenant's seat and revoke its keys — a cross-tenant
+  // write. Scope the lookup to this org and 404 otherwise.
+  const seat = await c.env.DB
+    .prepare("SELECT id FROM seats WHERE id = ? AND organization_id = ?")
+    .bind(seatId, auth.organizationId)
+    .first<{ id: string }>();
+  if (!seat) return c.json({ error: "seat_not_found" }, 404);
   await revokeApiKeysBySeat(c.env.DB, seatId);
   await deleteSeat(c.env.DB, seatId);
   return c.json({ removed: true });

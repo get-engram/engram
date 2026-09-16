@@ -22,6 +22,10 @@ import {
 import { fireWebhooks } from "../../services/webhooks.js";
 import { checkMilestone } from "../../services/milestones.js";
 import { canAccessConversation } from "../../services/spaces.js";
+import {
+  MAX_MESSAGES_PER_APPEND,
+  MAX_MESSAGE_METADATA_CHARS,
+} from "@getengram/shared";
 import { getConversationById } from "@getengram/db";
 import { audit } from "../../services/audit.js";
 import { hasScope, scopeError } from "../scopes.js";
@@ -46,13 +50,23 @@ export function registerAppendMessages(
         .array(
           z.object({
             role: z.enum(["user", "assistant", "system", "tool"]),
+            // Not hard-capped here: oversized single messages (tool-output
+            // dumps) are truncated server-side in appendMessages rather than
+            // rejected, so the CLI sync daemon can't wedge on a message it
+            // cannot split. Metadata IS capped — it's the smuggling vector.
             content: z.string(),
             tool_call_id: z.string().optional(),
             tool_name: z.string().optional(),
-            metadata: z.record(z.unknown()).optional(),
+            metadata: z
+              .record(z.unknown())
+              .refine((m) => JSON.stringify(m).length <= MAX_MESSAGE_METADATA_CHARS, {
+                message: `metadata exceeds ${MAX_MESSAGE_METADATA_CHARS} serialized characters`,
+              })
+              .optional(),
           })
         )
         .min(1)
+        .max(MAX_MESSAGES_PER_APPEND)
         .describe("Messages to append"),
       vault_entries: z
         .array(

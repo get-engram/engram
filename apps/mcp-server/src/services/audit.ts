@@ -27,7 +27,16 @@ export type AuditAction =
   | "subscription.checkout"
   | "subscription.upgrade_redirect"
   | "oauth.connection.revoked"
-  | "seat.accepted";
+  | "seat.accepted"
+  // Privileged operator actions against a specific user org. Previously the
+  // admin surface wrote nothing to the audit log despite logging every user
+  // action — a SOC 2 / breach-review gap. Actor recorded as "admin", org is
+  // the real target org id (org-agnostic operator actions log to console
+  // instead, since audit_log is org-scoped by an enforced FK).
+  | "admin.user.delete"
+  | "admin.user.tier_change"
+  | "admin.user.retention_change"
+  | "admin.user.grant_pro";
 
 /**
  * Audit log entry. Never throws — audit logging should not break the

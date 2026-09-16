@@ -1,6 +1,7 @@
 import { Hono } from "hono";
-import { getAuditLogs } from "@getengram/db";
+import { getAuditLogs, revokeApiKeysByOrg, clearOAuthTokensByOrg } from "@getengram/db";
 import { compressContent, ENCODING_GZIP } from "../utils/compress.js";
+import { audit } from "../services/audit.js";
 import type { Env } from "../types.js";
 import { sendDailyReport } from "../services/daily-report.js";
 import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
@@ -327,6 +328,7 @@ admin.patch("/users/:id", async (c) => {
     await c.env.DB.prepare(
       "UPDATE organizations SET tier = ? WHERE id = ?"
     ).bind(tier, id).run();
+    await audit(c.env.DB, id, "admin", "admin.user.tier_change", undefined, undefined, { tier });
     return c.json({ updated: true, id, tier });
   }
 
@@ -341,6 +343,7 @@ admin.patch("/users/:id", async (c) => {
     await c.env.DB.prepare(
       "UPDATE organizations SET retention_policy_days = ? WHERE id = ?"
     ).bind(days, id).run();
+    await audit(c.env.DB, id, "admin", "admin.user.retention_change", undefined, undefined, { retention_policy_days: days });
     return c.json({ updated: true, id, retention_policy_days: days });
   }
 
@@ -355,7 +358,13 @@ admin.delete("/users/:id", async (c) => {
   await c.env.DB.prepare(
     "UPDATE organizations SET deleted_at = datetime('now') WHERE id = ?"
   ).bind(id).run();
-  return c.json({ deleted: true, id });
+  // Admin/compliance deletion cuts access IMMEDIATELY — unlike the
+  // self-service delete (which keeps the key working so the owner can
+  // /restore), an operator deleting an org expects the credentials dead now.
+  await revokeApiKeysByOrg(c.env.DB, id);
+  await clearOAuthTokensByOrg(c.env.DB, id);
+  await audit(c.env.DB, id, "admin", "admin.user.delete");
+  return c.json({ deleted: true, id, credentials_revoked: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -374,6 +383,7 @@ admin.post("/users/:id/grant-pro", async (c) => {
     "SELECT tier, grace_ends_at FROM organizations WHERE id = ?"
   ).bind(id).first<{ tier: string; grace_ends_at: string }>();
 
+  await audit(c.env.DB, id, "admin", "admin.user.grant_pro", undefined, undefined, { days });
   return c.json({ granted: true, id, tier: "pro", grace_ends_at: org?.grace_ends_at });
 });
 
@@ -431,6 +441,11 @@ admin.post("/comp-internal", async (c) => {
       active_subscriptions: subIds,
       action: dryRun ? "would_cancel_and_comp" : (subIds.length ? "canceled_and_comped" : "tagged_internal_no_sub"),
     });
+  }
+  if (!dryRun && out.length > 0) {
+    // Org-agnostic operator action — console, not the org-scoped audit_log
+    // (see the email_log wipe above for why a synthetic org id can't be used).
+    console.warn(`[admin] comp_internal executed: orgs_matched=${out.length}`);
   }
   return c.json({ dry_run: dryRun, orgs_matched: out.length, orgs: out });
 });
@@ -609,6 +624,12 @@ admin.delete("/email-log", async (c) => {
   const res = await c.env.DB.prepare("DELETE FROM email_log WHERE type = ?")
     .bind(type)
     .run();
+  // This wipes send/observability history — surface the operator action so
+  // the wipe isn't invisible. Not an audit_log row: that table is org-scoped
+  // (organization_id NOT NULL + FK), and this action isn't tied to a real org,
+  // so a synthetic org id would just fail the FK silently. A console line is
+  // the honest place for an operator-level, org-agnostic action.
+  console.warn(`[admin] email_log wiped: type=${type} deleted=${res.meta.changes ?? 0}`);
   return c.json({ deleted: res.meta.changes ?? 0 });
 });
 

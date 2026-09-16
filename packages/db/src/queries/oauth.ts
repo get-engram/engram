@@ -151,6 +151,25 @@ export function getAccessTokenWithOrg(db: D1Database, tokenHash: string) {
     }>();
 }
 
+/**
+ * Cut off all of an org's OAuth access immediately. Access tokens have no
+ * revoked_at column and are gated only by expires_at, so they're DELETEd;
+ * refresh tokens are marked revoked so they can't mint new access tokens.
+ * Used on the admin/compliance deletion paths (see revokeApiKeysByOrg).
+ */
+export function clearOAuthTokensByOrg(db: D1Database, organizationId: string) {
+  return db.batch([
+    db
+      .prepare("DELETE FROM oauth_access_tokens WHERE organization_id = ?")
+      .bind(organizationId),
+    db
+      .prepare(
+        "UPDATE oauth_refresh_tokens SET revoked_at = datetime('now') WHERE organization_id = ? AND revoked_at IS NULL",
+      )
+      .bind(organizationId),
+  ]);
+}
+
 // ---------------------------------------------------------------------------
 // Refresh tokens (rotated on use)
 // ---------------------------------------------------------------------------

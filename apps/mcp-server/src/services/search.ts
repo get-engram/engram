@@ -14,6 +14,18 @@ const MAX_SNIPPET_CHARS = 5000;
 const DEFAULT_MIN_SCORE = 0.3;
 const TRUNCATION_MARKER = "\n...[truncated]";
 
+/** True for Engram-seeded system conversations (the welcome note) — identified
+ *  by metadata {"system":true}. These are not the user's memory and are
+ *  excluded from search results. Exported for testing. */
+export function isSystemConversation(metadata: string | null | undefined): boolean {
+  if (!metadata) return false;
+  try {
+    return (JSON.parse(metadata) as { system?: boolean }).system === true;
+  } catch {
+    return false;
+  }
+}
+
 // RRF constant — dampens high-rank dominance. k=60 is standard.
 const RRF_K = 60;
 // Max possible RRF score with 2 lists: 2 / (k + 0)
@@ -187,10 +199,10 @@ export async function searchConversations(
   if (uniqueConvIds.length > 0) {
     const placeholders = uniqueConvIds.map(() => "?").join(",");
     const rows = await env.DB.prepare(
-      `SELECT id, title, tags, updated_at, visibility, seat_id FROM conversations WHERE id IN (${placeholders}) AND organization_id = ?`
+      `SELECT id, title, tags, updated_at, visibility, seat_id, metadata FROM conversations WHERE id IN (${placeholders}) AND organization_id = ?`
     )
       .bind(...uniqueConvIds, organizationId)
-      .all<{ id: string; title: string; tags: string; updated_at: string | null; visibility?: string | null; seat_id?: string | null }>();
+      .all<{ id: string; title: string; tags: string; updated_at: string | null; visibility?: string | null; seat_id?: string | null; metadata?: string | null }>();
 
     for (const row of rows.results) {
       // Private-space enforcement (engram#264): a chunk whose
@@ -200,6 +212,17 @@ export async function searchConversations(
         (row.visibility ?? "shared") === "private" &&
         (row.seat_id ?? null) !== (viewerSeatId ?? null)
       ) {
+        blockedConvIds.add(row.id);
+        continue;
+      }
+      // The seeded welcome note (metadata {"system":true,...}) is instructional
+      // boilerplate, not the user's memory. Returning it as a search hit means a
+      // brand-new user's first "what do you remember?" surfaces our own onboarding
+      // prose as if they'd written it — which reads as broken and buries the
+      // activation moment. Exclude system conversations from ranked results; a
+      // user with no real memories now gets a clean empty result (which triggers
+      // searchEmptyTip) instead. (engram activation, 2026-09)
+      if (isSystemConversation(row.metadata)) {
         blockedConvIds.add(row.id);
         continue;
       }

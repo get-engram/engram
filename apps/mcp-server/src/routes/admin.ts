@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { getAuditLogs, revokeApiKeysByOrg, clearOAuthTokensByOrg, reconcileOrgCounters } from "@getengram/db";
 import { compressContent, ENCODING_GZIP } from "../utils/compress.js";
 import { audit } from "../services/audit.js";
+import { purgeDeletedOrganizations } from "../cron/purge-deleted.js";
 import type { Env } from "../types.js";
 import { sendDailyReport } from "../services/daily-report.js";
 import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
@@ -348,6 +349,17 @@ admin.patch("/users/:id", async (c) => {
   }
 
   return c.json({ error: "invalid_tier" }, 400);
+});
+
+// ---------------------------------------------------------------------------
+// POST /admin/run-purge — trigger the GDPR purge on demand (same code the
+// nightly cron runs). Resumable + bounded, so calling it repeatedly drains a
+// large backlog. Lets an operator verify erasure completed rather than waiting
+// for 03:00, and force a purge after a fix.
+// ---------------------------------------------------------------------------
+admin.post("/run-purge", async (c) => {
+  const purged = await purgeDeletedOrganizations(c.env);
+  return c.json({ ok: true, fully_purged: purged });
 });
 
 // ---------------------------------------------------------------------------

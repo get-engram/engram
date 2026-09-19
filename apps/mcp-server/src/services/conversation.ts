@@ -33,6 +33,7 @@ import {
 import { generateEmbeddings } from "./embedding.js";
 import { releaseStorage } from "./tier.js";
 import { storeContent, deleteContent, loadContent } from "./content-store.js";
+import { deleteVectorsByIds } from "./vectorize.js";
 import type { Env, AuthContext } from "../types.js";
 import { canAccessConversation } from "./spaces.js";
 
@@ -501,7 +502,7 @@ export async function updateMessage(
       : [];
 
     if (old.length > 0) {
-      await env.VECTORIZE.deleteByIds(old.map((c) => c.vectorize_id));
+      await deleteVectorsByIds(env, old.map((c) => c.vectorize_id));
       await deleteChunksByIds(
         env.DB,
         old.map((c) => c.id),
@@ -604,9 +605,10 @@ export async function deleteConversation(
   );
   const purged = await deleteContent(env, r2Ids.results.map((r) => r.id));
 
-  // Delete from Vectorize
+  // Delete from Vectorize (chunked to the 100-id limit — a large conversation
+  // has >100 chunks and would otherwise throw code 40007).
   if (vectorizeIds.length > 0) {
-    await env.VECTORIZE.deleteByIds(vectorizeIds);
+    await deleteVectorsByIds(env, vectorizeIds);
   }
 
   // Delete from D1 (cascading: chunks, messages, conversation)

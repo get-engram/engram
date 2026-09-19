@@ -358,8 +358,9 @@ admin.patch("/users/:id", async (c) => {
 // for 03:00, and force a purge after a fix.
 // ---------------------------------------------------------------------------
 admin.post("/run-purge", async (c) => {
-  const purged = await purgeDeletedOrganizations(c.env);
-  return c.json({ ok: true, fully_purged: purged });
+  const failures: Array<{ id: string; error: string }> = [];
+  const purged = await purgeDeletedOrganizations(c.env, failures);
+  return c.json({ ok: true, fully_purged: purged, failures });
 });
 
 // ---------------------------------------------------------------------------

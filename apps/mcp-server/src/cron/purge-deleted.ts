@@ -8,6 +8,7 @@ import {
   deleteOrganizationById,
 } from "@getengram/db";
 import { deleteContent } from "../services/content-store.js";
+import { deleteVectorsByIds } from "../services/vectorize.js";
 import type { Env } from "../types.js";
 
 // Rows fetched+deleted per IN(...) statement. Kept at a value D1 handles
@@ -36,7 +37,10 @@ const MAX_PER_STORE_PER_RUN = 10_000;
  * Returns the number of orgs FULLY purged this run (orgs still draining are
  * counted separately in the logs).
  */
-export async function purgeDeletedOrganizations(env: Env): Promise<number> {
+export async function purgeDeletedOrganizations(
+  env: Env,
+  failures?: Array<{ id: string; error: string }>,
+): Promise<number> {
   const expired = await getExpiredOrganizations(env.DB, 25);
   let purged = 0;
   let draining = 0;
@@ -52,7 +56,7 @@ export async function purgeDeletedOrganizations(env: Env): Promise<number> {
         const rows = batch.results ?? [];
         if (rows.length === 0) break;
         const vectorIds = rows.map((r) => r.vectorize_id).filter((v): v is string => !!v);
-        if (vectorIds.length > 0) await env.VECTORIZE.deleteByIds(vectorIds);
+        if (vectorIds.length > 0) await deleteVectorsByIds(env, vectorIds);
         await deleteChunkRowsAndFts(
           env.DB,
           rows.map((r) => r.id),
@@ -96,11 +100,9 @@ export async function purgeDeletedOrganizations(env: Env): Promise<number> {
     } catch (err) {
       // Per-org isolation: leave this org intact (deleted_at set) for the next
       // run; every other expired org still gets processed this run.
-      console.error(
-        `[purge] org ${id} FAILED — left intact for retry: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[purge] org ${id} FAILED — left intact for retry: ${msg}`);
+      failures?.push({ id, error: msg });
       continue;
     }
   }

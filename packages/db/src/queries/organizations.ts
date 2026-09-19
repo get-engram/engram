@@ -239,22 +239,37 @@ export function getChunkPurgeBatch(db: D1Database, organizationId: string, limit
     .all<{ id: string; vectorize_id: string | null; fts_rowid: number | null }>();
 }
 
+// D1 caps bound parameters per statement (a large IN(...) throws "too many SQL
+// variables"). Keep every IN-list statement well under that; the batch itself
+// can hold many such statements.
+const D1_IN_CHUNK = 90;
+
+function inDeleteStatements<T extends string | number>(
+  db: D1Database,
+  sqlPrefix: string,
+  values: T[],
+) {
+  const stmts = [];
+  for (let i = 0; i < values.length; i += D1_IN_CHUNK) {
+    const slice = values.slice(i, i + D1_IN_CHUNK);
+    const ph = slice.map(() => "?").join(",");
+    stmts.push(db.prepare(`${sqlPrefix} (${ph})`).bind(...slice));
+  }
+  return stmts;
+}
+
 /** Delete a batch of chunk rows AND their FTS index rows in one atomic batch.
+ *  IN-lists are chunked to stay under D1's bound-parameter limit.
  *  (Vectorize vectors are deleted separately by the caller — different store.) */
 export function deleteChunkRowsAndFts(
   db: D1Database,
   chunkIds: string[],
   ftsRowids: number[],
 ) {
-  const stmts = [];
-  if (ftsRowids.length > 0) {
-    const rph = ftsRowids.map(() => "?").join(",");
-    stmts.push(db.prepare(`DELETE FROM chunks_fts_v2 WHERE rowid IN (${rph})`).bind(...ftsRowids));
-  }
-  if (chunkIds.length > 0) {
-    const cph = chunkIds.map(() => "?").join(",");
-    stmts.push(db.prepare(`DELETE FROM conversation_chunks WHERE id IN (${cph})`).bind(...chunkIds));
-  }
+  const stmts = [
+    ...inDeleteStatements(db, "DELETE FROM chunks_fts_v2 WHERE rowid IN", ftsRowids),
+    ...inDeleteStatements(db, "DELETE FROM conversation_chunks WHERE id IN", chunkIds),
+  ];
   return stmts.length ? db.batch(stmts) : Promise.resolve([]);
 }
 
@@ -269,11 +284,10 @@ export function getMessagePurgeBatch(db: D1Database, organizationId: string, lim
     .all<{ id: string; content_encoding: string | null }>();
 }
 
-/** Delete a batch of message rows by id. */
+/** Delete a batch of message rows by id (IN-lists chunked under D1's limit). */
 export function deleteMessageRowsByIds(db: D1Database, messageIds: string[]) {
-  if (messageIds.length === 0) return Promise.resolve({ meta: {} } as unknown as D1Result);
-  const ph = messageIds.map(() => "?").join(",");
-  return db.prepare(`DELETE FROM messages WHERE id IN (${ph})`).bind(...messageIds).run();
+  if (messageIds.length === 0) return Promise.resolve([]);
+  return db.batch(inDeleteStatements(db, "DELETE FROM messages WHERE id IN", messageIds));
 }
 
 /** How much heavy data (messages, chunks) an org still has — the purge only

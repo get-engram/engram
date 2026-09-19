@@ -220,6 +220,73 @@ export function getExpiredOrganizations(db: D1Database, limit = 50) {
     .all<{ id: string }>();
 }
 
+// ── Resumable purge (bounded per run) ────────────────────────────────────
+// A large org's data is drained in bounded batches across successive cron runs
+// rather than deleted all at once. The old purge attempted a whole org in one
+// invocation; a ~6k-message org exceeded the worker's CPU/time budget, threw,
+// was caught by the per-org guard, and was skipped EVERY night — so large
+// deleted orgs were never actually erased. These helpers let the purge take a
+// fixed bite per run and only finalize (drop the org) once nothing remains.
+
+/** A bounded batch of an org's chunk rows, with the ids needed to also remove
+ *  their FTS rows and Vectorize vectors. */
+export function getChunkPurgeBatch(db: D1Database, organizationId: string, limit: number) {
+  return db
+    .prepare(
+      "SELECT id, vectorize_id, fts_rowid FROM conversation_chunks WHERE organization_id = ? LIMIT ?",
+    )
+    .bind(organizationId, limit)
+    .all<{ id: string; vectorize_id: string | null; fts_rowid: number | null }>();
+}
+
+/** Delete a batch of chunk rows AND their FTS index rows in one atomic batch.
+ *  (Vectorize vectors are deleted separately by the caller — different store.) */
+export function deleteChunkRowsAndFts(
+  db: D1Database,
+  chunkIds: string[],
+  ftsRowids: number[],
+) {
+  const stmts = [];
+  if (ftsRowids.length > 0) {
+    const rph = ftsRowids.map(() => "?").join(",");
+    stmts.push(db.prepare(`DELETE FROM chunks_fts_v2 WHERE rowid IN (${rph})`).bind(...ftsRowids));
+  }
+  if (chunkIds.length > 0) {
+    const cph = chunkIds.map(() => "?").join(",");
+    stmts.push(db.prepare(`DELETE FROM conversation_chunks WHERE id IN (${cph})`).bind(...chunkIds));
+  }
+  return stmts.length ? db.batch(stmts) : Promise.resolve([]);
+}
+
+/** A bounded batch of an org's message rows (id + encoding, so the caller can
+ *  purge the R2 body for r2:-encoded messages before dropping the row). */
+export function getMessagePurgeBatch(db: D1Database, organizationId: string, limit: number) {
+  return db
+    .prepare(
+      "SELECT id, content_encoding FROM messages WHERE organization_id = ? LIMIT ?",
+    )
+    .bind(organizationId, limit)
+    .all<{ id: string; content_encoding: string | null }>();
+}
+
+/** Delete a batch of message rows by id. */
+export function deleteMessageRowsByIds(db: D1Database, messageIds: string[]) {
+  if (messageIds.length === 0) return Promise.resolve({ meta: {} } as unknown as D1Result);
+  const ph = messageIds.map(() => "?").join(",");
+  return db.prepare(`DELETE FROM messages WHERE id IN (${ph})`).bind(...messageIds).run();
+}
+
+/** How much heavy data (messages, chunks) an org still has — the purge only
+ *  finalizes (drops the org + remaining small tables) when both are zero. */
+export function countOrgHeavyData(db: D1Database, organizationId: string) {
+  return db
+    .prepare(
+      "SELECT (SELECT COUNT(*) FROM messages WHERE organization_id = ?) AS messages, (SELECT COUNT(*) FROM conversation_chunks WHERE organization_id = ?) AS chunks",
+    )
+    .bind(organizationId, organizationId)
+    .first<{ messages: number; chunks: number }>();
+}
+
 export function getOrganizationStats(db: D1Database, organizationId: string) {
   return db
     .prepare(

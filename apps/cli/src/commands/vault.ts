@@ -1,6 +1,6 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { generateVaultKey, type Engram } from "@getengram/sdk";
 import { bold, dim } from "../output.js";
 
@@ -13,6 +13,35 @@ export async function vaultKeygen(
   const key = await generateVaultKey();
 
   if (flags.save !== undefined) {
+    // ~/.engram may not exist yet on a fresh machine; without this, writeFile
+    // ENOENT-crashes on the very first `vault keygen --save`.
+    await mkdir(dirname(VAULT_KEY_FILE), { recursive: true });
+
+    // Overwriting the key file is irreversible destruction: every secret
+    // encrypted under the old key becomes permanently undecryptable. Refuse
+    // unless the user explicitly passes --force, and back the old key up first
+    // so an accidental --force is still recoverable.
+    let existing: string | undefined;
+    try {
+      existing = (await readFile(VAULT_KEY_FILE, "utf-8")).trim();
+    } catch {
+      existing = undefined;
+    }
+    if (existing && flags.force === undefined) {
+      console.error(bold(`A vault key already exists at ${VAULT_KEY_FILE}.`));
+      console.error(
+        "Overwriting it will PERMANENTLY orphan every secret encrypted with the current key —"
+      );
+      console.error("there is no recovery. Re-run with --force to replace it (the old key is backed up first).");
+      process.exit(1);
+    }
+    if (existing) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const backup = `${VAULT_KEY_FILE}.bak-${stamp}`;
+      await writeFile(backup, existing + "\n", { mode: 0o600 });
+      console.log(dim(`Previous key backed up to ${backup}`));
+    }
+
     await writeFile(VAULT_KEY_FILE, key + "\n", { mode: 0o600 });
     console.log(`${bold("Vault key generated and saved to:")} ${VAULT_KEY_FILE}`);
     console.log(dim("Permissions set to owner-only (600)."));
@@ -142,7 +171,20 @@ export async function vaultGet(
     process.exit(1);
   }
 
-  const value = await client.vault.get(name);
+  let value: string | null;
+  try {
+    value = await client.vault.get(name);
+  } catch {
+    // The central failure mode of a zero-knowledge vault: retrieving on a
+    // different machine, or after the key was regenerated/overwritten. Web
+    // Crypto throws an opaque "operation-specific reason" here — translate it.
+    console.error(`Failed to decrypt "${name}": wrong vault key or corrupted data.`);
+    console.error(
+      `The value must be decrypted with the SAME key it was encrypted with. Check ENGRAM_VAULT_KEY or ${VAULT_KEY_FILE}.`
+    );
+    process.exit(1);
+    return;
+  }
   if (value === null) {
     console.error(`Secret "${name}" not found.`);
     process.exit(1);

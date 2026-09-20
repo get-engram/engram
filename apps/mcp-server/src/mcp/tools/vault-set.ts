@@ -3,6 +3,7 @@ import { z } from "zod";
 import { generateId } from "@getengram/shared";
 import { upsertNamedSecret } from "@getengram/db";
 import { audit } from "../../services/audit.js";
+import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerVaultSet(
@@ -23,6 +24,10 @@ export function registerVaultSet(
       encrypted_value: z
         .string()
         .min(1)
+        // Secrets are small (keys, tokens, connection strings, the odd cert).
+        // 64 KB of base64 ciphertext is well beyond any real secret and caps
+        // storage abuse of an otherwise unbounded, opaque field.
+        .max(65536, "Encrypted value exceeds 64 KB")
         .describe("Base64-encoded AES-256-GCM ciphertext"),
       iv: z
         .string()
@@ -41,6 +46,7 @@ export function registerVaultSet(
       openWorldHint: false,
     },
     async (params) => {
+      if (!hasScope(auth, "write")) return scopeError("write");
       const id = generateId("vlt");
 
       await upsertNamedSecret(env.DB, {

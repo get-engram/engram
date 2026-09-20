@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { listNamedSecrets } from "@getengram/db";
 import { audit } from "../../services/audit.js";
+import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerVaultList(
@@ -20,6 +21,7 @@ export function registerVaultList(
       openWorldHint: false,
     },
     async () => {
+      if (!hasScope(auth, "read")) return scopeError("read");
       const result = await listNamedSecrets(env.DB, auth.organizationId);
 
       const secrets = result.results.map((r: Record<string, unknown>) => ({

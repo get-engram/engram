@@ -31,6 +31,27 @@ describe("deleteOrganizationById", () => {
     expect(emailLog!.args).toEqual(["org_x"]);
   });
 
+  it("deletes both secret tables explicitly (D1 does not reliably enforce their cascade)", async () => {
+    const { db, statements } = captureDb();
+    await deleteOrganizationById(db, "org_x");
+    for (const table of ["named_secrets", "secrets_vault"]) {
+      const stmt = statements.find(
+        (s) => s.sql.includes(table) && s.sql.startsWith("DELETE"),
+      );
+      expect(
+        stmt,
+        `purge must clear ${table} explicitly, or account deletion leaves the user's secrets behind`,
+      ).toBeDefined();
+      expect(stmt!.args).toEqual(["org_x"]);
+      // ...and before the organizations row is gone.
+      const idx = statements.indexOf(stmt!);
+      const orgIdx = statements.findIndex((s) =>
+        s.sql.startsWith("DELETE FROM organizations WHERE id = ?"),
+      );
+      expect(idx).toBeLessThan(orgIdx);
+    }
+  });
+
   it("deletes the org row last, so children (and cascades) go first", async () => {
     const { db, statements } = captureDb();
     await deleteOrganizationById(db, "org_x");

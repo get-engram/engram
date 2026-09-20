@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getVaultEntriesByIds } from "@getengram/db";
 import { audit } from "../../services/audit.js";
+import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerResolveVault(
@@ -27,6 +28,7 @@ export function registerResolveVault(
       openWorldHint: false,
     },
     async (params) => {
+      if (!hasScope(auth, "read")) return scopeError("read");
       const result = await getVaultEntriesByIds(
         env.DB,
         params.vault_ids,

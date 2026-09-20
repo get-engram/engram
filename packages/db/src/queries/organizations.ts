@@ -188,6 +188,14 @@ export function deleteOrganizationById(db: D1Database, id: string) {
     // recipient email addresses behind, which is exactly the personal data
     // an erasure request is about. Every other org-linked table cascades.
     db.prepare("DELETE FROM email_log WHERE org_id = ?").bind(id),
+    // The vault tables DO declare ON DELETE CASCADE, but D1 does not reliably
+    // enforce cascades, so — exactly like email_log — we delete them
+    // explicitly. Leaving them to an unenforced cascade would silently orphan
+    // a user's (encrypted) secrets after account deletion, breaking the
+    // "deleted when you delete your account" guarantee. Pinned by
+    // purge-completeness.test.ts on an FK-enforcing SQLite.
+    db.prepare("DELETE FROM named_secrets WHERE organization_id = ?").bind(id),
+    db.prepare("DELETE FROM secrets_vault WHERE organization_id = ?").bind(id),
     db.prepare("DELETE FROM organizations WHERE id = ?").bind(id),
   ]);
 }

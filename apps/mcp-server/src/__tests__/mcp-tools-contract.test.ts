@@ -320,6 +320,57 @@ describe("MCP tool contract — wire field names", () => {
     });
   });
 
+  describe("vault scope enforcement", () => {
+    // A key issued read-only must never be able to mutate the vault. Before
+    // this, the five vault tools skipped hasScope() entirely, so a read-only
+    // key could overwrite or permanently delete secrets. These short-circuit
+    // before any DB access, so no seeding is needed.
+    it("rejects vault_set from a key without 'write'", async () => {
+      const { server, tools } = createCaptureServer();
+      registerVaultSet(server, env, { ...auth, scopes: ["read"] });
+      const { data, isError } = parseToolResponse(
+        await tools.get("vault_set")!.handler({
+          name: "OPENAI_KEY",
+          encrypted_value: "x",
+          iv: "y",
+          secret_type: "api_key",
+        })
+      );
+      expect(isError).toBe(true);
+      expect(data.error).toBe("insufficient_scope");
+      expect(data.required).toBe("write");
+    });
+
+    it("rejects vault_delete from a key without 'delete'", async () => {
+      const { server, tools } = createCaptureServer();
+      registerVaultDelete(server, env, { ...auth, scopes: ["read", "write"] });
+      const { data, isError } = parseToolResponse(
+        await tools.get("vault_delete")!.handler({ name: "OPENAI_KEY" })
+      );
+      expect(isError).toBe(true);
+      expect(data.error).toBe("insufficient_scope");
+      expect(data.required).toBe("delete");
+    });
+
+    it("rejects vault_get / vault_list / resolve_vault from a key without 'read'", async () => {
+      const { server, tools } = createCaptureServer();
+      registerVaultGet(server, env, { ...auth, scopes: ["write"] });
+      registerVaultList(server, env, { ...auth, scopes: ["write"] });
+      registerResolveVault(server, env, { ...auth, scopes: ["write"] });
+      for (const [name, params] of [
+        ["vault_get", { name: "X" }],
+        ["vault_list", {}],
+        ["resolve_vault", { vault_ids: ["vlt_1"] }],
+      ] as const) {
+        const { data, isError } = parseToolResponse(
+          await tools.get(name)!.handler(params)
+        );
+        expect(isError, name).toBe(true);
+        expect(data.error, name).toBe("insufficient_scope");
+      }
+    });
+  });
+
   describe("registered tool name inventory", () => {
     it("registers the exact set of tool names the SDK calls", () => {
       // The SDK's client.ts hard-codes these strings on every method. If

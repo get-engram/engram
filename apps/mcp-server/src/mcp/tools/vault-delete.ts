@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { deleteNamedSecret, getNamedSecret } from "@getengram/db";
 import { audit } from "../../services/audit.js";
+import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerVaultDelete(
@@ -26,6 +27,7 @@ export function registerVaultDelete(
       openWorldHint: false,
     },
     async (params) => {
+      if (!hasScope(auth, "delete")) return scopeError("delete");
       // Check existence first for audit
       const existing = await getNamedSecret(
         env.DB,

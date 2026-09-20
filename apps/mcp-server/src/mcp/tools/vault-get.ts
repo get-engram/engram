@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getNamedSecret } from "@getengram/db";
 import { audit } from "../../services/audit.js";
+import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
 
 export function registerVaultGet(
@@ -26,6 +27,7 @@ export function registerVaultGet(
       openWorldHint: false,
     },
     async (params) => {
+      if (!hasScope(auth, "read")) return scopeError("read");
       const row = await getNamedSecret(
         env.DB,
         auth.organizationId,

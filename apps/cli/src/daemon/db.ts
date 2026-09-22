@@ -33,6 +33,18 @@ CREATE TABLE IF NOT EXISTS pending_messages (
 
 CREATE INDEX IF NOT EXISTS idx_pending_unsent
   ON pending_messages(conversation_id) WHERE sent_at IS NULL;
+
+-- Sessions the user opted out of ("don't save this to engram"). Once a row
+-- exists, the syncer drops every future message for the session. If part of
+-- the session had already synced, delete_pending holds the server-side
+-- conversation id until the remote delete succeeds (it must survive the
+-- daemon being offline or restarted — "don't save this" is a promise).
+CREATE TABLE IF NOT EXISTS excluded_sessions (
+  session_id TEXT PRIMARY KEY,
+  reason TEXT NOT NULL,
+  delete_pending TEXT,
+  created_at TEXT NOT NULL
+);
 `;
 
 export class DaemonDb {
@@ -92,6 +104,56 @@ export class DaemonDb {
         meta.cwd ?? null,
         meta.gitBranch ?? null,
       );
+  }
+
+  // ── Excluded sessions (engram#462) ──
+
+  isSessionExcluded(sessionId: string): boolean {
+    return (
+      this.db
+        .prepare("SELECT 1 FROM excluded_sessions WHERE session_id = ?")
+        .get(sessionId) !== undefined
+    );
+  }
+
+  markSessionExcluded(
+    sessionId: string,
+    reason: string,
+    deletePendingConversationId?: string,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO excluded_sessions
+           (session_id, reason, delete_pending, created_at)
+         VALUES (?, ?, ?, datetime('now'))`,
+      )
+      .run(sessionId, reason, deletePendingConversationId ?? null);
+  }
+
+  /** Conversations that still need a server-side delete (opt-out arrived
+   *  after part of the session had synced). */
+  getPendingRemoteDeletes(): Array<{ session_id: string; delete_pending: string }> {
+    return this.db
+      .prepare(
+        "SELECT session_id, delete_pending FROM excluded_sessions WHERE delete_pending IS NOT NULL",
+      )
+      .all() as Array<{ session_id: string; delete_pending: string }>;
+  }
+
+  clearPendingRemoteDelete(sessionId: string): void {
+    this.db
+      .prepare(
+        "UPDATE excluded_sessions SET delete_pending = NULL WHERE session_id = ?",
+      )
+      .run(sessionId);
+  }
+
+  /** Drop every queued (sent or not) local row for a conversation — used when
+   *  the user opts a session out. */
+  deleteAllForConversation(conversationId: string): number {
+    return this.db
+      .prepare("DELETE FROM pending_messages WHERE conversation_id = ?")
+      .run(conversationId).changes;
   }
 
   // ── Pending messages ──

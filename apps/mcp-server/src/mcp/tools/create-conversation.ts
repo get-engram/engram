@@ -19,7 +19,7 @@ export function registerCreateConversation(
     "create_conversation",
     {
       description:
-        "Create a new conversation and return its conversation_id, used to group subsequently appended messages under one topic.",
+        "Create a new conversation and return its conversation_id, used to group subsequently appended messages under one topic. Memory is scoped to the user's account; on multi-seat team accounts, a stored conversation is visible to the whole team by default and can be restricted to its creator with visibility 'private'.",
       inputSchema: {
         title: z.string().optional().describe("Title for the conversation"),
         agent_id: z.string().optional().describe("Agent identifier (e.g. \"chatgpt\")"),
@@ -42,6 +42,9 @@ export function registerCreateConversation(
         title: "Create conversation",
         readOnlyHint: false,
         destructiveHint: false,
+        // Two identical calls create two conversations (unless an
+        // import_fingerprint matches) — not idempotent.
+        idempotentHint: false,
         openWorldHint: false,
       },
     },

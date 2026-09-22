@@ -22,7 +22,7 @@ export function registerSearch(
     "search",
     {
       description:
-        "Recall from the user's long-term memory. CALL THIS AT THE START of a task, and whenever the user references something from before ('what did we decide', 'like last time', 'my usual', a project/person/preference by name), to pull relevant prior context before answering — don't wait to be asked to search. Hybrid search (semantic + keyword) across stored conversations. Each result includes a short chunk_summary, the full chunk_text snippet, conversation_title, tags, and relevance scores, best match first.",
+        "Searches the user's long-term memory. Applicable when previously saved context is relevant to the current request — for example when the user references something from before ('what did we decide', 'like last time', 'my usual', a project/person/preference by name) or asks what is remembered about a topic. Hybrid search (semantic + keyword) across stored conversations. Each result includes a short chunk_summary, the full chunk_text snippet, conversation_title, tags, and relevance scores, best match first.",
       inputSchema: {
       query: z.string().max(MAX_SEARCH_QUERY_CHARS).describe("Search query text"),
       limit: z

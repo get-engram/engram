@@ -320,6 +320,54 @@ describe("MCP tool contract — wire field names", () => {
     });
   });
 
+  describe("directory compliance — no imperatives or upsell in injected text", () => {
+    // Both app stores rejected the listing (Sept 2026) for imperatives aimed
+    // at the model ("CALL THIS PROACTIVELY", "no permission-asking") and
+    // marketing in injected context. Instructions and tool descriptions must
+    // describe what a tool does and when it applies — nothing else. This
+    // pins every string a client sees at initialize/list-tools time.
+    const BANNED = [
+      /proactiv/i,
+      /without (being |waiting to be )?asked/i,
+      /right now/i,
+      /call this/i,
+      /no permission|don'?t ask permission|do not ask permission/i,
+      /don'?t wait/i,
+      /act[,.]? don'?t instruct/i,
+      /getengram\.app\/(dashboard|pricing|chatgpt)/i,
+    ];
+
+    it("server instructions are descriptive only", async () => {
+      const { SERVER_INSTRUCTIONS, VAULT_INSTRUCTIONS_OAUTH, VAULT_INSTRUCTIONS_FIRST_PARTY } =
+        await import("../mcp/server.js");
+      for (const text of [SERVER_INSTRUCTIONS, VAULT_INSTRUCTIONS_OAUTH, VAULT_INSTRUCTIONS_FIRST_PARTY]) {
+        for (const re of BANNED) {
+          expect(text, `banned pattern ${re} in server instructions`).not.toMatch(re);
+        }
+      }
+    });
+
+    it("every tool description is descriptive only", () => {
+      const { server, tools } = createCaptureServer();
+      registerCreateConversation(server, env, auth);
+      registerAppendMessages(server, env, auth);
+      registerSearch(server, env, auth);
+      registerGetConversation(server, env, auth);
+      registerListConversations(server, env, auth);
+      registerDeleteConversation(server, env, auth);
+      registerResolveVault(server, env, auth);
+      registerVaultSet(server, env, auth);
+      registerVaultGet(server, env, auth);
+      registerVaultList(server, env, auth);
+      registerVaultDelete(server, env, auth);
+      for (const [name, tool] of tools) {
+        for (const re of BANNED) {
+          expect(tool.description ?? "", `banned pattern ${re} in ${name}`).not.toMatch(re);
+        }
+      }
+    });
+  });
+
   describe("vault scope enforcement", () => {
     // A key issued read-only must never be able to mutate the vault. Before
     // this, the five vault tools skipped hasScope() entirely, so a read-only

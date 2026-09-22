@@ -39,6 +39,9 @@ export function registerManageSubscription(
       title: "Manage subscription",
       readOnlyHint: false,
       destructiveHint: false,
+      // Repeating an upgrade/downgrade request mints a fresh Stripe checkout
+      // or portal session each time — not idempotent.
+      idempotentHint: false,
       openWorldHint: true,
     },
     async (params) => {

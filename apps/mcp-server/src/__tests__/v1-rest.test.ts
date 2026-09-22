@@ -313,3 +313,101 @@ describe("REST v1 — update message (PATCH)", () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe("REST v1 — delete message (DELETE)", () => {
+  it("requires the delete scope", async () => {
+    const db = createMockD1();
+    const env = createMockEnv(db);
+    const app = createApp("org_del", ["read", "write", "search"]);
+    const res = await app.request(
+      "/api/v1/conversations/conv_x/messages/msg_x",
+      { method: "DELETE" },
+      env,
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("404s for a missing conversation or message", async () => {
+    const db = createMockD1();
+    const env = createMockEnv(db);
+    await insertOrganization(db, "org_del2", "Del Org 2");
+    const app = createApp("org_del2");
+    const res = await app.request(
+      "/api/v1/conversations/conv_missing/messages/msg_x",
+      { method: "DELETE" },
+      env,
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("deletes a message: row gone, count decremented, storage released", async () => {
+    const db = createMockD1();
+    const env = createMockEnv(db);
+    await insertOrganization(db, "org_del3", "Del Org 3");
+    const app = new Hono<HonoEnv>();
+    app.use("*", async (c, next) => {
+      c.set("auth", {
+        organizationId: "org_del3",
+        apiKeyId: "key_test",
+        scopes: ["read", "write", "search", "delete"] as Scope[],
+        tier: "enterprise" as const,
+      });
+      await next();
+    });
+    app.route("/api/v1", v1);
+
+    const create = await app.request(
+      "/api/v1/conversations",
+      { method: "POST", body: JSON.stringify({ title: "Delete from me" }), headers: { "Content-Type": "application/json" } },
+      env,
+    );
+    const { conversation_id: convId } = (await create.json()) as {
+      conversation_id: string;
+    };
+
+    const append = await app.request(
+      "/api/v1/messages",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          conversation_id: convId,
+          messages: [
+            { role: "user", content: "keep this one" },
+            { role: "user", content: "delete this one" },
+          ],
+        }),
+        headers: { "Content-Type": "application/json" },
+      },
+      env,
+    );
+    expect(append.status).toBe(200);
+    const { message_ids } = (await append.json()) as { message_ids: string[] };
+    expect(message_ids.length).toBe(2);
+
+    const del = await app.request(
+      `/api/v1/conversations/${convId}/messages/${message_ids[1]}`,
+      { method: "DELETE" },
+      env,
+    );
+    expect(del.status).toBe(200);
+    const body = (await del.json()) as { deleted: boolean; message_id: string };
+    expect(body.deleted).toBe(true);
+    expect(body.message_id).toBe(message_ids[1]);
+
+    // Idempotence from the caller's view: a second delete of the same id 404s.
+    const again = await app.request(
+      `/api/v1/conversations/${convId}/messages/${message_ids[1]}`,
+      { method: "DELETE" },
+      env,
+    );
+    expect(again.status).toBe(404);
+
+    // The sibling message is untouched.
+    const remaining = await app.request(
+      `/api/v1/conversations/${convId}/messages/${message_ids[0]}`,
+      { method: "DELETE" },
+      env,
+    );
+    expect(remaining.status).toBe(200);
+  });
+});

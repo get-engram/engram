@@ -10,6 +10,7 @@ import {
   deleteConversation,
   appendMessages,
   updateMessage,
+  deleteMessage,
   getOrCreateDefaultConversation,
 } from "../services/conversation.js";
 import {
@@ -418,6 +419,41 @@ v1.patch("/conversations/:id/messages/:messageId", async (c) => {
       sequence: updated.sequence,
     },
   });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /api/v1/conversations/:id/messages/:messageId — delete ONE message
+// (its content, its row, and its slice of the search index). Requires the
+// delete scope, like conversation deletion.
+// ---------------------------------------------------------------------------
+
+v1.delete("/conversations/:id/messages/:messageId", async (c) => {
+  const auth = c.get("auth");
+  if (!hasScope(auth, "delete")) return scopeError(c, "delete");
+
+  const conversationId = c.req.param("id");
+  const messageId = c.req.param("messageId");
+
+  const deleted = await deleteMessage(
+    c.env,
+    auth.organizationId,
+    conversationId,
+    messageId,
+    auth,
+  );
+  if (!deleted) {
+    return c.json({ error: "not_found", message: "Conversation or message not found" }, 404);
+  }
+
+  await audit(c.env.DB, auth.organizationId, auth.apiKeyId, "message.delete", "message", messageId, {
+    conversation_id: conversationId,
+  });
+  fireWebhooks(c.env.DB, auth.organizationId, "message.deleted", {
+    conversation_id: conversationId,
+    message_id: messageId,
+  });
+
+  return c.json({ deleted: true, message_id: messageId });
 });
 
 // ---------------------------------------------------------------------------

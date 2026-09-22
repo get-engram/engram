@@ -59,9 +59,15 @@ export async function loadContent(
   if (enc && enc.startsWith("r2:")) {
     const obj = await env.CONTENT.get(r2Key(msg.id));
     if (!obj) {
-      // A row marked r2:* must have an object; surface the inconsistency
-      // loudly instead of returning empty content that looks like data loss.
-      throw new Error(`[content-store] R2 object missing for message ${msg.id}`);
+      // A row marked r2:* should always have an object. This used to throw —
+      // but one orphaned row then made the ENTIRE conversation unreadable
+      // (get_conversation 500s) and, for connector users who can't call
+      // delete, un-fixable: a permanent brick (real case: an imported
+      // conversation, Sept 2026 support). Degrade to an explicit placeholder
+      // instead: the conversation stays readable, exportable, and deletable,
+      // and the log line keeps the inconsistency observable.
+      console.error(`[content-store] R2 object missing for message ${msg.id} — serving placeholder`);
+      return `[Message content unavailable: the stored copy of this message (${msg.id}) is missing. The rest of the conversation is unaffected.]`;
     }
     const stored = await obj.text();
     const realEnc = enc.slice(3); // strip "r2:"

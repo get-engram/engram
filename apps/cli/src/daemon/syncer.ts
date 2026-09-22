@@ -2,6 +2,7 @@ import type { Engram } from "@getengram/sdk";
 import { DaemonDb } from "./db.js";
 import { recordSuccess, recordFailure, classifyError } from "./status.js";
 import { parseStorageFullError } from "../storage-error.js";
+import { isPathExcluded, detectOptOut } from "./exclusions.js";
 import type { ParsedMessage, SessionMeta, PendingRow } from "./types.js";
 
 // Claude Code transcript messages can be enormous (tool output dumps), and
@@ -60,6 +61,25 @@ export class Syncer {
     meta: SessionMeta,
     messages: ParsedMessage[],
   ): Promise<void> {
+    // Capture exclusions (engram#462) — checked here, the single funnel, so
+    // an excluded session never touches the queue or the network.
+
+    // A session the user already opted out of stays out.
+    if (this.db.isSessionExcluded(sessionId)) return;
+
+    // Repo/directory exclusions: `engram exclude add <path>` or a
+    // .engramignore marker at the repo root. Checked per batch (cheap,
+    // cached) so a freshly added exclusion applies without a restart.
+    if (isPathExcluded(meta.cwd)) return;
+
+    // In-chat opt-out: a USER message saying "don't save this to engram"
+    // (or `engram:ignore`) excludes the whole session — including what was
+    // already captured.
+    if (messages.some((m) => m.role === "user" && detectOptOut(m.content))) {
+      await this.excludeSession(sessionId, "in-chat opt-out");
+      return;
+    }
+
     // Check if we already have a mapping
     let conversationId = this.db.getConversationId(sessionId);
 
@@ -71,6 +91,58 @@ export class Syncer {
     }
 
     this.db.enqueue(conversationId, messages);
+  }
+
+  /**
+   * The user said not to save this session. Semantics are "this session was
+   * never captured": stop future capture, wipe the local queue, and delete
+   * whatever already reached the server. The remote delete is persisted in
+   * excluded_sessions.delete_pending and retried from the flush loop until
+   * it succeeds — offline opt-out must still stick.
+   */
+  private async excludeSession(sessionId: string, reason: string): Promise<void> {
+    const conversationId = this.db.getConversationId(sessionId);
+
+    this.db.markSessionExcluded(sessionId, reason, conversationId ?? undefined);
+    this.pendingSessions.delete(sessionId);
+    const dropped =
+      this.db.deleteAllForConversation(`pending:${sessionId}`) +
+      (conversationId ? this.db.deleteAllForConversation(conversationId) : 0);
+
+    console.log(
+      `[engram] session ${sessionId} excluded (${reason}) — ` +
+        `${dropped} queued message(s) dropped` +
+        (conversationId ? ", deleting synced copy" : ""),
+    );
+
+    if (conversationId) {
+      await this.retryRemoteDeletes();
+    }
+  }
+
+  /** Delete server-side conversations for opted-out sessions; keeps
+   *  delete_pending until the server confirms. */
+  private async retryRemoteDeletes(): Promise<void> {
+    for (const row of this.db.getPendingRemoteDeletes()) {
+      try {
+        await this.client.deleteConversation(row.delete_pending);
+        this.db.clearPendingRemoteDelete(row.session_id);
+        console.log(
+          `[engram] deleted synced conversation ${row.delete_pending} for opted-out session`,
+        );
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // "Not found" means it's already gone (or was never fully created) —
+        // the promise is kept either way.
+        if (msg.includes("404") || /not.?found/i.test(msg)) {
+          this.db.clearPendingRemoteDelete(row.session_id);
+          continue;
+        }
+        console.error(
+          `[engram] opt-out delete failed for ${row.delete_pending} (will retry): ${msg}`,
+        );
+      }
+    }
   }
 
   startFlushLoop(): void {
@@ -94,6 +166,10 @@ export class Syncer {
     this.flushing = true;
 
     try {
+      // Step 0: Honor opt-outs whose server-side delete hasn't landed yet
+      // (e.g. the machine was offline when the user said "don't save this").
+      await this.retryRemoteDeletes();
+
       // Step 1: Create any pending conversations
       await this.createPendingConversations();
 
@@ -151,6 +227,17 @@ export class Syncer {
           if (this.db.getConversationId(sessionId)) return;
 
           const conversationId = await this.createConversation(sessionId, meta);
+
+          // Opt-out race (engram#462): the user may have said "don't save
+          // this" while the create was in flight — excludeSession saw no
+          // conversation id yet, so it couldn't schedule the remote delete.
+          // Schedule it now; the flush loop's retryRemoteDeletes handles it.
+          if (this.db.isSessionExcluded(sessionId)) {
+            this.db.markSessionExcluded(sessionId, "in-chat opt-out", conversationId);
+            this.db.deleteAllForConversation(`pending:${sessionId}`);
+            this.db.deleteAllForConversation(conversationId);
+            return;
+          }
 
           // Migrate pending messages from pending:sessionId → real conversationId
           this.db.remapPending(`pending:${sessionId}`, conversationId);

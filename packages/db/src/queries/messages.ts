@@ -136,6 +136,31 @@ export function getMessageById(
     .first();
 }
 
+/**
+ * Delete one message AND decrement the conversation's message_count in one
+ * atomic batch (mirror of insertMessagesWithCount — split writes are how the
+ * counter drifted historically). Org- and conversation-scoped.
+ */
+export function deleteMessageWithCount(
+  db: D1Database,
+  messageId: string,
+  conversationId: string,
+  organizationId: string
+) {
+  return db.batch([
+    db
+      .prepare(
+        "DELETE FROM messages WHERE id = ? AND conversation_id = ? AND organization_id = ?"
+      )
+      .bind(messageId, conversationId, organizationId),
+    db
+      .prepare(
+        "UPDATE conversations SET message_count = MAX(message_count - 1, 0), updated_at = datetime('now') WHERE id = ? AND organization_id = ?"
+      )
+      .bind(conversationId, organizationId),
+  ]);
+}
+
 export function updateMessageContent(
   db: D1Database,
   messageId: string,

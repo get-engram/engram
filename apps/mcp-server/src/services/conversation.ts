@@ -24,6 +24,7 @@ import {
   getVectorizeIdsByConversation,
   insertVaultEntries,
   getMessageById,
+  deleteMessageWithCount,
   updateMessageContent,
   getMessagesBySequenceRange,
   getChunksOverlappingSequence,
@@ -460,19 +461,45 @@ export async function updateMessage(
   // per-append-batch, so re-chunking just the window spanned by the
   // invalidated chunks can't shift neighbours.
   try {
+    await reindexSequenceWindow(env, conversationId, organizationId, existing.sequence);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[index] Failed to reindex after edit of ${messageId}: ${msg}`
+    );
+  }
+
+  return updated;
+}
+
+/**
+ * Rebuild the search index for the chunk window that spans `sequence`:
+ * overlapping chunks are deleted (D1 + FTS + Vectorize) and regenerated from
+ * the CURRENT message rows in that window. Shared by message edit (content
+ * changed) and message delete (row gone — the window regenerates without it).
+ * Chunk boundaries are per-append-batch, so re-chunking only the spanned
+ * window can't shift neighbouring chunks.
+ */
+async function reindexSequenceWindow(
+  env: Env,
+  conversationId: string,
+  organizationId: string,
+  sequence: number
+): Promise<void> {
+  {
     const overlapping = await getChunksOverlappingSequence(
       env.DB,
       conversationId,
       organizationId,
-      existing.sequence
+      sequence
     );
     const old = overlapping.results ?? [];
     const startSeq = old.length
       ? Math.min(...old.map((c) => c.start_sequence))
-      : existing.sequence;
+      : sequence;
     const endSeq = old.length
       ? Math.max(...old.map((c) => c.end_sequence))
-      : existing.sequence;
+      : sequence;
 
     const windowResult = await getMessagesBySequenceRange(
       env.DB,
@@ -556,14 +583,65 @@ export async function updateMessage(
         }))
       );
     }
+  }
+}
+
+/**
+ * Permanently delete a single message: its R2 body, its D1 row (with an
+ * atomic message_count decrement), and its slice of the search index — the
+ * chunk window it participated in is regenerated from the remaining messages,
+ * so recall can no longer surface the deleted content.
+ *
+ * Returns false if the conversation/message doesn't exist (or the viewer
+ * can't access a private conversation) — indistinguishable from absent,
+ * like the other delete paths.
+ */
+export async function deleteMessage(
+  env: Env,
+  organizationId: string,
+  conversationId: string,
+  messageId: string,
+  viewer?: AuthContext
+): Promise<boolean> {
+  const conv = await getConversationById(env.DB, conversationId, organizationId);
+  if (!conv) return false;
+  if (
+    viewer &&
+    !canAccessConversation(
+      viewer,
+      conv as { visibility?: string | null; seat_id?: string | null }
+    )
+  ) {
+    return false;
+  }
+
+  const existing = (await getMessageById(env.DB, messageId, organizationId)) as
+    | (Record<string, unknown> & { conversation_id: string; sequence: number })
+    | null;
+  if (!existing || existing.conversation_id !== conversationId) return false;
+
+  // R2 before D1, same as conversation delete: the row is the only pointer
+  // to the object — delete the row first and the body is orphaned forever.
+  // deleteContent is idempotent for inline/missing objects.
+  await deleteContent(env, [messageId]);
+
+  await deleteMessageWithCount(env.DB, messageId, conversationId, organizationId);
+
+  // Reindex is best-effort like edit — but a failure here means the deleted
+  // text may still be recalled from a stale chunk, so log it loudly.
+  try {
+    await reindexSequenceWindow(env, conversationId, organizationId, existing.sequence);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(
-      `[index] Failed to reindex after edit of ${messageId}: ${msg}`
+      `[index] Failed to reindex after delete of ${messageId} — stale chunks may remain until the next reindex: ${msg}`
     );
   }
 
-  return updated;
+  // Deleting frees storage (engram#275), one message's worth.
+  await releaseStorage(env.DB, organizationId, 1);
+
+  return true;
 }
 
 export async function deleteConversation(

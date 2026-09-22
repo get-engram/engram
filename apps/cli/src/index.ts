@@ -20,6 +20,7 @@ import { autoEnableCapture } from "./daemon/commands.js";
 import { upgrade } from "./commands/upgrade.js";
 import { usage as showUsage } from "./commands/usage.js";
 import { vaultKeygen, vaultStatus, loadVaultKey, vaultSet, vaultGet, vaultList, vaultDelete } from "./commands/vault.js";
+import { excludeAdd, excludeRemove, excludeList } from "./commands/exclude.js";
 import { bold, dim, red } from "./output.js";
 import { readStatus, syncErrorSummary } from "./daemon/status.js";
 
@@ -45,7 +46,7 @@ const TOP_COMMANDS = new Set([
   "signup", "login", "link", "whoami", "upgrade", "import",
 ]);
 // Commands that take 2 words (group + subcommand)
-const GROUP_COMMANDS = new Set(["auth", "conversations", "conv", "daemon", "vault"]);
+const GROUP_COMMANDS = new Set(["auth", "conversations", "conv", "daemon", "vault", "exclude"]);
 
 function parseArgs(argv: string[]): {
   command: string[];
@@ -167,6 +168,12 @@ ${bold("COMMANDS")}
   ${bold("vault list")}               List secret names ${dim("(never shows values)")}
   ${bold("vault delete")} <name>      Delete a named secret permanently
 
+  ${bold("exclude add")} [path]       Never capture sessions in a directory ${dim("(default: cwd)")}
+  ${bold("exclude remove")} [path]    Re-enable capture for a directory
+  ${bold("exclude list")}             Show excluded paths
+  ${dim("Also: a .engramignore file at a repo root excludes that repo (committable),")}
+  ${dim('and saying "don\'t save this to engram" in a session excludes + erases it.')}
+
   ${bold("start")}                    Start background daemon (auto-capture)
   ${bold("stop")}                     Stop the daemon
   ${bold("status")}                   Show daemon status and sync info
@@ -252,6 +259,9 @@ async function main(): Promise<void> {
   const CAPTURE_EXEMPT = new Set([
     "help", "version", "start", "stop", "restart", "install", "uninstall",
     "status", "log", "signup", "login", "link", "auth login", "auth logout",
+    // A user configuring exclusions is expressing a privacy preference —
+    // that must never silently resurrect the capture daemon (engram#462).
+    "exclude", "exclude add", "exclude remove", "exclude rm", "exclude list", "exclude ls",
   ]);
   const ensureCaptureAfter = !CAPTURE_EXEMPT.has(cmd);
 
@@ -377,6 +387,22 @@ async function main(): Promise<void> {
       case "vault status":
       case "vault":
         await vaultStatus();
+        break;
+
+      // Capture exclusions (engram#462)
+      case "exclude add":
+        await excludeAdd(args);
+        break;
+
+      case "exclude remove":
+      case "exclude rm":
+        await excludeRemove(args);
+        break;
+
+      case "exclude list":
+      case "exclude ls":
+      case "exclude":
+        await excludeList();
         break;
 
       // Daemon commands — short aliases + namespaced

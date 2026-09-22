@@ -11,6 +11,10 @@ interface Config {
   /** "off" = the user explicitly stopped capture; the CLI must not
    *  resurrect the daemon until they run start/install again. */
   autocapture?: "on" | "off";
+  /** Absolute paths whose sessions are never captured (engram#462).
+   *  Managed via `engram exclude add|remove|list`; the daemon hot-reloads
+   *  this list, no restart needed. */
+  excludePaths?: string[];
 }
 
 export async function loadConfig(): Promise<Config> {

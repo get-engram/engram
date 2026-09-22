@@ -17,25 +17,24 @@ import { registerAdminMetrics } from "./tools/admin-metrics.js";
 import { isExternalOAuthClient } from "./auth-kind.js";
 import type { Env, AuthContext } from "../types.js";
 
-// Surfaced to clients (ChatGPT, Claude, …) in the MCP `initialize` response so
-// the model knows to use Engram for memory proactively, without being asked —
-// and that it owns the conversation_id rather than asking the user for one.
-const SERVER_INSTRUCTIONS = `Engram is persistent, searchable memory. Use it proactively, without waiting to be asked.
+// Surfaced to clients in the MCP `initialize` response. Directory policy
+// (both Anthropic's and OpenAI's reviewers, Sept 2026): instructions and tool
+// descriptions may describe what a tool does and when it applies — they must
+// NOT contain imperatives aimed at the model (unprompted tool calls,
+// "no permission-asking"), scripted reply wording, or marketing/upsell copy.
+// The user (or the assistant, with the user's consent) decides when tools
+// are called. Keep every sentence here descriptive, or the listing gets
+// rejected again.
+export const SERVER_INSTRUCTIONS = `Engram provides persistent, user-controlled memory: conversation content the user chooses to save, stored verbatim and searchable by meaning across their connected apps.
 
-FIRST-TIME EXPERIENCE — act, don't instruct:
-On the first user turn in a chat, call \`memory_status\`. If \`storage.used\` is 1 or less (a brand-new account — the only thing stored is an auto-generated welcome note), this account has never saved or recalled anything yet. Do NOT open by explaining what Engram is, listing features, or giving instructions — the experienced save IS the onboarding:
-1. If the user's message contains ANY substantive content (a task, a topic, a preference, a fact about them): call \`append_messages\` with it immediately — no permission-asking, no preamble. Handle their actual request normally. Then PROVE the memory works instead of describing it: call \`search\` for what you just saved and show them the stored text coming back ("Here it is, already searchable: …"), followed by one line — "Open a brand-new chat, or a different app like Claude or Cursor, and ask what I remember about you." Seeing the round-trip is what makes it click.
-2. ONLY if the message is contentless (a bare greeting) is there nothing to save yet: ask one direct question — "What's one thing future conversations should remember — a project, a preference, a goal, or a person?" — and call \`append_messages\` with their answer the moment it arrives, replying "Saved to Engram."
-After the first real save, mention at most ONE next thing, only when it fits the conversation naturally (e.g. their full ChatGPT history can be imported at getengram.app/dashboard). Never present menus of options.
-
-- Recall: at the start of a task, call \`search\` with a short summary of the user's request to surface relevant prior context, and use what you find. Read chunk_summary to pick the relevant result, then chunk_text or \`get_conversation\` for full context. One search is enough — do not retry with rephrased queries.
-- Store: when something worth remembering is established — a decision, preference, fact, or useful context — call \`append_messages\` with the relevant messages from the current conversation, verbatim. conversation_id is OPTIONAL — omit it to use the user's default memory; never ask the user for one. Use \`create_conversation\` first only to group a distinct topic, then reuse that id.
-- "Remember this / save this chat": store the messages already in THIS conversation. You cannot retrieve the user's past or external conversations — so if they ask you to remember their whole history, save the current exchange, then tell them Engram records going forward and that they can bulk-import their full history by exporting their ChatGPT (or Claude) data and running \`engram import\` (see getengram.app/docs). Do not attempt to gather, reconstruct, or forward their entire chat history — you don't have access to it.
-- "Remember everything from this point forward": treat this as standing consent — keep calling \`append_messages\` with the substantive turns as the conversation develops, without asking again. Confirm briefly each time so the user knows what was saved.
-- "What do you remember about ___?": call \`search\` and answer strictly from the results — that shows what is actually stored, not what only exists in the current chat.
-- "How full is my memory?" / plan or usage questions: call \`memory_status\` and show the user the bar line verbatim (e.g. [████████░░] 82%).
-- Images and screenshots: Engram stores text. Write out what the image shows or means (names, facts, quotes), then store that text.
-- Skip trivial chatter (greetings, acknowledgements). Storage is verbatim and searchable by meaning.`;
+Tool applicability:
+- \`search\`: applicable when previously saved context is relevant to the user's request, or when the user asks what is remembered about a topic. Results include a chunk_summary for choosing among matches; chunk_text or \`get_conversation\` provide full context. Answers about stored memory should come from search results, which reflect what is actually stored.
+- \`append_messages\`: stores messages verbatim when the user asks to remember something ("remember this", "save this chat" — meaning messages from the current conversation). conversation_id is optional; when omitted, content is stored in the user's default memory. A request like "remember everything from this point forward" expresses the user's standing consent to save substantive turns as the conversation continues; a brief confirmation when saving keeps the user informed. Trivial chatter (greetings, acknowledgements) is not meaningful to store.
+- \`create_conversation\`: groups content for a distinct topic under its own conversation id, which can then be reused for related saves.
+- \`delete_conversation\`: permanently removes a stored conversation.
+- \`memory_status\`: reports storage usage and plan state, for questions like "how full is my memory?".
+- Engram stores text only; the content of an image can be stored as a written description.
+- Engram has no access to conversations outside the ones stored in it: past or external chat history cannot be retrieved or reconstructed. Users can bulk-import exported history from their account dashboard.`;
 
 // Secrets guidance differs by connection kind: OAuth connectors can't see
 // the vault tools (app marketplaces prohibit credential collection), which
@@ -44,13 +43,13 @@ After the first real save, mention at most ONE next thing, only when it fits the
 // existence explicit and keep secrets out of append_messages.
 const VAULT_INSTRUCTIONS_SHARED = `
 
-SECRETS — Engram includes a zero-knowledge encrypted vault, separate from memory. Memory (append_messages) is searchable, cloud-synced text that resurfaces in future context — NEVER store passwords, API keys, tokens, or government IDs there, even if the user asks; offer the vault instead.`;
+Secrets: Engram includes a zero-knowledge encrypted vault, separate from memory. Memory (append_messages) is searchable, cloud-synced text that resurfaces in future context, so it is not a suitable place for passwords, API keys, tokens, or government IDs — the vault is the appropriate store for those.`;
 
-const VAULT_INSTRUCTIONS_OAUTH = `${VAULT_INSTRUCTIONS_SHARED}
-When the user wants to save a secret ("save my API key", "add this to my vault"): this connector cannot access the vault (platform rules prohibit collecting credentials here), but the vault EXISTS — tell them to run \`engram vault set <NAME>\` with the Engram CLI, which encrypts the value on their machine (AES-256-GCM) before upload; the server never sees plaintext. Setup: getengram.app/docs.`;
+export const VAULT_INSTRUCTIONS_OAUTH = `${VAULT_INSTRUCTIONS_SHARED}
+The vault is not accessible from this connector (app-platform rules prohibit collecting credentials here). Secrets can be stored with the Engram CLI (\`engram vault set <NAME>\`), which encrypts the value on the user's machine (AES-256-GCM) before upload; the server never sees plaintext.`;
 
-const VAULT_INSTRUCTIONS_FIRST_PARTY = `${VAULT_INSTRUCTIONS_SHARED}
-When the user wants to save a secret, use the vault tools (vault_set / vault_get / vault_list / resolve_vault). Values must be encrypted client-side with the user's vault key (from \`engram vault keygen\`) before calling vault_set — the server only stores ciphertext. If you don't hold the vault key, direct the user to \`engram vault set <NAME>\` in the CLI, which handles encryption locally.`;
+export const VAULT_INSTRUCTIONS_FIRST_PARTY = `${VAULT_INSTRUCTIONS_SHARED}
+The vault tools (vault_set / vault_get / vault_list / resolve_vault) apply when the user asks to store or retrieve a secret. vault_set accepts values already encrypted client-side with the user's vault key (from \`engram vault keygen\`) — the server only stores ciphertext. Without the vault key, the Engram CLI (\`engram vault set <NAME>\`) handles encryption locally.`;
 
 export function createMcpServer(env: Env, auth: AuthContext): McpServer {
   const instructions =

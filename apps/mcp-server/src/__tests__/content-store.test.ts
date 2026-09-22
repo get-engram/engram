@@ -50,11 +50,20 @@ describe("content-store", () => {
     );
   });
 
-  it("throws loudly (never returns empty) if an r2-marked object is missing", async () => {
+  it("serves an explicit placeholder (never empty, never throws) if an r2-marked object is missing", async () => {
+    // Throwing here used to 500 the whole conversation on one orphaned row —
+    // unreadable AND (for connector users, who have no delete scope)
+    // undeletable. The placeholder keeps the conversation usable and names
+    // the affected message; the console.error keeps it observable.
     const e = env();
-    await expect(
-      loadContent(e, { id: "msg_missing", content: "", content_encoding: "r2:raw" }),
-    ).rejects.toThrow(/missing/);
+    const content = await loadContent(e, {
+      id: "msg_missing",
+      content: "",
+      content_encoding: "r2:raw",
+    });
+    expect(content).toMatch(/content unavailable/i);
+    expect(content).toContain("msg_missing");
+    expect(content.length).toBeGreaterThan(0);
   });
 });
 

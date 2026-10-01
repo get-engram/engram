@@ -1,9 +1,16 @@
 // User-facing copy for plan limits + usage, tailored for OAuth-connected apps
-// (ChatGPT/Claude) vs first-party API-key/SDK callers. OAuth users are routed
-// to their own dashboard to upgrade (their org was provisioned with the email
-// they connected) — we never try to sell/charge inside the app.
+// (ChatGPT/Claude) vs first-party API-key/SDK callers.
+//
+// Connector (isOAuth) copy is FACTUAL ONLY — it states the account's state and
+// where capacity is managed, with no URLs, no scripted reply wording ("tell the
+// user, warmly…"), and no directives aimed at the model. Both app directories
+// rejected the listing for exactly that (Sept 2026), and Anthropic was explicit
+// that an instruction moved into a tool output is still an instruction. The
+// contract test scans these strings; keep them descriptive.
+//
+// First-party copy (API keys / SDK — the user's own agents) may carry a login
+// URL: there is no app-store reviewer on that surface.
 
-const DASHBOARD = "https://getengram.app/dashboard";
 const PRICING = "https://getengram.app/pricing";
 // API-key/CLI users may have no email on the account — the dashboard's
 // key login ("Sign in with your API key" at /login) is their upgrade path.
@@ -49,17 +56,11 @@ export function limitMessage(opts: {
 }): string {
   const { unit, tier, limit, used, isOAuth } = opts;
   if (isOAuth) {
-    const planName = tier && tier !== "free" ? `${tier} plan's` : "free plan's";
-    const remedy =
-      tier && tier !== "free"
-        ? `open ${DASHBOARD}, sign in with the email they used to connect this app, and manage their plan (add capacity or seats)`
-        : `open ${DASHBOARD}, sign in with the email they used to connect this app, and choose Upgrade`;
+    const plan = tier && tier !== "free" ? tier : "free";
     return (
-      `You've reached the ${planName} monthly limit (${limit ?? "the included"} ${unit}). ` +
-      `Everything so far is safely saved in Engram. ` +
-      `Tell the user, warmly, that to keep saving memories they can ${remedy} — ` +
-      `the same account powers this connection, so the higher limit applies right away. ` +
-      `Don't try to collect payment here; just point them to their dashboard.`
+      `Monthly limit reached on the ${plan} plan (${limit ?? "the included"} ${unit} this month). ` +
+      `Everything saved so far is stored and searchable. ` +
+      `Additional monthly capacity is managed from the Engram account that was used to connect this app.`
     );
   }
   return (
@@ -82,11 +83,10 @@ export function storageFullMessage(opts: {
   const size = limit ? `${limit.toLocaleString("en-US")} messages` : "its current size";
   if (isOAuth) {
     return (
-      `Engram's memory is full (${size}). Everything already saved is safe, ` +
-      `searchable, and never expires. Tell the user, warmly: to keep saving new ` +
-      `memories they can upgrade for more space — open ${DASHBOARD} and sign in ` +
-      `with the email they used to connect this app — or delete old conversations ` +
-      `to free room. Don't try to collect payment here; just point them to their dashboard.`
+      `Engram's memory is full (${size}). Everything already saved stays stored, ` +
+      `searchable, and never expires. Saving new memories resumes when capacity is ` +
+      `added from the Engram account that was used to connect this app, or when older ` +
+      `conversations are deleted.`
     );
   }
   return (
@@ -105,13 +105,17 @@ export function approachingStorageNotice(
 ): string | undefined {
   if (!meter || meter.limit <= 0) return undefined;
   if (meter.used / meter.limit < 0.8) return undefined;
-  const where = isOAuth
-    ? `sign in at ${DASHBOARD} with the email you connected and upgrade for more space`
-    : `${KEY_LOGIN} ($9/mo for 1,000,000 messages)`;
+  const usedStr = `${meter.used.toLocaleString("en-US")}/${meter.limit.toLocaleString("en-US")} messages of memory used ` +
+    `(${meter.remaining.toLocaleString("en-US")} left). Nothing ever expires`;
+  if (isOAuth) {
+    return (
+      `${usedStr}. Past the limit, saving new memories pauses until capacity is added ` +
+      `from the Engram account that was used to connect this app, or older conversations are deleted.`
+    );
+  }
   return (
-    `${meter.used.toLocaleString("en-US")}/${meter.limit.toLocaleString("en-US")} messages of memory used ` +
-    `(${meter.remaining.toLocaleString("en-US")} left). Nothing ever expires — but to keep saving new ` +
-    `memories past the limit, ${where}, or delete old conversations to free room.`
+    `${usedStr} — but to keep saving new memories past the limit, ` +
+    `${KEY_LOGIN} ($9/mo for 1,000,000 messages), or delete old conversations to free room.`
   );
 }
 
@@ -122,11 +126,25 @@ export function approachingLimitNotice(
 ): string | undefined {
   if (!meter || meter.limit <= 0) return undefined;
   if (meter.used / meter.limit < 0.8) return undefined;
-  const where = isOAuth
-    ? `sign in at ${DASHBOARD} with the email you connected and upgrade`
-    : KEY_LOGIN;
-  return (
-    `${meter.used}/${meter.limit} included messages used this month (${meter.remaining} left). ` +
-    `To avoid interruption, ${where}.`
-  );
+  const usedStr = `${meter.used}/${meter.limit} included messages used this month (${meter.remaining} left).`;
+  if (isOAuth) {
+    return (
+      `${usedStr} Past the monthly limit, saving pauses until the next cycle ` +
+      `or additional capacity is added from the Engram account that was used to connect this app.`
+    );
+  }
+  return `${usedStr} To avoid interruption, ${KEY_LOGIN}.`;
+}
+
+/**
+ * The `note` field of memory_status. Connector copy names where capacity is
+ * managed but carries no URL; first-party copy may point at pricing.
+ */
+export function storageNote(storageLimit: number, isOAuth: boolean): string {
+  if (storageLimit <= 0) {
+    return "Memory never expires. This plan has unlimited storage.";
+  }
+  return isOAuth
+    ? "Memory never expires — deleting conversations frees space. Additional capacity is available on higher plans, managed from the Engram account that was used to connect this app."
+    : "Memory never expires — deleting conversations frees space. More room: upgrade at getengram.app/pricing.";
 }

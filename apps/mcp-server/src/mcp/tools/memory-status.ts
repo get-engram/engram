@@ -3,7 +3,7 @@ import { z } from "zod";
 import { TIER_LIMITS } from "@getengram/shared";
 import { getUsage, getOrganizationById, getStorageUsed } from "@getengram/db";
 import { storageLimitFor } from "../../services/tier.js";
-import { usageMeter, meterBar } from "../usage-messaging.js";
+import { usageMeter, meterBar, storageNote } from "../usage-messaging.js";
 import { isExternalOAuthClient } from "../auth-kind.js";
 import { firstRunActivationForCount } from "../coaching.js";
 import type { Env, AuthContext } from "../../types.js";
@@ -68,9 +68,6 @@ export function registerMemoryStatus(
       const monthlyUsed = usage?.messages_stored ?? 0;
 
       const isOAuth = isExternalOAuthClient(auth);
-      const upgradeAt = isOAuth
-        ? "getengram.app/dashboard (sign in with the email used to connect this app)"
-        : "getengram.app/pricing";
 
       const monthlyMeter = usageMeter(monthlyUsed, monthlyLimit);
       const activation = firstRunActivationForCount(auth, storageUsed);
@@ -94,13 +91,9 @@ export function registerMemoryStatus(
               },
             }
           : {}),
-        note:
-          storageLimit > 0
-            ? `Memory never expires — deleting conversations frees space. More room: upgrade at ${upgradeAt}.`
-            : "Memory never expires. This plan has unlimited storage.",
-        // First-run forcing function — the server instructions tell clients to
-        // call memory_status first; the RESULT itself carries the activation
-        // script for brand-new accounts (storageUsed known here, no extra query).
+        note: storageNote(storageLimit, isOAuth),
+        // Brand-new accounts get a factual account-state note (coaching.ts) —
+        // descriptive only, per directory policy: no directives, no URLs.
         ...(activation ? { activation } : {}),
       };
 

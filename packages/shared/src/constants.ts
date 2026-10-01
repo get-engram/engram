@@ -4,6 +4,11 @@ export const VECTORIZE_INDEX_NAME = "engram-vectors";
 export const CHUNK_WINDOW_SIZE = 5;
 export const CHUNK_STRIDE = 3;
 export const MAX_MESSAGES_PER_APPEND = 200;
+// Cap for OAuth-connected apps (ChatGPT/Claude). Connectors store what the
+// user asks to remember from the current exchange — not transcripts. A small
+// cap is also what keeps the schema from reading as "send the full
+// conversation history" to app-store reviewers (OpenAI, Sept 2026).
+export const MAX_MESSAGES_PER_APPEND_CONNECTOR = 25;
 export const DEFAULT_SEARCH_LIMIT = 10;
 export const DEFAULT_MESSAGE_LIMIT = 100;
 export const DEFAULT_CONVERSATION_LIMIT = 20;

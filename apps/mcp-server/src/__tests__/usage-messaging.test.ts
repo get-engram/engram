@@ -20,11 +20,18 @@ describe("usageMeter", () => {
 });
 
 describe("limitMessage", () => {
-  it("routes OAuth users to their own dashboard, not a sale", () => {
+  // Connector copy used to carry a dashboard URL and a scripted instruction
+  // ("tell the user, warmly…", "don't try to collect payment here"). Both app
+  // directories rejected that in Sept 2026 — Anthropic noted an instruction in
+  // a tool output is still an instruction — so connector copy is now factual
+  // only: state the account's situation, name no URL, direct nobody.
+  it("states the limit factually for OAuth, with no URL or directive", () => {
     const m = limitMessage({ unit: "messages", tier: "free", limit: 1000, used: 1000, isOAuth: true });
-    expect(m).toContain("getengram.app/dashboard");
-    expect(m).toMatch(/sign in/i);
-    expect(m).toMatch(/don't try to collect payment/i);
+    expect(m).toMatch(/limit reached/i);
+    expect(m).toContain("1000");
+    expect(m).toMatch(/free plan/i);
+    expect(m).not.toMatch(/https?:\/\/|getengram\.app/i);
+    expect(m).not.toMatch(/tell the user|warmly|don'?t try to collect/i);
   });
   it("points API-key users to key login", () => {
     const m = limitMessage({ unit: "messages", tier: "free", limit: 1000, used: 1000, isOAuth: false });
@@ -35,7 +42,9 @@ describe("limitMessage", () => {
 
 describe("approachingLimitNotice", () => {
   it("warns at/above 80% usage", () => {
-    expect(approachingLimitNotice({ used: 800, limit: 1000, remaining: 200 }, true)).toMatch(/dashboard/);
+    const oauth = approachingLimitNotice({ used: 800, limit: 1000, remaining: 200 }, true);
+    expect(oauth).toContain("800/1000");
+    expect(oauth).not.toMatch(/https?:\/\/|getengram\.app/i);
     expect(approachingLimitNotice({ used: 950, limit: 1000, remaining: 50 }, false)).toMatch(/login/);
   });
   it("stays quiet below 80%", () => {

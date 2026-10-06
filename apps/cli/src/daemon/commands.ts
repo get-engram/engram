@@ -8,7 +8,7 @@ import {
   openSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { bold, dim, red } from "../output.js";
 import { loadConfig, saveConfig } from "../config.js";
 import { readStatus, type SyncStatus } from "./status.js";
@@ -32,6 +32,17 @@ const LOG_FILE = join(ENGRAM_DIR, "daemon.log");
 const PLIST_NAME = "app.getengram.daemon";
 const PLIST_DIR = join(homedir(), "Library", "LaunchAgents");
 const PLIST_PATH = join(PLIST_DIR, `${PLIST_NAME}.plist`);
+
+// Bump when generatePlist() changes in a way existing installs must pick up.
+// A plist is written once at install time and never revisited, so upgrading
+// the CLI alone does NOT fix a defect that lives in the plist — the stale file
+// keeps launching the old thing. Every machine installed before v2 is still
+// pointing launchd at `worker-main.js`, the pre-0.4.2 entry point that has no
+// ABI preflight, which is why the self-heal shipped in 0.4.2 has never once
+// run on them (engram#469).
+//
+// v2: launch `worker.js` (preflight bootstrap) and give the job a PATH.
+const PLIST_VERSION = 2;
 
 // Resolve the worker script path relative to this file's compiled location
 function getWorkerPath(): string {
@@ -103,6 +114,10 @@ export async function daemonStart(
     await import("./worker.js");
     return;
   }
+
+  // A stale plist survives every CLI upgrade, so check it here rather than
+  // only at install time (engram#469).
+  migrateLaunchdIfStale();
 
   // Spawn detached worker process
   mkdirSync(ENGRAM_DIR, { recursive: true });
@@ -207,7 +222,11 @@ export async function daemonStatus(): Promise<void> {
   console.log(`${dim("Log:")} ${LOG_FILE}`);
 
   if (isLaunchdInstalled()) {
-    console.log(`${dim("Auto-start:")} enabled (launchd)`);
+    const stale = installedPlistVersion() < PLIST_VERSION;
+    console.log(
+      `${dim("Auto-start:")} enabled (launchd)` +
+        (stale ? red("  — outdated config, run 'engram start' to update") : ""),
+    );
   }
 }
 
@@ -245,6 +264,13 @@ function printSyncWarnings(status: SyncStatus): void {
 function generatePlist(): string {
   const workerPath = getWorkerPath();
   const nodePath = process.execPath;
+  // launchd hands a job a bare PATH (/usr/bin:/bin:/usr/sbin:/sbin) — npm is
+  // not on it. The ABI self-heal in preflight.ts shells out to `npm rebuild
+  // better-sqlite3`, so without this it fails with command-not-found at the
+  // exact moment it is needed. npm ships beside the node binary, so putting
+  // node's own directory first makes the heal reachable.
+  const nodeBinDir = dirname(nodePath);
+  const jobPath = `${nodeBinDir}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -274,9 +300,73 @@ function generatePlist(): string {
   <dict>
     <key>HOME</key>
     <string>${homedir()}</string>
+    <key>PATH</key>
+    <string>${jobPath}</string>
+    <key>ENGRAM_PLIST_VERSION</key>
+    <string>${PLIST_VERSION}</string>
   </dict>
 </dict>
 </plist>`;
+}
+
+/** Version stamped into an installed plist; 1 for plists written before stamping. */
+function installedPlistVersion(): number {
+  try {
+    const xml = readFileSync(PLIST_PATH, "utf-8");
+    const m = xml.match(
+      /<key>ENGRAM_PLIST_VERSION<\/key>\s*<string>(\d+)<\/string>/,
+    );
+    return m ? parseInt(m[1], 10) : 1;
+  } catch {
+    return 1;
+  }
+}
+
+/**
+ * Rewrite and reload a stale launchd plist (engram#469).
+ *
+ * Without this, a plist defect is permanent: `brew upgrade` / `npm i -g`
+ * replaces the code but leaves the plist, so the machine keeps launching the
+ * old entry point forever. That is how a self-heal shipped in 0.4.2 was still
+ * inert on a 0.6.0 install. Runs on any daemon start; silent when current.
+ */
+export function migrateLaunchdIfStale(): boolean {
+  if (process.platform !== "darwin") return false;
+  if (!isLaunchdInstalled()) return false;
+  if (installedPlistVersion() >= PLIST_VERSION) return false;
+
+  try {
+    writeFileSync(PLIST_PATH, generatePlist());
+  } catch {
+    return false; // not fatal — the daemon can still run in this session
+  }
+
+  // bootout/bootstrap is the modern pair; fall back to unload/load on older
+  // macOS. Either way a failure here is non-fatal: the new plist is on disk
+  // and takes effect at next login.
+  const uid = process.getuid?.() ?? 0;
+  try {
+    execSync(`launchctl bootout gui/${uid}/${PLIST_NAME}`, { stdio: "pipe" });
+  } catch {
+    try {
+      execSync(`launchctl unload "${PLIST_PATH}"`, { stdio: "pipe" });
+    } catch {
+      // already unloaded
+    }
+  }
+  try {
+    execSync(`launchctl bootstrap gui/${uid} "${PLIST_PATH}"`, { stdio: "pipe" });
+  } catch {
+    try {
+      execSync(`launchctl load -w "${PLIST_PATH}"`, { stdio: "pipe" });
+    } catch {
+      // takes effect at next login
+    }
+  }
+  console.log(
+    `${bold("Updated auto-start configuration")} ${dim(`(plist v${PLIST_VERSION})`)}`,
+  );
+  return true;
 }
 
 function isLaunchdInstalled(): boolean {
@@ -351,6 +441,8 @@ export async function autoEnableCapture(): Promise<void> {
     }
     if (process.platform === "darwin" && !isLaunchdInstalled()) {
       installLaunchd();
+    } else {
+      migrateLaunchdIfStale();
     }
     console.log(
       `${bold("Auto-capture is on")} — conversations from supported agents on this machine save to your Engram.`,

@@ -81,14 +81,46 @@ billing.post("/checkout", async (c) => {
     .json<{
       success_url?: string;
       cancel_url?: string;
-      plan?: "pro" | "team";
+      plan?: "pro" | "team" | "student";
       quantity?: number;
     }>()
     .catch(() => ({}) as Record<string, never>);
 
-  const plan = body.plan === "team" ? "team" : "pro";
+  const requested =
+    body.plan === "team" ? "team" : body.plan === "student" ? "student" : "pro";
+
+  // Student pricing is gated server-side (engram#471). A client can ask for
+  // it, but only a current verification grants it — never trust the plan field
+  // to decide what something costs.
+  let plan: "pro" | "team" | "student" = requested;
+  if (requested === "student") {
+    const row = await c.env.DB.prepare(
+      `SELECT student_verified_at, student_expires_at FROM organizations WHERE id = ?`,
+    )
+      .bind(auth.organizationId)
+      .first<{ student_verified_at: string | null; student_expires_at: string | null }>();
+    const active =
+      !!row?.student_verified_at &&
+      !!row.student_expires_at &&
+      new Date(row.student_expires_at + "Z").getTime() > Date.now();
+    if (!active) {
+      return c.json(
+        {
+          error: "student_not_verified",
+          message:
+            "Student pricing requires a verified university email. Verify at /student/verify first.",
+        },
+        403,
+      );
+    }
+  }
+
   const priceId =
-    plan === "team" ? c.env.STRIPE_PRICE_ID_TEAM : c.env.STRIPE_PRICE_ID_PRO;
+    plan === "team"
+      ? c.env.STRIPE_PRICE_ID_TEAM
+      : plan === "student"
+        ? c.env.STRIPE_PRICE_ID_STUDENT
+        : c.env.STRIPE_PRICE_ID_PRO;
   if (!priceId) {
     return c.json(
       { error: "price_not_configured", message: `No Stripe price configured for plan="${plan}"` },
@@ -277,10 +309,11 @@ type StripeEvent = {
 function priceToTier(
   env: Env,
   priceId: string | undefined,
-): "free" | "pro" | "team" | "enterprise" | null {
+): "free" | "pro" | "student" | "team" | "enterprise" | null {
   if (!priceId) return null;
   if (priceId === env.STRIPE_PRICE_ID_PRO) return "pro";
   if (priceId === env.STRIPE_PRICE_ID_TEAM) return "team";
+  if (priceId === env.STRIPE_PRICE_ID_STUDENT) return "student";
   return null;
 }
 

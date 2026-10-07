@@ -24,7 +24,11 @@ export const MAX_MESSAGE_METADATA_CHARS = 16_000;
 export const MAX_SEARCH_QUERY_CHARS = 4_096;
 
 // Tier definitions
-export type Tier = "free" | "pro" | "team" | "enterprise";
+// "student" is Pro entitlements at a student price — a billing distinction,
+// not a capability one. Keeping it a real tier (rather than a coupon on pro)
+// means the discount is revocable when enrollment lapses, and student counts
+// are a plain tier query.
+export type Tier = "free" | "pro" | "student" | "team" | "enterprise";
 
 export const TIER_LIMITS: Record<Tier, {
   /**
@@ -57,6 +61,16 @@ export const TIER_LIMITS: Record<Tier, {
     usage_dashboard: false,
   },
   pro: {
+    storage_messages: 1_000_000,
+    messages_per_month: 100_000, // abuse guard only
+    conversations: -1,
+    seats: 1,
+    api_keys: -1,
+    webhooks: false,
+    usage_dashboard: false,
+  },
+  // Identical to pro by design — see the Tier comment above.
+  student: {
     storage_messages: 1_000_000,
     messages_per_month: 100_000, // abuse guard only
     conversations: -1,

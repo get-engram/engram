@@ -17,7 +17,9 @@ import { mergeOrgs } from "./routes/merge-orgs.js";
 import { dashboardHtml } from "./routes/admin-dashboard.js";
 import { account } from "./routes/account.js";
 import { privacy } from "./routes/privacy.js";
+import { student } from "./routes/student.js";
 import { dataExport } from "./routes/export.js";
+import { withD1Retry, isTransientD1Error } from "./services/resilient-d1.js";
 import { oauthConnections } from "./routes/oauth-connections.js";
 import { memories } from "./routes/memories.js";
 import { invites } from "./routes/invites.js";
@@ -30,6 +32,7 @@ import { sendImportNudges } from "./cron/import-nudge.js";
 import { sendMaxoutNudges } from "./cron/maxout-nudge.js";
 import { sendActivationNudges } from "./cron/activation-nudge.js";
 import { sendRecallNudges } from "./cron/recall-nudge.js";
+import { sendStudentReverifyReminders } from "./cron/student-reverify.js";
 import { reconcileStripeToD1 } from "./cron/reconcile-stripe.js";
 export { DrainerDO } from "./services/drainer-do.js";
 import { sendWeeklyDigests } from "./cron/weekly-digest.js";
@@ -77,11 +80,10 @@ app.onError((err, c) => {
   // the client to slow down; a 503 + Retry-After lets callers (the CLI already
   // backs off on it) retry instead of hammering a struggling database.
   const msg = err.message || "";
-  const transient =
-    /overloaded|SQLITE_BUSY|Network connection lost|timed out|connection reset|storage.*(unavailable|busy)/i.test(
-      msg,
-    );
-  if (transient) {
+  // Same predicate the retry layer uses, so "what we retry" and "what we call
+  // transient" can't drift apart. Reaching here means the retries were already
+  // exhausted — D1 is under sustained pressure, not a momentary collision.
+  if (isTransientD1Error(err)) {
     console.error(`[error] ${c.req.method} ${c.req.path}: transient D1 — ${msg}`);
     c.header("Retry-After", "2");
     return c.json(
@@ -306,6 +308,7 @@ app.route("/api/webhooks", webhooks);
 app.route("/api/usage", usage);
 app.route("/api/account", account);
 app.route("/api/privacy", privacy);
+app.route("/api/student", student);
 app.route("/api/export", dataExport);
 app.route("/api/oauth/connections", oauthConnections);
 app.route("/api/memories", memories);
@@ -315,9 +318,30 @@ app.route("/api/memories", memories);
 app.use("/api/v1/*", meterApiRequest);
 app.route("/api/v1", v1);
 
+/**
+ * Every entry point gets the retrying DB (engram#469). Wrapping here rather
+ * than at each call site means a query added later is covered by default —
+ * the alternative is remembering to opt in forever, which nobody does.
+ */
+function resilient<E>(env: E): E {
+  const e = env as { DB?: D1Database } | undefined;
+  // Health checks and some tests invoke fetch with no env, or a partial one.
+  if (!e?.DB) return env;
+  return { ...e, DB: withD1Retry(e.DB) } as E;
+}
+
 export default {
-  fetch: app.fetch,
-  async scheduled(event: ScheduledEvent, env: Env, _ctx: ExecutionContext) {
+  // Signature mirrors Hono's own (env and ctx optional) so existing callers,
+  // including the tests that fetch /health with no env at all, keep working.
+  fetch(
+    request: Request,
+    env?: Parameters<typeof app.fetch>[1],
+    ctx?: ExecutionContext,
+  ) {
+    return app.fetch(request, resilient(env), ctx);
+  },
+  async scheduled(event: ScheduledEvent, rawEnv: Env, _ctx: ExecutionContext) {
+    const env = resilient(rawEnv);
     // Crons (see wrangler.toml [triggers]):
     //   */10 * * * * — Stripe->D1 tier reconcile (self-heals missed webhooks)
     //   03:00 UTC — GDPR purge of soft-deleted orgs
@@ -419,6 +443,8 @@ export default {
     // Recall nudge: saved a memory but never had a search return a hit — the
     // funnel's biggest measured leak (177 saved vs 50 recalled, 2026-08).
     await runJob("recall nudges", () => sendRecallNudges(env));
+    // Student verifications lapse after 12 months; remind 14 days out.
+    await runJob("student re-verify", () => sendStudentReverifyReminders(env));
 
     // Heartbeat: one line every run naming which jobs (if any) failed, so a
     // partial cron failure is greppable instead of silent.

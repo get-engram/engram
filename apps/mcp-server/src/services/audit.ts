@@ -29,6 +29,9 @@ export type AuditAction =
   | "subscription.upgrade_redirect"
   | "oauth.connection.revoked"
   | "seat.accepted"
+  | "student.verify_sent"
+  | "student.verified"
+  | "student.expired"
   // Privileged operator actions against a specific user org. Previously the
   // admin surface wrote nothing to the audit log despite logging every user
   // action — a SOC 2 / breach-review gap. Actor recorded as "admin", org is

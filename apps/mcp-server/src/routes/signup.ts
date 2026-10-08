@@ -13,11 +13,58 @@ import {
   insertApiKey,
   getApiKeyCount,
   setOrganizationEmail,
+  getApiKeyWithOrg,
 } from "@getengram/db";
 import { TIER_LIMITS, type Tier } from "@getengram/shared";
-import type { Env } from "../types.js";
+import type { Env, AuthContext } from "../types.js";
 import { verifySupabaseJwt } from "../utils/jwt.js";
 import { ipThrottle } from "../middleware/ip-throttle.js";
+import { hasScope, parseScopes } from "../mcp/scopes.js";
+import { audit } from "../services/audit.js";
+
+/**
+ * Authenticate an Engram API key on a /signup/* route (engram#475 audit).
+ *
+ * These routes are mounted outside authMiddleware, and each used to run its
+ * own `SELECT organization_id FROM api_keys WHERE key_hash = ?` — with no
+ * revoked_at or expires_at predicate. A revoked key could therefore still
+ * re-point an org's email and mint a web login for it: post-revocation
+ * account takeover. getApiKeyWithOrg is the one lookup that enforces
+ * revocation; nothing on this server may look a key up any other way.
+ */
+async function authenticateApiKey(
+  db: D1Database,
+  authHeader: string,
+): Promise<AuthContext | null> {
+  const token = authHeader.replace(/^Bearer\s+/i, "");
+  if (!token || !token.startsWith("engram_sk_live_")) return null;
+  const row = await getApiKeyWithOrg(db, await hashApiKey(token));
+  if (!row) return null;
+  return {
+    organizationId: row.organization_id,
+    apiKeyId: row.key_id,
+    tier: (row.tier ?? "free") as AuthContext["tier"],
+    scopes: parseScopes(row.scopes),
+    seatId: row.seat_id ?? null,
+  };
+}
+
+/**
+ * May a never-before-seen identity attach itself to this existing org just
+ * by presenting its email? (engram#475 audit, critical #1)
+ *
+ * No. The Supabase project auto-confirms every address
+ * (mailer_autoconfirm), so a JWT's email proves nothing about inbox control
+ * — anyone can sign up as anyone. Binding by email let an attacker claim any
+ * unbound org with memories in it (716 at the time of the audit). An org
+ * with nothing in it has nothing to steal, so a fresh identity may bind it;
+ * an org with data requires proof of inbox control first. Until the
+ * self-service claim flow ships, that proof is a support request — the same
+ * path the one real case (Oct 2026) already took.
+ */
+export function requiresClaim(org: { messages_stored_total?: number | null }): boolean {
+  return (org.messages_stored_total ?? 0) > 0;
+}
 
 const WELCOME_MESSAGE = `Welcome to Engram — your AI's long-term memory.
 
@@ -130,9 +177,24 @@ signup.post("/", async (c) => {
   let orgId: string;
   let created: boolean;
   const existing = (await getOrganizationByEmail(c.env.DB, email)) as
-    | { id: string }
+    | { id: string; messages_stored_total?: number | null }
     | null;
   if (existing) {
+    if (requiresClaim(existing as { messages_stored_total?: number | null })) {
+      await audit(c.env.DB, existing.id, null, "signup.claim_required", "organization", existing.id, {
+        sub: claims.sub,
+      });
+      return c.json(
+        {
+          error: "claim_required",
+          message:
+            "An Engram account with saved memories already exists for this email address. " +
+            "To link this sign-in to it, email hello@getengram.app from that address and " +
+            "we'll connect it — nothing in the account is affected.",
+        },
+        403,
+      );
+    }
     orgId = existing.id;
     created = false;
   } else {
@@ -202,25 +264,13 @@ signup.post("/anonymous", ipThrottle({ limit: 10, windowMs: 60_000, bucket: "sig
 // This updates the organization's email field so the account can be
 // found via email-based login later.
 signup.post("/link", async (c) => {
-  // Verify the API key manually (this route is under /signup, not /api/*)
-  const authHeader = c.req.header("authorization") ?? "";
-  const token = authHeader.replace(/^Bearer\s+/i, "");
-  if (!token || !token.startsWith("engram_sk_live_")) {
-    return c.json({ error: "unauthorized", message: "Missing or invalid API key" }, 401);
+  const auth = await authenticateApiKey(c.env.DB, c.req.header("authorization") ?? "");
+  if (!auth) {
+    return c.json({ error: "unauthorized", message: "Missing, invalid, or revoked API key" }, 401);
   }
-
-  // Hash and look up the key
-  const { hashApiKey } = await import("@getengram/shared");
-  const keyHash = await hashApiKey(token);
-  const keyRow = await c.env.DB.prepare(
-    "SELECT k.organization_id FROM api_keys k WHERE k.key_hash = ?",
-  )
-    .bind(keyHash)
-    .first<{ organization_id: string }>();
-
-  if (!keyRow) {
-    return c.json({ error: "unauthorized", message: "Invalid API key" }, 401);
-  }
+  // Re-pointing the org's email is a write — a read-only key may not do it.
+  if (!hasScope(auth, "write")) return c.json({ error: "insufficient_scope", message: "This action requires the 'write' scope." }, 403);
+  const keyRow = { organization_id: auth.organizationId };
 
   const body = await c.req.json<{ email?: string }>().catch(() => ({} as { email?: string }));
   const email = body.email?.trim();
@@ -237,7 +287,17 @@ signup.post("/link", async (c) => {
     );
   }
 
+  const before = (await getOrganizationById(c.env.DB, keyRow.organization_id)) as
+    | { email: string | null }
+    | null;
   await setOrganizationEmail(c.env.DB, keyRow.organization_id, email);
+  // Old and new value both recorded: the one audit entry that previously
+  // covered an email change held neither, which is why the Oct 2026 lockout
+  // had to be reconstructed from timestamps.
+  await audit(c.env.DB, keyRow.organization_id, auth.apiKeyId, "org.email_link", "organization", keyRow.organization_id, {
+    from: before?.email ?? null,
+    to: email,
+  });
 
   return c.json({ linked: true, organization_id: keyRow.organization_id, email });
 });
@@ -250,21 +310,13 @@ signup.post("/link", async (c) => {
 // Supabase requires email confirmation, the password works after the
 // user clicks the verification link.
 signup.post("/set-password", async (c) => {
-  const authHeader = c.req.header("authorization") ?? "";
-  const token = authHeader.replace(/^Bearer\s+/i, "");
-  if (!token || !token.startsWith("engram_sk_live_")) {
-    return c.json({ error: "unauthorized", message: "Missing or invalid API key" }, 401);
+  const auth = await authenticateApiKey(c.env.DB, c.req.header("authorization") ?? "");
+  if (!auth) {
+    return c.json({ error: "unauthorized", message: "Missing, invalid, or revoked API key" }, 401);
   }
-  const { hashApiKey } = await import("@getengram/shared");
-  const keyHash = await hashApiKey(token);
-  const keyRow = await c.env.DB.prepare(
-    "SELECT k.organization_id FROM api_keys k WHERE k.key_hash = ?",
-  )
-    .bind(keyHash)
-    .first<{ organization_id: string }>();
-  if (!keyRow) {
-    return c.json({ error: "unauthorized", message: "Invalid API key" }, 401);
-  }
+  if (!hasScope(auth, "write")) return c.json({ error: "insufficient_scope", message: "This action requires the 'write' scope." }, 403);
+  const keyRow = { organization_id: auth.organizationId };
+  await audit(c.env.DB, auth.organizationId, auth.apiKeyId, "account.set_password", "organization", auth.organizationId);
 
   const org = await c.env.DB.prepare(
     "SELECT email FROM organizations WHERE id = ?",

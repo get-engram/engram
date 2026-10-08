@@ -74,3 +74,32 @@ export function scopeError(scope: Scope) {
     isError: true as const,
   };
 }
+
+/**
+ * The scopes a caller may put on a key it mints (engram#475 audit).
+ *
+ * A minted key must never carry more authority than the principal minting
+ * it: a key whose creator holds only `read` cannot grant `delete`. Omitting
+ * `requested` means "everything I have", not "everything there is" — the old
+ * default of ALL_SCOPES was a privilege-escalation primitive for any
+ * read-only key or OAuth connector that could reach POST /api/keys.
+ *
+ * Returns the narrowed list, or a string describing why the request is
+ * invalid (unknown scope, empty set, or exceeds the caller).
+ */
+export function mintableScopes(
+  caller: readonly Scope[],
+  requested: unknown,
+): Scope[] | { error: string } {
+  if (requested === undefined) return [...caller];
+  if (!Array.isArray(requested) || !requested.every((s) => typeof s === "string" && isScope(s))) {
+    return { error: `scopes must be a subset of: ${ALL_SCOPES.join(", ")}` };
+  }
+  const wanted = [...new Set(requested as Scope[])];
+  if (wanted.length === 0) return { error: "at least one scope is required" };
+  const over = wanted.filter((s) => !caller.includes(s));
+  if (over.length > 0) {
+    return { error: `cannot grant scope(s) you do not hold: ${over.join(", ")}` };
+  }
+  return wanted;
+}

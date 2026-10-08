@@ -29,6 +29,14 @@ export type AuditAction =
   | "subscription.upgrade_redirect"
   | "oauth.connection.revoked"
   | "seat.accepted"
+  // Identity-layer actions (engram#475 audit). The entire api_keys lifecycle
+  // and every org-email change were previously unaudited — the Oct 2026
+  // lockout had to be reconstructed from timestamps.
+  | "key.create"
+  | "key.revoke"
+  | "org.email_link"
+  | "account.set_password"
+  | "signup.claim_required"
   // Privileged operator actions against a specific user org. Previously the
   // admin surface wrote nothing to the audit log despite logging every user
   // action — a SOC 2 / breach-review gap. Actor recorded as "admin", org is

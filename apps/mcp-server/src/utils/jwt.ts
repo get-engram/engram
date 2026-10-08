@@ -11,6 +11,8 @@ interface SupabaseJwtPayload {
   iss?: string;
   exp?: number;
   iat?: number;
+  /** Supabase sets email_verified here; under mailer_autoconfirm it is always true. */
+  user_metadata?: { email_verified?: boolean };
 }
 
 interface JwksKey {
@@ -129,8 +131,12 @@ export async function verifySupabaseJwt(
     new TextDecoder().decode(base64UrlDecode(payloadB64)),
   );
 
-  // Check expiry
-  if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
+  // Check expiry. exp is REQUIRED: a token with no exp used to verify
+  // forever (engram#475 audit). Supabase always sets it.
+  if (typeof payload.exp !== "number") {
+    throw new Error("JWT has no exp claim");
+  }
+  if (payload.exp < Math.floor(Date.now() / 1000)) {
     throw new Error("JWT has expired");
   }
 

@@ -1,7 +1,9 @@
 import { Hono } from "hono";
 import { generateId, generateApiKeyRaw, hashApiKey, TIER_LIMITS } from "@getengram/shared";
 import { insertApiKey, getApiKeysByOrg, getApiKeyCount, revokeApiKey } from "@getengram/db";
-import { ALL_SCOPES, isScope } from "../mcp/scopes.js";
+import { ALL_SCOPES, hasScope, mintableScopes } from "../mcp/scopes.js";
+import { isExternalOAuthClient } from "../mcp/auth-kind.js";
+import { audit } from "../services/audit.js";
 import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
@@ -18,31 +20,35 @@ keys.get("/", async (c) => {
 // Create a new API key
 keys.post("/", async (c) => {
   const auth = c.get("auth");
-  const body = await c.req.json<{ name?: string; scopes?: unknown }>();
 
-  // Optional least-privilege scopes; default to full access when omitted.
-  let scopes = [...ALL_SCOPES];
-  if (body.scopes !== undefined) {
-    if (
-      !Array.isArray(body.scopes) ||
-      !body.scopes.every((s) => typeof s === "string" && isScope(s))
-    ) {
-      return c.json(
-        {
-          error: "invalid_scopes",
-          message: `scopes must be a subset of: ${ALL_SCOPES.join(", ")}`,
-        },
-        400,
-      );
-    }
-    scopes = [...new Set(body.scopes as (typeof ALL_SCOPES)[number][])];
-    if (scopes.length === 0) {
-      return c.json(
-        { error: "invalid_scopes", message: "at least one scope is required" },
-        400,
-      );
-    }
+  // Minting a credential is a first-party, write-level act (engram#475
+  // audit). Before this gate ANY authenticated principal could mint a
+  // permanent full-scope key: a read-only key, or a ChatGPT connector the
+  // user had granted read-only consent to — which made every scope narrowing
+  // elsewhere in the system decorative.
+  if (isExternalOAuthClient(auth)) {
+    return c.json(
+      {
+        error: "forbidden",
+        message:
+          "API keys are managed from the Engram dashboard or CLI, not from a connected app.",
+      },
+      403,
+    );
   }
+  if (!hasScope(auth, "write")) return c.json({ error: "insufficient_scope", message: "This action requires the 'write' scope." }, 403);
+
+  const body = await c.req
+    .json<{ name?: string; scopes?: unknown }>()
+    .catch(() => ({}) as { name?: string; scopes?: unknown });
+
+  // A key never carries more than the principal minting it; omitted means
+  // "what I have", not ALL_SCOPES.
+  const narrowed = mintableScopes(auth.scopes ?? ALL_SCOPES, body.scopes);
+  if (!Array.isArray(narrowed)) {
+    return c.json({ error: "invalid_scopes", message: narrowed.error }, 400);
+  }
+  const scopes = narrowed;
 
   // Check key limit
   const limits = TIER_LIMITS[auth.tier];
@@ -63,6 +69,11 @@ keys.post("/", async (c) => {
   const name = body.name || "default";
 
   await insertApiKey(c.env.DB, id, auth.organizationId, keyHash, prefix, name, scopes.join(","));
+  await audit(c.env.DB, auth.organizationId, auth.apiKeyId, "key.create", "api_key", id, {
+    name,
+    scopes,
+    prefix,
+  });
 
   // Return the raw key ONCE — it can never be retrieved again
   return c.json({ id, key: raw, prefix, name, scopes }, 201);
@@ -73,12 +84,21 @@ keys.delete("/:id", async (c) => {
   const auth = c.get("auth");
   const keyId = c.req.param("id");
 
+  // Same gate as minting: revocation is a write, and not a connector's call.
+  // (A proper owner/member distinction is RBAC work tracked separately; this
+  // closes the read-only-principal case and makes the act visible.)
+  if (isExternalOAuthClient(auth)) {
+    return c.json({ error: "forbidden", message: "API keys are managed from the dashboard or CLI." }, 403);
+  }
+  if (!hasScope(auth, "write")) return c.json({ error: "insufficient_scope", message: "This action requires the 'write' scope." }, 403);
+
   // Don't allow revoking the key being used for this request
   if (keyId === auth.apiKeyId) {
     return c.json({ error: "Cannot revoke the API key currently in use" }, 400);
   }
 
   await revokeApiKey(c.env.DB, keyId, auth.organizationId);
+  await audit(c.env.DB, auth.organizationId, auth.apiKeyId, "key.revoke", "api_key", keyId);
   return c.json({ revoked: true });
 });
 

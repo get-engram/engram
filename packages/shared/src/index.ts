@@ -8,3 +8,4 @@ export * from "./utils/detect.js";
 export * from "./utils/vault.js";
 export * from "./utils/oauth.js";
 export * from "./constants.js";
+export * from "./academic-domains.js";

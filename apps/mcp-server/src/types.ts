@@ -10,6 +10,7 @@ export interface Env {
   STRIPE_WEBHOOK_SECRET: string;
   STRIPE_PRICE_ID_PRO: string;
   STRIPE_PRICE_ID_TEAM: string;
+  STRIPE_PRICE_ID_STUDENT: string;
   APP_URL: string; // e.g. "https://getengram.app"
   ADMIN_SECRET: string; // wrangler secret for /api/admin/* routes
   /** "1" pauses all writes for a maintenance window. Set and cleared with

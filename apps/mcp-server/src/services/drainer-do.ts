@@ -1,5 +1,6 @@
 import { drainBatch } from "./drain-batch.js";
 import type { Env } from "../types.js";
+import { withD1Retry } from "./resilient-d1.js";
 
 /**
  * DrainerDO — one autonomous drain worker as a Durable Object. Each instance
@@ -25,13 +26,22 @@ interface DrainerState {
   errors: number;
 }
 
+/** Local copy of index.ts's wrapper — importing index here would cycle. */
+function resilient(env: Env): Env {
+  return env?.DB ? { ...env, DB: withD1Retry(env.DB) } : env;
+}
+
 export class DrainerDO {
   private readonly state: DurableObjectState;
   private readonly env: Env;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
-    this.env = env;
+    // The Workers runtime constructs this class directly from the module
+    // export, so it never passes through the fetch/scheduled wrappers — it
+    // has to opt in explicitly. It is also the heaviest D1 writer there is,
+    // which makes it the worst entry point to leave unprotected (engram#469).
+    this.env = resilient(env);
   }
 
   private async load(): Promise<DrainerState> {

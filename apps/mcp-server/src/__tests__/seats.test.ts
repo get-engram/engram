@@ -17,6 +17,7 @@ function createSeatsEnv(db: D1Database): Env {
     STRIPE_WEBHOOK_SECRET: "whsec_test",
     STRIPE_PRICE_ID_PRO: "price_pro",
     STRIPE_PRICE_ID_TEAM: "price_team",
+    STRIPE_PRICE_ID_STUDENT: "price_student",
     APP_URL: "https://test.example.com",
     ADMIN_SECRET: "admin_test",
     SUPABASE_JWT_SECRET: "jwt_test",

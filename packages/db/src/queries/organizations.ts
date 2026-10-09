@@ -98,7 +98,7 @@ export function setOrganizationStripeCustomer(
 export function setOrganizationTier(
   db: D1Database,
   id: string,
-  tier: "free" | "pro" | "team" | "enterprise",
+  tier: "free" | "pro" | "student" | "team" | "enterprise",
   stripeSubscriptionId: string | null,
   seatLimit?: number,
 ) {

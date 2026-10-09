@@ -17,6 +17,7 @@ import { mergeOrgs } from "./routes/merge-orgs.js";
 import { dashboardHtml } from "./routes/admin-dashboard.js";
 import { account } from "./routes/account.js";
 import { privacy } from "./routes/privacy.js";
+import { student } from "./routes/student.js";
 import { dataExport } from "./routes/export.js";
 import { withD1Retry, isTransientD1Error } from "./services/resilient-d1.js";
 import { oauthConnections } from "./routes/oauth-connections.js";
@@ -31,6 +32,7 @@ import { sendImportNudges } from "./cron/import-nudge.js";
 import { sendMaxoutNudges } from "./cron/maxout-nudge.js";
 import { sendActivationNudges } from "./cron/activation-nudge.js";
 import { sendRecallNudges } from "./cron/recall-nudge.js";
+import { sendStudentReverifyReminders } from "./cron/student-reverify.js";
 import { reconcileStripeToD1 } from "./cron/reconcile-stripe.js";
 export { DrainerDO } from "./services/drainer-do.js";
 import { sendWeeklyDigests } from "./cron/weekly-digest.js";
@@ -306,6 +308,7 @@ app.route("/api/webhooks", webhooks);
 app.route("/api/usage", usage);
 app.route("/api/account", account);
 app.route("/api/privacy", privacy);
+app.route("/api/student", student);
 app.route("/api/export", dataExport);
 app.route("/api/oauth/connections", oauthConnections);
 app.route("/api/memories", memories);
@@ -445,6 +448,8 @@ export default {
     // Recall nudge: saved a memory but never had a search return a hit — the
     // funnel's biggest measured leak (177 saved vs 50 recalled, 2026-08).
     await runJob("recall nudges", () => sendRecallNudges(env));
+    // Student verifications lapse after 12 months; remind 14 days out.
+    await runJob("student re-verify", () => sendStudentReverifyReminders(env));
 
     // Heartbeat: one line every run naming which jobs (if any) failed, so a
     // partial cron failure is greppable instead of silent.

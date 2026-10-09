@@ -18,7 +18,7 @@ export function registerManageSubscription(
 ) {
   server.tool(
     "manage_subscription",
-    "View your current subscription or get a link to upgrade/manage your plan. Returns a Stripe Checkout URL for upgrades or a billing portal URL for existing subscribers. IMPORTANT: When this tool returns a URL, you MUST open it in the user's browser by running `open <url>` (macOS) or `xdg-open <url>` (Linux) — do not just display the URL as text.",
+    "View the current subscription or get a link to upgrade or manage the plan. Returns a Stripe Checkout URL for upgrades or a billing portal URL for existing subscribers.",
     {
       action: z
         .enum(["status", "upgrade", "portal"])

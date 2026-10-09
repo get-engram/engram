@@ -67,10 +67,20 @@ export function getChunksByVectorizeIds(
   // Vectorize metadata filter, so this is a second, SQL-level fence — if that
   // metadata filter ever regressed or a vector's org metadata diverged from
   // its D1 row, verbatim chunk_text still could not cross tenants.
+  //
+  // INDEXED BY is load-bearing, not a hint (engram#469, Oct 2026). Given both
+  // predicates, SQLite's planner picks idx_chunks_org and walks EVERY chunk the
+  // org owns before filtering by vectorize_id — 215k rows per search for the
+  // largest account, ~8k on average across 15.9k searches/week, 128M rows read
+  // in 7 days from this one statement. Four concurrent searches from one user
+  // were enough to overload D1 on 2026-10-06. Forcing the vectorize index turns
+  // that into ≤fetchK indexed lookups; the org check then runs on those rows.
+  // Verified with EXPLAIN QUERY PLAN against production. If the index is ever
+  // dropped this statement errors loudly rather than silently regressing.
   const placeholders = vectorizeIds.map(() => "?").join(",");
   return db
     .prepare(
-      `SELECT * FROM conversation_chunks WHERE vectorize_id IN (${placeholders}) AND organization_id = ?`
+      `SELECT * FROM conversation_chunks INDEXED BY idx_chunks_vectorize WHERE vectorize_id IN (${placeholders}) AND organization_id = ?`
     )
     .bind(...vectorizeIds, organizationId)
     .all();

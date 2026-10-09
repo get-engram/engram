@@ -18,6 +18,7 @@ import { dashboardHtml } from "./routes/admin-dashboard.js";
 import { account } from "./routes/account.js";
 import { privacy } from "./routes/privacy.js";
 import { dataExport } from "./routes/export.js";
+import { withD1Retry, isTransientD1Error } from "./services/resilient-d1.js";
 import { oauthConnections } from "./routes/oauth-connections.js";
 import { memories } from "./routes/memories.js";
 import { invites } from "./routes/invites.js";
@@ -77,11 +78,10 @@ app.onError((err, c) => {
   // the client to slow down; a 503 + Retry-After lets callers (the CLI already
   // backs off on it) retry instead of hammering a struggling database.
   const msg = err.message || "";
-  const transient =
-    /overloaded|SQLITE_BUSY|Network connection lost|timed out|connection reset|storage.*(unavailable|busy)/i.test(
-      msg,
-    );
-  if (transient) {
+  // Shares the retry layer's predicate so the two can't drift. It is kept at
+  // least as broad as the regex it replaced — reaching here means retries were
+  // already exhausted, i.e. sustained pressure rather than a brief collision.
+  if (isTransientD1Error(err)) {
     console.error(`[error] ${c.req.method} ${c.req.path}: transient D1 — ${msg}`);
     c.header("Retry-After", "2");
     return c.json(
@@ -315,9 +315,31 @@ app.route("/api/memories", memories);
 app.use("/api/v1/*", meterApiRequest);
 app.route("/api/v1", v1);
 
+/**
+ * Give an env a retrying DB (engram#469). Wrapping at the entry points rather
+ * than per call site means a query added later is covered by default.
+ * Exported so it can be tested and so every entry point — including the
+ * Durable Object — can apply it explicitly.
+ */
+export function resilient<E>(env: E): E {
+  const e = env as { DB?: D1Database } | undefined;
+  // Health checks and some tests invoke fetch with no env, or a partial one.
+  if (!e?.DB) return env;
+  return { ...e, DB: withD1Retry(e.DB) } as E;
+}
+
 export default {
-  fetch: app.fetch,
-  async scheduled(event: ScheduledEvent, env: Env, _ctx: ExecutionContext) {
+  // Signature mirrors Hono's own (env and ctx optional) so existing callers,
+  // including the tests that fetch /health with no env at all, keep working.
+  fetch(
+    request: Request,
+    env?: Parameters<typeof app.fetch>[1],
+    ctx?: ExecutionContext,
+  ) {
+    return app.fetch(request, resilient(env), ctx);
+  },
+  async scheduled(event: ScheduledEvent, rawEnv: Env, _ctx: ExecutionContext) {
+    const env = resilient(rawEnv);
     // Crons (see wrangler.toml [triggers]):
     //   */10 * * * * — Stripe->D1 tier reconcile (self-heals missed webhooks)
     //   03:00 UTC — GDPR purge of soft-deleted orgs
@@ -343,7 +365,11 @@ export default {
       // it is still just "slow". (Trend also lands in the daily report.)
       try {
         const t0 = Date.now();
-        await env.DB.prepare("SELECT id FROM organizations LIMIT 1").first();
+        // Deliberately the RAW handle: this probe is the early-warning signal
+        // for D1 pressure, and measuring it through the retry layer would hide
+        // exactly the condition it exists to detect — a hard overload would
+        // come back "fast" after a silent retry, or not log at all.
+        await rawEnv.DB.prepare("SELECT id FROM organizations LIMIT 1").first();
         const ms = Date.now() - t0;
         if (ms > 3000) console.error(`[d1-latency] WARNING: probe took ${ms}ms (>3s) — D1 under pressure`);
       } catch (err) {

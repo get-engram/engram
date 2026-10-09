@@ -9,6 +9,7 @@ import type { Tier } from "@getengram/shared";
 const RATE_LIMITS: Record<Tier, number> = {
   free: 30,
   pro: 120,
+  student: 120, // same entitlements as pro — only the price differs
   team: 300,
   enterprise: 600,
 };

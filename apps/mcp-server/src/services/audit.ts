@@ -37,6 +37,9 @@ export type AuditAction =
   | "org.email_link"
   | "account.set_password"
   | "signup.claim_required"
+  | "student.verify_sent"
+  | "student.verified"
+  | "student.expired"
   // Privileged operator actions against a specific user org. Previously the
   // admin surface wrote nothing to the audit log despite logging every user
   // action — a SOC 2 / breach-review gap. Actor recorded as "admin", org is

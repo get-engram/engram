@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   appendMessages,
   getOrCreateDefaultConversation,
+  type VaultEntryInput,
 } from "../../services/conversation.js";
 import { isExternalOAuthClient } from "../auth-kind.js";
 import { newUserAppendTip, firstSaveCelebration } from "../coaching.js";
@@ -24,6 +25,7 @@ import { checkMilestone } from "../../services/milestones.js";
 import { canAccessConversation } from "../../services/spaces.js";
 import {
   MAX_MESSAGES_PER_APPEND,
+  MAX_MESSAGES_PER_APPEND_CONNECTOR,
   MAX_MESSAGE_METADATA_CHARS,
 } from "@getengram/shared";
 import { getConversationById } from "@getengram/db";
@@ -36,58 +38,90 @@ export function registerAppendMessages(
   env: Env,
   auth: AuthContext
 ) {
+  // The connector surface is deliberately narrower than the first-party one
+  // (engram#467). OpenAI rejected v2.0.1 because the tool "request[s] input
+  // data that is overly broad … or includes the full conversation history":
+  // `system`/`tool` roles, tool_call_id/tool_name, free-form metadata and a
+  // 200-message cap together describe a transcript pipe, which is not what a
+  // ChatGPT/Claude user is consenting to when they say "remember this".
+  //
+  // API-key and SDK callers — the user's own agents, including the CLI sync
+  // daemon — keep the full schema: that surface has no app-store reviewer and
+  // genuinely does replay whole sessions, tool messages and all.
+  const connector = isExternalOAuthClient(auth);
+
+  const messageItem = connector
+    ? z.object({
+        role: z.enum(["user", "assistant"]),
+        content: z.string(),
+      })
+    : z.object({
+        role: z.enum(["user", "assistant", "system", "tool"]),
+        // Not hard-capped here: oversized single messages (tool-output
+        // dumps) are truncated server-side in appendMessages rather than
+        // rejected, so the CLI sync daemon can't wedge on a message it
+        // cannot split. Metadata IS capped — it's the smuggling vector.
+        content: z.string(),
+        tool_call_id: z.string().optional(),
+        tool_name: z.string().optional(),
+        metadata: z
+          .record(z.unknown())
+          .refine((m) => JSON.stringify(m).length <= MAX_MESSAGE_METADATA_CHARS, {
+            message: `metadata exceeds ${MAX_MESSAGE_METADATA_CHARS} serialized characters`,
+          })
+          .optional(),
+      });
+
+  const inputSchema = {
+    conversation_id: z
+      .string()
+      .optional()
+      .describe(
+        "Optional. Omit to append to the user's default memory; set to group messages under a specific conversation.",
+      ),
+    messages: z
+      .array(messageItem)
+      .min(1)
+      .max(connector ? MAX_MESSAGES_PER_APPEND_CONNECTOR : MAX_MESSAGES_PER_APPEND)
+      .describe(
+        connector
+          ? "The messages the user asked to remember, from the current exchange."
+          : "Messages to append",
+      ),
+    ...(connector
+      ? {}
+      : {
+          vault_entries: z
+            .array(
+              z.object({
+                id: z.string().describe("Vault entry ID (e.g. vlt_abc123)"),
+                encrypted_value: z
+                  .string()
+                  .describe("Base64-encoded AES-256-GCM ciphertext"),
+                iv: z.string().describe("Base64-encoded 12-byte IV"),
+                secret_type: z
+                  .string()
+                  .describe(
+                    "Type of secret (api_key, ssn, connection_string, etc.)",
+                  ),
+              }),
+            )
+            .optional()
+            .describe(
+              "Client-encrypted vault entries. Server stores these as opaque blobs — zero knowledge.",
+            ),
+        }),
+  };
+
   server.registerTool(
     "append_messages",
     {
       description:
-        "Saves messages to the user's long-term memory, making them available in future sessions in this app and any other AI the user connects. Applicable when the user asks to remember or save something (a preference, a fact, a decision, a goal, project context), or under a standing request from the user to keep saving as the conversation continues. Stores messages verbatim, auto-chunked + embedded for search. conversation_id is optional: omit it to append to the user's default memory, or set it to group messages under a specific conversation. The response returns the conversation_id used. Stores only the messages passed in — it cannot fetch past or external chat history (bulk import is separate, via the Engram CLI). Not suitable for secrets (passwords, API keys, tokens, government IDs): stored text is searchable and resurfaces in future context; Engram's separate zero-knowledge encrypted vault is the store for credentials. Optionally accepts client-encrypted vault entries.",
-      inputSchema: {
-      conversation_id: z
-        .string()
-        .optional()
-        .describe("Optional. Omit to append to the user's default memory; set to group messages under a specific conversation."),
-      messages: z
-        .array(
-          z.object({
-            role: z.enum(["user", "assistant", "system", "tool"]),
-            // Not hard-capped here: oversized single messages (tool-output
-            // dumps) are truncated server-side in appendMessages rather than
-            // rejected, so the CLI sync daemon can't wedge on a message it
-            // cannot split. Metadata IS capped — it's the smuggling vector.
-            content: z.string(),
-            tool_call_id: z.string().optional(),
-            tool_name: z.string().optional(),
-            metadata: z
-              .record(z.unknown())
-              .refine((m) => JSON.stringify(m).length <= MAX_MESSAGE_METADATA_CHARS, {
-                message: `metadata exceeds ${MAX_MESSAGE_METADATA_CHARS} serialized characters`,
-              })
-              .optional(),
-          })
-        )
-        .min(1)
-        .max(MAX_MESSAGES_PER_APPEND)
-        .describe("Messages to append"),
-      vault_entries: z
-        .array(
-          z.object({
-            id: z.string().describe("Vault entry ID (e.g. vlt_abc123)"),
-            encrypted_value: z
-              .string()
-              .describe("Base64-encoded AES-256-GCM ciphertext"),
-            iv: z.string().describe("Base64-encoded 12-byte IV"),
-            secret_type: z
-              .string()
-              .describe(
-                "Type of secret (api_key, ssn, connection_string, etc.)"
-              ),
-          })
-        )
-        .optional()
-        .describe(
-          "Client-encrypted vault entries. Server stores these as opaque blobs — zero knowledge."
-        ),
-      },
+        "Saves messages to the user's long-term memory, making them available in future sessions in this app and any other AI the user connects. Applicable when the user asks to remember or save something (a preference, a fact, a decision, a goal, project context), or under a standing request from the user to keep saving as the conversation continues. Stores messages verbatim, auto-chunked + embedded for search. conversation_id is optional: omit it to append to the user's default memory, or set it to group messages under a specific conversation. The response returns the conversation_id used. Stores only the messages passed in — it cannot fetch past or external chat history (bulk import is separate, via the Engram CLI). Not suitable for secrets (passwords, API keys, tokens, government IDs): stored text is searchable and resurfaces in future context; Engram's separate zero-knowledge encrypted vault is the store for credentials." +
+        (connector
+          ? ""
+          : " Optionally accepts client-encrypted vault entries."),
+      inputSchema,
       outputSchema: {
         conversation_id: z.string().describe("The conversation the messages were stored in"),
         appended: z.number().describe("Number of messages stored"),
@@ -122,6 +156,10 @@ export function registerAppendMessages(
       if (!hasScope(auth, "write")) return scopeError("write");
       const isOAuth = isExternalOAuthClient(auth);
       const count = params.messages.length;
+      // Absent from the connector schema entirely — read through a cast so the
+      // handler stays shared between both shapes.
+      const vaultEntries = (params as { vault_entries?: VaultEntryInput[] })
+        .vault_entries;
 
       // Primary gate (engram#275): lifetime storage. Atomically reserves
       // space; released below if a later step rejects or fails.
@@ -220,11 +258,13 @@ export function registerAppendMessages(
           env,
           auth.organizationId,
           conversationId,
-          params.messages.map((m) => ({
-            ...m,
-            metadata: m.metadata as Record<string, unknown>,
-          })),
-          params.vault_entries
+          params.messages.map((m) => {
+            // `metadata` exists only on the first-party shape; narrow via the
+            // union rather than asserting it onto the connector shape.
+            const meta = (m as { metadata?: Record<string, unknown> }).metadata;
+            return { ...m, metadata: meta };
+          }),
+          vaultEntries
         );
       } catch (err) {
         // The write failed — free the reserved storage so the lifetime
@@ -242,7 +282,7 @@ export function registerAppendMessages(
         conversationId,
         {
           count: messages.length,
-          vault_entries: params.vault_entries?.length ?? 0,
+          vault_entries: vaultEntries?.length ?? 0,
         }
       );
 
@@ -284,7 +324,7 @@ export function registerAppendMessages(
         conversation_id: conversationId,
         appended: messages.length,
         message_ids: messages.map((m) => m.id),
-        vault_entries_stored: params.vault_entries?.length ?? 0,
+        vault_entries_stored: vaultEntries?.length ?? 0,
         ...(meter ? { usage: meter } : {}),
         ...(storageMeterVal ? { storage: storageMeterVal } : {}),
         ...(notice ? { notice } : {}),

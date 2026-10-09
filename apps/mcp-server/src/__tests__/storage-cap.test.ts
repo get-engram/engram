@@ -35,14 +35,17 @@ describe("storage cap tiers (engram#275)", () => {
 });
 
 describe("storage messaging", () => {
-  it("memory-full copy is warm, mentions safety, dashboard for OAuth", () => {
+  // Connector copy is factual only (engram#467): no URL, no scripted reply
+  // wording, no directive aimed at the model. It still has to tell the user
+  // what happened and what resolves it — just descriptively.
+  it("memory-full copy for OAuth states the situation with no URL or directive", () => {
     const m = storageFullMessage({ limit: 10_000, isOAuth: true });
     expect(m).toContain("10,000");
     expect(m).toMatch(/memory is full/i);
-    expect(m).toMatch(/never expires|safe/i);
-    expect(m).toContain("getengram.app/dashboard");
-    expect(m).toMatch(/delete old conversations/i);
-    expect(m).toMatch(/don't try to collect payment/i);
+    expect(m).toMatch(/never expires|stays stored/i);
+    expect(m).toMatch(/deleted|capacity/i);
+    expect(m).not.toMatch(/https?:\/\/|getengram\.app/i);
+    expect(m).not.toMatch(/tell the user|warmly|don'?t try to collect/i);
   });
 
   it("memory-full copy points API callers at key login", () => {
@@ -61,10 +64,10 @@ describe("storage messaging", () => {
     expect(approachingStorageNotice(undefined, false)).toBeUndefined();
   });
 
-  it("80% warning routes OAuth users to their dashboard", () => {
-    expect(
-      approachingStorageNotice(usageMeter(9_500, 10_000), true),
-    ).toMatch(/dashboard/);
+  it("80% warning for OAuth reports usage without a URL", () => {
+    const m = approachingStorageNotice(usageMeter(9_500, 10_000), true);
+    expect(m).toContain("9,500/10,000");
+    expect(m).not.toMatch(/https?:\/\/|getengram\.app/i);
   });
 
   it("meterBar renders a 10-segment bar with percentage", () => {

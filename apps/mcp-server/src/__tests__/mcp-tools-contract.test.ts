@@ -13,6 +13,18 @@ import { registerVaultSet } from "../mcp/tools/vault-set.js";
 import { registerVaultGet } from "../mcp/tools/vault-get.js";
 import { registerVaultList } from "../mcp/tools/vault-list.js";
 import { registerVaultDelete } from "../mcp/tools/vault-delete.js";
+import { registerMemoryStatus } from "../mcp/tools/memory-status.js";
+import { registerWhoami } from "../mcp/tools/whoami.js";
+import { registerManageSubscription } from "../mcp/tools/manage-subscription.js";
+import {
+  limitMessage,
+  storageFullMessage,
+  approachingLimitNotice,
+  approachingStorageNotice,
+  storageNote,
+  usageMeter,
+} from "../mcp/usage-messaging.js";
+import { z } from "zod";
 import type { Env, AuthContext } from "../types.js";
 
 /**
@@ -335,7 +347,21 @@ describe("MCP tool contract — wire field names", () => {
       /don'?t wait/i,
       /act[,.]? don'?t instruct/i,
       /getengram\.app\/(dashboard|pricing|chatgpt)/i,
+      // Second rejection round (OpenAI 2026-09-22 + Anthropic feedback):
+      // scripted reply wording and model-directed imperatives, wherever they
+      // appear — Anthropic: "moving such an instruction into a tool output
+      // does not resolve it."
+      /tell the user/i,
+      /warmly/i,
+      /don'?t try to/i,
+      /just point them/i,
+      /you must/i,
+      /IMPORTANT:/,
+      /open <url>|xdg-open/i,
     ];
+    // Connector-facing tool OUTPUT must additionally carry no URL at all —
+    // any link in a limit/usage notice reads as an upsell to a reviewer.
+    const URL = /https?:\/\/|getengram\.app/i;
 
     it("server instructions are descriptive only", async () => {
       const { SERVER_INSTRUCTIONS, VAULT_INSTRUCTIONS_OAUTH, VAULT_INSTRUCTIONS_FIRST_PARTY } =
@@ -360,11 +386,92 @@ describe("MCP tool contract — wire field names", () => {
       registerVaultGet(server, env, auth);
       registerVaultList(server, env, auth);
       registerVaultDelete(server, env, auth);
+      registerMemoryStatus(server, env, auth);
+      registerWhoami(server, env, auth);
+      registerManageSubscription(server, env, auth);
+      expect(tools.size).toBe(14);
       for (const [name, tool] of tools) {
         for (const re of BANNED) {
           expect(tool.description ?? "", `banned pattern ${re} in ${name}`).not.toMatch(re);
         }
       }
+    });
+
+    it("every tool sets all four annotation hints explicitly", () => {
+      // OpenAI: "confirm annotations are explicitly set to true or false (not
+      // null) for every tool." Positional server.tool() and registerTool()
+      // both land in `annotations` via the capture shim.
+      const { server, tools } = createCaptureServer();
+      registerCreateConversation(server, env, auth);
+      registerAppendMessages(server, env, auth);
+      registerSearch(server, env, auth);
+      registerGetConversation(server, env, auth);
+      registerListConversations(server, env, auth);
+      registerDeleteConversation(server, env, auth);
+      registerMemoryStatus(server, env, auth);
+      registerWhoami(server, env, auth);
+      registerManageSubscription(server, env, auth);
+      registerResolveVault(server, env, auth);
+      registerVaultSet(server, env, auth);
+      registerVaultGet(server, env, auth);
+      registerVaultList(server, env, auth);
+      registerVaultDelete(server, env, auth);
+      for (const [name, tool] of tools) {
+        for (const hint of ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"]) {
+          expect(typeof tool.annotations?.[hint], `${name}.${hint} must be an explicit boolean`).toBe("boolean");
+        }
+      }
+    });
+
+    it("connector-facing usage notices are factual only — no directives, no URLs", () => {
+      const samples = [
+        limitMessage({ unit: "messages", tier: "pro", limit: 1000, used: 1000, isOAuth: true }),
+        limitMessage({ unit: "conversations", isOAuth: true }),
+        storageFullMessage({ limit: 10_000, isOAuth: true }),
+        storageFullMessage({ isOAuth: true }),
+        approachingStorageNotice(usageMeter(9_000, 10_000), true),
+        approachingLimitNotice(usageMeter(900, 1_000), true),
+        storageNote(10_000, true),
+        storageNote(-1, true),
+      ].filter((t): t is string => typeof t === "string");
+      expect(samples).toHaveLength(8);
+      for (const text of samples) {
+        for (const re of BANNED) {
+          expect(text, `banned pattern ${re} in connector notice: ${text}`).not.toMatch(re);
+        }
+        expect(text, `URL in connector notice: ${text}`).not.toMatch(URL);
+      }
+    });
+
+    it("connector append_messages schema is narrow; first-party keeps the full shape", () => {
+      // OpenAI: "tools request input data that is overly broad … or includes the
+      // full conversation history." Connectors get {role: user|assistant, content}
+      // with a small cap and no vault/metadata/tool fields. API-key callers (the
+      // CLI daemon) keep the full schema.
+      const shapeOf = (a: AuthContext) => {
+        const { server, tools } = createCaptureServer();
+        registerAppendMessages(server, env, a);
+        const schema = tools.get("append_messages")!.schema as Record<string, z.ZodTypeAny>;
+        const messages = schema.messages as z.ZodArray<z.ZodObject<z.ZodRawShape>>;
+        const item = messages.element.shape;
+        return {
+          keys: Object.keys(schema).sort(),
+          itemKeys: Object.keys(item).sort(),
+          roles: (item.role as z.ZodEnum<[string, ...string[]]>).options,
+          max: messages._def.maxLength?.value,
+        };
+      };
+      const connector = shapeOf({ ...auth, apiKeyId: "oauth:client_contract" });
+      expect(connector.keys).toEqual(["conversation_id", "messages"]);
+      expect(connector.itemKeys).toEqual(["content", "role"]);
+      expect(connector.roles).toEqual(["user", "assistant"]);
+      expect(connector.max).toBe(25);
+
+      const firstParty = shapeOf(auth);
+      expect(firstParty.keys).toEqual(["conversation_id", "messages", "vault_entries"]);
+      expect(firstParty.itemKeys).toEqual(["content", "metadata", "role", "tool_call_id", "tool_name"]);
+      expect(firstParty.roles).toEqual(["user", "assistant", "system", "tool"]);
+      expect(firstParty.max).toBe(200);
     });
   });
 

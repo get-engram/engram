@@ -33,6 +33,8 @@ import { sendMaxoutNudges } from "./cron/maxout-nudge.js";
 import { sendActivationNudges } from "./cron/activation-nudge.js";
 import { sendRecallNudges } from "./cron/recall-nudge.js";
 import { sendStudentReverifyReminders } from "./cron/student-reverify.js";
+import { pruneExpiredOAuthTokens } from "./cron/prune-oauth-tokens.js";
+import { enforceAuditRetention } from "./cron/audit-retention.js";
 import { reconcileStripeToD1 } from "./cron/reconcile-stripe.js";
 export { DrainerDO } from "./services/drainer-do.js";
 import { sendWeeklyDigests } from "./cron/weekly-digest.js";
@@ -450,6 +452,10 @@ export default {
     await runJob("recall nudges", () => sendRecallNudges(env));
     // Student verifications lapse after 12 months; remind 14 days out.
     await runJob("student re-verify", () => sendStudentReverifyReminders(env));
+    // D1 hygiene (engram#469): reclaim dead OAuth tokens nightly, and hold
+    // audit_log to its stated retention floor instead of an emergency wipe.
+    await runJob("prune oauth tokens", () => pruneExpiredOAuthTokens(env));
+    await runJob("audit retention", () => enforceAuditRetention(env));
 
     // Heartbeat: one line every run naming which jobs (if any) failed, so a
     // partial cron failure is greppable instead of silent.

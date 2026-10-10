@@ -24,6 +24,7 @@ import {
   revokeRefreshTokenChain,
   getOrganizationByEmail,
   insertOrganizationWithEmail,
+  upsertOrgIdentity,
 } from "@getengram/db";
 import { verifySupabaseJwt } from "../utils/jwt.js";
 import { seedWelcomeConversation } from "../routes/signup.js";
@@ -325,6 +326,17 @@ oauth.post("/authorize/approve", async (c) => {
         ),
       );
     }
+  }
+
+  // Record which Supabase user this org belongs to (migration 0040). Until
+  // this line existed the connector path discarded `sub` and kept only the
+  // email string, so the same person later signing in on the website looked
+  // like a stranger to /signup and was gated. Best-effort: OAuth must never
+  // fail over bookkeeping.
+  try {
+    await upsertOrgIdentity(c.env.DB, orgId, claims.sub, email, "oauth");
+  } catch (err) {
+    console.error(`[oauth] identity record failed for ${orgId}: ${err instanceof Error ? err.message : err}`);
   }
 
   const scope = body.scope || DEFAULT_SCOPE;

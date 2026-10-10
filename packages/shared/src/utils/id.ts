@@ -13,6 +13,7 @@ const PREFIXES = {
   aud: "aud_",
   vlt: "vlt_",
   stv: "stv_",
+  clm: "clm_", // org claim link (migration 0040)
 } as const;
 
 type PrefixKey = keyof typeof PREFIXES;

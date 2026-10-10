@@ -37,6 +37,11 @@ export type AuditAction =
   | "org.email_link"
   | "account.set_password"
   | "signup.claim_required"
+  // Self-service claim (follow-up to #476): the link email going out, and the
+  // bind it produced. `org.claimed` is the one row that explains how a web
+  // login came to own a pre-existing org without support touching it.
+  | "signup.claim_sent"
+  | "org.claimed"
   | "student.verify_sent"
   | "student.verified"
   | "student.expired"

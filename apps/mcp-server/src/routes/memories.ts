@@ -13,8 +13,7 @@ import { searchConversations } from "../services/search.js";
 import {
   loadPrivacy,
   PRIVACY_BODIES_NOTICE,
-  PRIVACY_CROSS_CONVERSATION_NOTICE,
-} from "../services/privacy.js";
+  PRIVACY_CROSS_CONVERSATION_NOTICE, stripBodyFields } from "../services/privacy.js";
 import { fireWebhooks } from "../services/webhooks.js";
 import { audit } from "../services/audit.js";
 import { usageMeter, meterBar } from "../mcp/usage-messaging.js";
@@ -113,9 +112,7 @@ memories.get("/search", async (c) => {
   }
 
   const raw = await searchConversations(c.env, auth.organizationId, query, limit, undefined, undefined, undefined, undefined, undefined, undefined, auth.seatId);
-  const results = privacy.canReadBodies
-    ? raw
-    : raw.map(({ chunk_text: _c, ...rest }) => rest);
+  const results = privacy.canReadBodies ? raw : stripBodyFields(raw);
 
   await audit(c.env.DB, auth.organizationId, auth.apiKeyId, "search", undefined, undefined, {
     query,

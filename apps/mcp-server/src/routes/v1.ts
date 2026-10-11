@@ -24,8 +24,7 @@ import { searchConversations } from "../services/search.js";
 import {
   loadPrivacy,
   PRIVACY_BODIES_NOTICE,
-  PRIVACY_CROSS_CONVERSATION_NOTICE,
-} from "../services/privacy.js";
+  PRIVACY_CROSS_CONVERSATION_NOTICE, stripBodyFields } from "../services/privacy.js";
 import { fireWebhooks } from "../services/webhooks.js";
 import { audit } from "../services/audit.js";
 import { hasScope, type Scope } from "../mcp/scopes.js";
@@ -500,9 +499,7 @@ v1.get("/search", async (c) => {
     project,
     auth.seatId, // private-space filter (engram#264)
   );
-  const results = privacy.canReadBodies
-    ? raw
-    : raw.map(({ chunk_text: _c, ...rest }) => rest);
+  const results = privacy.canReadBodies ? raw : stripBodyFields(raw);
 
   await trackSearchRun(c.env.DB, auth.organizationId).catch(() => {});
   await audit(c.env.DB, auth.organizationId, auth.apiKeyId, "search", undefined, undefined, {

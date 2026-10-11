@@ -1,17 +1,63 @@
 import { Hono } from "hono";
 import {
   getOrganizationById,
+  getOrganizationByEmail,
   getOrganizationStats,
   softDeleteOrganization,
   restoreOrganization,
   setOrganizationEmail,
 } from "@getengram/db";
 import { audit } from "../services/audit.js";
+import { hasScope } from "../mcp/scopes.js";
+import { isExternalOAuthClient } from "../mcp/auth-kind.js";
+import type { Context } from "hono";
 import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
 
 const account = new Hono<HonoEnv>();
+
+/**
+ * Account lifecycle and identity are first-party, write-level acts.
+ *
+ * These handlers used to check only `auth.seatId` (owner vs Team member),
+ * which let two credentials through that must never reach them:
+ *   - a key minted with scopes=["read"]. Proved live 2026-10-11: a read-only
+ *     key was refused by POST /api/keys and then successfully soft-deleted
+ *     its own organization, scheduling every conversation, message, chunk
+ *     and vector for permanent purge.
+ *   - an OAuth connector token. A connected app's consent vocabulary is
+ *     engram:read / engram:write; neither word means "destroy this account"
+ *     or "change the address that owns it", so a prompt-injected assistant
+ *     holding read-only consent could do both.
+ *
+ * PATCH is the sharper of the two: organizations.email is the identity
+ * anchor that /signup, /signup/login and the #480 claim link all resolve
+ * against, so re-pointing it is an account-takeover primitive, not a
+ * profile edit.
+ *
+ * GET stays open to read-only callers — it is the key-validation "whoami".
+ */
+function denyUnlessFirstPartyWrite(c: Context<HonoEnv>): Response | null {
+  const auth = c.get("auth");
+  if (isExternalOAuthClient(auth)) {
+    return c.json(
+      {
+        error: "forbidden",
+        message:
+          "Account settings are managed from the Engram dashboard or CLI, not from a connected app.",
+      },
+      403,
+    );
+  }
+  if (!hasScope(auth, "write")) {
+    return c.json(
+      { error: "insufficient_scope", message: "This action requires the 'write' scope." },
+      403,
+    );
+  }
+  return null;
+}
 
 const GRACE_PERIOD_DAYS = 30;
 
@@ -51,8 +97,19 @@ account.get("/", async (c) => {
 
 // PATCH /api/account — update organization settings (email)
 account.patch("/", async (c) => {
+  const denied = denyUnlessFirstPartyWrite(c);
+  if (denied) return denied;
+
   const auth = c.get("auth");
   const orgId = auth.organizationId;
+  // Owner-only: a Team member's seat key must not re-point the address the
+  // whole organization is identified by.
+  if (auth.seatId) {
+    return c.json(
+      { error: "forbidden", message: "Only the organization owner can change the account email." },
+      403,
+    );
+  }
   const body = await c.req.json<{ email?: string }>().catch(() => ({}));
   const email = (body as { email?: string }).email?.trim();
 
@@ -60,14 +117,34 @@ account.patch("/", async (c) => {
     return c.json({ error: "invalid_email", message: "A valid email is required" }, 400);
   }
 
+  // Same collision rule POST /signup/link already enforces: one address maps
+  // to one org, or the email-keyed lookups behind sign-in and the claim link
+  // become ambiguous.
+  const clash = (await getOrganizationByEmail(c.env.DB, email)) as { id: string } | null;
+  if (clash && clash.id !== orgId) {
+    return c.json(
+      { error: "email_taken", message: "This email is already linked to another account" },
+      409,
+    );
+  }
+
+  const before = (await getOrganizationById(c.env.DB, orgId)) as { email: string | null } | null;
   await setOrganizationEmail(c.env.DB, orgId, email);
-  await audit(c.env.DB, orgId, auth.apiKeyId, "account.update_email");
+  // Record old and new: an unexplained email change is the signature of a
+  // takeover, and the Oct 2026 lockout had to be reconstructed without one.
+  await audit(c.env.DB, orgId, auth.apiKeyId, "account.update_email", "organization", orgId, {
+    from: before?.email ?? null,
+    to: email,
+  });
 
   return c.json({ updated: true, email });
 });
 
 // DELETE /api/account — soft-delete the organization (30-day grace period)
 account.delete("/", async (c) => {
+  const denied = denyUnlessFirstPartyWrite(c);
+  if (denied) return denied;
+
   const auth = c.get("auth");
   const orgId = auth.organizationId;
 
@@ -109,6 +186,9 @@ account.delete("/", async (c) => {
 
 // POST /api/account/restore — undo soft-delete within 30-day window
 account.post("/restore", async (c) => {
+  const denied = denyUnlessFirstPartyWrite(c);
+  if (denied) return denied;
+
   const auth = c.get("auth");
   const orgId = auth.organizationId;
 

@@ -6,8 +6,7 @@ import { audit } from "../../services/audit.js";
 import {
   loadPrivacy,
   PRIVACY_BODIES_NOTICE,
-  PRIVACY_CROSS_CONVERSATION_NOTICE,
-} from "../../services/privacy.js";
+  PRIVACY_CROSS_CONVERSATION_NOTICE, stripBodyFields } from "../../services/privacy.js";
 import { hasScope, scopeError } from "../scopes.js";
 import { MAX_SEARCH_QUERY_CHARS } from "@getengram/shared";
 import { searchEmptyTip, firstRunActivation } from "../coaching.js";
@@ -111,9 +110,7 @@ export function registerSearch(
 
       // When bodies are hidden, return the matching conversations'
       // metadata (title, tags, score) but drop the verbatim snippet.
-      const results = privacy.canReadBodies
-        ? raw
-        : raw.map(({ chunk_text: _c, ...rest }) => rest);
+      const results = privacy.canReadBodies ? raw : stripBodyFields(raw);
 
       // Track usage
       await trackSearchRun(env.DB, auth.organizationId).catch(() => {});

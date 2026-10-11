@@ -4,10 +4,18 @@ import { enforceAuditRetention, AUDIT_RETENTION_DAYS } from "../cron/audit-reten
 import type { Env } from "../types.js";
 
 /**
- * Stub D1 that serves `pages` rows per SELECT page until exhausted, and
- * records every statement + its bindings, so the tests can pin the batching
- * shape without a real database.
+ * These tests exist because the previous ones PASSED while the jobs deleted
+ * nothing in production for two nights.
+ *
+ * The old stub accepted any number of bound parameters, so an IN-list of 500
+ * looked fine here and threw `D1_ERROR: too many SQL variables` against the
+ * real database — every night, silently, because the scheduled runner
+ * isolates per-job failures. The stub below enforces D1's real limits, so a
+ * regression fails here instead of in production.
  */
+const D1_MAX_BOUND_PARAMS = 100;
+
+/** Stub D1 that enforces the bound-parameter cap and serves rows per DELETE. */
 function stubDb(rowsPerTable: Record<string, number>) {
   const log: Array<{ sql: string; args: unknown[] }> = [];
   const remaining = { ...rowsPerTable };
@@ -19,18 +27,24 @@ function stubDb(rowsPerTable: Record<string, number>) {
           args = a;
           return stmt;
         },
-        all: async () => {
-          const table = /FROM (\w+)/.exec(sql)![1];
-          const limit = Number(args[args.length - 1]);
-          const n = Math.min(remaining[table] ?? 0, limit);
-          remaining[table] = (remaining[table] ?? 0) - n;
-          log.push({ sql, args });
-          const key = /SELECT (\w+)/.exec(sql)![1];
-          return { results: Array.from({ length: n }, (_, i) => ({ [key]: `${table}_${i}` })) };
-        },
         run: async () => {
+          if (args.length > D1_MAX_BOUND_PARAMS) {
+            // The exact failure the real database produced.
+            throw new Error("D1_ERROR: too many SQL variables: SQLITE_ERROR");
+          }
           log.push({ sql, args });
-          return { success: true, meta: { changes: args.length } };
+          const table = /DELETE FROM (\w+)/.exec(sql)?.[1];
+          const limit = Number(/LIMIT (\d+)/.exec(sql)?.[1] ?? 0);
+          const n = Math.min(remaining[table ?? ""] ?? 0, limit);
+          if (table) remaining[table] = (remaining[table] ?? 0) - n;
+          return { success: true, meta: { changes: n } };
+        },
+        all: async () => {
+          if (args.length > D1_MAX_BOUND_PARAMS) {
+            throw new Error("D1_ERROR: too many SQL variables: SQLITE_ERROR");
+          }
+          log.push({ sql, args });
+          return { results: [] };
         },
       };
       return stmt;
@@ -39,41 +53,54 @@ function stubDb(rowsPerTable: Record<string, number>) {
   return { db, log, env: { DB: db } as unknown as Env };
 }
 
+const binds = (log: Array<{ args: unknown[] }>) => Math.max(0, ...log.map((l) => l.args.length));
+
 describe("pruneExpiredOAuthTokens", () => {
-  it("deletes expired rows from BOTH token tables in bounded batches", async () => {
+  it("drains both token tables without ever exceeding D1's parameter cap", async () => {
     const { env, log } = stubDb({ oauth_access_tokens: 1200, oauth_refresh_tokens: 3 });
     const n = await pruneExpiredOAuthTokens(env);
     expect(n).toBe(1203);
-    const deletes = log.filter((l) => l.sql.startsWith("DELETE"));
-    // 1200 access rows → 500 + 500 + 200; refresh → one batch of 3
-    expect(deletes.map((d) => d.args.length)).toEqual([500, 500, 200, 3]);
-    expect(deletes[0].sql).toMatch(/^DELETE FROM oauth_access_tokens WHERE token_hash IN \(/);
-    expect(deletes[3].sql).toMatch(/^DELETE FROM oauth_refresh_tokens WHERE token_hash IN \(/);
+    // 1200 access -> 500 + 500 + 200 (stops: 200 < BATCH); refresh -> 3
+    expect(log.map((l) => /DELETE FROM (\w+)/.exec(l.sql)![1])).toEqual([
+      "oauth_access_tokens",
+      "oauth_access_tokens",
+      "oauth_access_tokens",
+      "oauth_refresh_tokens",
+    ]);
+    expect(binds(log)).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMS);
+    expect(binds(log)).toBe(0); // the LIMIT is in the SQL; nothing is bound
   });
 
-  it("only ever selects by expiry — never touches a live token", async () => {
+  it("only ever deletes by expiry — a live token is never in range", async () => {
     const { env, log } = stubDb({ oauth_access_tokens: 1 });
     await pruneExpiredOAuthTokens(env);
-    for (const s of log.filter((l) => l.sql.startsWith("SELECT"))) {
+    for (const s of log) {
       expect(s.sql).toMatch(/WHERE expires_at < datetime\('now'\)/);
+      expect(s.sql).toMatch(/DELETE FROM oauth_(access|refresh)_tokens WHERE token_hash IN \(\s*SELECT/);
     }
   });
 
   it("is a no-op when nothing is expired", async () => {
-    const { env, log } = stubDb({});
+    const { env } = stubDb({});
     expect(await pruneExpiredOAuthTokens(env)).toBe(0);
-    expect(log.some((l) => l.sql.startsWith("DELETE"))).toBe(false);
+  });
+
+  it("stays bounded on a huge backlog instead of one unbounded delete", async () => {
+    const { env, log } = stubDb({ oauth_access_tokens: 10_000_000 });
+    const n = await pruneExpiredOAuthTokens(env);
+    expect(n).toBe(25_000); // 50 batches x 500, per table
+    expect(log.length).toBe(51); // 50 access + 1 refresh probe
   });
 });
 
 describe("enforceAuditRetention", () => {
-  it("uses the stated floor and nothing shorter", async () => {
+  it("uses the stated floor, binds exactly one parameter, and never exceeds the cap", async () => {
     const { env, log } = stubDb({ audit_log: 1 });
     await enforceAuditRetention(env);
-    const sel = log.find((l) => l.sql.startsWith("SELECT"))!;
     expect(AUDIT_RETENTION_DAYS).toBeGreaterThanOrEqual(90);
-    expect(sel.args[0]).toBe(`-${AUDIT_RETENTION_DAYS} days`);
-    expect(sel.sql).toMatch(/created_at < datetime\('now', \?\)/);
+    expect(log[0].args).toEqual([`-${AUDIT_RETENTION_DAYS} days`]);
+    expect(binds(log)).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMS);
+    expect(log[0].sql).toMatch(/created_at < datetime\('now', \?\)/);
   });
 
   it("caps a run above daily inflow so retention can actually catch up", async () => {
@@ -81,13 +108,12 @@ describe("enforceAuditRetention", () => {
     const { env } = stubDb({ audit_log: 1_000_000 });
     const n = await enforceAuditRetention(env);
     expect(n).toBeGreaterThan(15_400);
-    expect(n).toBe(30_000); // 60 batches × 500 — bounded, not unbounded
+    expect(n).toBe(30_000); // 60 batches x 500 — bounded, not unbounded
   });
 
-  it("deletes by id in batches and stops when the page runs dry", async () => {
+  it("stops as soon as a batch comes back short", async () => {
     const { env, log } = stubDb({ audit_log: 750 });
     expect(await enforceAuditRetention(env)).toBe(750);
-    const deletes = log.filter((l) => l.sql.startsWith("DELETE FROM audit_log WHERE id IN"));
-    expect(deletes.map((d) => d.args.length)).toEqual([500, 250]);
+    expect(log.length).toBe(2);
   });
 });

@@ -440,6 +440,18 @@ export default {
     // Enterprise custom-retention policies (engram#289) — no-op unless an
     // admin has explicitly set retention_policy_days on an org.
     await runJob("retention policy", () => enforceRetentionPolicies(env));
+    // D1 hygiene (engram#469): reclaim dead OAuth tokens nightly, and hold
+    // audit_log to its stated retention floor instead of an emergency wipe.
+    //
+    // These run with the other compliance jobs, BEFORE the lifecycle nudges.
+    // They were originally appended after them, at the very end of a chain of
+    // ten sequential jobs — several of which make a network call per org
+    // across ~2,500 orgs — and in two nights they never executed once: tokens
+    // that expired on 2026-06-30 were still present, while the prune's own
+    // query matched a full 500-row batch on the first try. Marketing email
+    // must not be able to starve data hygiene.
+    await runJob("prune oauth tokens", () => pruneExpiredOAuthTokens(env));
+    await runJob("audit retention", () => enforceAuditRetention(env));
     // Import-first onboarding (engram#253): one nudge per org that signed up
     // yesterday and hasn't stored anything yet.
     await runJob("import nudges", () => sendImportNudges(env));
@@ -452,10 +464,6 @@ export default {
     await runJob("recall nudges", () => sendRecallNudges(env));
     // Student verifications lapse after 12 months; remind 14 days out.
     await runJob("student re-verify", () => sendStudentReverifyReminders(env));
-    // D1 hygiene (engram#469): reclaim dead OAuth tokens nightly, and hold
-    // audit_log to its stated retention floor instead of an emergency wipe.
-    await runJob("prune oauth tokens", () => pruneExpiredOAuthTokens(env));
-    await runJob("audit retention", () => enforceAuditRetention(env));
 
     // Heartbeat: one line every run naming which jobs (if any) failed, so a
     // partial cron failure is greppable instead of silent.

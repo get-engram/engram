@@ -14,7 +14,12 @@ import {
   getApiKeyCount,
   setOrganizationEmail,
   getApiKeyWithOrg,
+  upsertOrgIdentity,
+  hasOrgIdentity,
+  clearOAuthTokensByOrg,
 } from "@getengram/db";
+import { requiresClaim, startClaim, claimMessage } from "../services/claim.js";
+export { requiresClaim };
 import { TIER_LIMITS, type Tier } from "@getengram/shared";
 import type { Env, AuthContext } from "../types.js";
 import { verifySupabaseJwt } from "../utils/jwt.js";
@@ -62,9 +67,6 @@ async function authenticateApiKey(
  * self-service claim flow ships, that proof is a support request — the same
  * path the one real case (Oct 2026) already took.
  */
-export function requiresClaim(org: { messages_stored_total?: number | null }): boolean {
-  return (org.messages_stored_total ?? 0) > 0;
-}
 
 const WELCOME_MESSAGE = `Welcome to Engram — your AI's long-term memory.
 
@@ -180,27 +182,28 @@ signup.post("/", async (c) => {
     | { id: string; messages_stored_total?: number | null }
     | null;
   if (existing) {
-    if (requiresClaim(existing as { messages_stored_total?: number | null })) {
-      await audit(c.env.DB, existing.id, null, "signup.claim_required", "organization", existing.id, {
-        sub: claims.sub,
-      });
-      return c.json(
-        {
-          error: "claim_required",
-          message:
-            "An Engram account with saved memories already exists for this email address. " +
-            "To link this sign-in to it, email hello@getengram.app from that address and " +
-            "we'll connect it — nothing in the account is affected.",
-        },
-        403,
-      );
+    // The Supabase user that created this org — through ChatGPT/Claude
+    // connect, the CLI, or an earlier web signup — is on org_identities.
+    // That user arriving through a new surface is not a takeover and is not
+    // gated. Only a sub this org has never seen has to prove the inbox.
+    const known = await hasOrgIdentity(c.env.DB, existing.id, claims.sub);
+    if (!known && requiresClaim(existing)) {
+      const claim = await startClaim(c.env, existing, claims.sub, email, "web");
+      return c.json({ error: "claim_required", message: claimMessage(claim, "web"), claim }, 403);
     }
     orgId = existing.id;
     created = false;
+    // Identity is recorded the moment the gate is passed — before anything
+    // that can fail. If the key mint below throws, the retry must still see
+    // this sub as the org's own user rather than gate it.
+    await upsertOrgIdentity(c.env.DB, orgId, claims.sub, email, "signup");
   } else {
     orgId = generateId("org");
     const orgName = email.split("@")[0];
     await insertOrganizationWithEmail(c.env.DB, orgId, orgName, email, ref, requestCountry(c.req.raw));
+    // Before the welcome seed: that seed sets messages_stored_total = 1, which
+    // would make a retry of a half-finished signup gate its own creator.
+    await upsertOrgIdentity(c.env.DB, orgId, claims.sub, email, "signup");
     await seedWelcomeConversation(c.env.DB, orgId);
     created = true;
   }
@@ -359,7 +362,7 @@ signup.post("/set-password", async (c) => {
     msg?: string;
     error_description?: string;
     session?: unknown;
-    user?: { identities?: unknown[] };
+    user?: { id?: string; identities?: unknown[] };
   };
   if (!res.ok) {
     const msg = j.msg || j.error_description || "";
@@ -386,6 +389,12 @@ signup.post("/set-password", async (c) => {
       },
       409,
     );
+  }
+
+  // This is the moment a CLI-born org gets a Supabase user: record it, or the
+  // very next web login would be gated by the org's own memories.
+  if (j.user?.id) {
+    await upsertOrgIdentity(c.env.DB, auth.organizationId, j.user.id, org.email, "set-password");
   }
 
   return c.json({ ok: true, confirmation_required: !j.session, email: org.email });
@@ -428,14 +437,31 @@ signup.post("/login", async (c) => {
       401,
     );
   }
+  const session = (await authRes.json().catch(() => ({}))) as { user?: { id?: string } };
+  const sub = session.user?.id;
+  // Fail closed: without the user id the identity check below cannot run,
+  // and a key minted here would be bound to nobody.
+  if (!sub) {
+    return c.json({ error: "auth_failed", message: "Identity provider did not return a user id" }, 502);
+  }
 
   // Find the org by email
-  const org = (await getOrganizationByEmail(c.env.DB, email)) as { id: string } | null;
+  const org = (await getOrganizationByEmail(c.env.DB, email)) as
+    | { id: string; messages_stored_total?: number | null }
+    | null;
   if (!org) {
     return c.json(
       { error: "no_account", message: "No Engram account found for this email. Run 'engram signup' first." },
       404,
     );
+  }
+
+  // Same rule as /signup: a password proves the Supabase account, not the
+  // inbox. The org's own user (recorded at connect/signup) logs in freely; a
+  // sub the org has never seen gets the claim link and must come back.
+  if (!(await hasOrgIdentity(c.env.DB, org.id, sub)) && requiresClaim(org)) {
+    const claim = await startClaim(c.env, org, sub, email, "cli");
+    return c.json({ error: "claim_required", message: claimMessage(claim, "cli"), claim }, 403);
   }
 
   // Check if org already has a key at limit
@@ -454,6 +480,9 @@ signup.post("/login", async (c) => {
     );
   }
 
+  // Identity first, key second — see /signup for why.
+  await upsertOrgIdentity(c.env.DB, org.id, sub, email, "cli-login");
+
   // Mint a new API key
   const keyId = generateId("key");
   const { raw, prefix } = generateApiKeyRaw();
@@ -465,6 +494,118 @@ signup.post("/login", async (c) => {
     api_key: raw,
     key_prefix: prefix,
   });
+});
+
+// POST /signup/claim — redeem a claim link (see startClaim). Authenticated by
+// the same Supabase JWT /signup takes: the token proves the inbox, the JWT
+// proves which sign-in is asking, and the row's `sub` requires them to be the
+// user who was gated — a forwarded link cannot bind a different login.
+signup.post("/claim", ipThrottle({ limit: 60, windowMs: 60_000, bucket: "signup-claim" }), async (c) => {
+  const jwtSecret = c.env.SUPABASE_JWT_SECRET;
+  if (!jwtSecret) {
+    return c.json({ error: "server_misconfigured", message: "SUPABASE_JWT_SECRET is not set" }, 500);
+  }
+  const jwt = (c.req.header("authorization") ?? "").replace(/^Bearer\s+/i, "");
+  if (!jwt) {
+    return c.json({ error: "unauthorized", message: "Missing Bearer token" }, 401);
+  }
+  let claims;
+  try {
+    claims = await verifySupabaseJwt(jwt, jwtSecret, c.env.SUPABASE_URL);
+  } catch (err) {
+    return c.json({ error: "unauthorized", message: err instanceof Error ? err.message : "Invalid token" }, 401);
+  }
+  const email = claims.email;
+  if (!email) {
+    return c.json({ error: "invalid_token", message: "JWT does not contain an email claim" }, 400);
+  }
+
+  const body = await c.req.json<{ token?: string }>().catch(() => ({}) as { token?: string });
+  const token = (body.token ?? "").trim();
+  if (!token) {
+    return c.json({ error: "invalid_request", message: "token is required" }, 400);
+  }
+
+  const row = await c.env.DB.prepare(
+    `SELECT id, organization_id, sub, email, consumed_at,
+            (expires_at < datetime('now')) AS expired
+     FROM org_claims WHERE token_hash = ?`,
+  )
+    .bind(await hashApiKey(token))
+    .first<{
+      id: string;
+      organization_id: string;
+      sub: string;
+      email: string;
+      consumed_at: string | null;
+      expired: number;
+    }>();
+
+  // Unknown, used, expired, and someone-else's are all reported identically —
+  // a probing caller learns nothing about which tokens exist.
+  const invalid = () =>
+    c.json(
+      { error: "invalid_token", message: "That link is invalid or has expired. Sign in again to get a new one." },
+      400,
+    );
+  if (!row || row.consumed_at || row.expired || row.sub !== claims.sub) return invalid();
+  if (row.email.toLowerCase() !== email.toLowerCase()) return invalid();
+
+  // The org must still be the one this address maps to: /signup/link could
+  // have re-pointed the email while the link sat in an inbox.
+  const org = (await getOrganizationByEmail(c.env.DB, email)) as { id: string } | null;
+  if (!org || org.id !== row.organization_id) return invalid();
+
+  // Consume before minting, and only if nobody else got there first: a
+  // double-submit races on this UPDATE, and only the request that flips
+  // consumed_at goes on to hand out a key.
+  const consumed = await c.env.DB.prepare(
+    `UPDATE org_claims SET consumed_at = datetime('now') WHERE id = ? AND consumed_at IS NULL`,
+  )
+    .bind(row.id)
+    .run();
+  if ((consumed.meta?.changes ?? 0) === 0) return invalid();
+
+  await upsertOrgIdentity(c.env.DB, org.id, claims.sub, email, "claim");
+  const keyId = generateId("key");
+  const { raw, prefix } = generateApiKeyRaw();
+  const keyHash = await hashApiKey(raw);
+  await insertApiKey(c.env.DB, keyId, org.id, keyHash, prefix, "Default");
+
+  // Whoever proves the inbox owns the org. Credentials issued before this
+  // claim came from a sub we cannot vouch for: /signup/link sets an org's
+  // address with no inbox proof, so a stranger could park someone's email on
+  // their own org and wait for the real owner to claim it. Owner keys and
+  // connector tokens are cut; Team seat keys stay. The legitimate case pays
+  // one `engram login` / reconnect; the planted-email attack pays everything.
+  const cut = await c.env.DB.prepare(
+    `UPDATE api_keys SET revoked_at = datetime('now')
+     WHERE organization_id = ? AND revoked_at IS NULL AND seat_id IS NULL AND id != ?`,
+  )
+    .bind(org.id, keyId)
+    .run();
+  await clearOAuthTokensByOrg(c.env.DB, org.id);
+  const revokedKeys = cut.meta?.changes ?? 0;
+
+  await audit(c.env.DB, org.id, keyId, "org.claimed", "organization", org.id, {
+    sub: claims.sub,
+    claim_id: row.id,
+    revoked_keys: revokedKeys,
+  });
+
+  // Same shape as a /signup success so the dashboard reuses its profile path;
+  // created:false keeps the welcome email from firing weeks into someone's use.
+  return c.json(
+    {
+      organization_id: org.id,
+      api_key: raw,
+      key_prefix: prefix,
+      created: false,
+      claimed: true,
+      revoked_keys: revokedKeys,
+    },
+    200,
+  );
 });
 
 export { signup };

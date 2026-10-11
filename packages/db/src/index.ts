@@ -11,3 +11,4 @@ export * from "./queries/vault.js";
 export * from "./queries/named-secrets.js";
 export * from "./queries/oauth.js";
 export * from "./queries/fts-keys.js";
+export * from "./queries/identities.js";

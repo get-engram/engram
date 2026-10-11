@@ -37,6 +37,71 @@ async function stripeFetch<T = unknown>(
   return json;
 }
 
+/**
+ * Product + price provisioning (one-time setup, driven by /admin).
+ *
+ * Prices are normally created by hand in the Stripe dashboard, but the Stripe
+ * CLI's restricted key has no `product_write` permission, so the student price
+ * could not be created from a terminal. The worker's own STRIPE_SECRET_KEY
+ * can do it, and doing it here means the price is created with the exact
+ * lookup_key and metadata the webhook's tier mapping expects rather than
+ * whatever a hand-typed form produced.
+ *
+ * Idempotent by lookup_key: a second call returns the existing price and
+ * creates nothing. Never updates an existing price — Stripe prices are
+ * immutable by design, and silently repointing a plan's price is how live
+ * subscribers end up billed a different amount.
+ */
+export interface StripePrice {
+  id: string;
+  unit_amount: number | null;
+  currency: string;
+  lookup_key: string | null;
+  active: boolean;
+  livemode: boolean;
+  product: string;
+  recurring: { interval: string } | null;
+}
+
+export async function findPriceByLookupKey(
+  secretKey: string,
+  lookupKey: string,
+): Promise<StripePrice | null> {
+  const res = await stripeFetch<{ data: StripePrice[] }>(
+    secretKey,
+    `/prices?lookup_keys[]=${encodeURIComponent(lookupKey)}&active=true&limit=1`,
+  );
+  return res.data?.[0] ?? null;
+}
+
+export async function createRecurringPrice(
+  secretKey: string,
+  params: {
+    productName: string;
+    productDescription: string;
+    tier: string;
+    unitAmount: number;
+    lookupKey: string;
+    nickname: string;
+    currency?: string;
+  },
+): Promise<StripePrice> {
+  const product = await stripeFetch<{ id: string }>(secretKey, `/products`, {
+    name: params.productName,
+    description: params.productDescription,
+    "metadata[tier]": params.tier,
+  });
+  return stripeFetch<StripePrice>(secretKey, `/prices`, {
+    product: product.id,
+    unit_amount: params.unitAmount,
+    currency: params.currency ?? "usd",
+    "recurring[interval]": "month",
+    lookup_key: params.lookupKey,
+    nickname: params.nickname,
+    "metadata[tier]": params.tier,
+  });
+}
+
 export interface StripeCustomer {
   id: string;
   email: string | null;

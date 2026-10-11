@@ -6,6 +6,7 @@ import { purgeDeletedOrganizations } from "../cron/purge-deleted.js";
 import type { Env } from "../types.js";
 import { sendDailyReport } from "../services/daily-report.js";
 import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
+import { findPriceByLookupKey, createRecurringPrice } from "../services/stripe.js";
 import { computeMrr } from "../services/mrr.js";
 import { ftsRowid, orgFtsToken } from "@getengram/db";
 
@@ -573,6 +574,66 @@ admin.post("/users/:id/sync-stripe", async (c) => {
     return c.json(result, code);
   }
   return c.json(result);
+});
+
+// ---------------------------------------------------------------------------
+// POST /admin/stripe/ensure-student-price — create the $3/mo Student price
+//
+// Student pricing shipped with every code path in place except the Stripe
+// price itself, because the Stripe CLI's restricted key lacks product_write.
+// The worker's STRIPE_SECRET_KEY has it, so the price is created here, with
+// the lookup_key and metadata[tier] the billing webhook's tier mapping
+// expects. Idempotent: returns the existing price if one already carries the
+// lookup key, and never mutates it. The returned id still has to be set as
+// the STRIPE_PRICE_ID_STUDENT secret — this endpoint deliberately cannot
+// write its own configuration.
+// ---------------------------------------------------------------------------
+const STUDENT_LOOKUP_KEY = "student_monthly";
+const STUDENT_UNIT_AMOUNT = 300; // $3.00/month
+
+admin.post("/stripe/ensure-student-price", async (c) => {
+  const secretKey = c.env.STRIPE_SECRET_KEY;
+  if (!secretKey) return c.json({ error: "stripe_not_configured" }, 500);
+
+  try {
+    const existing = await findPriceByLookupKey(secretKey, STUDENT_LOOKUP_KEY);
+    if (existing) {
+      return c.json({
+        created: false,
+        price_id: existing.id,
+        unit_amount: existing.unit_amount,
+        currency: existing.currency,
+        interval: existing.recurring?.interval ?? null,
+        livemode: existing.livemode,
+        configured: c.env.STRIPE_PRICE_ID_STUDENT === existing.id,
+      });
+    }
+    const price = await createRecurringPrice(secretKey, {
+      productName: "Engram Student",
+      productDescription:
+        "Pro entitlements at student pricing. Requires a verified university email address; re-verified yearly.",
+      tier: "student",
+      unitAmount: STUDENT_UNIT_AMOUNT,
+      lookupKey: STUDENT_LOOKUP_KEY,
+      nickname: "Student monthly",
+    });
+    return c.json({
+      created: true,
+      price_id: price.id,
+      unit_amount: price.unit_amount,
+      currency: price.currency,
+      interval: price.recurring?.interval ?? null,
+      livemode: price.livemode,
+      configured: false,
+      next_step: "wrangler secret put STRIPE_PRICE_ID_STUDENT",
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // A restricted key without product_write lands here; the message names
+    // the missing permission, which is the whole diagnostic value.
+    console.error(`[admin] ensure-student-price failed: ${message}`);
+    return c.json({ error: "stripe_error", message }, 502);
+  }
 });
 
 // POST /admin/daily-report/send — manually trigger the daily ops email

@@ -37,6 +37,11 @@ export type AuditAction =
   | "org.email_link"
   | "account.set_password"
   | "signup.claim_required"
+  // Self-service claim (follow-up to #476). `signup.claim_required` is written
+  // once per attempted link send (metadata: sub, via, delivered) — not per
+  // gate hit. `org.claimed` is the one row that explains how a sign-in came to
+  // own a pre-existing org without support touching it.
+  | "org.claimed"
   | "student.verify_sent"
   | "student.verified"
   | "student.expired"

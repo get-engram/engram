@@ -45,8 +45,17 @@ export const PRIVACY_CROSS_CONVERSATION_NOTICE =
  * Every caller that returns search rows MUST route through this, so a new
  * body-derived column cannot leak by being forgotten in one of three places.
  */
-export function stripBodyFields<
-  T extends { chunk_text?: unknown; chunk_summary?: unknown },
->(rows: T[]): Omit<T, "chunk_text" | "chunk_summary">[] {
-  return rows.map(({ chunk_text: _text, chunk_summary: _summary, ...rest }) => rest);
+export function stripBodyFields<T extends object>(
+  rows: T[],
+): Omit<T, "chunk_text" | "chunk_summary">[] {
+  return rows.map((row) => {
+    // Widened locally so the two fields can be peeled off whatever row shape
+    // a caller has, without the generic demanding that they be declared.
+    const {
+      chunk_text: _text,
+      chunk_summary: _summary,
+      ...rest
+    } = row as T & { chunk_text?: unknown; chunk_summary?: unknown };
+    return rest as Omit<T, "chunk_text" | "chunk_summary">;
+  });
 }

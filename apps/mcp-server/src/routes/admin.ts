@@ -3,6 +3,8 @@ import { getAuditLogs, revokeApiKeysByOrg, clearOAuthTokensByOrg, reconcileOrgCo
 import { compressContent, ENCODING_GZIP } from "../utils/compress.js";
 import { audit } from "../services/audit.js";
 import { purgeDeletedOrganizations } from "../cron/purge-deleted.js";
+import { pruneExpiredOAuthTokens } from "../cron/prune-oauth-tokens.js";
+import { enforceAuditRetention } from "../cron/audit-retention.js";
 import type { Env } from "../types.js";
 import { sendDailyReport } from "../services/daily-report.js";
 import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
@@ -634,6 +636,35 @@ admin.post("/stripe/ensure-student-price", async (c) => {
     console.error(`[admin] ensure-student-price failed: ${message}`);
     return c.json({ error: "stripe_error", message }, 502);
   }
+});
+
+// ---------------------------------------------------------------------------
+// POST /admin/hygiene/run — run the nightly D1 hygiene jobs on demand.
+//
+// Same idea as /admin/run-purge. It exists because these jobs are otherwise
+// unobservable: they write no audit rows, and the only evidence that they had
+// silently never executed was that OAuth tokens which expired months earlier
+// were still in the table. Returning the row counts makes "did hygiene run,
+// and did it reclaim anything?" a question with an answer.
+//
+// Both jobs are internally bounded and resumable, so calling this repeatedly
+// is safe — it drains a backlog in fixed bites rather than one huge delete.
+// ---------------------------------------------------------------------------
+admin.post("/hygiene/run", async (c) => {
+  const started = Date.now();
+  const result: Record<string, number | string> = {};
+  try {
+    result.oauth_tokens_pruned = await pruneExpiredOAuthTokens(c.env);
+  } catch (err) {
+    result.oauth_tokens_error = err instanceof Error ? err.message : String(err);
+  }
+  try {
+    result.audit_rows_removed = await enforceAuditRetention(c.env);
+  } catch (err) {
+    result.audit_error = err instanceof Error ? err.message : String(err);
+  }
+  result.took_ms = Date.now() - started;
+  return c.json(result);
 });
 
 // POST /admin/daily-report/send — manually trigger the daily ops email

@@ -1,3 +1,4 @@
+import { HTTPException } from "hono/http-exception";
 import {
   generateId,
   chunkMessages,
@@ -184,10 +185,26 @@ export async function appendMessages(
 
   messageInputs = boundMessageContent(messageInputs);
 
-  // Verify conversation exists and belongs to org
+  // Verify conversation exists and belongs to org. The lookup is org-scoped,
+  // so another tenant's id is indistinguishable from a nonexistent one —
+  // which is the correct answer to give either way.
+  //
+  // Thrown as a 404 HTTPException rather than a bare Error because the bare
+  // Error reached app.onError and became a 500: a client that mistyped a
+  // conversation_id got "internal_error", and every such mistake landed in
+  // the logs as a server fault. The MCP tool pre-checks and returns its own
+  // "Conversation not found", so this is the REST surface's equivalent.
   const conv = await getConversationById(env.DB, conversationId, organizationId);
   if (!conv) {
-    throw new Error(`Conversation ${conversationId} not found`);
+    throw new HTTPException(404, {
+      res: Response.json(
+        {
+          error: "conversation_not_found",
+          message: "No conversation with that id exists in this account.",
+        },
+        { status: 404 },
+      ),
+    });
   }
 
   // Get current max sequence

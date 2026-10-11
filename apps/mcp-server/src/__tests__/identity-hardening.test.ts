@@ -47,7 +47,9 @@ function stubDb(rows: StubRows) {
         },
         run: async () => {
           writes.push(sql);
-          return { success: true, meta: {} };
+          // D1 always reports `changes`; the claim path reads it from its
+          // INSERT OR IGNORE to tell a real send from a lost window race.
+          return { success: true, meta: { changes: 1 } };
         },
         all: async () => ({ results: [] }),
       };

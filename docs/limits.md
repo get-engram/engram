@@ -110,6 +110,7 @@ Requests are rate limited per organization with a token bucket. Limits scale by 
 |------|--------------------|
 | Free | 30 |
 | Pro | 120 |
+| Student | 120 |
 | Team | 300 |
 | Enterprise | 600 |
 

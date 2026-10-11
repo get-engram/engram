@@ -11,6 +11,7 @@ export type IdentitySource =
   | "signup"
   | "claim"
   | "cli-login"
+  | "set-password"
   | "profile"
   | "backfill";
 

@@ -16,7 +16,10 @@ import {
   getApiKeyWithOrg,
   upsertOrgIdentity,
   hasOrgIdentity,
+  clearOAuthTokensByOrg,
 } from "@getengram/db";
+import { requiresClaim, startClaim, claimMessage } from "../services/claim.js";
+export { requiresClaim };
 import { TIER_LIMITS, type Tier } from "@getengram/shared";
 import type { Env, AuthContext } from "../types.js";
 import { verifySupabaseJwt } from "../utils/jwt.js";
@@ -64,126 +67,6 @@ async function authenticateApiKey(
  * self-service claim flow ships, that proof is a support request — the same
  * path the one real case (Oct 2026) already took.
  */
-export function requiresClaim(org: { messages_stored_total?: number | null }): boolean {
-  return (org.messages_stored_total ?? 0) > 0;
-}
-
-/**
- * Self-service claim (follow-up to #476; migration 0040).
- *
- * The gate exists because Supabase auto-confirms addresses: a JWT's email
- * proves a string was typed, not that an inbox was read. The one thing that
- * does prove inbox control is a link we mailed there coming back — so when
- * the gate fires we send one, and POST /signup/claim redeems it. Until this
- * existed the only way through was "email support", which two of the three
- * users gated in its first 48 hours had to do.
- *
- * The gate itself fires far less often now: org_identities records the
- * Supabase user behind every bind, so the org's own user returning through a
- * new surface never sees it. What is left is a genuinely unknown sub.
- */
-const CLAIM_TTL_MINUTES = 30;
-/** A fresh link is not re-sent inside this window — a reload is not a request for another email. */
-const CLAIM_RESEND_COOLDOWN_SECONDS = 120;
-/** Per org per day. The token is unguessable; this stops us being used to mail someone. */
-const CLAIM_MAX_SENDS_PER_DAY = 5;
-
-export type ClaimReason = "sent" | "cooldown" | "rate_limited" | "delivery_failed";
-export interface ClaimState {
-  email: string;
-  sent: boolean;
-  reason: ClaimReason;
-  expires_minutes: number;
-  retry_after_seconds: number;
-}
-
-/** 32 bytes of CSPRNG as base64url — only ever stored hashed. */
-function randomToken(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(32));
-  let s = "";
-  for (const b of bytes) s += String.fromCharCode(b);
-  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-async function startClaim(
-  env: Env,
-  org: { id: string; messages_stored_total?: number | null },
-  sub: string,
-  email: string,
-): Promise<ClaimState> {
-  const base = { email, expires_minutes: CLAIM_TTL_MINUTES };
-
-  // Cooldown: an unconsumed link for this (org, sub) issued moments ago means
-  // the dashboard reloaded, not that the user needs another email.
-  const recent = await env.DB.prepare(
-    `SELECT created_at FROM org_claims
-     WHERE organization_id = ? AND sub = ? AND consumed_at IS NULL
-       AND created_at > datetime('now', ?)
-     ORDER BY created_at DESC LIMIT 1`,
-  )
-    .bind(org.id, sub, `-${CLAIM_RESEND_COOLDOWN_SECONDS} seconds`)
-    .first<{ created_at: string }>();
-  if (recent) {
-    const ageSec = (Date.now() - new Date(recent.created_at + "Z").getTime()) / 1000;
-    return {
-      ...base,
-      sent: false,
-      reason: "cooldown",
-      retry_after_seconds: Math.max(1, Math.ceil(CLAIM_RESEND_COOLDOWN_SECONDS - ageSec)),
-    };
-  }
-
-  const today = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM org_claims
-     WHERE organization_id = ? AND created_at > datetime('now', '-1 day')`,
-  )
-    .bind(org.id)
-    .first<{ n: number }>();
-  if ((today?.n ?? 0) >= CLAIM_MAX_SENDS_PER_DAY) {
-    return { ...base, sent: false, reason: "rate_limited", retry_after_seconds: 24 * 3600 };
-  }
-
-  const token = randomToken();
-  const tokenHash = await hashApiKey(token);
-  await env.DB.prepare(
-    `INSERT INTO org_claims (id, organization_id, sub, email, token_hash, expires_at)
-     VALUES (?, ?, ?, ?, ?, datetime('now', ?))`,
-  )
-    .bind(generateId("clm"), org.id, sub, email, tokenHash, `+${CLAIM_TTL_MINUTES} minutes`)
-    .run();
-
-  // Mail goes out via engram-web, which owns the Resend credentials and the
-  // templates — the same path student verification and every nudge use.
-  const secret = (env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET;
-  const claimUrl = `${env.APP_URL}/claim?token=${encodeURIComponent(token)}`;
-  let delivered = false;
-  if (secret && env.APP_URL) {
-    try {
-      const res = await fetch(`${env.APP_URL}/api/email/claim-link`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret}` },
-        body: JSON.stringify({
-          to: email,
-          claim_url: claimUrl,
-          expires_minutes: CLAIM_TTL_MINUTES,
-          messages: org.messages_stored_total ?? undefined,
-        }),
-      });
-      delivered = res.ok;
-      if (!res.ok) console.error(`[claim] link email failed: ${res.status}`);
-    } catch (err) {
-      console.error(`[claim] link email threw: ${err instanceof Error ? err.message : err}`);
-    }
-  }
-  await audit(env.DB, org.id, null, "signup.claim_sent", "organization", org.id, { sub, delivered });
-
-  return {
-    ...base,
-    sent: delivered,
-    reason: delivered ? "sent" : "delivery_failed",
-    retry_after_seconds: CLAIM_RESEND_COOLDOWN_SECONDS,
-  };
-}
 
 const WELCOME_MESSAGE = `Welcome to Engram — your AI's long-term memory.
 
@@ -304,29 +187,23 @@ signup.post("/", async (c) => {
     // That user arriving through a new surface is not a takeover and is not
     // gated. Only a sub this org has never seen has to prove the inbox.
     const known = await hasOrgIdentity(c.env.DB, existing.id, claims.sub);
-    if (!known && requiresClaim(existing as { messages_stored_total?: number | null })) {
-      await audit(c.env.DB, existing.id, null, "signup.claim_required", "organization", existing.id, {
-        sub: claims.sub,
-      });
-      const claim = await startClaim(c.env, existing, claims.sub, email);
-      return c.json(
-        {
-          error: "claim_required",
-          message:
-            "An Engram account with saved memories already exists for this email address. " +
-            `To connect this sign-in to it, open the link we emailed to ${email} — or email ` +
-            "hello@getengram.app from that address and we'll connect it. Nothing in the account is affected.",
-          claim,
-        },
-        403,
-      );
+    if (!known && requiresClaim(existing)) {
+      const claim = await startClaim(c.env, existing, claims.sub, email, "web");
+      return c.json({ error: "claim_required", message: claimMessage(claim, "web"), claim }, 403);
     }
     orgId = existing.id;
     created = false;
+    // Identity is recorded the moment the gate is passed — before anything
+    // that can fail. If the key mint below throws, the retry must still see
+    // this sub as the org's own user rather than gate it.
+    await upsertOrgIdentity(c.env.DB, orgId, claims.sub, email, "signup");
   } else {
     orgId = generateId("org");
     const orgName = email.split("@")[0];
     await insertOrganizationWithEmail(c.env.DB, orgId, orgName, email, ref, requestCountry(c.req.raw));
+    // Before the welcome seed: that seed sets messages_stored_total = 1, which
+    // would make a retry of a half-finished signup gate its own creator.
+    await upsertOrgIdentity(c.env.DB, orgId, claims.sub, email, "signup");
     await seedWelcomeConversation(c.env.DB, orgId);
     created = true;
   }
@@ -338,7 +215,6 @@ signup.post("/", async (c) => {
   const { raw, prefix } = generateApiKeyRaw();
   const keyHash = await hashApiKey(raw);
   await insertApiKey(c.env.DB, keyId, orgId, keyHash, prefix, "Default");
-  await upsertOrgIdentity(c.env.DB, orgId, claims.sub, email, "signup");
 
   return c.json(
     {
@@ -486,7 +362,7 @@ signup.post("/set-password", async (c) => {
     msg?: string;
     error_description?: string;
     session?: unknown;
-    user?: { identities?: unknown[] };
+    user?: { id?: string; identities?: unknown[] };
   };
   if (!res.ok) {
     const msg = j.msg || j.error_description || "";
@@ -513,6 +389,12 @@ signup.post("/set-password", async (c) => {
       },
       409,
     );
+  }
+
+  // This is the moment a CLI-born org gets a Supabase user: record it, or the
+  // very next web login would be gated by the org's own memories.
+  if (j.user?.id) {
+    await upsertOrgIdentity(c.env.DB, auth.organizationId, j.user.id, org.email, "set-password");
   }
 
   return c.json({ ok: true, confirmation_required: !j.session, email: org.email });
@@ -556,7 +438,12 @@ signup.post("/login", async (c) => {
     );
   }
   const session = (await authRes.json().catch(() => ({}))) as { user?: { id?: string } };
-  const sub = session.user?.id ?? null;
+  const sub = session.user?.id;
+  // Fail closed: without the user id the identity check below cannot run,
+  // and a key minted here would be bound to nobody.
+  if (!sub) {
+    return c.json({ error: "auth_failed", message: "Identity provider did not return a user id" }, 502);
+  }
 
   // Find the org by email
   const org = (await getOrganizationByEmail(c.env.DB, email)) as
@@ -572,19 +459,9 @@ signup.post("/login", async (c) => {
   // Same rule as /signup: a password proves the Supabase account, not the
   // inbox. The org's own user (recorded at connect/signup) logs in freely; a
   // sub the org has never seen gets the claim link and must come back.
-  if (sub && !(await hasOrgIdentity(c.env.DB, org.id, sub)) && requiresClaim(org)) {
-    await audit(c.env.DB, org.id, null, "signup.claim_required", "organization", org.id, { sub, via: "cli" });
-    const claim = await startClaim(c.env, org, sub, email);
-    return c.json(
-      {
-        error: "claim_required",
-        message:
-          `This sign-in isn't connected to the Engram account for ${email} yet. ` +
-          `Open the link we emailed to ${email}, then run 'engram login' again.`,
-        claim,
-      },
-      403,
-    );
+  if (!(await hasOrgIdentity(c.env.DB, org.id, sub)) && requiresClaim(org)) {
+    const claim = await startClaim(c.env, org, sub, email, "cli");
+    return c.json({ error: "claim_required", message: claimMessage(claim, "cli"), claim }, 403);
   }
 
   // Check if org already has a key at limit
@@ -603,12 +480,14 @@ signup.post("/login", async (c) => {
     );
   }
 
+  // Identity first, key second — see /signup for why.
+  await upsertOrgIdentity(c.env.DB, org.id, sub, email, "cli-login");
+
   // Mint a new API key
   const keyId = generateId("key");
   const { raw, prefix } = generateApiKeyRaw();
   const keyHash = await hashApiKey(raw);
   await insertApiKey(c.env.DB, keyId, org.id, keyHash, prefix, "CLI login");
-  if (sub) await upsertOrgIdentity(c.env.DB, org.id, sub, email, "cli-login");
 
   return c.json({
     organization_id: org.id,
@@ -621,7 +500,7 @@ signup.post("/login", async (c) => {
 // the same Supabase JWT /signup takes: the token proves the inbox, the JWT
 // proves which sign-in is asking, and the row's `sub` requires them to be the
 // user who was gated — a forwarded link cannot bind a different login.
-signup.post("/claim", ipThrottle({ limit: 20, windowMs: 60_000, bucket: "signup-claim" }), async (c) => {
+signup.post("/claim", ipThrottle({ limit: 60, windowMs: 60_000, bucket: "signup-claim" }), async (c) => {
   const jwtSecret = c.env.SUPABASE_JWT_SECRET;
   if (!jwtSecret) {
     return c.json({ error: "server_misconfigured", message: "SUPABASE_JWT_SECRET is not set" }, 500);
@@ -687,20 +566,44 @@ signup.post("/claim", ipThrottle({ limit: 20, windowMs: 60_000, bucket: "signup-
     .run();
   if ((consumed.meta?.changes ?? 0) === 0) return invalid();
 
+  await upsertOrgIdentity(c.env.DB, org.id, claims.sub, email, "claim");
   const keyId = generateId("key");
   const { raw, prefix } = generateApiKeyRaw();
   const keyHash = await hashApiKey(raw);
   await insertApiKey(c.env.DB, keyId, org.id, keyHash, prefix, "Default");
-  await upsertOrgIdentity(c.env.DB, org.id, claims.sub, email, "claim");
+
+  // Whoever proves the inbox owns the org. Credentials issued before this
+  // claim came from a sub we cannot vouch for: /signup/link sets an org's
+  // address with no inbox proof, so a stranger could park someone's email on
+  // their own org and wait for the real owner to claim it. Owner keys and
+  // connector tokens are cut; Team seat keys stay. The legitimate case pays
+  // one `engram login` / reconnect; the planted-email attack pays everything.
+  const cut = await c.env.DB.prepare(
+    `UPDATE api_keys SET revoked_at = datetime('now')
+     WHERE organization_id = ? AND revoked_at IS NULL AND seat_id IS NULL AND id != ?`,
+  )
+    .bind(org.id, keyId)
+    .run();
+  await clearOAuthTokensByOrg(c.env.DB, org.id);
+  const revokedKeys = cut.meta?.changes ?? 0;
+
   await audit(c.env.DB, org.id, keyId, "org.claimed", "organization", org.id, {
     sub: claims.sub,
     claim_id: row.id,
+    revoked_keys: revokedKeys,
   });
 
   // Same shape as a /signup success so the dashboard reuses its profile path;
   // created:false keeps the welcome email from firing weeks into someone's use.
   return c.json(
-    { organization_id: org.id, api_key: raw, key_prefix: prefix, created: false, claimed: true },
+    {
+      organization_id: org.id,
+      api_key: raw,
+      key_prefix: prefix,
+      created: false,
+      claimed: true,
+      revoked_keys: revokedKeys,
+    },
     200,
   );
 });

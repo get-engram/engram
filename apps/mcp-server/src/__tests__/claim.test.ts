@@ -23,6 +23,10 @@ interface Rows {
   daily?: number;
   claim?: Record<string, unknown> | null;
   updateChanges?: number;
+  /** what the INSERT OR IGNORE into org_claims reports (0 = lost the window race) */
+  insertChanges?: number;
+  /** what getApiKeyWithOrg's join returns, for API-key-authenticated routes */
+  keyWithOrg?: Record<string, unknown> | null;
 }
 
 function stubDb(rows: Rows) {
@@ -36,6 +40,7 @@ function stubDb(rows: Rows) {
           return stmt;
         },
         first: async () => {
+          if (/FROM api_keys k\s+JOIN organizations/i.test(sql)) return rows.keyWithOrg ?? null;
           if (/FROM org_identities/i.test(sql)) return rows.identity ?? null;
           if (/FROM organizations WHERE email/i.test(sql)) return rows.orgByEmail ?? null;
           if (/FROM organizations WHERE id/i.test(sql)) return rows.orgByEmail ?? null;
@@ -47,14 +52,24 @@ function stubDb(rows: Rows) {
         },
         run: async () => {
           writes.push({ sql, args });
-          const changes = /UPDATE org_claims/i.test(sql) ? (rows.updateChanges ?? 1) : 1;
+          const changes = /UPDATE org_claims/i.test(sql)
+            ? (rows.updateChanges ?? 1)
+            : /INSERT OR IGNORE INTO org_claims/i.test(sql)
+              ? (rows.insertChanges ?? 1)
+              : 1;
           return { success: true, meta: { changes } };
         },
         all: async () => ({ results: [] }),
+        __sql: sql,
+        __args: () => args,
       };
       return stmt;
     },
-    batch: async () => [],
+    // clearOAuthTokensByOrg goes through batch(); record those too.
+    batch: async (stmts: Array<{ __sql: string; __args: () => unknown[] }>) => {
+      for (const st of stmts) writes.push({ sql: st.__sql, args: st.__args() });
+      return [];
+    },
   } as unknown as D1Database;
   return { db, writes };
 }
@@ -145,7 +160,7 @@ describe("POST /signup with an existing org that holds data", () => {
     expect(body.claim).toMatchObject({ email: EMAIL, sent: true, reason: "sent", expires_minutes: 30 });
 
     expect(has(writes, /INSERT INTO api_keys/i)).toBe(false);
-    const ins = writes.find((w) => /INSERT INTO org_claims/i.test(w.sql))!;
+    const ins = writes.find((w) => /INSERT OR IGNORE INTO org_claims/i.test(w.sql))!;
     expect(ins).toBeTruthy();
     // args: id, org, sub, email, token_hash, ttl — the hash is sha256 hex, never the token
     expect(ins.args[1]).toBe("org_h");
@@ -165,7 +180,29 @@ describe("POST /signup with an existing org that holds data", () => {
     const tokenInMail = (sent.claim_url as string).split("token=")[1];
     expect(ins.args[4]).not.toBe(tokenInMail);
 
-    expect(has(writes, /INSERT INTO audit_log/i)).toBe(true);
+    // exactly one audit row — per send, not per gate hit
+    expect(writes.filter((w) => /INSERT INTO audit_log/i.test(w.sql)).length).toBe(1);
+    expect(has(writes, /DELETE FROM org_claims/i)).toBe(false);
+  });
+
+  it("records the identity BEFORE minting when the org's own user connects", async () => {
+    const { db, writes } = stubDb({ identity: { present: 1 }, orgByEmail: ORG });
+    await post("/signup", db, SUB);
+    const order = writes.map((w) => w.sql);
+    const iIdent = order.findIndex((s) => /INSERT INTO org_identities/i.test(s));
+    const iMint = order.findIndex((s) => /INSERT INTO api_keys/i.test(s));
+    expect(iIdent).toBeGreaterThanOrEqual(0);
+    expect(iMint).toBeGreaterThan(iIdent);
+  });
+
+  it("collapses a parallel burst: losing the send-window race reports cooldown and sends nothing", async () => {
+    const { db, writes } = stubDb({ identity: null, orgByEmail: ORG, insertChanges: 0 });
+    const res = await post("/signup", db, "sub_stranger");
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { claim: { reason: string; sent: boolean } };
+    expect(body.claim).toMatchObject({ reason: "cooldown", sent: false });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(has(writes, /INSERT INTO audit_log/i)).toBe(false);
   });
 
   it("does not gate an unknown sub on an EMPTY org (nothing to take over)", async () => {
@@ -185,8 +222,9 @@ describe("POST /signup with an existing org that holds data", () => {
     expect(body.claim.reason).toBe("cooldown");
     expect(body.claim.retry_after_seconds).toBeGreaterThan(0);
     expect(body.claim.retry_after_seconds).toBeLessThanOrEqual(120);
-    expect(has(writes, /INSERT INTO org_claims/i)).toBe(false);
+    expect(has(writes, /INSERT OR IGNORE INTO org_claims/i)).toBe(false);
     expect(fetchMock).not.toHaveBeenCalled();
+    expect(has(writes, /INSERT INTO audit_log/i)).toBe(false);
   });
 
   it("caps sends per org per day", async () => {
@@ -194,16 +232,110 @@ describe("POST /signup with an existing org that holds data", () => {
     const res = await post("/signup", db, "sub_stranger");
     const body = (await res.json()) as { claim: { reason: string; sent: boolean } };
     expect(body.claim).toMatchObject({ reason: "rate_limited", sent: false });
-    expect(has(writes, /INSERT INTO org_claims/i)).toBe(false);
+    expect(has(writes, /INSERT OR IGNORE INTO org_claims/i)).toBe(false);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("reports delivery failure honestly instead of claiming the email went out", async () => {
+  it("reports delivery failure honestly and removes the undeliverable row", async () => {
     fetchMock.mockResolvedValue(new Response("nope", { status: 500 }));
-    const { db } = stubDb({ identity: null, orgByEmail: ORG });
+    const { db, writes } = stubDb({ identity: null, orgByEmail: ORG });
     const res = await post("/signup", db, "sub_stranger");
     const body = (await res.json()) as { claim: { reason: string; sent: boolean } };
     expect(body.claim).toMatchObject({ reason: "delivery_failed", sent: false });
+    const ins = writes.find((w) => /INSERT OR IGNORE INTO org_claims/i.test(w.sql))!;
+    const del = writes.find((w) => /DELETE FROM org_claims WHERE id/i.test(w.sql))!;
+    expect(del).toBeTruthy();
+    expect(del.args[0]).toBe(ins.args[0]); // the same row it just inserted
+  });
+
+  it("the message tells the truth per outcome", async () => {
+    const { db } = stubDb({ identity: null, orgByEmail: ORG, daily: 5 });
+    const body = (await (await post("/signup", db, "sub_stranger")).json()) as { message: string };
+    expect(body.message).toMatch(/Too many connection links/);
+    expect(body.message).not.toMatch(/open the link we just emailed/);
+  });
+});
+
+// ── /signup/login: the CLI gets the same rule ────────────────────────────
+
+describe("POST /signup/login", () => {
+  function supabaseAnswers(user: unknown) {
+    fetchMock.mockImplementation(async (url: string) =>
+      String(url).includes("/auth/v1/token")
+        ? new Response(JSON.stringify({ access_token: "x", user }), { status: 200 })
+        : new Response("{}", { status: 200 }),
+    );
+  }
+  const loginEnv = (db: D1Database) =>
+    ({ ...envWith(db), SUPABASE_ANON_KEY: "anon" }) as unknown as Env;
+  async function login(db: D1Database) {
+    const { app: a } = app(db);
+    return a.request(
+      "/signup/login",
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: EMAIL, password: "pw" }) },
+      loginEnv(db),
+    );
+  }
+
+  it("gates an unknown sub on an org with data instead of minting a key", async () => {
+    supabaseAnswers({ id: "sub_stranger" });
+    const { db, writes } = stubDb({ identity: null, orgByEmail: ORG });
+    const res = await login(db);
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string; message: string };
+    expect(body.error).toBe("claim_required");
+    expect(body.message).toMatch(/engram login/);
+    expect(has(writes, /INSERT INTO api_keys/i)).toBe(false);
+  });
+
+  it("lets the org's own user in and records the identity before the key", async () => {
+    supabaseAnswers({ id: SUB });
+    const { db, writes } = stubDb({ identity: { present: 1 }, orgByEmail: ORG });
+    const res = await login(db);
+    expect(res.status).toBe(200);
+    const order = writes.map((w) => w.sql);
+    expect(order.findIndex((s) => /INSERT INTO org_identities/i.test(s))).toBeLessThan(
+      order.findIndex((s) => /INSERT INTO api_keys/i.test(s)),
+    );
+    const ident = writes.find((w) => /INSERT INTO org_identities/i.test(w.sql))!;
+    expect(ident.args[3]).toBe("cli-login");
+  });
+
+  it("fails closed when the identity provider returns no user id", async () => {
+    supabaseAnswers(undefined);
+    const { db, writes } = stubDb({ identity: null, orgByEmail: ORG });
+    const res = await login(db);
+    expect(res.status).toBe(502);
+    expect(has(writes, /INSERT INTO api_keys/i)).toBe(false);
+  });
+});
+
+// ── /signup/set-password: the moment a CLI-born org gets a Supabase user ──
+
+describe("POST /signup/set-password", () => {
+  it("records the newly created Supabase user on the org", async () => {
+    fetchMock.mockImplementation(async (url: string) =>
+      String(url).includes("/auth/v1/signup")
+        ? new Response(JSON.stringify({ user: { id: "sub_cli", identities: [{}] }, session: {} }), { status: 200 })
+        : new Response("{}", { status: 200 }),
+    );
+    const { db, writes } = stubDb({
+      keyWithOrg: { key_id: "key_1", organization_id: "org_h", scopes: "read,write,search,delete", seat_id: null, tier: "free" },
+      orgByEmail: ORG,
+    });
+    const { app: a } = app(db);
+    const res = await a.request(
+      "/signup/set-password",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer engram_sk_live_abc" },
+        body: JSON.stringify({ password: "longenough" }),
+      },
+      { ...envWith(db), SUPABASE_ANON_KEY: "anon" } as unknown as Env,
+    );
+    expect(res.status).toBe(200);
+    const ident = writes.find((w) => /INSERT INTO org_identities/i.test(w.sql))!;
+    expect(ident.args).toEqual(["org_h", "sub_cli", EMAIL, "set-password"]);
   });
 });
 
@@ -229,12 +361,35 @@ describe("POST /signup/claim", () => {
 
     const order = writes.map((w) => w.sql);
     const iConsume = order.findIndex((s) => /UPDATE org_claims SET consumed_at/i.test(s));
+    const iIdent = order.findIndex((s) => /INSERT INTO org_identities/i.test(s));
     const iMint = order.findIndex((s) => /INSERT INTO api_keys/i.test(s));
     expect(iConsume).toBeGreaterThanOrEqual(0);
-    expect(iMint).toBeGreaterThan(iConsume); // consume BEFORE mint
+    expect(iIdent).toBeGreaterThan(iConsume); // consume, then identity, then mint
+    expect(iMint).toBeGreaterThan(iIdent);
     const ident = writes.find((w) => /INSERT INTO org_identities/i.test(w.sql))!;
     expect(ident.args).toEqual(["org_h", SUB, EMAIL, "claim"]);
     expect(has(writes, /INSERT INTO audit_log/i)).toBe(true);
+  });
+
+  it("cuts every credential that predates the claim — owner keys and connector tokens, not seat keys", async () => {
+    const { db, writes } = stubDb({ orgByEmail: ORG, claim: CLAIM_ROW });
+    const res = await post("/signup/claim", db, SUB, { token: "tok" });
+    expect(res.status).toBe(200);
+    expect((await res.json()) as Record<string, unknown>).toHaveProperty("revoked_keys", 1);
+
+    const mint = writes.find((w) => /INSERT INTO api_keys/i.test(w.sql))!;
+    const newKeyId = mint.args[0];
+    const revoke = writes.find((w) => /UPDATE api_keys SET revoked_at/i.test(w.sql))!;
+    expect(revoke.sql).toMatch(/seat_id IS NULL/);
+    expect(revoke.sql).toMatch(/id != \?/);
+    expect(revoke.args).toEqual(["org_h", newKeyId]); // the key just minted survives
+    expect(has(writes, /DELETE FROM oauth_access_tokens WHERE organization_id/i)).toBe(true);
+    expect(has(writes, /UPDATE oauth_refresh_tokens SET revoked_at/i)).toBe(true);
+    // the revocation happens AFTER the new key exists, never before
+    const order = writes.map((w) => w.sql);
+    expect(order.findIndex((s) => /UPDATE api_keys SET revoked_at/i.test(s))).toBeGreaterThan(
+      order.findIndex((s) => /INSERT INTO api_keys/i.test(s)),
+    );
   });
 
   it.each([

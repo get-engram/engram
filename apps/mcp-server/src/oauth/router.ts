@@ -25,8 +25,10 @@ import {
   getOrganizationByEmail,
   insertOrganizationWithEmail,
   upsertOrgIdentity,
+  hasOrgIdentity,
 } from "@getengram/db";
 import { verifySupabaseJwt } from "../utils/jwt.js";
+import { requiresClaim, startClaim, claimMessage } from "../services/claim.js";
 import { seedWelcomeConversation } from "../routes/signup.js";
 import { DEFAULT_SCOPE, originOf } from "./metadata.js";
 import type { Env } from "../types.js";
@@ -88,6 +90,21 @@ function isValidRedirectUri(uri: string): boolean {
     return false;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Record which Supabase user an org belongs to (migration 0040). Until this
+ * existed the connector path discarded `sub` and kept only the email string,
+ * so the same person later signing in on the website looked like a stranger
+ * to /signup and was gated. Best-effort: OAuth must never fail over
+ * bookkeeping — a miss here degrades to one claim email later, not a lockout.
+ */
+async function recordIdentity(db: D1Database, orgId: string, sub: string, email: string): Promise<void> {
+  try {
+    await upsertOrgIdentity(db, orgId, sub, email, "oauth");
+  } catch (err) {
+    console.error(`[oauth] identity record failed for ${orgId}: ${err instanceof Error ? err.message : err}`);
   }
 }
 
@@ -290,17 +307,36 @@ oauth.post("/authorize/approve", async (c) => {
     return denied("invalid_request");
   }
 
-  // Find-or-create the org for this user (mirrors /signup behavior).
+  // Find-or-create the org for this user (mirrors /signup behavior — including
+  // its gate). This path never had one: it bound whichever Supabase user
+  // arrived first with a matching email string, and under mailer_autoconfirm
+  // that string is unverified. The org's own user (on org_identities) connects
+  // freely; a sub the org has never seen must prove the inbox first, exactly
+  // as on the website. The consent page renders error_description.
   let orgId: string;
-  const existing = (await getOrganizationByEmail(c.env.DB, email)) as { id: string } | null;
+  const existing = (await getOrganizationByEmail(c.env.DB, email)) as
+    | { id: string; messages_stored_total?: number | null }
+    | null;
   if (existing) {
+    const known = await hasOrgIdentity(c.env.DB, existing.id, claims.sub);
+    if (!known && requiresClaim(existing)) {
+      const claim = await startClaim(c.env, existing, claims.sub, email, "oauth");
+      return c.json(
+        { error: "claim_required", error_description: claimMessage(claim, "oauth"), claim },
+        403,
+      );
+    }
     orgId = existing.id;
+    await recordIdentity(c.env.DB, orgId, claims.sub, email);
   } else {
     orgId = generateId("org");
     // Derive referral source from the OAuth client name (e.g. "ChatGPT",
     // "Cursor", "Claude Desktop") — lowercase, fallback to "oauth".
     const ref = (client.client_name || "oauth").toLowerCase().replace(/\s+/g, "-");
     await insertOrganizationWithEmail(c.env.DB, orgId, email.split("@")[0], email, ref, requestCountry(c.req.raw));
+    // Before the welcome seed, which sets messages_stored_total = 1 and would
+    // otherwise gate this very user on a retry of a half-finished connect.
+    await recordIdentity(c.env.DB, orgId, claims.sub, email);
     // Activation parity with /signup (engram#onboarding): connector-directory
     // users never see the dashboard, so this is their only welcome. Seed the
     // getting-started note (their first search hits something real) and fire
@@ -326,17 +362,6 @@ oauth.post("/authorize/approve", async (c) => {
         ),
       );
     }
-  }
-
-  // Record which Supabase user this org belongs to (migration 0040). Until
-  // this line existed the connector path discarded `sub` and kept only the
-  // email string, so the same person later signing in on the website looked
-  // like a stranger to /signup and was gated. Best-effort: OAuth must never
-  // fail over bookkeeping.
-  try {
-    await upsertOrgIdentity(c.env.DB, orgId, claims.sub, email, "oauth");
-  } catch (err) {
-    console.error(`[oauth] identity record failed for ${orgId}: ${err instanceof Error ? err.message : err}`);
   }
 
   const scope = body.scope || DEFAULT_SCOPE;

@@ -34,7 +34,8 @@ CREATE INDEX IF NOT EXISTS idx_org_identities_sub ON org_identities(sub);
 -- Only the token HASH is stored (same discipline as api_keys and
 -- student_verifications): a leaked row is not redeemable. `sub` pins the
 -- claim to the Supabase user who asked for it, so a forwarded link cannot
--- bind someone else's login. Rows are kept after consumption as the trail.
+-- bind someone else's login. One row per delivered send is the trail (a row
+-- whose email never left is deleted so cooldown and cap stay truthful).
 CREATE TABLE IF NOT EXISTS org_claims (
   id              TEXT PRIMARY KEY,
   organization_id TEXT NOT NULL,
@@ -44,8 +45,14 @@ CREATE TABLE IF NOT EXISTS org_claims (
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
   expires_at      TEXT NOT NULL,
   consumed_at     TEXT,
+  -- 2-minute bucket the send happened in ("YYYY-MM-DD HH:MM" floored to even
+  -- minutes). With the unique index below, a parallel burst from one
+  -- (org, sub) — the dashboard rendering twice — yields one row and one
+  -- email; the loser's INSERT OR IGNORE reports zero changes.
+  send_window     TEXT NOT NULL,
   FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_org_claims_token ON org_claims(token_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_org_claims_window ON org_claims(organization_id, sub, send_window);
 -- Serves the per-(org, sub) cooldown lookup and the per-org daily send cap.
 CREATE INDEX IF NOT EXISTS idx_org_claims_org_created ON org_claims(organization_id, created_at);

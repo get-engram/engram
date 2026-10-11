@@ -29,3 +29,24 @@ export const PRIVACY_BODIES_NOTICE =
 
 export const PRIVACY_CROSS_CONVERSATION_NOTICE =
   "Cross-conversation access is disabled by this account's privacy settings. Provide a specific conversation_id to read within a single conversation. The account owner can change this at getengram.app/dashboard.";
+
+/**
+ * Remove every body-DERIVED field from a search result row.
+ *
+ * `chunk_summary` is not metadata. summarizeChunk() returns the chunk
+ * whitespace-normalised and truncated — for anything under the summary
+ * budget that is the message text, character for character. The three
+ * search paths each stripped only `chunk_text`, so with
+ * "Share full message bodies" OFF a stored password came back verbatim in
+ * `chunk_summary` (reproduced live 2026-10-11). The toggle's own copy
+ * promises "only metadata — titles, tags, roles, and timestamps", and a
+ * summary of the body is none of those.
+ *
+ * Every caller that returns search rows MUST route through this, so a new
+ * body-derived column cannot leak by being forgotten in one of three places.
+ */
+export function stripBodyFields<
+  T extends { chunk_text?: unknown; chunk_summary?: unknown },
+>(rows: T[]): Omit<T, "chunk_text" | "chunk_summary">[] {
+  return rows.map(({ chunk_text: _text, chunk_summary: _summary, ...rest }) => rest);
+}

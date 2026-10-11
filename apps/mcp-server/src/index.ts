@@ -17,7 +17,7 @@ import { mergeOrgs } from "./routes/merge-orgs.js";
 import { dashboardHtml } from "./routes/admin-dashboard.js";
 import { account } from "./routes/account.js";
 import { privacy } from "./routes/privacy.js";
-import { student } from "./routes/student.js";
+import { student, studentPublic } from "./routes/student.js";
 import { dataExport } from "./routes/export.js";
 import { withD1Retry, isTransientD1Error } from "./services/resilient-d1.js";
 import { oauthConnections } from "./routes/oauth-connections.js";
@@ -298,6 +298,12 @@ app.use(
     maxAge: 86400,
   }),
 );
+// Mounted BEFORE authMiddleware: redeeming a student verification link is a
+// browser following an email and carries no API key — the one-time token is
+// the credential. Registered first, so Hono answers it here and the auth
+// middleware below never runs for this one path.
+app.route("/api/student", studentPublic);
+
 app.use("/api/*", authMiddleware);
 
 // Billing routes are exempt from rate limiting — never block someone trying to pay.

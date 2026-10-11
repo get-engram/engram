@@ -34,6 +34,24 @@ const MAX_SENDS_PER_DAY = 5;
  */
 export const student = new Hono<HonoEnv>();
 
+/**
+ * Redemption is PUBLIC and lives on its own router.
+ *
+ * /api/* sits behind authMiddleware, but the person redeeming a student
+ * verification link is a browser following an email — it has no API key.
+ * Mounted under the authenticated group, POST /api/student/confirm answered
+ * every real attempt with 401 "Missing or invalid Authorization header", so
+ * no student could ever complete verification. Confirmed against production
+ * on 2026-10-11, the day the feature shipped.
+ *
+ * Possession of the one-time token IS the authentication here, exactly as it
+ * is for the account-claim link: the token is 32 bytes of CSPRNG, stored
+ * only as a hash, single-use, and expires in an hour. index.ts mounts this
+ * BEFORE authMiddleware so the handler answers first; every other
+ * /api/student/* route still requires a key.
+ */
+export const studentPublic = new Hono<HonoEnv>();
+
 student.post("/verify", async (c) => {
   const auth = c.get("auth");
   const body = await c.req
@@ -142,7 +160,7 @@ student.post("/verify", async (c) => {
   });
 });
 
-student.post("/confirm", async (c) => {
+studentPublic.post("/confirm", async (c) => {
   const body = await c.req
     .json<{ token?: string }>()
     .catch(() => ({}) as { token?: string });

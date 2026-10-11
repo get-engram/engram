@@ -22,24 +22,31 @@ import type { Env } from "../types.js";
  */
 export const AUDIT_RETENTION_DAYS = 90;
 const BATCH = 500;
-const MAX_BATCHES_PER_RUN = 60; // 30k rows/night, ~2× inflow
+const MAX_BATCHES_PER_RUN = 60; // 30k rows/night, ~2x inflow
 
+/**
+ * The LIMIT lives inside the DELETE so the statement binds exactly ONE
+ * parameter (the retention window). The original paged ids and bound them as
+ * an IN-list of 500, which exceeds D1's 100-parameter cap and threw
+ * `too many SQL variables` on every run — see prune-oauth-tokens.ts, where
+ * the same bug silently did nothing for two nights. This job had not yet hit
+ * it only because nothing in the table is older than the floor.
+ */
 export async function enforceAuditRetention(env: Env): Promise<number> {
   let total = 0;
   for (let i = 0; i < MAX_BATCHES_PER_RUN; i++) {
-    const page = await env.DB.prepare(
-      `SELECT id FROM audit_log WHERE created_at < datetime('now', ?) LIMIT ?`,
+    const r = await env.DB.prepare(
+      `DELETE FROM audit_log WHERE id IN (
+         SELECT id FROM audit_log
+         WHERE created_at < datetime('now', ?)
+         LIMIT ${BATCH}
+       )`,
     )
-      .bind(`-${AUDIT_RETENTION_DAYS} days`, BATCH)
-      .all<{ id: string }>();
-    const ids = (page.results ?? []).map((r) => r.id);
-    if (ids.length === 0) break;
-    const ph = ids.map(() => "?").join(",");
-    const r = await env.DB.prepare(`DELETE FROM audit_log WHERE id IN (${ph})`)
-      .bind(...ids)
+      .bind(`-${AUDIT_RETENTION_DAYS} days`)
       .run();
-    total += r.meta?.changes ?? ids.length;
-    if (ids.length < BATCH) break;
+    const changes = r.meta?.changes ?? 0;
+    total += changes;
+    if (changes < BATCH) break;
   }
   return total;
 }

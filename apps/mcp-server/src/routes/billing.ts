@@ -9,6 +9,7 @@ import {
   createCheckoutSession,
   createOrGetCustomer,
   createPortalSession,
+  priceToTier,
   verifyWebhookSignature,
 } from "../services/stripe.js";
 import type { Env, AuthContext } from "../types.js";
@@ -305,17 +306,6 @@ type StripeEvent = {
   type: string;
   data: { object: Record<string, unknown> };
 };
-
-function priceToTier(
-  env: Env,
-  priceId: string | undefined,
-): "free" | "pro" | "student" | "team" | "enterprise" | null {
-  if (!priceId) return null;
-  if (priceId === env.STRIPE_PRICE_ID_PRO) return "pro";
-  if (priceId === env.STRIPE_PRICE_ID_TEAM) return "team";
-  if (priceId === env.STRIPE_PRICE_ID_STUDENT) return "student";
-  return null;
-}
 
 async function resolveOrgIdFromEvent(
   env: Env,

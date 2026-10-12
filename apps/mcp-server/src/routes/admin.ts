@@ -8,6 +8,7 @@ import { enforceAuditRetention } from "../cron/audit-retention.js";
 import type { Env } from "../types.js";
 import { sendDailyReport } from "../services/daily-report.js";
 import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
+import { priceToTier } from "../services/stripe.js";
 import { findPriceByLookupKey, createRecurringPrice } from "../services/stripe.js";
 import { computeMrr } from "../services/mrr.js";
 import { ftsRowid, orgFtsToken } from "@getengram/db";
@@ -204,7 +205,7 @@ admin.get("/timeseries", async (c) => {
     // per-day deltas to walk it backwards on the client.
     c.env.DB.prepare(
       `SELECT COUNT(*) AS n FROM organizations
-       WHERE deleted_at IS NULL AND tier IN ('pro','team','enterprise')
+       WHERE deleted_at IS NULL AND tier IN ('pro','student','team','enterprise')
          AND COALESCE(referral_source,'') != 'internal'`,
     ).first<{ n: number }>(),
   ]);
@@ -328,7 +329,7 @@ admin.patch("/users/:id", async (c) => {
     .catch(() => ({} as { tier?: string; retention_policy_days?: number | null }));
   const tier = body.tier;
 
-  if (tier && ["free", "pro", "team", "enterprise"].includes(tier)) {
+  if (tier && ["free", "pro", "student", "team", "enterprise"].includes(tier)) {
     await c.env.DB.prepare(
       "UPDATE organizations SET tier = ? WHERE id = ?"
     ).bind(tier, id).run();
@@ -544,7 +545,8 @@ admin.get("/users/:id/stripe", async (c) => {
       const activeSub = subs.data.find((s) => s.status === "active" || s.status === "trialing");
       if (activeSub && org.tier === "free") {
         result.mismatch = true;
-        result.expected_tier = activeSub.items?.data?.[0]?.price?.id === c.env.STRIPE_PRICE_ID_TEAM ? "team" : "pro";
+        result.expected_tier =
+          priceToTier(c.env, activeSub.items?.data?.[0]?.price?.id) ?? "pro";
       }
     }
   }

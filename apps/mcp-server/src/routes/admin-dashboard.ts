@@ -78,6 +78,9 @@ export const dashboardHtml = `<!DOCTYPE html>
   .tier-badge { display: inline-block; padding: .1rem .4rem; border-radius: 4px; font-size: .7rem; font-weight: 600; text-transform: uppercase; }
   .tier-free { background: rgba(115,115,115,.2); color: var(--muted); }
   .tier-pro { background: rgba(59,130,246,.15); color: var(--accent); }
+  /* Student is Pro entitlements at a student price, so it reads as a paid
+     plan but must be distinguishable at a glance from Pro. */
+  .tier-student { background: rgba(34,197,94,.15); color: var(--green, #22c55e); }
   .tier-team { background: rgba(168,85,247,.15); color: var(--purple); }
   .tier-enterprise { background: rgba(234,179,8,.15); color: var(--yellow); }
 
@@ -244,7 +247,7 @@ function shortTime(iso) {
 }
 
 function tierSelect(userId, currentTier) {
-  const tiers = ['free', 'pro', 'team', 'enterprise'];
+  const tiers = ['free', 'pro', 'student', 'team', 'enterprise'];
   let html = '<select class="tier-select" onchange="changeTier(\\'' + userId + '\\', this.value)">';
   for (const t of tiers) {
     html += '<option value="' + t + '"' + (t === (currentTier || 'free') ? ' selected' : '') + '>' + t + '</option>';

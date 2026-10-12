@@ -1,4 +1,5 @@
 import type { Env } from "../types.js";
+import { priceToTier } from "./stripe.js";
 
 // ---------------------------------------------------------------------------
 // Reconcile one org's D1 tier/cancel state from its live Stripe subscriptions.
@@ -96,8 +97,28 @@ export async function syncOrganizationFromStripe(
     // Live subscription — set the tier from its price, clear any stale churn.
     const priceId = activeSub.items?.data?.[0]?.price?.id;
     const quantity = activeSub.items?.data?.[0]?.quantity ?? 1;
-    let tier = "pro";
-    if (priceId === env.STRIPE_PRICE_ID_TEAM) tier = "team";
+    // Shared mapping — see services/stripe.ts for why this must not be
+    // re-implemented here.
+    const mapped = priceToTier(env, priceId);
+    let tier: string;
+    if (mapped) {
+      tier = mapped;
+    } else if (org.tier && org.tier !== "free") {
+      // An unrecognised price must never silently become "pro" — that is
+      // exactly how a student subscriber got rewritten every ten minutes.
+      // Keep whatever paid tier they already hold and make it visible.
+      tier = org.tier;
+      console.error(
+        `[stripe-sync] unknown price ${priceId} for org ${org.id} — kept tier "${tier}"`,
+      );
+    } else {
+      // Paying for something this deployment does not recognise: entitle
+      // them rather than leave a payer on free, but say so loudly.
+      tier = "pro";
+      console.error(
+        `[stripe-sync] unknown price ${priceId} for org ${org.id} — defaulted to "pro"`,
+      );
+    }
     const seatLimit = tier === "team" ? quantity : 1;
 
     // Both of Stripe's scheduled-cancel mechanisms count: the bool AND the

@@ -102,6 +102,33 @@ export async function createRecurringPrice(
   });
 }
 
+/**
+ * The ONE price -> tier mapping.
+ *
+ * There used to be two. billing.ts (webhook) knew about the student price;
+ * stripe-sync.ts (the 10-minute reconcile cron) did not — it read
+ * `let tier = "pro"; if (priceId === STRIPE_PRICE_ID_TEAM) tier = "team";`
+ * so every price that was not Team fell through to "pro". The result: a real
+ * $3/month student subscriber (mwill002@odu.edu, verified 2026-10-12) was
+ * rewritten from "student" to "pro" within ten minutes of every correction,
+ * which is why the admin dashboard never showed a student. Entitlements are
+ * identical so nothing broke for the user, but the operator could not see
+ * who was on the plan and the paid-plan counts misattributed them.
+ *
+ * Returns null for a price the deployment does not recognise — callers must
+ * decide what that means rather than guessing a tier.
+ */
+export function priceToTier(
+  env: { STRIPE_PRICE_ID_PRO?: string; STRIPE_PRICE_ID_TEAM?: string; STRIPE_PRICE_ID_STUDENT?: string },
+  priceId: string | undefined,
+): "pro" | "student" | "team" | null {
+  if (!priceId) return null;
+  if (priceId === env.STRIPE_PRICE_ID_PRO) return "pro";
+  if (priceId === env.STRIPE_PRICE_ID_TEAM) return "team";
+  if (priceId === env.STRIPE_PRICE_ID_STUDENT) return "student";
+  return null;
+}
+
 export interface StripeCustomer {
   id: string;
   email: string | null;

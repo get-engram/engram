@@ -1,10 +1,19 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.debragail/engram",
+  "name": "app.getengram/engram",
   "title": "Engram",
-  "description": "Persistent memory for AI agents — verbatim conversations, searchable by meaning.",
-  "version": "1.1.0",
+  "description": "Persistent, verbatim, searchable memory for AI assistants \u2014 one memory across every MCP client.",
+  "version": "0.1.1",
   "websiteUrl": "https://getengram.app",
+  "icons": [
+    {
+      "src": "https://getengram.app/logo.png",
+      "mimeType": "image/png",
+      "sizes": [
+        "512x512"
+      ]
+    }
+  ],
   "repository": {
     "url": "https://github.com/get-engram/engram",
     "source": "github"
@@ -12,15 +21,7 @@
   "remotes": [
     {
       "type": "streamable-http",
-      "url": "https://mcp.getengram.app/mcp",
-      "headers": [
-        {
-          "name": "Authorization",
-          "description": "Bearer token — use your Engram API key (engram_sk_live_*) or OAuth access token",
-          "isRequired": true,
-          "isSecret": true
-        }
-      ]
+      "url": "https://mcp.getengram.app/mcp"
     }
   ]
 }

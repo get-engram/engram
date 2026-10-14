@@ -31,6 +31,11 @@ import {
   getChunksOverlappingSequence,
   deleteChunksByIds,
   getR2MessageIdsByConversation,
+
+  insertMessageRevision,
+  nextRevisionNumber,
+  getR2RevisionIdsByMessage,
+  getR2RevisionIdsByConversation,
 } from "@getengram/db";
 import { generateEmbeddings } from "./embedding.js";
 import { releaseStorage } from "./tier.js";
@@ -464,6 +469,36 @@ export async function updateMessage(
     );
   }
   const updated = redacted[0];
+
+  // Preserve the body we are about to destroy.
+  //
+  // storeContent writes to the SAME R2 key, so without this the previous
+  // wording is gone from both stores with no way back. Engram's whole claim
+  // is that it keeps what was actually said rather than a later
+  // interpretation of it — an edit used to erase exactly that. See migration
+  // 0041. History is kept in full: nothing here prunes.
+  //
+  // Done BEFORE the overwrite and allowed to throw: losing history silently
+  // is the bug being fixed, so a failure must abort the edit rather than
+  // proceed and destroy it.
+  const previousText = await loadContent(env, {
+    id: messageId,
+    content: (existing.content as string) ?? "",
+    content_encoding: (existing.content_encoding as string | null) ?? null,
+  });
+  const revisionId = generateId("rev");
+  const revisionNo = await nextRevisionNumber(env.DB, messageId);
+  const archived = await storeContent(env, revisionId, previousText);
+  await insertMessageRevision(env.DB, {
+    id: revisionId,
+    messageId,
+    conversationId,
+    organizationId,
+    revision: revisionNo,
+    content: archived.content,
+    contentEncoding: archived.encoding,
+  });
+
   // Overwrite the R2 object for this message (same key) — falls back to inline.
   const stored = await storeContent(env, messageId, updated.content);
   await updateMessageContent(
@@ -640,7 +675,12 @@ export async function deleteMessage(
   // R2 before D1, same as conversation delete: the row is the only pointer
   // to the object — delete the row first and the body is orphaned forever.
   // deleteContent is idempotent for inline/missing objects.
-  await deleteContent(env, [messageId]);
+  //
+  // Edit history goes with it. The revision ROWS cascade from messages, but
+  // D1 does not cascade R2, so a superseded body would otherwise stay in the
+  // bucket after the user deleted the message it belonged to.
+  const revIds = await getR2RevisionIdsByMessage(env.DB, messageId);
+  await deleteContent(env, [messageId, ...(revIds.results ?? []).map((r) => r.id)]);
 
   await deleteMessageWithCount(env.DB, messageId, conversationId, organizationId);
 
@@ -698,7 +738,17 @@ export async function deleteConversation(
     conversationId,
     organizationId
   );
-  const purged = await deleteContent(env, r2Ids.results.map((r) => r.id));
+  // Superseded bodies live under their own R2 keys and are not reachable from
+  // the message ids, so they have to be collected explicitly.
+  const revR2 = await getR2RevisionIdsByConversation(
+    env.DB,
+    conversationId,
+    organizationId
+  );
+  const purged = await deleteContent(env, [
+    ...r2Ids.results.map((r) => r.id),
+    ...(revR2.results ?? []).map((r) => r.id),
+  ]);
 
   // Delete from Vectorize (chunked to the 100-id limit — a large conversation
   // has >100 chunks and would otherwise throw code 40007).

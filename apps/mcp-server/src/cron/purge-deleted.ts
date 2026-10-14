@@ -4,6 +4,8 @@ import {
   deleteChunkRowsAndFts,
   getMessagePurgeBatch,
   deleteMessageRowsByIds,
+  getRevisionPurgeBatch,
+  deleteRevisionRowsByIds,
   countOrgHeavyData,
   deleteOrganizationById,
 } from "@getengram/db";
@@ -63,6 +65,24 @@ export async function purgeDeletedOrganizations(
           rows.map((r) => r.fts_rowid).filter((n): n is number => n != null),
         );
         chunkDone += rows.length;
+        if (rows.length < BATCH) break;
+      }
+
+      // ── Message edit history — MUST drain BEFORE messages ───────────────
+      // message_revisions cascades from messages. Deleting message rows first
+      // silently removes the revision rows too, taking with them the only
+      // record of their R2 keys and orphaning those objects in the bucket
+      // forever — after the user asked to be erased. Bounded per run like
+      // every other store here.
+      for (let drained = 0; drained < MAX_PER_STORE_PER_RUN; drained += BATCH) {
+        const batch = await getRevisionPurgeBatch(env.DB, id, BATCH);
+        const rows = batch.results ?? [];
+        if (rows.length === 0) break;
+        const r2Ids = rows
+          .filter((r) => (r.content_encoding ?? "").startsWith("r2:"))
+          .map((r) => r.id);
+        if (r2Ids.length > 0) await deleteContent(env, r2Ids);
+        await deleteRevisionRowsByIds(env.DB, rows.map((r) => r.id));
         if (rows.length < BATCH) break;
       }
 

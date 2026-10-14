@@ -12,3 +12,4 @@ export * from "./queries/named-secrets.js";
 export * from "./queries/oauth.js";
 export * from "./queries/fts-keys.js";
 export * from "./queries/identities.js";
+export * from "./queries/message-revisions.js";

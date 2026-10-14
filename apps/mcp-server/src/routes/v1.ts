@@ -3,6 +3,10 @@ import { z } from "zod";
 import {
   listConversations as dbListConversations,
   getOrgConversationCount,
+
+  listMessageRevisions,
+  getMessageById,
+  getConversationById,
 } from "@getengram/db";
 import {
   createConversationDedup,
@@ -27,6 +31,7 @@ import {
   PRIVACY_CROSS_CONVERSATION_NOTICE, stripBodyFields } from "../services/privacy.js";
 import { fireWebhooks } from "../services/webhooks.js";
 import { audit } from "../services/audit.js";
+import { loadContent } from "../services/content-store.js";
 import { hasScope, type Scope } from "../mcp/scopes.js";
 import { canAccessConversation } from "../services/spaces.js";
 import { usageMeter } from "../mcp/usage-messaging.js";
@@ -417,6 +422,82 @@ v1.patch("/conversations/:id/messages/:messageId", async (c) => {
       content: updated.content,
       sequence: updated.sequence,
     },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/conversations/:id/messages/:messageId/revisions — edit history
+//
+// Every superseded body of a message, oldest first, alongside the one in
+// force. Editing used to overwrite in place and destroy the previous wording
+// (migration 0041); storing it is only half the fix — this is how you read it
+// back and answer "what did this actually say before someone changed it?".
+//
+// Bodies are message content, so the org's privacy setting governs them
+// exactly as it governs get_conversation: with "share full message bodies"
+// off, callers get the revision metadata (when it changed, which revision)
+// and no text.
+// ---------------------------------------------------------------------------
+v1.get("/conversations/:id/messages/:messageId/revisions", async (c) => {
+  const auth = c.get("auth");
+  if (!hasScope(auth, "read")) return scopeError(c, "read");
+
+  const conversationId = c.req.param("id");
+  const messageId = c.req.param("messageId");
+
+  // Org-scoped, and the message must really live in this conversation —
+  // otherwise history is a way to read across conversations by id.
+  const conv = await getConversationById(c.env.DB, conversationId, auth.organizationId);
+  if (!conv) {
+    return c.json(
+      { error: "conversation_not_found", message: "No conversation with that id exists in this account." },
+      404,
+    );
+  }
+  const msg = (await getMessageById(c.env.DB, messageId, auth.organizationId)) as
+    | (Record<string, unknown> & { conversation_id: string })
+    | null;
+  if (!msg || msg.conversation_id !== conversationId) {
+    return c.json(
+      { error: "message_not_found", message: "No message with that id exists in this conversation." },
+      404,
+    );
+  }
+
+  const privacy = await loadPrivacy(c.env.DB, auth.organizationId);
+  const rows = await listMessageRevisions(c.env.DB, messageId, auth.organizationId);
+
+  const revisions = await Promise.all(
+    (rows.results ?? []).map(async (r) => ({
+      revision: r.revision,
+      replaced_at: r.replaced_at,
+      ...(privacy.canReadBodies
+        ? {
+            content: await loadContent(c.env, {
+              id: r.id,
+              content: r.content,
+              content_encoding: r.content_encoding,
+            }),
+          }
+        : { body_hidden: true as const }),
+    })),
+  );
+
+  return c.json({
+    message_id: messageId,
+    conversation_id: conversationId,
+    current: privacy.canReadBodies
+      ? {
+          content: await loadContent(c.env, {
+            id: messageId,
+            content: (msg.content as string) ?? "",
+            content_encoding: (msg.content_encoding as string | null) ?? null,
+          }),
+        }
+      : { body_hidden: true },
+    revisions,
+    total: revisions.length,
+    ...(privacy.canReadBodies ? {} : { privacy_notice: PRIVACY_BODIES_NOTICE }),
   });
 });
 

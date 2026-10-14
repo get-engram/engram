@@ -439,7 +439,8 @@ All requests require the same `Authorization: Bearer engram_sk_live_...` header.
 | `GET /api/v1/conversations/:id` | `get_conversation` | Fetch a conversation with messages. Query: `message_limit`, `message_offset` |
 | `DELETE /api/v1/conversations/:id` | `delete_conversation` | Delete a conversation, its messages, and embeddings |
 | `POST /api/v1/messages` | `append_messages` | Store messages. Body: `{ conversation_id?, messages: [{ role, content, ... }] }` — omit `conversation_id` to use the default memory |
-| `PATCH /api/v1/conversations/:id/messages/:messageId` | — (REST only) | Update a message's content in place. Body: `{ content }` → `200 { updated, message }`. The edit runs the same redaction pipeline as append, and the affected slice of the search index is rebuilt so recall matches the stored text. Requires the `write` scope. |
+| `PATCH /api/v1/conversations/:id/messages/:messageId` | — (REST only) | Update a message's content. Body: `{ content }` → `200 { updated, message }`. The edit runs the same redaction pipeline as append, and the affected slice of the search index is rebuilt so recall matches the stored text. **The superseded body is kept** — see the revisions endpoint below. Requires the `write` scope. |
+| `GET /api/v1/conversations/:id/messages/:messageId/revisions` | — (REST only) | Full edit history for one message → `200 { message_id, conversation_id, current, revisions[], total }`, oldest revision first. Every body a message has ever had is retained; nothing is pruned. Honours the org's "share full message bodies" privacy setting — with it off, revision metadata is returned without text. Requires the `read` scope. |
 | `GET /api/v1/search` | `search` | Hybrid search. Query: `q` (required), `limit`, `conversation_id`, `tags`, `project` |
 
 ### Example

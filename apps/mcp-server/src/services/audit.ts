@@ -29,6 +29,9 @@ export type AuditAction =
   | "subscription.upgrade_redirect"
   | "oauth.connection.revoked"
   | "seat.accepted"
+  // An invite link presented by someone other than the invited address —
+  // the signature of a forwarded or leaked invite.
+  | "seat.accept_rejected"
   // Identity-layer actions (engram#475 audit). The entire api_keys lifecycle
   // and every org-email change were previously unaudited — the Oct 2026
   // lockout had to be reconstructed from timestamps.

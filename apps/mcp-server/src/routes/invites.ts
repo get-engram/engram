@@ -87,6 +87,41 @@ invites.post("/accept", async (c) => {
   if (seat.accepted_at) return c.json({ error: "already_accepted" }, 409);
   if (isExpired(seat)) return c.json({ error: "invite_expired" }, 410);
 
+  // The invite is addressed to a PERSON, not to whoever holds the link.
+  //
+  // This used to accept any signed-in account and then overwrite the seat's
+  // email with theirs — so a forwarded invite, a link pasted in Slack, or a
+  // leaked URL handed the sender's teammate a full-scope key
+  // (read,write,search,delete) on the org's shared memory. The audit entry
+  // below has always recorded `email` and `invited_email` as separate
+  // fields, which is to say the code knew they could differ and never
+  // compared them.
+  //
+  // Strict match, case- and whitespace-insensitive. There is no legacy data
+  // to grandfather: the seats table was empty fleet-wide until the unique
+  // index blocking second members was lifted (engram-web#251).
+  const invited = (seat.email ?? "").trim().toLowerCase();
+  const accepting = email.trim().toLowerCase();
+  if (!invited || invited !== accepting) {
+    await audit(
+      c.env.DB,
+      seat.organization_id,
+      null,
+      "seat.accept_rejected",
+      "seat",
+      seat.id,
+      { invited_email: seat.email ?? null, attempted_by: email },
+    );
+    return c.json(
+      {
+        error: "wrong_account",
+        message:
+          "This invite was sent to a different email address. Sign in with the address it was sent to, or ask for a new invite.",
+      },
+      403,
+    );
+  }
+
   const org = (await getOrganizationById(c.env.DB, seat.organization_id)) as
     | { id: string; name: string; tier: string; deleted_at: string | null }
     | null;
@@ -95,6 +130,8 @@ invites.post("/accept", async (c) => {
   // Accept + mint a seat-bound API key on the team org. The token hash is
   // cleared so the invite link is single-use.
   await acceptSeat(c.env.DB, seat.id);
+  // Clearing the hash makes the link single-use. The email is rewritten only
+  // to normalise case now that it is known to match the invited address.
   await c.env.DB.prepare(
     "UPDATE seats SET invite_token_hash = NULL, email = ? WHERE id = ?",
   )

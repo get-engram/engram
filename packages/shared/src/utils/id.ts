@@ -14,6 +14,7 @@ const PREFIXES = {
   vlt: "vlt_",
   stv: "stv_",
   clm: "clm_", // org claim link (migration 0040)
+  rev: "rev_", // superseded message body (migration 0041)
 } as const;
 
 type PrefixKey = keyof typeof PREFIXES;

@@ -11,6 +11,8 @@ import {
   createPortalSession,
   priceToTier,
   verifyWebhookSignature,
+
+  resolvePlanPrice,
 } from "../services/stripe.js";
 import type { Env, AuthContext } from "../types.js";
 
@@ -66,7 +68,27 @@ async function churnIfCurrentSub(
 const billing = new Hono<HonoEnv>();
 
 /** Team is a shared plan: one seat is Pro with extra steps. */
-export const TEAM_MIN_SEATS = 2;
+export { TEAM_MIN_SEATS } from "../services/stripe.js";
+
+/**
+ * Does this org currently hold a verified academic address?
+ *
+ * The same proof grants two different things: the Student price for one
+ * person, and the Education price on Team seats for a department or lab.
+ * Both are revocable the moment the yearly re-verification lapses, which is
+ * the only thing keeping either honest.
+ */
+async function academicallyVerified(db: D1Database, orgId: string): Promise<boolean> {
+  const row = await db
+    .prepare(`SELECT student_verified_at, student_expires_at FROM organizations WHERE id = ?`)
+    .bind(orgId)
+    .first<{ student_verified_at: string | null; student_expires_at: string | null }>();
+  return (
+    !!row?.student_verified_at &&
+    !!row.student_expires_at &&
+    new Date(row.student_expires_at + "Z").getTime() > Date.now()
+  );
+}
 
 // POST /api/billing/checkout
 // Authed. Creates a Checkout Session and returns its URL. The caller is
@@ -96,17 +118,10 @@ billing.post("/checkout", async (c) => {
   // Student pricing is gated server-side (engram#471). A client can ask for
   // it, but only a current verification grants it — never trust the plan field
   // to decide what something costs.
-  let plan: "pro" | "team" | "student" = requested;
+  const plan: "pro" | "team" | "student" = requested;
+  const academic = await academicallyVerified(c.env.DB, auth.organizationId);
   if (requested === "student") {
-    const row = await c.env.DB.prepare(
-      `SELECT student_verified_at, student_expires_at FROM organizations WHERE id = ?`,
-    )
-      .bind(auth.organizationId)
-      .first<{ student_verified_at: string | null; student_expires_at: string | null }>();
-    const active =
-      !!row?.student_verified_at &&
-      !!row.student_expires_at &&
-      new Date(row.student_expires_at + "Z").getTime() > Date.now();
+    const active = academic;
     if (!active) {
       return c.json(
         {
@@ -119,12 +134,12 @@ billing.post("/checkout", async (c) => {
     }
   }
 
-  const priceId =
-    plan === "team"
-      ? c.env.STRIPE_PRICE_ID_TEAM
-      : plan === "student"
-        ? c.env.STRIPE_PRICE_ID_STUDENT
-        : c.env.STRIPE_PRICE_ID_PRO;
+  // Education pricing is APPLIED, never requested: a verified academic org
+  // buying Team seats gets the academic price automatically. A client cannot
+  // ask for the discount, so asking cannot grant it.
+  const { priceId, minSeats } = resolvePlanPrice(c.env, plan, {
+    academicallyVerified: academic,
+  });
   if (!priceId) {
     return c.json(
       { error: "price_not_configured", message: `No Stripe price configured for plan="${plan}"` },
@@ -196,14 +211,14 @@ billing.post("/checkout", async (c) => {
   // days. A single-seat "team" is Pro with extra steps; at $9/seat it would
   // also undercut Pro outright. The floor makes the plan mean what its name
   // says: more than one person sharing a memory.
-  const quantity = plan === "team" ? Math.max(TEAM_MIN_SEATS, body.quantity ?? TEAM_MIN_SEATS) : 1;
+  const quantity = Math.max(minSeats, body.quantity ?? minSeats);
 
   const session = await createCheckoutSession(c.env.STRIPE_SECRET_KEY, {
     customerId,
     priceId,
     quantity,
     adjustableQuantity: plan === "team",
-    minQuantity: plan === "team" ? TEAM_MIN_SEATS : undefined,
+    minQuantity: plan === "team" ? minSeats : undefined,
     successUrl,
     cancelUrl,
     organizationId: org.id,

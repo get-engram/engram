@@ -23,6 +23,7 @@ function createBillingEnv(db: D1Database): Env {
     STRIPE_PRICE_ID_PRO: TEST_PRICE_PRO,
     STRIPE_PRICE_ID_TEAM: TEST_PRICE_TEAM,
     STRIPE_PRICE_ID_STUDENT: "price_student",
+  STRIPE_PRICE_ID_EDU_TEAM: "price_edu_team",
     APP_URL: TEST_APP_URL,
     ADMIN_SECRET: "admin_test",
     SUPABASE_JWT_SECRET: "jwt_test",

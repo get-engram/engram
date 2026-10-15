@@ -11,6 +11,8 @@ export interface Env {
   STRIPE_PRICE_ID_PRO: string;
   STRIPE_PRICE_ID_TEAM: string;
   STRIPE_PRICE_ID_STUDENT: string;
+  /** Team at academic pricing — used when the org has a verified academic email. */
+  STRIPE_PRICE_ID_EDU_TEAM: string;
   APP_URL: string; // e.g. "https://getengram.app"
   ADMIN_SECRET: string; // wrangler secret for /api/admin/* routes
   /** "1" pauses all writes for a maintenance window. Set and cleared with

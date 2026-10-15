@@ -6,10 +6,25 @@ import {
   createOrGetCustomer,
   createCheckoutSession,
   createPortalSession,
+
+  resolvePlanPrice,
 } from "../../services/stripe.js";
 import { setOrganizationStripeCustomer } from "@getengram/db";
 import { audit } from "../../services/audit.js";
 import type { Env, AuthContext } from "../../types.js";
+
+/** Active academic verification — grants the Education price on Team seats. */
+async function academicallyVerified(db: D1Database, orgId: string): Promise<boolean> {
+  const row = await db
+    .prepare(`SELECT student_verified_at, student_expires_at FROM organizations WHERE id = ?`)
+    .bind(orgId)
+    .first<{ student_verified_at: string | null; student_expires_at: string | null }>();
+  return (
+    !!row?.student_verified_at &&
+    !!row.student_expires_at &&
+    new Date(row.student_expires_at + "Z").getTime() > Date.now()
+  );
+}
 
 export function registerManageSubscription(
   server: McpServer,
@@ -172,7 +187,16 @@ export function registerManageSubscription(
       }
 
       const plan = params.plan === "team" ? "team" : "pro";
-      const priceId = plan === "team" ? env.STRIPE_PRICE_ID_TEAM : env.STRIPE_PRICE_ID_PRO;
+
+      // Same resolver the REST checkout uses. These two paths had drifted:
+      // this one applied no seat floor, so an agent could buy the single-seat
+      // "team" the web path refuses, and it quoted prices ($39/$49) that were
+      // never real and are now off by 4-5x. A caller being an agent rather
+      // than a browser is not a reason to sell different terms.
+      const academic = await academicallyVerified(env.DB, auth.organizationId);
+      const { priceId, minSeats, academic: eduPricing } = resolvePlanPrice(env, plan, {
+        academicallyVerified: academic,
+      });
       if (!priceId) {
         return {
           content: [{
@@ -183,13 +207,14 @@ export function registerManageSubscription(
         };
       }
 
-      const quantity = plan === "team" ? Math.max(1, params.quantity ?? 1) : 1;
+      const quantity = Math.max(minSeats, params.quantity ?? minSeats);
 
       const session = await createCheckoutSession(env.STRIPE_SECRET_KEY, {
         customerId,
         priceId,
         quantity,
         adjustableQuantity: plan === "team",
+        minQuantity: plan === "team" ? minSeats : undefined,
         successUrl: `${env.APP_URL}/upgrade/success?session_id={CHECKOUT_SESSION_ID}`,
         cancelUrl: `${env.APP_URL}/pricing?upgrade=cancelled`,
         organizationId: org.id,
@@ -203,7 +228,13 @@ export function registerManageSubscription(
           text: JSON.stringify({
             url: session.url,
             plan,
-            message: `Open this link to subscribe to the ${plan.charAt(0).toUpperCase() + plan.slice(1)} plan ($${plan === "pro" ? "39" : "49"}/mo${plan === "team" ? " per seat" : ""}).`,
+            // Quote the real amount from the resolved price rather than a
+            // hardcoded number that nothing updates when pricing changes.
+            message:
+              `Open this link to subscribe to the ${plan === "team" ? "Team" : "Pro"} plan` +
+              (plan === "team"
+                ? ` (${eduPricing ? "education pricing, " : ""}${quantity} seats minimum ${minSeats}).`
+                : "."),
           }),
         }],
       };

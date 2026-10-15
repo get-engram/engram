@@ -18,6 +18,7 @@ function createSeatsEnv(db: D1Database): Env {
     STRIPE_PRICE_ID_PRO: "price_pro",
     STRIPE_PRICE_ID_TEAM: "price_team",
     STRIPE_PRICE_ID_STUDENT: "price_student",
+  STRIPE_PRICE_ID_EDU_TEAM: "price_edu_team",
     APP_URL: "https://test.example.com",
     ADMIN_SECRET: "admin_test",
     SUPABASE_JWT_SECRET: "jwt_test",

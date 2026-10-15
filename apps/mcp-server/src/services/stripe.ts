@@ -127,14 +127,65 @@ export async function createRecurringPrice(
  * decide what that means rather than guessing a tier.
  */
 export function priceToTier(
-  env: { STRIPE_PRICE_ID_PRO?: string; STRIPE_PRICE_ID_TEAM?: string; STRIPE_PRICE_ID_STUDENT?: string },
+  env: {
+    STRIPE_PRICE_ID_PRO?: string;
+    STRIPE_PRICE_ID_TEAM?: string;
+    STRIPE_PRICE_ID_STUDENT?: string;
+    STRIPE_PRICE_ID_EDU_TEAM?: string;
+  },
   priceId: string | undefined,
 ): "pro" | "student" | "team" | null {
   if (!priceId) return null;
   if (priceId === env.STRIPE_PRICE_ID_PRO) return "pro";
   if (priceId === env.STRIPE_PRICE_ID_TEAM) return "team";
   if (priceId === env.STRIPE_PRICE_ID_STUDENT) return "student";
+  // Education Team is the TEAM tier at an academic price — deliberately not a
+  // separate tier. Entitlements are identical, and `tier === "team"` guards
+  // pooled per-seat storage (services/tier.ts) and the seat limit; a parallel
+  // tier would have to be added to every one of those call sites, and missing
+  // one silently gives a department a single seat's worth of memory.
+  if (priceId === env.STRIPE_PRICE_ID_EDU_TEAM) return "team";
   return null;
+}
+
+/** Team is a shared plan: one seat is Pro with extra steps. */
+export const TEAM_MIN_SEATS = 2;
+
+/**
+ * Which Stripe price a plan resolves to, and the seat floor that goes with it.
+ *
+ * Lives here because there are TWO checkout paths — POST /api/billing/checkout
+ * and the manage_subscription MCP tool — and they had already drifted: the MCP
+ * tool quoted "$39/mo" and "$49/mo" at the point of purchase (real prices: $9)
+ * and applied no seat minimum at all, so an agent could buy the single-seat
+ * team that the web path now refuses. One resolver, both callers.
+ *
+ * Education pricing is not a separate plan the caller asks for — it is the
+ * Team plan bought by an org that has verified an academic address. Asking
+ * for the discount cannot grant it; only the verification does.
+ */
+export function resolvePlanPrice(
+  env: {
+    STRIPE_PRICE_ID_PRO?: string;
+    STRIPE_PRICE_ID_TEAM?: string;
+    STRIPE_PRICE_ID_STUDENT?: string;
+    STRIPE_PRICE_ID_EDU_TEAM?: string;
+  },
+  plan: "pro" | "team" | "student",
+  opts: { academicallyVerified?: boolean } = {},
+): { priceId: string | undefined; minSeats: number; academic: boolean } {
+  if (plan === "team") {
+    const academic = Boolean(opts.academicallyVerified && env.STRIPE_PRICE_ID_EDU_TEAM);
+    return {
+      priceId: academic ? env.STRIPE_PRICE_ID_EDU_TEAM : env.STRIPE_PRICE_ID_TEAM,
+      minSeats: TEAM_MIN_SEATS,
+      academic,
+    };
+  }
+  if (plan === "student") {
+    return { priceId: env.STRIPE_PRICE_ID_STUDENT, minSeats: 1, academic: true };
+  }
+  return { priceId: env.STRIPE_PRICE_ID_PRO, minSeats: 1, academic: false };
 }
 
 export interface StripeCustomer {

@@ -595,6 +595,58 @@ admin.post("/users/:id/sync-stripe", async (c) => {
 const STUDENT_LOOKUP_KEY = "student_monthly";
 const STUDENT_UNIT_AMOUNT = 300; // $3.00/month
 
+// ---------------------------------------------------------------------------
+// POST /admin/stripe/ensure-team-price — move Team to $9/seat
+//
+// Stripe prices are immutable, so a price change is a NEW price; the lookup
+// key is transferred so `team_monthly` keeps meaning "the current Team
+// price" rather than leaving two prices where it is ambiguous. Idempotent:
+// if team_monthly already points at a $9 price this returns it untouched.
+//
+// Safe to run because nobody is on the old price — at the time of the change
+// Stripe held two CANCELED team subscriptions and zero active ones.
+// ---------------------------------------------------------------------------
+const TEAM_LOOKUP_KEY = "team_monthly";
+const TEAM_UNIT_AMOUNT = 900; // $9.00/seat/month
+
+admin.post("/stripe/ensure-team-price", async (c) => {
+  const secretKey = c.env.STRIPE_SECRET_KEY;
+  if (!secretKey) return c.json({ error: "stripe_not_configured" }, 500);
+  try {
+    const existing = await findPriceByLookupKey(secretKey, TEAM_LOOKUP_KEY);
+    if (existing && existing.unit_amount === TEAM_UNIT_AMOUNT) {
+      return c.json({
+        created: false,
+        price_id: existing.id,
+        unit_amount: existing.unit_amount,
+        configured: c.env.STRIPE_PRICE_ID_TEAM === existing.id,
+      });
+    }
+    const price = await createRecurringPrice(secretKey, {
+      productName: "Engram Team",
+      productDescription:
+        "Shared memory for a team. 1,000,000 messages per seat, pooled across the org, plus webhooks and a usage dashboard. Minimum 2 seats.",
+      tier: "team",
+      unitAmount: TEAM_UNIT_AMOUNT,
+      lookupKey: TEAM_LOOKUP_KEY,
+      nickname: "Team monthly (per seat)",
+      transferLookupKey: Boolean(existing),
+    });
+    return c.json({
+      created: true,
+      price_id: price.id,
+      unit_amount: price.unit_amount,
+      replaced: existing?.id ?? null,
+      configured: false,
+      next_step: "wrangler secret put STRIPE_PRICE_ID_TEAM",
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[admin] ensure-team-price failed: ${message}`);
+    return c.json({ error: "stripe_error", message }, 502);
+  }
+});
+
 admin.post("/stripe/ensure-student-price", async (c) => {
   const secretKey = c.env.STRIPE_SECRET_KEY;
   if (!secretKey) return c.json({ error: "stripe_not_configured" }, 500);

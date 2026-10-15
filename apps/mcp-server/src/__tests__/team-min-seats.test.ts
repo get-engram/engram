@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { TEAM_MIN_SEATS } from "../routes/billing.js";
+import { TEAM_MIN_SEATS, resolvePlanPrice } from "../services/stripe.js";
 import { createCheckoutSession } from "../services/stripe.js";
 import { vi, beforeEach, afterEach } from "vitest";
 
@@ -61,5 +61,47 @@ describe("team seat minimum", () => {
     const b = sentBody();
     expect(b.get("line_items[0][quantity]")).toBe("1");
     expect(b.get("line_items[0][adjustable_quantity][enabled]")).toBeNull();
+  });
+});
+
+describe("resolvePlanPrice — education pricing is applied, not requested", () => {
+  const ENV = {
+    STRIPE_PRICE_ID_PRO: "price_pro",
+    STRIPE_PRICE_ID_TEAM: "price_team",
+    STRIPE_PRICE_ID_STUDENT: "price_student",
+    STRIPE_PRICE_ID_EDU_TEAM: "price_edu_team",
+  };
+
+  it("gives a verified academic org the education price on Team", () => {
+    const r = resolvePlanPrice(ENV, "team", { academicallyVerified: true });
+    expect(r.priceId).toBe("price_edu_team");
+    expect(r.academic).toBe(true);
+    expect(r.minSeats).toBe(2);
+  });
+
+  it("gives an unverified org the standard Team price", () => {
+    const r = resolvePlanPrice(ENV, "team", { academicallyVerified: false });
+    expect(r.priceId).toBe("price_team");
+    expect(r.academic).toBe(false);
+    expect(r.minSeats).toBe(2);
+  });
+
+  it("cannot be talked into the discount — only verification grants it", () => {
+    // there is no caller-supplied "edu" plan to ask for
+    expect(resolvePlanPrice(ENV, "team").priceId).toBe("price_team");
+    expect(resolvePlanPrice(ENV, "pro", { academicallyVerified: true }).priceId).toBe("price_pro");
+  });
+
+  it("falls back to the standard price when no education price is configured", () => {
+    const r = resolvePlanPrice({ ...ENV, STRIPE_PRICE_ID_EDU_TEAM: undefined }, "team", {
+      academicallyVerified: true,
+    });
+    expect(r.priceId).toBe("price_team");
+    expect(r.academic).toBe(false);
+  });
+
+  it("keeps single-seat plans at a floor of one", () => {
+    expect(resolvePlanPrice(ENV, "pro").minSeats).toBe(1);
+    expect(resolvePlanPrice(ENV, "student").minSeats).toBe(1);
   });
 });

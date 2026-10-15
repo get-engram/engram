@@ -647,6 +647,50 @@ admin.post("/stripe/ensure-team-price", async (c) => {
   }
 });
 
+// Education Team: Team entitlements at the academic per-seat price. Applied
+// automatically when the org has a verified academic address — see
+// resolvePlanPrice. $3/seat matches the Student price, keeping the whole
+// catalogue "one price per person": $9 for anyone, $3 if you are academic.
+const EDU_TEAM_LOOKUP_KEY = "edu_team_monthly";
+const EDU_TEAM_UNIT_AMOUNT = 300; // $3.00/seat/month
+
+admin.post("/stripe/ensure-edu-team-price", async (c) => {
+  const secretKey = c.env.STRIPE_SECRET_KEY;
+  if (!secretKey) return c.json({ error: "stripe_not_configured" }, 500);
+  try {
+    const existing = await findPriceByLookupKey(secretKey, EDU_TEAM_LOOKUP_KEY);
+    if (existing && existing.unit_amount === EDU_TEAM_UNIT_AMOUNT) {
+      return c.json({
+        created: false,
+        price_id: existing.id,
+        unit_amount: existing.unit_amount,
+        configured: c.env.STRIPE_PRICE_ID_EDU_TEAM === existing.id,
+      });
+    }
+    const price = await createRecurringPrice(secretKey, {
+      productName: "Engram Education Team",
+      productDescription:
+        "Team for departments, labs and research groups. Shared memory pooled across seats, webhooks and a usage dashboard, at academic pricing. Requires a verified academic email, re-verified yearly. Minimum 2 seats.",
+      tier: "team",
+      unitAmount: EDU_TEAM_UNIT_AMOUNT,
+      lookupKey: EDU_TEAM_LOOKUP_KEY,
+      nickname: "Education Team monthly (per seat)",
+      transferLookupKey: Boolean(existing),
+    });
+    return c.json({
+      created: true,
+      price_id: price.id,
+      unit_amount: price.unit_amount,
+      configured: false,
+      next_step: "wrangler secret put STRIPE_PRICE_ID_EDU_TEAM",
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[admin] ensure-edu-team-price failed: ${message}`);
+    return c.json({ error: "stripe_error", message }, 502);
+  }
+});
+
 admin.post("/stripe/ensure-student-price", async (c) => {
   const secretKey = c.env.STRIPE_SECRET_KEY;
   if (!secretKey) return c.json({ error: "stripe_not_configured" }, 500);

@@ -65,6 +65,9 @@ async function churnIfCurrentSub(
 
 const billing = new Hono<HonoEnv>();
 
+/** Team is a shared plan: one seat is Pro with extra steps. */
+export const TEAM_MIN_SEATS = 2;
+
 // POST /api/billing/checkout
 // Authed. Creates a Checkout Session and returns its URL. The caller is
 // expected to redirect the user to the returned URL.
@@ -184,13 +187,23 @@ billing.post("/checkout", async (c) => {
     `${c.env.APP_URL}/upgrade/success?session_id={CHECKOUT_SESSION_ID}`;
   const cancelUrl = body.cancel_url || `${c.env.APP_URL}/pricing?upgrade=cancelled`;
 
-  const quantity = plan === "team" ? Math.max(1, body.quantity ?? 1) : 1;
+  // Team has a TWO SEAT MINIMUM, and it is the more important half of the
+  // Sept->Oct 2026 repricing.
+  //
+  // Both Team subscriptions ever sold bought ONE seat: $27 for what Pro gave
+  // at $9 plus webhooks. That is the worst configuration of the product, and
+  // the product was happily selling it — one of them cancelled after four
+  // days. A single-seat "team" is Pro with extra steps; at $9/seat it would
+  // also undercut Pro outright. The floor makes the plan mean what its name
+  // says: more than one person sharing a memory.
+  const quantity = plan === "team" ? Math.max(TEAM_MIN_SEATS, body.quantity ?? TEAM_MIN_SEATS) : 1;
 
   const session = await createCheckoutSession(c.env.STRIPE_SECRET_KEY, {
     customerId,
     priceId,
     quantity,
     adjustableQuantity: plan === "team",
+    minQuantity: plan === "team" ? TEAM_MIN_SEATS : undefined,
     successUrl,
     cancelUrl,
     organizationId: org.id,

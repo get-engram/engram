@@ -84,6 +84,13 @@ export async function createRecurringPrice(
     lookupKey: string;
     nickname: string;
     currency?: string;
+    /**
+     * Move the lookup key off whatever price currently holds it. Stripe
+     * prices are immutable, so a price CHANGE is always a new price — and
+     * without this the key stays pinned to the old one, leaving two prices
+     * where `team_monthly` means the superseded amount.
+     */
+    transferLookupKey?: boolean;
   },
 ): Promise<StripePrice> {
   const product = await stripeFetch<{ id: string }>(secretKey, `/products`, {
@@ -97,6 +104,7 @@ export async function createRecurringPrice(
     currency: params.currency ?? "usd",
     "recurring[interval]": "month",
     lookup_key: params.lookupKey,
+    ...(params.transferLookupKey ? { transfer_lookup_key: "true" } : {}),
     nickname: params.nickname,
     "metadata[tier]": params.tier,
   });
@@ -167,6 +175,8 @@ export async function createCheckoutSession(
     // If true, we let the customer tweak the quantity inside the Checkout
     // session itself (e.g. change the seat count before paying).
     adjustableQuantity?: boolean;
+    /** Floor for the Checkout quantity picker (Team's seat minimum). */
+    minQuantity?: number;
     successUrl: string;
     cancelUrl: string;
     organizationId: string;
@@ -186,7 +196,10 @@ export async function createCheckoutSession(
   };
   if (params.adjustableQuantity) {
     body["line_items[0][adjustable_quantity][enabled]"] = "true";
-    body["line_items[0][adjustable_quantity][minimum]"] = 1;
+    // Without this the customer could drop the picker back to 1 inside
+    // Checkout and buy a single-seat "team" anyway — which is exactly what
+    // both historical Team subscriptions did.
+    body["line_items[0][adjustable_quantity][minimum]"] = params.minQuantity ?? 1;
     body["line_items[0][adjustable_quantity][maximum]"] = 999;
   }
   return stripeFetch<CheckoutSession>(secretKey, `/checkout/sessions`, body);

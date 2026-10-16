@@ -8,15 +8,45 @@ const SKIP_TYPES = new Set([
   "last-prompt",
 ]);
 
+interface ImageSource {
+  type?: string;        // "base64" | "url" | "file"
+  media_type?: string;  // "image/png", …
+  data?: string;        // base64 payload
+  url?: string;
+  file_id?: string;
+}
+
 interface ContentBlock {
   type: string;
   text?: string;
+  source?: ImageSource;
   thinking?: string;
   name?: string;
   input?: unknown;
   content?: unknown;
   tool_use_id?: string;
   signature?: string;
+}
+
+/**
+ * Engram stores text, so an image cannot be kept as pixels — but it must not
+ * vanish either. A turn that read "what is wrong with this?" next to a
+ * screenshot is nonsense on its own, and that is exactly what recall used to
+ * return. This records that something visual was attached, with enough detail
+ * to recognise it later and to decide whether it is worth running OCR over.
+ */
+function describeImage(block: ContentBlock): string {
+  const src = block.source ?? {};
+  const kind = (src.media_type || "image").replace(/^image\//, "").toUpperCase();
+  // base64 encodes 3 bytes per 4 chars; close enough to show scale.
+  const bytes = src.data ? Math.floor((src.data.length * 3) / 4) : 0;
+  const size = bytes >= 1_048_576
+    ? `${(bytes / 1_048_576).toFixed(1)} MB`
+    : bytes >= 1024
+      ? `${Math.round(bytes / 1024)} KB`
+      : bytes > 0 ? `${bytes} B` : "";
+  const where = src.url ? ` ${src.url}` : "";
+  return `[image attached: ${kind}${size ? `, ${size}` : ""}${where}]`;
 }
 
 interface JsonlLine {
@@ -120,12 +150,23 @@ export class Parser implements LineParser {
       return;
     }
 
-    // Array content — could contain tool_result blocks
+    // Array content. Claude Code switches a user turn from a plain string to
+    // an array of blocks the moment anything is attached — an image, most
+    // commonly. This loop used to look only for tool_result, so every such
+    // turn was dropped WHOLE: not just the image, but the question typed
+    // alongside it. Measured on the owner's own transcripts before the fix:
+    // 214 user turns and 413,471 characters of their own words never reached
+    // Engram, 106 of those turns because a screenshot was attached.
     if (!Array.isArray(content)) return;
 
     const messages: ParsedMessage[] = [];
+    const parts: string[] = [];
     for (const block of content) {
-      if (block.type === "tool_result") {
+      if (block.type === "text" && block.text?.trim()) {
+        parts.push(block.text);
+      } else if (block.type === "image") {
+        parts.push(describeImage(block));
+      } else if (block.type === "tool_result") {
         const text =
           typeof block.content === "string"
             ? block.content
@@ -138,6 +179,12 @@ export class Parser implements LineParser {
           });
         }
       }
+    }
+
+    // The user's own words come first; tool results are the machinery that
+    // followed them.
+    if (parts.length > 0) {
+      messages.unshift({ role: "user", content: parts.join("\n\n") });
     }
 
     if (messages.length > 0) {

@@ -5,10 +5,19 @@ import type { Env } from "../types.js";
 
 /**
  * /admin/stripe/ensure-student-price writes to LIVE Stripe, so the one thing
- * that must hold is idempotency: a second call creates nothing. These tests
+ * that must hold is idempotency: a second call creates no PRICE. These tests
  * pin that, and that a permissions failure is reported rather than swallowed
  * (the Stripe CLI's restricted key lacking product_write is exactly why this
  * endpoint exists).
+ *
+ * The product is a deliberate exception. Prices are immutable so recreating
+ * one churns the lookup key, but products are mutable — and because this
+ * endpoint used to return early without touching the product, a description
+ * edited in code never reached checkout. That is how the Education Team
+ * product spent weeks telling customers it needed a "verified academic
+ * email" while every other surface said "university email". So the
+ * idempotent path now reconciles the product text, and writes only when it
+ * actually differs.
  */
 
 function app(env: Partial<Env>) {
@@ -30,6 +39,14 @@ const PRICE = {
   recurring: { interval: "month" },
 };
 
+/** What Stripe currently holds for the product the price points at. */
+const LIVE_PRODUCT = {
+  id: "prod_x",
+  name: "Engram Student",
+  description:
+    "Pro entitlements at student pricing. Requires a verified university email address; re-verified yearly.",
+};
+
 const fetchMock = vi.fn();
 beforeEach(() => {
   fetchMock.mockReset();
@@ -43,8 +60,10 @@ const json = (body: unknown, status = 200) =>
 const calls = () => fetchMock.mock.calls.map(([url, init]) => `${(init as RequestInit)?.method ?? "GET"} ${url}`);
 
 describe("POST /admin/stripe/ensure-student-price", () => {
-  it("returns the existing price and creates nothing", async () => {
-    fetchMock.mockResolvedValueOnce(json({ data: [PRICE] }));
+  it("returns the existing price and creates no price", async () => {
+    fetchMock
+      .mockResolvedValueOnce(json({ data: [PRICE] }))
+      .mockResolvedValueOnce(json(LIVE_PRODUCT));
     const res = await app({ STRIPE_SECRET_KEY: "sk_test", STRIPE_PRICE_ID_STUDENT: PRICE.id }).call();
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({
@@ -52,15 +71,37 @@ describe("POST /admin/stripe/ensure-student-price", () => {
       price_id: PRICE.id,
       unit_amount: 300,
       interval: "month",
+      product_updated: false,
       configured: true,
     });
-    expect(calls()).toHaveLength(1);
+    // Reads the product to compare, but creates nothing.
     expect(calls()[0]).toMatch(/^GET .*\/prices\?lookup_keys\[\]=student_monthly/);
-    expect(calls().some((c) => c.includes("/products"))).toBe(false);
+    expect(calls().some((c) => c.startsWith("POST"))).toBe(false);
+  });
+
+  it("rewrites the product when the live description has drifted from the code", async () => {
+    fetchMock
+      .mockResolvedValueOnce(json({ data: [PRICE] }))
+      .mockResolvedValueOnce(json({ ...LIVE_PRODUCT, description: "Requires a verified academic email." }))
+      .mockResolvedValueOnce(json({ ...LIVE_PRODUCT }));
+    const res = await app({ STRIPE_SECRET_KEY: "sk_test", STRIPE_PRICE_ID_STUDENT: PRICE.id }).call();
+    expect(await res.json()).toMatchObject({ created: false, product_updated: true });
+
+    const post = fetchMock.mock.calls.find(
+      ([, init]) => (init as RequestInit)?.method === "POST",
+    ) as [string, RequestInit];
+    expect(post[0]).toContain("/products/prod_x");
+    const body = new URLSearchParams(post[1].body as string);
+    expect(body.get("description")).toContain("university email");
+    expect(body.get("description")).not.toContain("academic email");
+    // The price is never recreated just because wording changed.
+    expect(calls().some((c) => c === "POST https://api.stripe.com/v1/prices")).toBe(false);
   });
 
   it("reports configured:false when the price exists but the secret does not point at it", async () => {
-    fetchMock.mockResolvedValueOnce(json({ data: [PRICE] }));
+    fetchMock
+      .mockResolvedValueOnce(json({ data: [PRICE] }))
+      .mockResolvedValueOnce(json(LIVE_PRODUCT));
     const res = await app({ STRIPE_SECRET_KEY: "sk_test" }).call();
     expect(await res.json()).toMatchObject({ created: false, configured: false });
   });

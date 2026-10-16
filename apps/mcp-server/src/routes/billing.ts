@@ -71,7 +71,7 @@ const billing = new Hono<HonoEnv>();
 export { TEAM_MIN_SEATS } from "../services/stripe.js";
 
 /**
- * Does this org currently hold a verified academic address?
+ * Does this org currently hold a verified university address?
  *
  * The same proof grants two different things: the Student price for one
  * person, and the Education price on Team seats for a department or lab.

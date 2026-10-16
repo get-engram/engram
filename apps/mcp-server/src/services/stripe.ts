@@ -74,6 +74,40 @@ export async function findPriceByLookupKey(
   return res.data?.[0] ?? null;
 }
 
+/**
+ * Reconcile a product's name and description with what the code says they
+ * should be.
+ *
+ * The "ensure price" endpoints short-circuit as soon as a price exists at the
+ * right amount, which is correct for the PRICE — Stripe prices are immutable
+ * and recreating one churns the lookup key. But it meant the PRODUCT text
+ * never got reconciled, so a description edited in code silently never
+ * reached checkout. That is how the Education Team product ended up telling
+ * customers it needs a "verified academic email" while every other surface,
+ * including the Student product beside it, said "university email".
+ *
+ * Products are mutable, so this is a plain update. Returns true if anything
+ * actually changed, so callers can report it honestly.
+ */
+export async function reconcileProduct(
+  secretKey: string,
+  productId: string,
+  want: { name: string; description: string },
+): Promise<boolean> {
+  const current = await stripeFetch<{ name?: string; description?: string }>(
+    secretKey,
+    `/products/${encodeURIComponent(productId)}`,
+  );
+  if (current.name === want.name && current.description === want.description) {
+    return false;
+  }
+  await stripeFetch(secretKey, `/products/${encodeURIComponent(productId)}`, {
+    name: want.name,
+    description: want.description,
+  });
+  return true;
+}
+
 export async function createRecurringPrice(
   secretKey: string,
   params: {
@@ -161,7 +195,7 @@ export const TEAM_MIN_SEATS = 2;
  * team that the web path now refuses. One resolver, both callers.
  *
  * Education pricing is not a separate plan the caller asks for — it is the
- * Team plan bought by an org that has verified an academic address. Asking
+ * Team plan bought by an org that has verified a university address. Asking
  * for the discount cannot grant it; only the verification does.
  */
 export function resolvePlanPrice(

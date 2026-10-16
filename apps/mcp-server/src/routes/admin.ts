@@ -9,7 +9,7 @@ import type { Env } from "../types.js";
 import { sendDailyReport } from "../services/daily-report.js";
 import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
 import { priceToTier } from "../services/stripe.js";
-import { findPriceByLookupKey, createRecurringPrice } from "../services/stripe.js";
+import { findPriceByLookupKey, createRecurringPrice, reconcileProduct } from "../services/stripe.js";
 import { computeMrr } from "../services/mrr.js";
 import { ftsRowid, orgFtsToken } from "@getengram/db";
 
@@ -594,6 +594,11 @@ admin.post("/users/:id/sync-stripe", async (c) => {
 // ---------------------------------------------------------------------------
 const STUDENT_LOOKUP_KEY = "student_monthly";
 const STUDENT_UNIT_AMOUNT = 300; // $3.00/month
+const STUDENT_PRODUCT = {
+  name: "Engram Student",
+  description:
+    "Pro entitlements at student pricing. Requires a verified university email address; re-verified yearly.",
+};
 
 // ---------------------------------------------------------------------------
 // POST /admin/stripe/ensure-team-price — move Team to $9/seat
@@ -608,6 +613,11 @@ const STUDENT_UNIT_AMOUNT = 300; // $3.00/month
 // ---------------------------------------------------------------------------
 const TEAM_LOOKUP_KEY = "team_monthly";
 const TEAM_UNIT_AMOUNT = 900; // $9.00/seat/month
+const TEAM_PRODUCT = {
+  name: "Engram Team",
+  description:
+    "Shared memory for a team. 1,000,000 messages per seat, pooled across the org, plus webhooks and a usage dashboard. Minimum 2 seats.",
+};
 
 admin.post("/stripe/ensure-team-price", async (c) => {
   const secretKey = c.env.STRIPE_SECRET_KEY;
@@ -615,17 +625,18 @@ admin.post("/stripe/ensure-team-price", async (c) => {
   try {
     const existing = await findPriceByLookupKey(secretKey, TEAM_LOOKUP_KEY);
     if (existing && existing.unit_amount === TEAM_UNIT_AMOUNT) {
+      const updated = await reconcileProduct(secretKey, existing.product, TEAM_PRODUCT);
       return c.json({
         created: false,
         price_id: existing.id,
         unit_amount: existing.unit_amount,
+        product_updated: updated,
         configured: c.env.STRIPE_PRICE_ID_TEAM === existing.id,
       });
     }
     const price = await createRecurringPrice(secretKey, {
-      productName: "Engram Team",
-      productDescription:
-        "Shared memory for a team. 1,000,000 messages per seat, pooled across the org, plus webhooks and a usage dashboard. Minimum 2 seats.",
+      productName: TEAM_PRODUCT.name,
+      productDescription: TEAM_PRODUCT.description,
       tier: "team",
       unitAmount: TEAM_UNIT_AMOUNT,
       lookupKey: TEAM_LOOKUP_KEY,
@@ -648,11 +659,16 @@ admin.post("/stripe/ensure-team-price", async (c) => {
 });
 
 // Education Team: Team entitlements at the academic per-seat price. Applied
-// automatically when the org has a verified academic address — see
+// automatically when the org has a verified university address — see
 // resolvePlanPrice. $3/seat matches the Student price, keeping the whole
 // catalogue "one price per person": $9 for anyone, $3 if you are academic.
 const EDU_TEAM_LOOKUP_KEY = "edu_team_monthly";
 const EDU_TEAM_UNIT_AMOUNT = 300; // $3.00/seat/month
+const EDU_TEAM_PRODUCT = {
+  name: "Engram Education Team",
+  description:
+    "Team for departments, labs and research groups. Shared memory pooled across seats, webhooks and a usage dashboard, at academic pricing. Requires a verified university email, re-verified yearly. Minimum 2 seats.",
+};
 
 admin.post("/stripe/ensure-edu-team-price", async (c) => {
   const secretKey = c.env.STRIPE_SECRET_KEY;
@@ -660,17 +676,18 @@ admin.post("/stripe/ensure-edu-team-price", async (c) => {
   try {
     const existing = await findPriceByLookupKey(secretKey, EDU_TEAM_LOOKUP_KEY);
     if (existing && existing.unit_amount === EDU_TEAM_UNIT_AMOUNT) {
+      const updated = await reconcileProduct(secretKey, existing.product, EDU_TEAM_PRODUCT);
       return c.json({
         created: false,
         price_id: existing.id,
         unit_amount: existing.unit_amount,
+        product_updated: updated,
         configured: c.env.STRIPE_PRICE_ID_EDU_TEAM === existing.id,
       });
     }
     const price = await createRecurringPrice(secretKey, {
-      productName: "Engram Education Team",
-      productDescription:
-        "Team for departments, labs and research groups. Shared memory pooled across seats, webhooks and a usage dashboard, at academic pricing. Requires a verified academic email, re-verified yearly. Minimum 2 seats.",
+      productName: EDU_TEAM_PRODUCT.name,
+      productDescription: EDU_TEAM_PRODUCT.description,
       tier: "team",
       unitAmount: EDU_TEAM_UNIT_AMOUNT,
       lookupKey: EDU_TEAM_LOOKUP_KEY,
@@ -698,6 +715,7 @@ admin.post("/stripe/ensure-student-price", async (c) => {
   try {
     const existing = await findPriceByLookupKey(secretKey, STUDENT_LOOKUP_KEY);
     if (existing) {
+      const updated = await reconcileProduct(secretKey, existing.product, STUDENT_PRODUCT);
       return c.json({
         created: false,
         price_id: existing.id,
@@ -705,13 +723,13 @@ admin.post("/stripe/ensure-student-price", async (c) => {
         currency: existing.currency,
         interval: existing.recurring?.interval ?? null,
         livemode: existing.livemode,
+        product_updated: updated,
         configured: c.env.STRIPE_PRICE_ID_STUDENT === existing.id,
       });
     }
     const price = await createRecurringPrice(secretKey, {
-      productName: "Engram Student",
-      productDescription:
-        "Pro entitlements at student pricing. Requires a verified university email address; re-verified yearly.",
+      productName: STUDENT_PRODUCT.name,
+      productDescription: STUDENT_PRODUCT.description,
       tier: "student",
       unitAmount: STUDENT_UNIT_AMOUNT,
       lookupKey: STUDENT_LOOKUP_KEY,

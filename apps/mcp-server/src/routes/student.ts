@@ -21,7 +21,7 @@ const MAX_SENDS_PER_DAY = 5;
 /**
  * Student verification (engram#471).
  *
- *   POST /student/verify   {email}  — send a one-time link to an academic address
+ *   POST /student/verify   {email}  — send a one-time link to a university address
  *   POST /student/confirm  {token}  — redeem it; org becomes student-eligible
  *   GET  /student/status            — what the dashboard renders
  *

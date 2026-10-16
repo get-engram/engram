@@ -22,17 +22,37 @@ const ABI_MISMATCH =
  * crashed outright. Now that capture is on by default, that failure mode
  * has to self-heal.
  *
- * Strategy: try to load; on an ABI mismatch, run `npm rebuild
+ * Strategy: try to OPEN a database; on an ABI mismatch, run `npm rebuild
  * better-sqlite3` in the package that owns it (better-sqlite3 ships
  * prebuilds for common ABIs, so this is usually a quick download, not a
- * compile) and try once more. Returns true when the module loads; false
- * after printing the exact manual fix when it can't.
+ * compile) and try once more. Returns true when sqlite actually works;
+ * false after printing the exact manual fix when it can't.
+ *
+ * Opening a database is the whole point, and the reason this function was
+ * broken from the day it shipped. `require("better-sqlite3")` does NOT load
+ * the native addon — the binding is resolved lazily, on first construction.
+ * So the old check returned true on a machine whose addon could not load,
+ * the heal never ran, and the daemon died a few lines later inside
+ * worker-main with the exact error this was written to repair. The owner's
+ * machine crashlooped that way 2,358 times over three weeks (engram#496).
+ * Anything cheaper than `new Database(":memory:")` is not a real check.
  */
+/**
+ * Load the addon for real. An in-memory database touches no disk and is
+ * closed immediately, so this is cheap — and unlike a bare require() it
+ * actually dlopens the binary.
+ */
+function probeSqlite(): void {
+  const Database = req("better-sqlite3") as new (path: string) => { close(): void };
+  const db = new Database(":memory:");
+  db.close();
+}
+
 export function ensureNativeSqlite(
   log: (msg: string) => void = (m) => console.error(m),
 ): boolean {
   try {
-    req("better-sqlite3");
+    probeSqlite();
     return true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -52,7 +72,10 @@ export function ensureNativeSqlite(
         stdio: "pipe",
         timeout: 180_000,
       });
-      req("better-sqlite3");
+      // Re-probe, not re-require: the failed module stays in require's
+      // cache, so only a fresh open proves the rebuild took.
+      delete req.cache?.[req.resolve("better-sqlite3")];
+      probeSqlite();
       log("better-sqlite3 rebuilt for this Node — continuing.");
       return true;
     } catch {

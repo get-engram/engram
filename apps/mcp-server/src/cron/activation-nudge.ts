@@ -1,4 +1,5 @@
 import type { Env } from "../types.js";
+import { TIER_LIMITS } from "@getengram/shared";
 
 /**
  * Activation nudge: orgs that signed up a week ago but still have an
@@ -19,13 +20,27 @@ import type { Env } from "../types.js";
  * week apart): import-nudge = "import your history"; this = "here's how to
  * actually use it across apps".
  */
+/**
+ * The Free storage ceiling the email quotes. Imported rather than retyped —
+ * a marketing number that drifts from the enforced one is how /pricing ended
+ * up advertising allowances the product never had.
+ */
+const FREE_MESSAGE_LIMIT = TIER_LIMITS.free.storage_messages;
+
 export async function sendActivationNudges(env: Env): Promise<number> {
   if (!env.APP_URL) return 0;
   const secret = (env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET;
   if (!secret) return 0;
 
+  // messages_stored_total and the account age come along now: the email
+  // states the reader's real numbers instead of asserting their memory is
+  // empty. Computing the age in SQL keeps the cron free of date arithmetic
+  // and of any disagreement about what "now" means between Worker and page.
   const dormant = await env.DB.prepare(
-    `SELECT id, name, email FROM organizations
+    `SELECT id, name, email,
+            messages_stored_total AS saved,
+            CAST(julianday('now') - julianday(created_at) AS INTEGER) AS days_old
+     FROM organizations
      WHERE deleted_at IS NULL
        AND email IS NOT NULL
        AND messages_stored_total <= 1
@@ -33,7 +48,13 @@ export async function sendActivationNudges(env: Env): Promise<number> {
        AND digest_opt_out = 0
        AND created_at <= datetime('now', '-7 days')
      LIMIT 100`,
-  ).all<{ id: string; name: string; email: string }>();
+  ).all<{
+    id: string;
+    name: string;
+    email: string;
+    saved: number;
+    days_old: number;
+  }>();
 
   const { unsubscribeSig } = await import("./weekly-digest.js");
 
@@ -51,6 +72,9 @@ export async function sendActivationNudges(env: Env): Promise<number> {
           to: org.email,
           name: org.name,
           unsubscribe_url: `https://mcp.getengram.app/email/unsubscribe?org=${encodeURIComponent(org.id)}&sig=${sig}`,
+          saved_messages: org.saved ?? 0,
+          days_since_signup: org.days_old ?? 0,
+          limit: FREE_MESSAGE_LIMIT,
         }),
       });
       if (res.ok) {

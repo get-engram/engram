@@ -12,6 +12,8 @@ import { loadConfig, getBaseUrl } from "../config.js";
 import { DaemonDb } from "./db.js";
 import { Watcher } from "./watcher.js";
 import { Syncer } from "./syncer.js";
+import { SecretScrubber } from "./scrubber.js";
+import { loadVaultKey } from "../commands/vault.js";
 import { availableAdapters } from "./adapters.js";
 
 const ENGRAM_DIR = join(homedir(), ".engram");
@@ -52,7 +54,28 @@ async function main(): Promise<void> {
 
   const db = new DaemonDb(DB_FILE);
 
-  const syncer = new Syncer(db, client);
+  // Known-value secret scrubbing. Deliberately a SEPARATE client: giving the
+  // syncing client a vault key would switch on the SDK's auto-vaulting of
+  // every captured message (client.store → processContent), which is a
+  // behaviour change in its own right. This one exists only to read the
+  // vault so the scrubber can match exact values.
+  const vaultKey = await loadVaultKey();
+  let scrubber: SecretScrubber | null = null;
+  if (vaultKey) {
+    const vaultClient = new Engram({
+      apiKey,
+      baseUrl: process.env.ENGRAM_BASE_URL ?? config.baseUrl ?? getBaseUrl(),
+      vault: { encryptionKey: vaultKey },
+      timeout: 30_000,
+    });
+    scrubber = new SecretScrubber(vaultClient.vault, vaultKey, log);
+    scrubber.start();
+    log("vault scrubber: on (exact-match redaction of named secrets and the vault key)");
+  } else {
+    log("vault scrubber: off (no vault key configured — only pattern redaction applies)");
+  }
+
+  const syncer = new Syncer(db, client, scrubber);
 
   // Wrap syncer.onMessages to handle the async call
   const onMessages: ConstructorParameters<typeof Watcher>[1] = (
@@ -88,12 +111,13 @@ async function main(): Promise<void> {
     for (const w of watchers) w.stop();
     syncer.stopFlushLoop();
 
-    // Final flush
+    // Final flush — still scrubbed: the scrubber is stopped only after.
     try {
       await syncer.flush();
     } catch {
       // best effort
     }
+    scrubber?.stop();
 
     db.close();
 

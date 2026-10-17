@@ -18,6 +18,8 @@ interface ImageSource {
 
 interface ContentBlock {
   type: string;
+  /** tool_use blocks carry an id; tool_result blocks point at it. */
+  id?: string;
   text?: string;
   source?: ImageSource;
   thinking?: string;
@@ -48,6 +50,36 @@ function describeImage(block: ContentBlock): string {
   const where = src.url ? ` ${src.url}` : "";
   return `[image attached: ${kind}${size ? `, ${size}` : ""}${where}]`;
 }
+
+/**
+ * Commands whose entire purpose is to print a secret. Their output must
+ * never be captured, no matter what it looks like.
+ *
+ * `engram vault get NAME` decrypts and prints a vault value; `engram vault
+ * keygen` prints the vault KEY. Both are first-party, and docs/vault.md
+ * tells users to run the first one from inside an agent session. Before
+ * this check, that session's transcript — tool output included — was shipped
+ * to the server and vector-indexed, so the one feature built to keep a
+ * secret out of memory was the one putting it there. The server-side regex
+ * cannot help: a password or a PIN has no shape to match.
+ *
+ * Reading the key file directly is the same leak by a different door.
+ */
+//
+// Matched on the subcommand, not the binary name: `node dist/index.js vault
+// get`, `npx engram vault get` and `./engram vault get` all print the same
+// value. Withholding the output of some other tool's `vault get` by mistake
+// is a harmless over-redaction; missing one of these is the leak.
+const REVEALS_SECRET = /\bvault\s+(get|keygen)\b|\.engram\/vault-key\b/;
+
+function commandOf(input: unknown): string {
+  if (!input || typeof input !== "object") return "";
+  const cmd = (input as { command?: unknown }).command;
+  return typeof cmd === "string" ? cmd : "";
+}
+
+export const REDACTED_TOOL_OUTPUT =
+  "[output withheld by engram: this command prints a secret]";
 
 interface JsonlLine {
   type: string;
@@ -81,6 +113,13 @@ interface PendingAssistant {
  */
 export class Parser implements LineParser {
   private pending: PendingAssistant | null = null;
+
+  /**
+   * tool_use ids whose result must not be captured. Bounded: an id is
+   * removed the moment its result is seen, and a session produces a few
+   * hundred tool calls at most.
+   */
+  private secretToolIds = new Set<string>();
   private lastSessionId: string | null = null;
   private lastMeta: SessionMeta | null = null;
   private onMessages: OnMessages;
@@ -167,8 +206,11 @@ export class Parser implements LineParser {
       } else if (block.type === "image") {
         parts.push(describeImage(block));
       } else if (block.type === "tool_result") {
-        const text =
-          typeof block.content === "string"
+        const withheld =
+          !!block.tool_use_id && this.secretToolIds.delete(block.tool_use_id);
+        const text = withheld
+          ? REDACTED_TOOL_OUTPUT
+          : typeof block.content === "string"
             ? block.content
             : JSON.stringify(block.content ?? "");
         if (text.trim()) {
@@ -225,6 +267,9 @@ export class Parser implements LineParser {
             name: block.name,
             input: block.input,
           });
+          if (block.id && REVEALS_SECRET.test(commandOf(block.input))) {
+            this.secretToolIds.add(block.id);
+          }
         }
         // Skip thinking blocks — internal reasoning, not conversation
       }

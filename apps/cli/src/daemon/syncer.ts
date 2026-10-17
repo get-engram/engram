@@ -3,6 +3,7 @@ import { DaemonDb } from "./db.js";
 import { recordSuccess, recordFailure, classifyError } from "./status.js";
 import { parseStorageFullError } from "../storage-error.js";
 import { isPathExcluded, detectOptOut } from "./exclusions.js";
+import type { SecretScrubber } from "./scrubber.js";
 import type { ParsedMessage, SessionMeta, PendingRow } from "./types.js";
 
 // Claude Code transcript messages can be enormous (tool output dumps), and
@@ -46,7 +47,11 @@ export class Syncer {
     SessionMeta
   >();
 
-  constructor(db: DaemonDb, client: Engram) {
+  constructor(
+    db: DaemonDb,
+    client: Engram,
+    private readonly scrubber: SecretScrubber | null = null,
+  ) {
     this.db = db;
     this.client = client;
   }
@@ -88,6 +93,25 @@ export class Syncer {
       // The flush loop will create the conversation and re-map them.
       this.pendingSessions.set(sessionId, meta);
       conversationId = `pending:${sessionId}`;
+    }
+
+    // Value-exact scrubbing of known vault secrets, applied to every role
+    // (tool output is where `engram vault get` lands). This is the last
+    // point before content touches disk, so even the local queue never
+    // holds a plaintext vault value.
+    if (this.scrubber?.active) {
+      let hits = 0;
+      for (const m of messages) {
+        const r = this.scrubber.scrub(m.content);
+        if (r.replaced.length > 0) {
+          m.content = r.text;
+          hits += r.replaced.reduce((n, x) => n + x.count, 0);
+        }
+      }
+      if (hits > 0) {
+        // Names would be fine to log; counts are enough and give nothing away.
+        console.error(`[engram] scrubbed ${hits} vault value occurrence(s) from captured transcript`);
+      }
     }
 
     this.db.enqueue(conversationId, messages);

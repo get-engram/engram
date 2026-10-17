@@ -174,7 +174,9 @@ The vault decrypts secrets locally with ENGRAM_VAULT_KEY.
 Secrets are never sent to or stored on remote servers in plaintext.
 ```
 
-Claude Code will then use `engram vault get` to retrieve secrets on demand, keeping them out of the conversation history and codebase.
+Claude Code will then use `engram vault get` to retrieve secrets on demand, keeping them out of the codebase.
+
+A note on "out of the conversation history": the value *is* printed into the session when the agent runs `engram vault get`, because that is what the command is for. If the capture daemon (`engram start`) is running, it withholds the output of `engram vault get` and `engram vault keygen` from capture, and — when a vault key is configured — replaces any exact occurrence of a named secret elsewhere in the transcript with `[VAULT:name]` before anything is queued. That is what keeps the value out of your memory. Pattern-based redaction on the server would not: a password or a PIN has no shape to match.
 
 ### MCP tools for agents
 

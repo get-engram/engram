@@ -77,7 +77,17 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
       .all<{ tier: string; n: number }>(),
     db
       .prepare(
-        "SELECT COUNT(*) AS n FROM organizations WHERE deleted_at IS NULL AND stripe_subscription_id IS NOT NULL",
+        // Fallback only — used when Stripe is unreachable. Two corrections
+        // against the original: exclude the owner's internal accounts (the
+        // same data-driven rule computeMrr uses, tagged by
+        // POST /admin/comp-internal), and note that a non-null
+        // stripe_subscription_id outlives the subscription — comping an
+        // account deletes the Stripe sub but leaves this column set, so the
+        // old query counted a comped owner account as a paying customer.
+        `SELECT COUNT(*) AS n FROM organizations
+         WHERE deleted_at IS NULL
+           AND stripe_subscription_id IS NOT NULL
+           AND COALESCE(referral_source, '') != 'internal'`,
       )
       .first<{ n: number }>(),
     // Total messages via the maintained per-conversation counter (3.1k rows),
@@ -141,7 +151,13 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
     totals: {
       organizations: Object.values(byTier).reduce((a, b) => a + b, 0),
       by_tier: byTier,
-      paying: paying?.n ?? 0,
+      // One source of truth with the Revenue line below. The same email was
+      // reporting "14 paying" beside "$96/mo from 12 customers", because
+      // this number came from a D1 column and that one came from Stripe
+      // with internal accounts excluded. Stripe is authoritative when
+      // reachable; computeMrr returns zero subscriptions when it is not,
+      // which is the signal to fall back to the (now also corrected) count.
+      paying: mrr.subscriptions > 0 ? mrr.external_subscriptions : (paying?.n ?? 0),
       messages: msgTotal?.n ?? 0,
       conversations: convTotal?.n ?? 0,
     },

@@ -20,7 +20,7 @@ export function registerVaultSet(
         .min(1)
         .max(255)
         .regex(/^[A-Za-z_][A-Za-z0-9_.-]*$/, "Name must be alphanumeric with underscores, dots, or hyphens")
-        .describe("Secret name (e.g. DATABASE_URL, OPENAI_KEY)"),
+        .describe("Secret name (e.g. DATABASE_URL, STRIPE_SECRET_KEY)"),
       encrypted_value: z
         .string()
         .min(1)

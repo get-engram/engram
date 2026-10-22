@@ -22,7 +22,10 @@ export function registerCreateConversation(
         "Create a new conversation and return its conversation_id, used to group subsequently appended messages under one topic. Memory is scoped to the user's account; on multi-seat team accounts, a stored conversation is visible to the whole team by default and can be restricted to its creator with visibility 'private'.",
       inputSchema: {
         title: z.string().optional().describe("Title for the conversation"),
-        agent_id: z.string().optional().describe("Agent identifier (e.g. \"chatgpt\")"),
+        // Example names a generic value rather than a competing assistant:
+        // the Claude directory review asks listings not to reference other
+        // AI systems, and a schema example is listing surface too.
+        agent_id: z.string().optional().describe("Agent identifier (e.g. \"assistant\")"),
         tags: z.array(z.string()).optional().describe("Tags for filtering"),
         metadata: z.record(z.unknown()).optional().describe("Arbitrary metadata"),
         visibility: z

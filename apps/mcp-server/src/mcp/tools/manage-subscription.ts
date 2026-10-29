@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getOrganizationById } from "@getengram/db";
-import { TIER_LIMITS } from "@getengram/shared";
+import { TIER_LIMITS, PURCHASABLE_PLANS } from "@getengram/shared";
 import {
   createOrGetCustomer,
   createCheckoutSession,
@@ -42,7 +42,7 @@ export function registerManageSubscription(
           '"status" — show current tier and limits. "upgrade" — get a checkout link to subscribe to Pro or Team. "portal" — get a link to manage an existing subscription.',
         ),
       plan: z
-        .enum(["pro", "team"])
+        .enum(PURCHASABLE_PLANS)
         .optional()
         .describe('Target plan for upgrade. Defaults to "pro". Only used with action "upgrade".'),
       quantity: z

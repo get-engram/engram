@@ -35,6 +35,48 @@ export const MAX_SEARCH_QUERY_CHARS = 4_096;
 // are a plain tier query.
 export type Tier = "free" | "pro" | "student" | "team" | "enterprise";
 
+/**
+ * Every tier that pays. THE place this set is spelled out on the worker side.
+ *
+ * Student was added to pricing and the database without anyone grepping for
+ * hand-rolled `tier IN ('pro','team')` sets, and the web admin dropped paying
+ * students in four places (engram-web#264). A tier added to `Tier` but not
+ * here fails to compile; the guard test in paid-tiers.test.ts fails on any
+ * new SQL literal or `=== "pro" || === "team"` chain.
+ *
+ * Mirrors PAID_TIERS in engram-web/src/lib/auth/permissions.ts — the repos
+ * are not a workspace, so the constant lives once per repo, as Tier does.
+ */
+export const PAID_TIERS = ["pro", "student", "team", "enterprise"] as const satisfies readonly Exclude<Tier, "free">[];
+export type PaidTier = (typeof PAID_TIERS)[number];
+const _everyPaidTierListed: Record<Exclude<Tier, "free">, true> = {
+  pro: true, student: true, team: true, enterprise: true,
+} satisfies Record<PaidTier, true>;
+void _everyPaidTierListed;
+
+export function isPaidTier(t: string | null | undefined): t is PaidTier {
+  return (PAID_TIERS as readonly string[]).includes(t ?? "");
+}
+
+/** Tiers promised PRIORITY support. Pro and Student get email support, not priority. */
+export const PRIORITY_SUPPORT_TIERS = ["team", "enterprise"] as const satisfies readonly PaidTier[];
+
+/**
+ * Plans a customer can ASK for at checkout. Student is applied, never
+ * requested (resolvePlanPrice), and Enterprise is contact-priced — so this is
+ * deliberately not PAID_TIERS.
+ */
+export const PURCHASABLE_PLANS = ["pro", "team"] as const satisfies readonly PaidTier[];
+
+/**
+ * Render a tier tuple as a SQL IN-list. Only ever fed our own constants above,
+ * never user input, so string interpolation is safe here and keeps the one
+ * source of truth reaching into the queries.
+ */
+export function sqlTierList(tiers: readonly string[]): string {
+  return tiers.map((t) => `'${t}'`).join(",");
+}
+
 export const TIER_LIMITS: Record<Tier, {
   /**
    * Lifetime message storage (engram#275) — the primary billing gate,

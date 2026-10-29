@@ -3,6 +3,7 @@
 // JSON to `${APP_URL}/api/reports/daily` authenticated with ADMIN_SECRET.
 import type { Env } from "../types.js";
 import { computeMrr, committedCents, committedSubscriptions } from "./mrr.js";
+import { PRIORITY_SUPPORT_TIERS, sqlTierList } from "@getengram/shared";
 
 export interface DailyReport {
   generated_at: string;
@@ -130,7 +131,7 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
       .all<{ ref: string; n: number }>(),
     db
       .prepare(
-        "SELECT email FROM organizations WHERE tier IN ('team','enterprise') AND email IS NOT NULL AND deleted_at IS NULL",
+        `SELECT email FROM organizations WHERE tier IN (${sqlTierList(PRIORITY_SUPPORT_TIERS)}) AND email IS NOT NULL AND deleted_at IS NULL`,
       )
       .all<{ email: string }>(),
   ]);

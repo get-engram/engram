@@ -12,6 +12,7 @@ import { priceToTier } from "../services/stripe.js";
 import { findPriceByLookupKey, createRecurringPrice, reconcileProduct } from "../services/stripe.js";
 import { computeMrr } from "../services/mrr.js";
 import { ftsRowid, orgFtsToken } from "@getengram/db";
+import { PAID_TIERS, sqlTierList } from "@getengram/shared";
 
 type AdminEnv = { Bindings: Env };
 
@@ -205,7 +206,7 @@ admin.get("/timeseries", async (c) => {
     // per-day deltas to walk it backwards on the client.
     c.env.DB.prepare(
       `SELECT COUNT(*) AS n FROM organizations
-       WHERE deleted_at IS NULL AND tier IN ('pro','student','team','enterprise')
+       WHERE deleted_at IS NULL AND tier IN (${sqlTierList(PAID_TIERS)})
          AND COALESCE(referral_source,'') != 'internal'`,
     ).first<{ n: number }>(),
   ]);

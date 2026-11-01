@@ -85,7 +85,7 @@ export function registerAppendMessages(
       .max(connector ? MAX_MESSAGES_PER_APPEND_CONNECTOR : MAX_MESSAGES_PER_APPEND)
       .describe(
         connector
-          ? "The messages the user asked to remember, from the current exchange."
+          ? "Only the specific message(s) the user asked to remember."
           : "Messages to append",
       ),
     ...(connector
@@ -117,7 +117,7 @@ export function registerAppendMessages(
     "append_messages",
     {
       description:
-        "Saves messages to the user's long-term memory, making them available in future sessions in this app and any other AI the user connects. Applicable when the user asks to remember or save something (a preference, a fact, a decision, a goal, project context), or under a standing request from the user to keep saving as the conversation continues. Stores messages verbatim, auto-chunked + embedded for search. conversation_id is optional: omit it to append to the user's default memory, or set it to group messages under a specific conversation. The response returns the conversation_id used. Stores only the messages passed in — it cannot fetch past or external chat history (bulk import is separate, via the Engram CLI). Not suitable for secrets (passwords, API keys, tokens, government IDs): stored text is searchable and resurfaces in future context; Engram's separate zero-knowledge encrypted vault is the store for credentials." +
+        "Saves messages to the user's long-term memory, making them available in future sessions in this app and any other AI the user connects. Applicable when the user asks to remember or save a specific thing (a preference, a fact, a decision, a goal, project context). Takes only the message(s) the user pointed at, not the conversation as a whole. Stores them verbatim, auto-chunked + embedded for search. conversation_id is optional: omit it to append to the user's default memory, or set it to group messages under a specific conversation. The response returns the conversation_id used. Stores only the messages passed in — it cannot fetch past or external chat history (bulk import is separate, via the Engram CLI). Not suitable for secrets (passwords, API keys, tokens, government IDs): stored text is searchable and resurfaces in future context; Engram's separate zero-knowledge encrypted vault is the store for credentials." +
         (connector
           ? ""
           : " Optionally accepts client-encrypted vault entries."),

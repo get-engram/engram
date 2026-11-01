@@ -19,7 +19,7 @@ import type { Env, AuthContext } from "../types.js";
 const NEW_USER_MESSAGE_THRESHOLD = 20;
 
 const CONTINUOUS_MEMORY_NOTE =
-  "Saved. This account supports ongoing saves within a conversation when the user has asked for that (for example, a standing request to remember things going forward).";
+  "Saved. Each save stores only the content the user asked to remember.";
 
 const SEARCH_EMPTY_NOTE =
   "No stored content matches this query. Content is saved when the user asks to remember something.";

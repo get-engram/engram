@@ -44,6 +44,31 @@ describe("Claude directory policy", () => {
     }
   });
 
+  it("never reads as a request for the conversation history (OpenAI scanner, 2026-10-31)", () => {
+    // OpenAI's automated scan flagged the server instructions and
+    // append_messages as "appear to request the user's full conversation
+    // history". These phrases were the trigger.
+    const banned = [
+      /save this chat/i,
+      /from this point forward/i,
+      /as the conversation continues/i,
+      /standing (request|consent)/i,
+      /current (exchange|conversation)/i,
+      /ongoing saves/i,
+      /(whole|entire|full) (conversation|chat|transcript)/i,
+    ];
+    const texts = [
+      { file: "server.ts", text: SERVER_INSTRUCTIONS },
+      ...toolSources,
+      { file: "coaching.ts", text: readFileSync(resolve(__dirname, "../mcp/coaching.ts"), "utf-8") },
+    ];
+    for (const { file, text } of texts) {
+      // Code comments are not model-visible; only strings reach the scanner.
+      const visible = text.replace(/^\s*\/\/.*$/gm, "");
+      for (const re of banned) expect(visible, `${file}: ${re}`).not.toMatch(re);
+    }
+  });
+
   it("names no competing assistant in the instructions", () => {
     expect(SERVER_INSTRUCTIONS).not.toMatch(/ChatGPT|Cursor|Gemini|Windsurf|Perplexity|OpenAI/i);
   });

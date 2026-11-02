@@ -140,6 +140,8 @@ invites.post("/accept", async (c) => {
 
   const { raw, prefix } = generateApiKeyRaw();
   const keyId = generateId("key");
+  // Seat binding is part of the INSERT (engram#441): there is no window in
+  // which this key exists as an owner-level (null-seat) credential.
   await insertApiKey(
     c.env.DB,
     keyId,
@@ -148,10 +150,8 @@ invites.post("/accept", async (c) => {
     prefix,
     `Seat — ${email}`,
     "read,write,search,delete",
+    seat.id,
   );
-  await c.env.DB.prepare("UPDATE api_keys SET seat_id = ? WHERE id = ?")
-    .bind(seat.id, keyId)
-    .run();
 
   await audit(c.env.DB, seat.organization_id, keyId, "seat.accepted", "seat", seat.id, {
     email,

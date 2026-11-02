@@ -143,6 +143,14 @@ export function createMockD1(): D1Database {
           );
         }
 
+        // Filter by seat_id = ? — resolved by placeholder ordinal so it composes
+        // with the organization_id filter above (getApiKeysByOrg for a seat member).
+        if (sql.includes("seat_id = ?")) {
+          const before = sql.slice(0, sql.indexOf("seat_id = ?"));
+          const ordinal = (before.match(/\?/g) ?? []).length;
+          results = results.filter((r) => r.seat_id === bindings[ordinal]);
+        }
+
         // Filter by conversation_id
         if (sql.includes("conversation_id = ?")) {
           const convIdx = sql.includes("organization_id = ?") ? 1 : 0;

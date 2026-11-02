@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { authMiddleware } from "./middleware/auth.js";
+import { authMiddleware, timingSafeEqual } from "./middleware/auth.js";
 import { rateLimitMiddleware } from "./middleware/rate-limit.js";
 import { createMcpServer } from "./mcp/server.js";
 import { keys } from "./routes/keys.js";
@@ -278,7 +278,9 @@ app.use(
 app.use("/admin/*", async (c, next) => {
   const auth = c.req.header("Authorization");
   const secret = (c.env as Env & { ADMIN_SECRET: string }).ADMIN_SECRET;
-  if (!secret || auth !== `Bearer ${secret}`) {
+  // Constant-time compare, same as the ADMIN_SECRET path in authMiddleware:
+  // a `!==` on the bearer leaks the matching-prefix length through timing.
+  if (!secret || !auth?.startsWith("Bearer ") || !timingSafeEqual(auth.slice(7), secret)) {
     return c.json({ error: "Unauthorized" }, 401);
   }
   await next();

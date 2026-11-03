@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { pruneExpiredOAuthTokens } from "../cron/prune-oauth-tokens.js";
 import { enforceAuditRetention, AUDIT_RETENTION_DAYS } from "../cron/audit-retention.js";
+import { pruneStripeWebhookEvents, STRIPE_EVENT_RETENTION_DAYS } from "../cron/prune-stripe-events.js";
 import type { Env } from "../types.js";
 
 /**
@@ -115,5 +116,39 @@ describe("enforceAuditRetention", () => {
     const { env, log } = stubDb({ audit_log: 750 });
     expect(await enforceAuditRetention(env)).toBe(750);
     expect(log.length).toBe(2);
+  });
+});
+
+describe("pruneStripeWebhookEvents", () => {
+  it("drains the ledger in bounded batches with nothing bound", async () => {
+    const { env, log } = stubDb({ stripe_webhook_events: 1200 });
+    const n = await pruneStripeWebhookEvents(env);
+    expect(n).toBe(1200);
+    expect(log.length).toBe(3); // 500 + 500 + 200 (stops: 200 < BATCH)
+    expect(binds(log)).toBe(0); // the LIMIT and the cutoff are in the SQL
+    const cutoff = new RegExp(
+      `received_at < datetime\\('now', '-${STRIPE_EVENT_RETENTION_DAYS} days'\\)`,
+    );
+    for (const s of log) {
+      expect(s.sql).toMatch(/DELETE FROM stripe_webhook_events WHERE event_id IN \(\s*SELECT/);
+      expect(s.sql).toMatch(cutoff);
+    }
+  });
+
+  it("keeps a row past Stripe's 3-day retry horizon", () => {
+    expect(STRIPE_EVENT_RETENTION_DAYS).toBeGreaterThanOrEqual(3);
+  });
+
+  it("bounds a run so a backlog drains over several nights", async () => {
+    const { env, log } = stubDb({ stripe_webhook_events: 1_000_000 });
+    const n = await pruneStripeWebhookEvents(env);
+    expect(n).toBe(10_000); // 20 batches x 500
+    expect(log.length).toBe(20);
+  });
+
+  it("stops as soon as a batch comes back short", async () => {
+    const { env, log } = stubDb({ stripe_webhook_events: 7 });
+    expect(await pruneStripeWebhookEvents(env)).toBe(7);
+    expect(log.length).toBe(1);
   });
 });

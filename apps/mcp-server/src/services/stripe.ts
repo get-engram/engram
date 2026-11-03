@@ -225,25 +225,85 @@ export function resolvePlanPrice(
 export interface StripeCustomer {
   id: string;
   email: string | null;
+  /** Stamped with `organization_id` at creation; the only proof of ownership. */
+  metadata?: Record<string, string>;
 }
 
+/**
+ * The Stripe customer for an organization: the one it created, or a new one.
+ *
+ * Ownership is the `metadata.organization_id` stamp written at creation, never
+ * the email. The email is caller-controlled (PATCH /api/account sets it with no
+ * verification) and it is not unique in Stripe: an org that changes its Engram
+ * address leaves its customer behind under the old one, which any other org
+ * can then register. Resolving by email alone (engram#443) handed that org the
+ * first org's customer, and with it the billing portal: cancel the
+ * subscription, swap the card, read the invoices. So a customer found by email
+ * is reused only when it carries this org's stamp; otherwise this org gets a
+ * customer of its own, and the other org's stays untouched.
+ *
+ * The customer list is a strongly consistent read, unlike /customers/search,
+ * so a customer created a moment ago is seen.
+ */
 export async function createOrGetCustomer(
   secretKey: string,
   email: string,
   organizationId: string,
 ): Promise<StripeCustomer> {
-  // Search for an existing customer with this email + org metadata
+  if (!organizationId) {
+    throw new Error("createOrGetCustomer: organizationId is required");
+  }
   const search = await stripeFetch<{ data: StripeCustomer[] }>(
     secretKey,
-    `/customers?email=${encodeURIComponent(email)}&limit=1`,
+    `/customers?email=${encodeURIComponent(email)}&limit=100`,
   );
-  if (search.data && search.data.length > 0) {
-    return search.data[0];
-  }
+  const own = (search.data ?? []).find(
+    (customer) => customer.metadata?.organization_id === organizationId,
+  );
+  if (own) return own;
   return stripeFetch<StripeCustomer>(secretKey, `/customers`, {
     email,
     "metadata[organization_id]": organizationId,
   });
+}
+
+/**
+ * One customer by id, or null when Stripe no longer has it.
+ *
+ * Stripe answers a deleted customer with 200 and `deleted: true`, and an id it
+ * has never seen with 404; both are "no such customer" to a caller deciding
+ * whether a cached id is still worth anything. Any other failure throws: an
+ * outage is not evidence either way.
+ */
+export async function getCustomer(
+  secretKey: string,
+  customerId: string,
+): Promise<StripeCustomer | null> {
+  const res = await fetch(`${STRIPE_API}/customers/${encodeURIComponent(customerId)}`, {
+    headers: { Authorization: `Bearer ${secretKey}` },
+  });
+  if (res.status === 404) return null;
+  const json = (await res.json()) as StripeCustomer & {
+    deleted?: boolean;
+    error?: { message: string };
+  };
+  if (!res.ok) {
+    throw new Error(`stripe: ${json?.error?.message || `Stripe API ${res.status}`}`);
+  }
+  if (json.deleted) return null;
+  return json;
+}
+
+export type CustomerOwnership = "own" | "unstamped" | "foreign";
+
+/** Whose customer is this? The stamp decides; its absence is not an answer. */
+export function customerOwnership(
+  customer: StripeCustomer,
+  organizationId: string,
+): CustomerOwnership {
+  const stamp = customer.metadata?.organization_id;
+  if (!stamp) return "unstamped";
+  return stamp === organizationId ? "own" : "foreign";
 }
 
 export interface CheckoutSession {

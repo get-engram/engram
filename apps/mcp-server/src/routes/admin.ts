@@ -620,6 +620,10 @@ admin.post("/users/:id/sync-stripe", async (c) => {
       result.reason === "no_stripe_customer" ? 400 :
       result.reason === "stripe_api_error" ? 502 :
       result.reason === "no_subscriptions_returned" ? 409 :
+      // D1 and Stripe disagree about whose customer this is: the link was
+      // removed (foreign) or is left to the org's next billing action (missing).
+      result.reason === "foreign_customer" ? 409 :
+      result.reason === "customer_missing" ? 409 :
       200;
     return c.json(result, code);
   }

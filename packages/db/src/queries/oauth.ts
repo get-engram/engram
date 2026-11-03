@@ -99,10 +99,16 @@ export function getAuthorizationCode(db: D1Database, codeHash: string) {
     }>();
 }
 
+/**
+ * Consume an authorization code. Conditional on `consumed_at IS NULL` so the
+ * UPDATE itself is the single-use lock: two concurrent exchanges of one code
+ * both pass the SELECT, but only one flips the row. Callers must check
+ * `meta.changes === 1` before issuing tokens (engram#453).
+ */
 export function consumeAuthorizationCode(db: D1Database, codeHash: string) {
   return db
     .prepare(
-      "UPDATE oauth_authorization_codes SET consumed_at = datetime('now') WHERE code_hash = ?",
+      "UPDATE oauth_authorization_codes SET consumed_at = datetime('now') WHERE code_hash = ? AND consumed_at IS NULL",
     )
     .bind(codeHash)
     .run();
@@ -203,6 +209,7 @@ export function getRefreshToken(db: D1Database, tokenHash: string) {
       expires_at: string;
       rotated_to: string | null;
       revoked_at: string | null;
+      grace_used_at: string | null;
     }>();
 }
 
@@ -221,21 +228,24 @@ export function rotateRefreshToken(
 }
 
 /**
- * Revoke every refresh token for a client+org pair. Called on refresh-token
- * reuse detection (a token already rotated/revoked is presented again).
+ * Claim the one-time reuse grace on an already-rotated refresh token.
+ * Conditional UPDATE: exactly one presentation of a rotated token can turn
+ * `meta.changes === 1`; every later one is reuse (engram#446).
  */
-export function revokeRefreshTokenChain(
-  db: D1Database,
-  clientId: string,
-  organizationId: string,
-) {
+export function claimRefreshGrace(db: D1Database, tokenHash: string) {
   return db
     .prepare(
-      "UPDATE oauth_refresh_tokens SET revoked_at = datetime('now') WHERE client_id = ? AND organization_id = ? AND revoked_at IS NULL",
+      "UPDATE oauth_refresh_tokens SET grace_used_at = datetime('now') WHERE token_hash = ? AND rotated_to IS NOT NULL AND grace_used_at IS NULL",
     )
-    .bind(clientId, organizationId)
+    .bind(tokenHash)
     .run();
 }
+
+// Refresh-token reuse detection used to call a refresh-only revoke here
+// (revokeRefreshTokenChain). It left the access tokens the thief had already
+// minted alive for up to an hour, so "detected" did not mean "stopped"
+// (engram#442). The token endpoint now uses revokeOAuthConnection below,
+// which also deletes the access tokens.
 
 // ---------------------------------------------------------------------------
 // Connected apps (dashboard "manage access")

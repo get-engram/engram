@@ -33,6 +33,8 @@ export function createOAuthD1(): D1Database {
       eq,
       consumedNull: /consumed_at\s+IS\s+NULL/i.test(whereSql),
       revokedNull: /revoked_at\s+IS\s+NULL/i.test(whereSql),
+      graceNull: /grace_used_at\s+IS\s+NULL/i.test(whereSql),
+      rotatedNotNull: /rotated_to\s+IS\s+NOT\s+NULL/i.test(whereSql),
       unexpired: /expires_at\s*>\s*datetime\('now'\)/i.test(whereSql),
     };
   }
@@ -43,9 +45,16 @@ export function createOAuthD1(): D1Database {
     }
     if (w.consumedNull && row.consumed_at != null) return false;
     if (w.revokedNull && row.revoked_at != null) return false;
+    if (w.graceNull && row.grace_used_at != null) return false;
+    if (w.rotatedNotNull && row.rotated_to == null) return false;
     if (w.unexpired && !(String(row.expires_at) > nowStr())) return false;
     return true;
   }
+
+  // Real D1 reports the number of rows a write touched in meta.changes; the
+  // token endpoint relies on it as its lock (conditional UPDATE == 1 row).
+  const written = (changes: number): D1Result =>
+    ({ results: [], success: true, meta: { changes } }) as unknown as D1Result;
 
   const stmt = (sql: string, args: unknown[] = []) => ({
     bind: (...a: unknown[]) => stmt(sql, a),
@@ -56,7 +65,7 @@ export function createOAuthD1(): D1Database {
         const row: Row = {};
         cols.forEach((c, i) => (row[c] = args[i] ?? null));
         table(insert[1]).push(row);
-        return { results: [], success: true, meta: {} };
+        return written(1);
       }
       const update = sql.match(/UPDATE\s+(\w+)\s+SET\s+(.+?)\s+WHERE\s/is);
       if (update) {
@@ -75,17 +84,22 @@ export function createOAuthD1(): D1Database {
         // Re-parse WHERE using only the args after the SET placeholders.
         const w2 = parseWhere(sql, args.slice(argPtr));
         void w;
+        let changes = 0;
         for (const row of table(name)) {
-          if (matches(row, w2)) for (const [c, v] of setters) row[c] = v;
+          if (matches(row, w2)) {
+            for (const [c, v] of setters) row[c] = v;
+            changes++;
+          }
         }
-        return { results: [], success: true, meta: {} };
+        return written(changes);
       }
       const del = sql.match(/DELETE\s+FROM\s+(\w+)\s+WHERE\s/is);
       if (del) {
         const name = del[1];
         const w = parseWhere(sql, args);
+        const before = table(name).length;
         tables[name] = table(name).filter((r) => !matches(r, w));
-        return { results: [], success: true, meta: {} };
+        return written(before - tables[name].length);
       }
       return { results: [], success: true, meta: {} };
     }),

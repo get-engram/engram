@@ -13,13 +13,16 @@ import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
 //
 // Safe by construction: syncOrganizationFromStripe never downgrades on an
 // empty Stripe result, so this can run fleet-wide without nuking live payers.
+// It also refuses to sync from a customer stamped for another org and unlinks
+// it (engram#443), so a poisoned row heals within one tick instead of
+// inheriting someone else's plan.
 // Only orgs with a stripe_customer_id are touched (a handful today), so the
 // Stripe API volume is trivial; batch/paginate if that grows.
 // ---------------------------------------------------------------------------
 
 export async function reconcileStripeToD1(
   env: Env,
-): Promise<{ checked: number; changed: number; errors: number }> {
+): Promise<{ checked: number; changed: number; errors: number; unlinked: number }> {
   // Enterprise is manually managed (comped / negotiated, often with no live
   // Stripe sub) — never auto-sync it from Stripe (the helper also guards this).
   // grace_ends_at lets the helper skip active admin grants/comps.
@@ -30,6 +33,7 @@ export async function reconcileStripeToD1(
   let checked = 0;
   let changed = 0;
   let errors = 0;
+  let unlinked = 0;
 
   for (const org of rows.results ?? []) {
     try {
@@ -37,6 +41,7 @@ export async function reconcileStripeToD1(
       const result = await syncOrganizationFromStripe(env, org);
       checked++;
       if (result.synced && result.tier !== before) changed++;
+      if (!result.synced && result.reason === "foreign_customer") unlinked++;
     } catch (err) {
       errors++;
       console.error(
@@ -45,5 +50,5 @@ export async function reconcileStripeToD1(
     }
   }
 
-  return { checked, changed, errors };
+  return { checked, changed, errors, unlinked };
 }

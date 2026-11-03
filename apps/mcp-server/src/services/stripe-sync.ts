@@ -1,5 +1,6 @@
 import type { Env } from "../types.js";
 import { priceToTier } from "./stripe.js";
+import { resolveCachedCustomer, type ResolvedCustomer } from "./stripe-customer.js";
 
 // ---------------------------------------------------------------------------
 // Reconcile one org's D1 tier/cancel state from its live Stripe subscriptions.
@@ -16,6 +17,8 @@ import { priceToTier } from "./stripe.js";
 //   - a recoverable sub (past_due dunning / paused / incomplete) → don't
 //     downgrade; the customer may still pay. Only churn on genuinely terminal
 //     subs (canceled / incomplete_expired / unpaid).
+//   - a cached customer stamped for ANOTHER org (engram#443) → unlink it and
+//     sync nothing; its subscription is not this org's entitlement.
 // ---------------------------------------------------------------------------
 
 export interface OrgSyncInput {
@@ -33,7 +36,9 @@ export type StripeSyncResult =
         | "stripe_api_error"
         | "no_subscriptions_returned"
         | "manual_tier"
-        | "in_dunning";
+        | "in_dunning"
+        | "foreign_customer"
+        | "customer_missing";
       tier: string;
     }
   | {
@@ -76,11 +81,33 @@ export async function syncOrganizationFromStripe(
     return { synced: false, reason: "no_stripe_customer", tier: org.tier };
   }
 
+  // The cached customer must be this org's own (engram#443): a row pointing at
+  // another org's customer would otherwise inherit that org's subscription,
+  // and with it its tier, on every tick. Only positive evidence unlinks here;
+  // a customer that is merely gone is left for the org's next billing action,
+  // so a revoked or wrong-mode key can never strip the fleet of its links.
+  let resolved: ResolvedCustomer;
+  try {
+    resolved = await resolveCachedCustomer(env, org, { unlinkMissing: false });
+  } catch (err) {
+    console.error(
+      `[stripe-sync] org ${org.id}: customer lookup failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { synced: false, reason: "stripe_api_error", tier: org.tier };
+  }
+  if (!resolved.ok) {
+    const reason =
+      resolved.reason === "foreign" ? "foreign_customer" :
+      resolved.reason === "missing" ? "customer_missing" :
+      "no_stripe_customer";
+    return { synced: false, reason, tier: org.tier };
+  }
+
   // limit=100 (Stripe max): status=all is ordered created-desc, so a live sub
   // must never be paginated out behind old churned subs — that would read as a
   // false cancellation, and the cron would apply it fleet-wide.
   const subsRes = await fetch(
-    `https://api.stripe.com/v1/subscriptions?customer=${org.stripe_customer_id}&status=all&limit=100`,
+    `https://api.stripe.com/v1/subscriptions?customer=${encodeURIComponent(resolved.customerId)}&status=all&limit=100`,
     { headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` } },
   );
   if (!subsRes.ok) {

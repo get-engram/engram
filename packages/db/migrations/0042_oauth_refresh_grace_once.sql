@@ -1,0 +1,12 @@
+-- Refresh-token reuse grace is redeemable once (engram#446).
+--
+-- Re-presenting a refresh token within 60 s of its rotation is treated as a
+-- dropped response rather than theft, and the caller is handed a fresh pair.
+-- Nothing recorded that the grace had been used, so the same rotated token
+-- could be replayed for the whole window, each replay minting an independent
+-- chain that reuse detection could never see.
+--
+-- grace_used_at is set by a conditional UPDATE (… WHERE grace_used_at IS NULL)
+-- in the token endpoint; the one caller whose UPDATE changes a row gets the
+-- pair, every other presentation of that token is reuse.
+ALTER TABLE oauth_refresh_tokens ADD COLUMN grace_used_at TEXT;

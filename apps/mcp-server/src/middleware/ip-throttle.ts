@@ -1,5 +1,5 @@
-import type { Context, Next } from "hono";
-import type { Env, AuthContext } from "../types.js";
+import type { Context, Env as HonoEnv, MiddlewareHandler, Next } from "hono";
+import type { Env } from "../types.js";
 
 /**
  * Best-effort per-IP throttle for UNAUTHENTICATED routes.
@@ -39,12 +39,18 @@ function maybeSweep(now: number, windowMs: number) {
   }
 }
 
-export function ipThrottle(opts: { limit: number; windowMs: number; bucket: string }) {
+/**
+ * Generic over the router's Hono env so the same middleware mounts on routers
+ * with and without the `auth` variable (signup vs. oauth). It reads only the
+ * request headers, so any env with our Bindings is enough.
+ */
+export function ipThrottle<E extends HonoEnv & { Bindings: Env } = { Bindings: Env }>(opts: {
+  limit: number;
+  windowMs: number;
+  bucket: string;
+}): MiddlewareHandler<E> {
   const { limit, windowMs, bucket: name } = opts;
-  return async function (
-    c: Context<{ Bindings: Env; Variables: { auth: AuthContext } }>,
-    next: Next,
-  ) {
+  return async function (c: Context<E>, next: Next) {
     const ip = c.req.header("CF-Connecting-IP");
     if (!ip) {
       // No trustworthy client IP (local dev, non-CF ingress) — don't block.

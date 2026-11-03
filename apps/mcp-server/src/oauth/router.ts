@@ -21,13 +21,15 @@ import {
   insertRefreshToken,
   getRefreshToken,
   rotateRefreshToken,
-  revokeRefreshTokenChain,
+  claimRefreshGrace,
+  revokeOAuthConnection,
   getOrganizationByEmail,
   insertOrganizationWithEmail,
   upsertOrgIdentity,
   hasOrgIdentity,
 } from "@getengram/db";
 import { verifySupabaseJwt } from "../utils/jwt.js";
+import { ipThrottle } from "../middleware/ip-throttle.js";
 import { requiresClaim, startClaim, claimMessage } from "../services/claim.js";
 import { seedWelcomeConversation } from "../routes/signup.js";
 import { DEFAULT_SCOPE, originOf } from "./metadata.js";
@@ -94,6 +96,33 @@ function isValidRedirectUri(uri: string): boolean {
 }
 
 /**
+ * Longest client_name we store and render. Real connectors use a word or two
+ * ("ChatGPT", "Claude Desktop", "Cursor"); anything longer is noise on the
+ * consent screen and in referral attribution.
+ */
+const CLIENT_NAME_MAX = 64;
+
+/**
+ * DCR client_name is self-asserted by an unauthenticated caller and then
+ * rendered on the consent screen as "<name> wants to connect", so it is
+ * treated as untrusted display text (engram#447): control and format
+ * characters are stripped (a zero-width space or a bidi override turns
+ * "ChatGPT" into something that renders identically but matches nothing),
+ * whitespace is collapsed, and the length is capped. Returns null when
+ * nothing printable is left so the consent screen falls back to
+ * "An application" rather than an empty bold span.
+ */
+export function normalizeClientName(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const cleaned = raw
+    .replace(/[\p{Cc}\p{Cf}]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return null;
+  return cleaned.length > CLIENT_NAME_MAX ? cleaned.slice(0, CLIENT_NAME_MAX) : cleaned;
+}
+
+/**
  * Record which Supabase user an org belongs to (migration 0040). Until this
  * existed the connector path discarded `sub` and kept only the email string,
  * so the same person later signing in on the website looked like a stranger
@@ -123,7 +152,13 @@ oauth.use(
 // ---------------------------------------------------------------------------
 // Dynamic Client Registration (RFC 7591)
 // ---------------------------------------------------------------------------
-oauth.post("/register", async (c) => {
+// Registration is unauthenticated by design (RFC 7591 open DCR), which made
+// it the one route an anonymous caller could hit without bound: a loop here
+// fills oauth_clients and, with a chosen client_name, mass-produces
+// consent-screen impersonations. A legitimate client registers once per
+// install, so even a platform NAT sharing one egress address sits far below
+// this ceiling (engram#447). Same floor-not-wall caveats as ipThrottle.
+oauth.post("/register", ipThrottle<HonoEnv>({ limit: 30, windowMs: 60_000, bucket: "oauth-register" }), async (c) => {
   const body = (await c.req.json().catch(() => null)) as {
     redirect_uris?: unknown;
     client_name?: unknown;
@@ -156,7 +191,7 @@ oauth.post("/register", async (c) => {
   const grantTypes = Array.isArray(body.grant_types)
     ? body.grant_types.filter((g): g is string => typeof g === "string")
     : ["authorization_code", "refresh_token"];
-  const clientName = typeof body.client_name === "string" ? body.client_name : null;
+  const clientName = normalizeClientName(body.client_name);
 
   const clientId = generateClientId();
   let clientSecret: string | null = null;
@@ -486,8 +521,14 @@ async function handleAuthorizationCodeGrant(
     return c.json({ error: "invalid_grant", error_description: "PKCE verification failed" }, 400);
   }
 
-  // Single-use: consume before issuing so a replay can't mint a second token.
-  await consumeAuthorizationCode(c.env.DB, codeHash);
+  // Single-use, atomically: the conditional UPDATE is the lock. Two
+  // concurrent exchanges of one code both pass the SELECT and PKCE checks
+  // above; only the one whose UPDATE flips consumed_at may mint tokens. The
+  // other sees zero changes and is refused exactly like a replay (#453).
+  const consumed = await consumeAuthorizationCode(c.env.DB, codeHash);
+  if (consumed.meta.changes !== 1) {
+    return c.json({ error: "invalid_grant", error_description: "Code invalid, expired, or used" }, 400);
+  }
   return issueTokens(c, clientId, row.organization_id, row.scope);
 }
 
@@ -526,12 +567,27 @@ async function handleRefreshTokenGrant(
       rotatedAgeMs >= 0 &&
       rotatedAgeMs < REFRESH_REUSE_GRACE_SECONDS * 1000;
 
-    if (!withinGrace) {
+    // The grace is redeemable ONCE per rotated token. Claiming it is a
+    // conditional UPDATE, so two callers inside the window — a client
+    // retrying a dropped response and a thief replaying the same token —
+    // cannot both walk away with a pair: exactly one claim changes the row,
+    // every other presentation is reuse (#446).
+    const graceClaimed =
+      withinGrace && (await claimRefreshGrace(c.env.DB, tokenHash)).meta.changes === 1;
+
+    if (!graceClaimed) {
       console.warn(
-        `[oauth] refresh reuse outside grace — revoking chain for org=${row.organization_id} ` +
-          `client=${clientId} rotated_age_ms=${Number.isFinite(rotatedAgeMs) ? rotatedAgeMs : "unknown"}`,
+        `[oauth] refresh reuse ${withinGrace ? "(grace already used)" : "outside grace"} — ` +
+          `revoking org=${row.organization_id} client=${clientId} ` +
+          `rotated_age_ms=${Number.isFinite(rotatedAgeMs) ? rotatedAgeMs : "unknown"}`,
       );
-      await revokeRefreshTokenChain(c.env.DB, row.client_id, row.organization_id);
+      // Everything this client holds for the org dies: the refresh tokens
+      // AND the access tokens already minted. Access tokens are gated only
+      // by expires_at, so revoking refresh tokens alone left a thief's
+      // session alive for up to ACCESS_TTL after "detection" (#442). Scope
+      // is client+org, as on the dashboard's disconnect: access tokens are
+      // not linked to a chain, so nothing narrower can reach the stolen one.
+      await revokeOAuthConnection(c.env.DB, row.organization_id, row.client_id);
       return c.json({ error: "invalid_grant", error_description: "Refresh token reuse detected" }, 400);
     }
 

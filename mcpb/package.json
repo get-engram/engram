@@ -1,10 +1,15 @@
 {
   "name": "engram-mcpb",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Engram desktop extension bundle for Claude Desktop",
   "main": "server/index.js",
   "dependencies": {
     "mcp-remote": "^0.1.29"
+  },
+  "overrides": {
+    "qs": "^6.16.0",
+    "proxy-addr": "^2.0.8",
+    "undici": "^7.30.1"
   }
 }

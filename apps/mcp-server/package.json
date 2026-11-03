@@ -24,9 +24,10 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260423.1",
     "@getengram/sdk": "workspace:*",
+    "@types/node": "^20.19.39",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.2.7",
+    "vitest": "^4.1.12",
     "wrangler": "^4.84.1"
   }
 }

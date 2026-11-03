@@ -8,6 +8,7 @@ export async function listConversations(
 ): Promise<void> {
   const result = await engram.listConversations({
     limit: flags.limit ? parseInt(flags.limit) : undefined,
+    offset: flags.offset ? parseInt(flags.offset) : undefined,
     agentId: flags.agent,
     tags: flags.tags ? flags.tags.split(",") : undefined,
     sort: flags.sort as "created_at" | "updated_at" | "message_count" | undefined,
@@ -19,7 +20,14 @@ export async function listConversations(
     return;
   }
 
-  console.log(`${result.total} conversation(s)\n`);
+  // `total` is the account-wide match count (engram#540); the table below is
+  // one page of it, so say so when they differ.
+  const shown = result.conversations.length;
+  console.log(
+    shown < result.total
+      ? `Showing ${shown} of ${result.total} conversation(s) ${dim("(--limit/--offset to page)")}\n`
+      : `${result.total} conversation(s)\n`,
+  );
   table(
     result.conversations.map((c) => ({
       id: c.id,

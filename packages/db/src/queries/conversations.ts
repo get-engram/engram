@@ -62,23 +62,23 @@ export function getDefaultConversationId(db: D1Database, organizationId: string)
     .first<{ id: string }>();
 }
 
-export function listConversations(
-  db: D1Database,
-  organizationId: string,
-  opts: {
-    limit: number;
-    offset: number;
-    agentId?: string;
-    tags?: string[];
-    sort: string;
-    order: string;
-    /** Seat of the caller (engram#264): private conversations belonging
-     * to other seats are hidden. Omit to skip filtering (admin/export). */
-    viewerSeatId?: string | null;
-    filterVisibility?: boolean;
-  }
-) {
-  let sql = "SELECT * FROM conversations WHERE organization_id = ?";
+/** Filters shared by listConversations and countConversations (engram#540). */
+export interface ConversationFilter {
+  agentId?: string;
+  tags?: string[];
+  /** Seat of the caller (engram#264): private conversations belonging
+   * to other seats are hidden. Omit to skip filtering (admin/export). */
+  viewerSeatId?: string | null;
+  filterVisibility?: boolean;
+}
+
+/**
+ * WHERE clause for a conversation listing. Built once and used by both the
+ * page query and the count query, so `total` can never disagree with the
+ * rows it describes (engram#540: it used to be the page size).
+ */
+function conversationFilter(organizationId: string, opts: ConversationFilter) {
+  let sql = " WHERE organization_id = ?";
   const params: unknown[] = [organizationId];
 
   if (opts.filterVisibility) {
@@ -104,17 +104,47 @@ export function listConversations(
     }
   }
 
+  return { sql, params };
+}
+
+export function listConversations(
+  db: D1Database,
+  organizationId: string,
+  opts: ConversationFilter & {
+    limit: number;
+    offset: number;
+    sort: string;
+    order: string;
+  }
+) {
+  const where = conversationFilter(organizationId, opts);
+
   const allowedSort = ["created_at", "updated_at", "message_count"];
   const allowedOrder = ["asc", "desc"];
   const sort = allowedSort.includes(opts.sort) ? opts.sort : "updated_at";
   const order = allowedOrder.includes(opts.order) ? opts.order : "desc";
-  sql += ` ORDER BY ${sort} ${order} LIMIT ? OFFSET ?`;
-  params.push(opts.limit, opts.offset);
 
   return db
-    .prepare(sql)
-    .bind(...params)
+    .prepare(`SELECT * FROM conversations${where.sql} ORDER BY ${sort} ${order} LIMIT ? OFFSET ?`)
+    .bind(...where.params, opts.limit, opts.offset)
     .all();
+}
+
+/**
+ * How many conversations the same filters match — the `total` of a list
+ * response. A page holds at most `limit` rows; `total` is how many rows the
+ * caller can page through with `offset`.
+ */
+export function countConversations(
+  db: D1Database,
+  organizationId: string,
+  opts: ConversationFilter
+) {
+  const where = conversationFilter(organizationId, opts);
+  return db
+    .prepare(`SELECT COUNT(*) AS count FROM conversations${where.sql}`)
+    .bind(...where.params)
+    .first<{ count: number }>();
 }
 
 export function updateConversationMessageCount(

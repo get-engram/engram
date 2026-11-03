@@ -1,6 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { listConversations as dbListConversations } from "@getengram/db";
+import {
+  listConversations as dbListConversations,
+  countConversations as dbCountConversations,
+} from "@getengram/db";
 import { audit } from "../../services/audit.js";
 import {
   loadPrivacy,
@@ -46,6 +49,8 @@ export function registerListConversations(
             .loose(),
         ),
         total: z.number(),
+        limit: z.number().optional(),
+        offset: z.number().optional(),
       },
       annotations: {
         title: "List conversations",
@@ -76,16 +81,24 @@ export function registerListConversations(
         };
       }
 
-      const result = await dbListConversations(env.DB, auth.organizationId, {
-        limit: params.limit,
-        offset: params.offset,
+      const filter = {
         agentId: params.agent_id,
         tags: params.tags,
-        sort: params.sort,
-        order: params.order,
         viewerSeatId: auth.seatId ?? null,
         filterVisibility: true,
-      });
+      };
+      // The page and its count share one WHERE clause (engram#540): `total`
+      // is the number of conversations the filters match, not the page size.
+      const [result, counted] = await Promise.all([
+        dbListConversations(env.DB, auth.organizationId, {
+          limit: params.limit,
+          offset: params.offset,
+          sort: params.sort,
+          order: params.order,
+          ...filter,
+        }),
+        dbCountConversations(env.DB, auth.organizationId, filter),
+      ]);
 
       const conversations = (result.results as Array<Record<string, unknown>>).map(
         ({ organization_id: _o, ...c }) => ({
@@ -100,7 +113,9 @@ export function registerListConversations(
       const activation = await firstRunActivation(env, auth);
       const payload = {
         conversations,
-        total: conversations.length,
+        total: counted?.count ?? conversations.length,
+        limit: params.limit,
+        offset: params.offset,
         ...(activation ? { activation } : {}),
       };
       return {

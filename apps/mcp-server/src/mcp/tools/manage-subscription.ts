@@ -9,8 +9,7 @@ import {
 
   resolvePlanPrice,
 } from "../../services/stripe.js";
-import { resolveCachedCustomer } from "../../services/stripe-customer.js";
-import { setOrganizationStripeCustomer } from "@getengram/db";
+import { bindStripeCustomer, resolveCachedCustomer } from "../../services/stripe-customer.js";
 import { audit } from "../../services/audit.js";
 import { isSeatMember } from "../auth-kind.js";
 import type { Env, AuthContext } from "../../types.js";
@@ -168,7 +167,20 @@ export function registerManageSubscription(
       if (!customerId) {
         const customer = await createOrGetCustomer(env.STRIPE_SECRET_KEY, org.email, org.id);
         customerId = customer.id;
-        await setOrganizationStripeCustomer(env.DB, org.id, customerId);
+        // Refused when another org already holds this customer (engram#536).
+        if ((await bindStripeCustomer(env.DB, org.id, customerId)) === "conflict") {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: "stripe_customer_conflict",
+                message:
+                  "This billing identity is already attached to another organization. Contact support.",
+              }),
+            }],
+            isError: true,
+          };
+        }
       }
 
       // If already subscribed, redirect to portal instead

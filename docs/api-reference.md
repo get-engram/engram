@@ -202,7 +202,7 @@ List conversations with filtering and sorting options.
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
-| `limit` | integer | No | 20 | Max conversations to return (1–100) |
+| `limit` | integer | No | 20 | Conversations per page (1–100; larger values are capped at 100, not rejected) |
 | `offset` | integer | No | 0 | Offset for pagination |
 | `agent_id` | string | No | — | Filter by agent ID |
 | `tags` | string[] | No | — | Filter by tags |
@@ -226,6 +226,8 @@ List conversations with filtering and sorting options.
   "total": 1
 }
 ```
+
+`total` is the number of conversations that match the filters across the whole account, not the number in this page. Page with `offset` until `offset + conversations.length` reaches `total`. The REST endpoint also echoes the `limit` and `offset` it applied.
 
 ### Example
 
@@ -435,7 +437,7 @@ All requests require the same `Authorization: Bearer engram_sk_live_...` header.
 | Endpoint | MCP equivalent | Description |
 |----------|----------------|-------------|
 | `POST /api/v1/conversations` | `create_conversation` | Create a conversation. Body: `{ title?, agent_id?, tags?, metadata? }` → `201 { conversation_id }` |
-| `GET /api/v1/conversations` | `list_conversations` | List conversations. Query: `limit`, `offset`, `agent_id`, `tags` (comma-separated), `sort`, `order` |
+| `GET /api/v1/conversations` | `list_conversations` | List conversations. Query: `limit`, `offset`, `agent_id`, `tags` (comma-separated), `sort`, `order` → `200 { conversations[], total, limit, offset }`. `total` counts every conversation matching the filters, not just the page |
 | `GET /api/v1/conversations/:id` | `get_conversation` | Fetch a conversation with messages. Query: `message_limit`, `message_offset` |
 | `DELETE /api/v1/conversations/:id` | `delete_conversation` | Delete a conversation, its messages, and embeddings |
 | `POST /api/v1/messages` | `append_messages` | Store messages. Body: `{ conversation_id?, messages: [{ role, content, ... }] }` — omit `conversation_id` to use the default memory |

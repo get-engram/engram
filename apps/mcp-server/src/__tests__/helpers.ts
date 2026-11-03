@@ -247,6 +247,17 @@ export function createMockD1(): D1Database {
           );
         }
 
+        // LIMIT ? OFFSET ? — bound as the last two parameters by every
+        // paging query (list conversations, messages, audit log). Honouring
+        // them lets tests tell a page apart from the whole table (engram#540).
+        if (/LIMIT \? OFFSET \?\s*$/i.test(sql) && bindings.length >= 2) {
+          const limit = Number(bindings[bindings.length - 2]);
+          const offset = Number(bindings[bindings.length - 1]);
+          if (Number.isFinite(limit) && Number.isFinite(offset)) {
+            results = results.slice(offset, offset + limit);
+          }
+        }
+
         return { results, success: true, meta: {} };
       }),
     };

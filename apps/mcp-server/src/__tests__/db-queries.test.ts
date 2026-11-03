@@ -9,6 +9,7 @@ import {
   insertConversation,
   getConversationById,
   listConversations,
+  countConversations,
   updateConversationMessageCount,
   insertMessages,
   getMessagesByConversation,
@@ -107,6 +108,56 @@ describe("Conversation queries", () => {
       order: "desc",
     });
     expect(result.results.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("counts the conversations the same filters match (engram#540)", async () => {
+    const counted = await countConversations(db, orgId, {});
+    expect(counted?.count).toBe(2);
+    const other = await countConversations(db, "org_other", {});
+    expect(other?.count).toBe(0);
+  });
+
+  it("builds the list and the count from one WHERE clause", async () => {
+    // `total` used to be the page size. The only way it can never drift from
+    // the rows again is for both statements to share the filter builder, so
+    // pin the SQL and the bound parameters rather than the mock's answer.
+    const seen: { sql: string; args: unknown[] }[] = [];
+    const capture = {
+      prepare: (sql: string) => ({
+        bind: (...args: unknown[]) => {
+          seen.push({ sql, args });
+          return {
+            all: async () => ({ results: [], success: true, meta: {} }),
+            first: async () => null,
+          };
+        },
+      }),
+    } as unknown as D1Database;
+    const filter = {
+      agentId: "agent_x",
+      tags: ["a", "b"],
+      viewerSeatId: "seat_1",
+      filterVisibility: true,
+    };
+    await listConversations(capture, orgId, {
+      limit: 5,
+      offset: 10,
+      sort: "created_at",
+      order: "asc",
+      ...filter,
+    });
+    await countConversations(capture, orgId, filter);
+    const [list, count] = seen;
+    const whereOf = (sql: string) =>
+      sql.slice(
+        sql.indexOf(" WHERE"),
+        sql.includes(" ORDER BY") ? sql.indexOf(" ORDER BY") : undefined,
+      );
+    expect(whereOf(count.sql)).toBe(whereOf(list.sql));
+    expect(whereOf(count.sql)).toContain("agent_id = ?");
+    expect(whereOf(count.sql)).toContain("seat_id = ?");
+    expect(count.args).toEqual(list.args.slice(0, -2));
+    expect(list.args.slice(-2)).toEqual([5, 10]);
   });
 });
 

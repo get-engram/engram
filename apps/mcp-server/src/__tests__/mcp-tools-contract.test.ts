@@ -297,6 +297,25 @@ describe("MCP tool contract — wire field names", () => {
       expect(data).toHaveProperty("total");
       expect(Array.isArray(data.conversations)).toBe(true);
     });
+
+    it("total counts the whole account, not the page (engram#540)", async () => {
+      const { server, tools } = createCaptureServer();
+      registerListConversations(server, env, auth);
+      const tool = tools.get("list_conversations")!;
+      for (const n of [1, 2, 3]) {
+        await dbInsertConversation(db, `conv_total_${n}`, ORG, `Total ${n}`, null, [], {});
+      }
+
+      const { data, isError } = parseToolResponse(
+        await tool.handler({ limit: 2, offset: 0, sort: "updated_at", order: "desc" })
+      );
+      expect(isError).toBe(false);
+      expect(data.conversations).toHaveLength(2);
+      expect(data.total).toBeGreaterThanOrEqual(3);
+      expect(data.total).toBeGreaterThan(data.conversations.length);
+      expect(data.limit).toBe(2);
+      expect(data.offset).toBe(0);
+    });
   });
 
   describe("delete_conversation", () => {

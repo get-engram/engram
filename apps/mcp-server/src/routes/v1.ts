@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import {
   listConversations as dbListConversations,
+  countConversations as dbCountConversations,
   getOrgConversationCount,
 
   listMessageRevisions,
@@ -162,16 +163,18 @@ v1.get("/conversations", async (c) => {
     source: "rest",
   });
 
-  const result = await dbListConversations(c.env.DB, auth.organizationId, {
-    limit,
-    offset,
+  const filter = {
     agentId: c.req.query("agent_id") || undefined,
     tags: tagsParam ? tagsParam.split(",").map((t) => t.trim()).filter(Boolean) : undefined,
-    sort,
-    order,
     viewerSeatId: auth.seatId ?? null,
     filterVisibility: true,
-  });
+  };
+  // The page and its count share one WHERE clause (engram#540): `total` is
+  // the number of conversations the filters match, not the page size.
+  const [result, counted] = await Promise.all([
+    dbListConversations(c.env.DB, auth.organizationId, { limit, offset, sort, order, ...filter }),
+    dbCountConversations(c.env.DB, auth.organizationId, filter),
+  ]);
 
   const conversations = (result.results as Array<Record<string, unknown>>).map(
     ({ organization_id: _o, ...conv }) => ({
@@ -181,7 +184,7 @@ v1.get("/conversations", async (c) => {
     }),
   );
 
-  return c.json({ conversations, total: conversations.length });
+  return c.json({ conversations, total: counted?.count ?? conversations.length, limit, offset });
 });
 
 // ---------------------------------------------------------------------------

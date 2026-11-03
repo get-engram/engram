@@ -60,7 +60,7 @@ export function registerSearch(
                 end_sequence: z.number().optional(),
                 tags: z.array(z.string()).optional(),
               })
-              .passthrough(),
+              .loose(),
           )
           .describe("Relevant conversation snippets, best match first"),
         total: z.number(),

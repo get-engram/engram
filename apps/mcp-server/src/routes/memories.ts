@@ -39,7 +39,7 @@ memories.post("/", async (c) => {
   const auth = c.get("auth");
   const parsed = saveSchema.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) {
-    return c.json({ error: "invalid_body", details: parsed.error.flatten() }, 400);
+    return c.json({ error: "invalid_body", details: z.flattenError(parsed.error) }, 400);
   }
   const { text, conversation_id } = parsed.data;
 

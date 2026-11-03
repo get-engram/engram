@@ -75,7 +75,7 @@ const createConversationSchema = z.object({
   title: z.string().optional(),
   agent_id: z.string().optional(),
   tags: z.array(z.string()).optional(),
-  metadata: z.record(z.unknown()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
   visibility: z.enum(["shared", "private"]).optional(),
 });
 
@@ -87,7 +87,7 @@ v1.post("/conversations", async (c) => {
     await c.req.json().catch(() => ({})),
   );
   if (!parsed.success) {
-    return c.json({ error: "invalid_body", details: parsed.error.flatten() }, 400);
+    return c.json({ error: "invalid_body", details: z.flattenError(parsed.error) }, 400);
   }
 
   const countResult = await getOrgConversationCount(c.env.DB, auth.organizationId);
@@ -273,7 +273,7 @@ const appendSchema = z.object({
         tool_call_id: z.string().optional(),
         tool_name: z.string().optional(),
         metadata: z
-          .record(z.unknown())
+          .record(z.string(), z.unknown())
           .refine((m) => JSON.stringify(m).length <= MAX_MESSAGE_METADATA_CHARS, {
             message: `metadata exceeds ${MAX_MESSAGE_METADATA_CHARS} serialized characters`,
           })
@@ -290,7 +290,7 @@ v1.post("/messages", async (c) => {
 
   const parsed = appendSchema.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) {
-    return c.json({ error: "invalid_body", details: parsed.error.flatten() }, 400);
+    return c.json({ error: "invalid_body", details: z.flattenError(parsed.error) }, 400);
   }
   const count = parsed.data.messages.length;
 

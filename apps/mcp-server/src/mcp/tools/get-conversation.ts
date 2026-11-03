@@ -41,12 +41,12 @@ export function registerGetConversation(
             title: z.string().nullable().optional(),
             agent_id: z.string().nullable().optional(),
             tags: z.array(z.string()).optional(),
-            metadata: z.record(z.unknown()).optional(),
+            metadata: z.record(z.string(), z.unknown()).optional(),
             message_count: z.number().optional(),
             created_at: z.string().optional(),
             updated_at: z.string().optional(),
           })
-          .passthrough(),
+          .loose(),
         messages: z.array(
           z
             .object({
@@ -57,7 +57,7 @@ export function registerGetConversation(
               sequence: z.number().optional(),
               created_at: z.string().optional(),
             })
-            .passthrough(),
+            .loose(),
         ),
       },
       annotations: {

@@ -27,7 +27,7 @@ export function registerCreateConversation(
         // AI systems, and a schema example is listing surface too.
         agent_id: z.string().optional().describe("Agent identifier (e.g. \"assistant\")"),
         tags: z.array(z.string()).optional().describe("Tags for filtering"),
-        metadata: z.record(z.unknown()).optional().describe("Arbitrary metadata"),
+        metadata: z.record(z.string(), z.unknown()).optional().describe("Arbitrary metadata"),
         visibility: z
           .enum(["shared", "private"])
           .optional()

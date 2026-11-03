@@ -5,14 +5,14 @@ export const MessageInputSchema = z.object({
   content: z.string(),
   tool_call_id: z.string().optional(),
   tool_name: z.string().optional(),
-  metadata: z.record(z.unknown()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
 });
 
 export const CreateConversationSchema = z.object({
   title: z.string().optional(),
   agent_id: z.string().optional(),
   tags: z.array(z.string()).optional(),
-  metadata: z.record(z.unknown()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
 });
 
 export const AppendMessagesSchema = z.object({
@@ -47,6 +47,6 @@ export const DeleteConversationSchema = z.object({
 });
 
 export const SignupSchema = z.object({
-  email: z.string().email(),
+  email: z.email(),
   plan: z.enum(["free", "pro"]).optional().default("free"),
 });

@@ -186,6 +186,7 @@ ${bold("COMMANDS")}
 ${bold("OPTIONS")}
   --json          Output as JSON
   --limit <n>     Limit results
+  --offset <n>    Skip the first n results (paging)
   --tags <a,b>    Filter by tags
   --agent <id>    Filter by agent ID
 

@@ -46,25 +46,43 @@ export function usageMeter(used?: number, limit?: number): UsageMeter | undefine
   return { used, limit, remaining: Math.max(0, limit - used) };
 }
 
+/**
+ * The monthly plan limits a caller can hit, and how each reads. `indexing`
+ * is the embedding budget (engram#445) — counted in chunks, which is what a
+ * save actually costs; `searches` the search budget (engram#451).
+ */
+const UNIT_COPY = {
+  messages: { label: "Message", noun: "messages" },
+  conversations: { label: "Conversation", noun: "conversations" },
+  searches: { label: "Search", noun: "searches" },
+  indexing: { label: "Indexing", noun: "indexed chunks" },
+} as const;
+export type LimitUnit = keyof typeof UNIT_COPY;
+
 /** Friendly message when a plan limit is hit. */
 export function limitMessage(opts: {
-  unit: "messages" | "conversations";
+  unit: LimitUnit;
   tier?: string;
   limit?: number;
   used?: number;
   isOAuth: boolean;
 }): string {
   const { unit, tier, limit, used, isOAuth } = opts;
+  const { label, noun } = UNIT_COPY[unit];
   if (isOAuth) {
     const plan = tier && tier !== "free" ? tier : "free";
+    const state =
+      unit === "searches"
+        ? "Everything saved so far stays stored; search resumes with the next monthly period."
+        : "Everything saved so far is stored and searchable.";
     return (
-      `Monthly limit reached on the ${plan} plan (${limit ?? "the included"} ${unit} this month). ` +
-      `Everything saved so far is stored and searchable. ` +
+      `Monthly limit reached on the ${plan} plan (${limit ?? "the included"} ${noun} this month). ` +
+      `${state} ` +
       `Additional monthly capacity is managed from the Engram account that was used to connect this app.`
     );
   }
   return (
-    `${unit === "messages" ? "Message" : "Conversation"} limit reached ` +
+    `${label} limit reached ` +
     `(${used ?? "?"}/${limit ?? "?"} this month on the ${tier ?? "free"} plan). ` +
     `To continue, ${KEY_LOGIN}.`
   );

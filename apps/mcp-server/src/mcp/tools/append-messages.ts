@@ -18,6 +18,8 @@ import {
 import {
   checkAndTrackMessages,
   checkAndTrackStorage,
+  checkAndTrackIndexing,
+  estimateIndexingUnits,
   releaseStorage,
 } from "../../services/tier.js";
 import { fireWebhooks } from "../../services/webhooks.js";
@@ -222,6 +224,44 @@ export function registerAppendMessages(
                 limit: tierCheck.limit,
                 used: tierCheck.used,
                 tier: tierCheck.tier,
+                upgrade_url: isOAuth
+                  ? "https://getengram.app/dashboard"
+                  : "https://getengram.app/pricing",
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // Tertiary gate (engram#445/#450): the indexing budget, charged in
+      // the unit that costs money — chunks embedded — and never refunded
+      // by a delete, so a save/delete loop can't farm the embedding model.
+      const indexCheck = await checkAndTrackIndexing(
+        env.DB,
+        auth.organizationId,
+        auth.tier,
+        estimateIndexingUnits(params.messages)
+      );
+
+      if (!indexCheck.allowed) {
+        await releaseStorage(env.DB, auth.organizationId, count);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                error: indexCheck.error,
+                message: limitMessage({
+                  unit: "indexing",
+                  tier: indexCheck.tier,
+                  limit: indexCheck.limit,
+                  used: indexCheck.used,
+                  isOAuth,
+                }),
+                limit: indexCheck.limit,
+                used: indexCheck.used,
+                tier: indexCheck.tier,
                 upgrade_url: isOAuth
                   ? "https://getengram.app/dashboard"
                   : "https://getengram.app/pricing",

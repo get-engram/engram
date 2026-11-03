@@ -1,9 +1,19 @@
-import { TIER_LIMITS, type Tier } from "@getengram/shared";
+import {
+  TIER_LIMITS,
+  MAX_MESSAGE_CONTENT_CHARS,
+  chunkMessages,
+  generateId,
+  type Tier,
+  type Message,
+} from "@getengram/shared";
 import {
   getOrCreateUsage,
   atomicIncrementMessages,
   incrementMessagesStored,
   incrementSearchesRun,
+  atomicIncrementSearches,
+  incrementChunksIndexed,
+  atomicIncrementChunksIndexed,
   incrementApiRequests,
   atomicIncrementStorage,
   incrementStorage,
@@ -11,7 +21,6 @@ import {
   getStorageUsed,
   getOrganizationById,
 } from "@getengram/db";
-import { generateId } from "@getengram/shared";
 
 export interface TierCheckResult {
   allowed: boolean;
@@ -126,14 +135,128 @@ export async function trackMessagesStored(
 }
 
 /**
- * Increment searches_run counter. Ensures usage row exists first.
+ * Count one search against the period's search budget BEFORE the search
+ * runs (engram#451). The query embedding and the vector + FTS query are
+ * the cost being bounded, so the gate sits in front of them; tiers without
+ * a budget just count.
  */
-export async function trackSearchRun(
+export async function checkAndTrackSearch(
   db: D1Database,
-  organizationId: string
-) {
+  organizationId: string,
+  tier: Tier,
+): Promise<TierCheckResult> {
+  const limit = TIER_LIMITS[tier].searches_per_month;
   await ensureUsage(db, organizationId);
-  await incrementSearchesRun(db, organizationId);
+
+  if (limit === -1) {
+    await incrementSearchesRun(db, organizationId);
+    return { allowed: true, tier };
+  }
+
+  const result = await atomicIncrementSearches(db, organizationId, limit);
+  if (!result) {
+    const usage = (await ensureUsage(db, organizationId)) as { searches_run?: number } | null;
+    return {
+      allowed: false,
+      error: "search_quota_exceeded",
+      limit,
+      used: usage?.searches_run,
+      tier,
+    };
+  }
+  return { allowed: true, used: result.searches_run, limit, tier };
+}
+
+/**
+ * Clip one message body to MAX_MESSAGE_CONTENT_CHARS with a visible marker
+ * — the single rule every write path (append, edit) and the indexing
+ * estimate share, so what is charged is what is chunked. The marker keeps
+ * the clip honest: the reader sees the memory was cut, not silently
+ * altered. Enormous single messages are tool-output dumps (Claude Code),
+ * where the tail is the least useful part.
+ */
+export function boundContent(content: string): string {
+  if (content.length <= MAX_MESSAGE_CONTENT_CHARS) return content;
+  return (
+    content.slice(0, MAX_MESSAGE_CONTENT_CHARS) +
+    `\n\n…[truncated: message exceeded ${MAX_MESSAGE_CONTENT_CHARS.toLocaleString()} characters]`
+  );
+}
+
+/**
+ * How many chunks `messages` will embed when appended — computed with the
+ * real chunker so the number charged is the number generated. Only order
+ * and body length matter (windows of 5 messages, stride 3; oversized
+ * bodies split), so the placeholder ids and sequences are irrelevant.
+ * Bodies are clipped exactly the way append clips them before chunking.
+ */
+export function estimateIndexingUnits(
+  messages: ReadonlyArray<{ role: string; content: string }>,
+): number {
+  if (messages.length === 0) return 0;
+  const pseudo: Message[] = messages.map((m, i) => ({
+    id: `est_${i}`,
+    conversation_id: "est",
+    organization_id: "est",
+    role: m.role as Message["role"],
+    content: boundContent(m.content),
+    tool_call_id: null,
+    tool_name: null,
+    sequence: i + 1,
+    metadata: {},
+    created_at: "",
+  }));
+  return chunkMessages(pseudo, { onWarn: () => {} }).length;
+}
+
+/**
+ * Thrown by write paths that must refuse BEFORE changing anything when the
+ * indexing budget is exhausted (message edit). Carries the check so the
+ * route can answer 429 with limit/used/tier like the other gates.
+ */
+export class IndexingQuotaError extends Error {
+  readonly result: TierCheckResult;
+  constructor(result: TierCheckResult) {
+    super(result.error ?? "indexing_quota_exceeded");
+    this.name = "IndexingQuotaError";
+    this.result = result;
+  }
+}
+
+/**
+ * Reserve `units` chunks of the period's indexing budget (engram#445,
+ * #450) — the number of embeddings about to be generated, on append or on
+ * an edit/delete re-index. The counter is monotonic: deleting frees
+ * storage but never refunds indexing, so a save/delete loop cannot re-run
+ * the embedding model past the budget. Tiers without a budget just count.
+ */
+export async function checkAndTrackIndexing(
+  db: D1Database,
+  organizationId: string,
+  tier: Tier,
+  units: number,
+): Promise<TierCheckResult> {
+  const limit = TIER_LIMITS[tier].chunks_indexed_per_month;
+  if (units <= 0) return { allowed: true, limit, tier };
+  await ensureUsage(db, organizationId);
+
+  if (limit === -1) {
+    await incrementChunksIndexed(db, organizationId, units);
+    return { allowed: true, tier };
+  }
+
+  const result = await atomicIncrementChunksIndexed(db, organizationId, units, limit);
+  if (!result) {
+    const usage = (await ensureUsage(db, organizationId)) as { chunks_indexed?: number } | null;
+    return {
+      allowed: false,
+      error: "indexing_quota_exceeded",
+      limit,
+      used: usage?.chunks_indexed,
+      tier,
+    };
+  }
+  return { allowed: true, used: result.chunks_indexed, limit, tier };
 }
 
 /**

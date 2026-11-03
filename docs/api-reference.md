@@ -457,4 +457,4 @@ curl "https://mcp.getengram.app/api/v1/search?q=billing+database+choice" \
   -H "Authorization: Bearer engram_sk_live_..."
 ```
 
-REST error responses use conventional status codes: `400` invalid body/query, `401` bad key, `403` missing scope, `402` storage or plan limit, `404` not found, `429` monthly velocity limit.
+REST error responses use conventional status codes: `400` invalid body/query, `401` bad key, `403` missing scope, `402` storage or plan limit, `404` not found, `429` a monthly budget (`message_limit_exceeded`, `indexing_quota_exceeded`, `search_quota_exceeded` — see [limits](limits.md#monthly-cost-budgets)) or the per-minute rate limit.

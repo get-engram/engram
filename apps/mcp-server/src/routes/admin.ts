@@ -13,6 +13,10 @@ import { audit } from "../services/audit.js";
 import { purgeDeletedOrganizations } from "../cron/purge-deleted.js";
 import { pruneExpiredOAuthTokens } from "../cron/prune-oauth-tokens.js";
 import { enforceAuditRetention, AUDIT_RETENTION_DAYS } from "../cron/audit-retention.js";
+import { sendMaxoutNudges } from "../cron/maxout-nudge.js";
+import { sendActivationNudges } from "../cron/activation-nudge.js";
+import { sendRecallNudges } from "../cron/recall-nudge.js";
+import { sendImportNudges } from "../cron/import-nudge.js";
 import type { Env } from "../types.js";
 import { sendDailyReport } from "../services/daily-report.js";
 import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
@@ -838,14 +842,18 @@ admin.post("/daily-report/send", async (c) => {
 // Runs the same function the cron runs, so the per-org "already nudged" stamp
 // is applied exactly as usual — a manual run can't cause a duplicate send
 // later. Useful when someone hits the storage cap hours after the daily pass.
+//
+// The runners are imported statically on purpose. A dynamic import made esbuild
+// wrap everything the cron modules reach (zod included) in a lazy initialiser,
+// which broke the production upload in #528. See no-dynamic-import.test.ts.
 // ---------------------------------------------------------------------------
 admin.post("/nudges/run", async (c) => {
   const type = c.req.query("type") ?? "maxout";
   const runners: Record<string, (env: Env) => Promise<number>> = {
-    maxout: (env) => import("../cron/maxout-nudge.js").then((m) => m.sendMaxoutNudges(env)),
-    activation: (env) => import("../cron/activation-nudge.js").then((m) => m.sendActivationNudges(env)),
-    recall: (env) => import("../cron/recall-nudge.js").then((m) => m.sendRecallNudges(env)),
-    import: (env) => import("../cron/import-nudge.js").then((m) => m.sendImportNudges(env)),
+    maxout: sendMaxoutNudges,
+    activation: sendActivationNudges,
+    recall: sendRecallNudges,
+    import: sendImportNudges,
   };
   const run = runners[type];
   if (!run) {

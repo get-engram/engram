@@ -1,4 +1,5 @@
 import type { Env } from "../types.js";
+import { unsubscribeSig } from "./weekly-digest.js";
 
 /**
  * Recall nudge: the save -> recall gap is the funnel's biggest measured leak.
@@ -38,8 +39,6 @@ export async function sendRecallNudges(env: Env): Promise<number> {
        )
      LIMIT 100`,
   ).all<{ id: string; name: string; email: string }>();
-
-  const { unsubscribeSig } = await import("./weekly-digest.js");
 
   let sent = 0;
   for (const org of targets.results ?? []) {

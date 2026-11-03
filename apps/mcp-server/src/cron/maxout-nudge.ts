@@ -1,5 +1,6 @@
 import { TIER_LIMITS } from "@getengram/shared";
 import type { Env } from "../types.js";
+import { unsubscribeSig } from "./weekly-digest.js";
 
 /**
  * Maxout upgrade nudge: free orgs that have filled their lifetime memory
@@ -30,8 +31,6 @@ export async function sendMaxoutNudges(env: Env): Promise<number> {
   )
     .bind(freeLimit)
     .all<{ id: string; name: string; email: string }>();
-
-  const { unsubscribeSig } = await import("./weekly-digest.js");
 
   let sent = 0;
   for (const org of maxed.results ?? []) {

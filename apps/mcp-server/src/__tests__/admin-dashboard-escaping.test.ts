@@ -50,19 +50,19 @@ describe("admin console escaping (engram#512)", () => {
     expect(idAttr("a".repeat(65))).toBe("");
   });
 
-  it("every dynamic inline handler interpolates a validated id and nothing else", () => {
-    const handlers = [...script.matchAll(/on(?:click|change)="([^"]*)"/g)].map((m) => m[1]);
-    // tierSelect, four per-user buttons, revoke, sync-from-Stripe, close.
-    expect(handlers.length).toBeGreaterThanOrEqual(8);
+  it("every runtime-built data-id / data-org interpolates a validated id and nothing else", () => {
+    // Controls carry ids in data attributes and are dispatched by one
+    // delegated listener (engram#514); there are no inline handlers left.
+    expect(script).not.toMatch(/\son(?:click|change)=/);
 
-    let dynamic = 0;
-    for (const handler of handlers) {
-      expect(handler, handler).not.toContain("esc(");
-      for (const seg of handler.matchAll(/' \+ (.+?) \+ '/g)) {
-        dynamic++;
-        expect(seg[1], handler).toMatch(/^idAttr\([A-Za-z_][\w.]*\)$/);
-      }
+    const built = [...script.matchAll(/data-(?:id|org)="' \+ (.+?) \+ '"/g)].map((m) => m[1]);
+    // tierSelect, four per-user buttons, revoke (org + key), sync-from-Stripe.
+    expect(built.length).toBeGreaterThanOrEqual(8);
+    for (const seg of built) {
+      expect(seg, seg).not.toContain("esc(");
+      expect(seg, seg).toMatch(/^idAttr\([A-Za-z_][\w.]*\)$/);
     }
-    expect(dynamic).toBeGreaterThanOrEqual(8);
+    // ...and no data-id / data-org is built any other way.
+    expect([...script.matchAll(/data-(?:id|org)="/g)]).toHaveLength(built.length);
   });
 });

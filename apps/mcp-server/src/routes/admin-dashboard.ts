@@ -1,5 +1,14 @@
 // Self-contained admin dashboard HTML — served at GET /admin
 // Auth is handled client-side: user enters ADMIN_SECRET, stored in sessionStorage.
+//
+// The page runs under a hash-based Content-Security-Policy (engram#514, see
+// adminConsoleSecurityPolicy at the bottom): keep ALL script in the one
+// <script> block and ALL styling in the one <style> block. No on*= handlers
+// (controls carry data-action and are dispatched by one delegated listener)
+// and no style= attributes (classes only), in markup or in HTML built at
+// runtime — the browser would refuse them.
+
+import { inlineHashSources } from "../middleware/security-headers.js";
 
 export const dashboardHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -95,7 +104,35 @@ export const dashboardHtml = `<!DOCTYPE html>
   .audit-input input:focus { outline: none; border-color: var(--accent); }
 
   /* Status */
-  .status-bar { position: fixed; bottom: 0; left: 0; right: 0; padding: .4rem 1rem; font-size: .75rem; color: var(--muted); background: var(--surface); border-top: 1px solid var(--border); text-align: center; transition: opacity .3s; }
+  .status-bar { position: fixed; bottom: 0; left: 0; right: 0; padding: .4rem 1rem; font-size: .75rem; color: var(--muted); background: var(--surface); border-top: 1px solid var(--border); text-align: center; transition: opacity .3s; opacity: 0; }
+
+  /* Stripe modal. Its markup is built at runtime; every rule lives here so
+     the page needs no style attributes (engram#514). */
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 1rem; }
+  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; max-width: 600px; margin: 0 auto; max-height: 80vh; overflow-y: auto; }
+  .modal h3 { margin-bottom: 1rem; }
+  .modal h4 { margin: .75rem 0 .5rem; }
+  .modal-actions { margin-top: 1rem; text-align: right; }
+  .mismatch { background: rgba(239,68,68,.15); border: 1px solid var(--red); border-radius: 6px; padding: .75rem; margin-bottom: 1rem; }
+  .kv { width: 100%; font-size: .85rem; }
+  .kv td { padding: .3rem .5rem; }
+  .sub { border: 1px solid var(--border); border-radius: 6px; padding: .75rem; margin-bottom: .5rem; font-size: .8rem; }
+
+  /* Utilities */
+  [hidden] { display: none !important; }
+  .btn-block { width: 100%; }
+  .muted { color: var(--muted); }
+  .green { color: var(--green); }
+  .red { color: var(--red); }
+  .blue { color: var(--accent); }
+  .small { font-size: .8rem; }
+  .mono { font-family: monospace; font-size: .8rem; }
+  .note { color: var(--muted); font-size: .85rem; }
+  .mt { margin-top: .75rem; }
+  .mt-sm { margin-top: .5rem; }
+  .mt-xs { margin-top: .3rem; }
+  td.empty { text-align: center; color: var(--muted); padding: 1rem; }
+  td.details { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
 
   /* Responsive */
   @media (max-width: 640px) {
@@ -112,7 +149,7 @@ export const dashboardHtml = `<!DOCTYPE html>
     <h1>Engram Admin</h1>
     <div id="login-error" class="error"></div>
     <input type="password" id="secret-input" placeholder="Admin secret" autofocus>
-    <button class="btn btn-primary" style="width:100%" onclick="doLogin()">Sign in</button>
+    <button class="btn btn-primary btn-block" data-action="login">Sign in</button>
   </div>
 </div>
 
@@ -122,8 +159,8 @@ export const dashboardHtml = `<!DOCTYPE html>
     <h1>Engram Admin</h1>
     <div class="header-actions">
       <label><input type="checkbox" id="auto-refresh"> Auto-refresh</label>
-      <button class="btn" onclick="refresh()">Refresh</button>
-      <button class="btn btn-danger" onclick="logout()">Logout</button>
+      <button class="btn" data-action="refresh">Refresh</button>
+      <button class="btn btn-danger" data-action="logout">Logout</button>
     </div>
   </div>
 
@@ -153,7 +190,7 @@ export const dashboardHtml = `<!DOCTYPE html>
   <div class="section">
     <div class="section-header">
       <h2>All Users</h2>
-      <span id="user-count" style="font-size:.8rem;color:var(--muted)"></span>
+      <span id="user-count" class="muted small"></span>
     </div>
     <div class="table-wrap">
       <table>
@@ -175,8 +212,8 @@ export const dashboardHtml = `<!DOCTYPE html>
       <div class="pagination">
         <span class="page-info" id="page-info"></span>
         <div class="page-btns">
-          <button class="btn btn-sm" id="prev-btn" onclick="prevPage()">Prev</button>
-          <button class="btn btn-sm" id="next-btn" onclick="nextPage()">Next</button>
+          <button class="btn btn-sm" id="prev-btn" data-action="prev-page">Prev</button>
+          <button class="btn btn-sm" id="next-btn" data-action="next-page">Next</button>
         </div>
       </div>
     </div>
@@ -187,9 +224,9 @@ export const dashboardHtml = `<!DOCTYPE html>
     <div class="section-header"><h2>Audit Logs</h2></div>
     <div class="audit-input">
       <input type="text" id="audit-org-input" placeholder="Organization ID">
-      <button class="btn" onclick="loadAudit()">Load</button>
+      <button class="btn" data-action="load-audit">Load</button>
     </div>
-    <div class="table-wrap" id="audit-wrap" style="display:none">
+    <div class="table-wrap" id="audit-wrap" hidden>
       <table>
         <thead><tr><th>Action</th><th>Actor</th><th>Details</th><th>Time</th></tr></thead>
         <tbody id="audit-body"></tbody>
@@ -201,9 +238,9 @@ export const dashboardHtml = `<!DOCTYPE html>
     <div class="section-header"><h2>API Keys</h2></div>
     <div class="audit-input">
       <input type="text" id="keys-org-input" placeholder="Organization ID">
-      <button class="btn" onclick="loadKeys()">Load</button>
+      <button class="btn" data-action="load-keys">Load</button>
     </div>
-    <div class="table-wrap" id="keys-wrap" style="display:none">
+    <div class="table-wrap" id="keys-wrap" hidden>
       <table>
         <thead><tr><th>Prefix</th><th>Name</th><th>Scopes</th><th>Seat</th><th>Last used</th><th>Created</th><th>State</th><th></th></tr></thead>
         <tbody id="keys-body"></tbody>
@@ -212,7 +249,7 @@ export const dashboardHtml = `<!DOCTYPE html>
   </div>
 </div>
 
-<div id="status-bar" class="status-bar" style="opacity:0"></div>
+<div id="status-bar" class="status-bar"></div>
 
 <script>
 const BASE = location.origin;
@@ -224,15 +261,17 @@ const PAGE_SIZE = 50;
 let totalUsers = 0;
 let refreshTimer = null;
 
-// Rows from the last render, keyed by id. An inline handler carries only an
-// id; anything shown to the operator afterwards (a name in a confirm box)
-// is looked up here rather than threaded through markup (engram#512).
+// Rows from the last render, keyed by id. A control carries only an id in
+// its data-id; anything shown to the operator afterwards (a name in a
+// confirm box) is looked up here rather than threaded through markup
+// (engram#512).
 const USERS = new Map();
 const KEYS = new Map();
 
-// The only value that may be interpolated into an inline event handler.
-// Ids are server-minted (org_..., key_...) and never contain a quote;
-// anything else is not an id, and '' inside the handler's quotes is inert.
+// The only value that may be interpolated into a data-id / data-org
+// attribute. Ids are server-minted (org_..., key_...) and never contain a
+// quote; anything else is not an id, and '' makes the control a no-op (the
+// dispatcher checks again before an id becomes part of a URL).
 function idAttr(id) {
   return typeof id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(id) ? id : '';
 }
@@ -258,7 +297,7 @@ function status(msg) {
 // innerHTML trick left both quote characters alone, which is right for a
 // text node and wrong inside title="..." (engram#512).
 function esc(s) {
-  if (s == null) return '<span style="color:var(--muted)">-</span>';
+  if (s == null) return '<span class="muted">-</span>';
   return String(s).replace(/[&<>"']/g, ch =>
     ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '>' ? '&gt;' : ch === '"' ? '&quot;' : '&#39;');
 }
@@ -277,7 +316,7 @@ function shortTime(iso) {
 
 function tierSelect(userId, currentTier) {
   const tiers = ['free', 'pro', 'student', 'team', 'enterprise'];
-  let html = '<select class="tier-select" onchange="changeTier(\\'' + idAttr(userId) + '\\', this.value)">';
+  let html = '<select class="tier-select" data-id="' + idAttr(userId) + '">';
   for (const t of tiers) {
     html += '<option value="' + t + '"' + (t === (currentTier || 'free') ? ' selected' : '') + '>' + t + '</option>';
   }
@@ -354,7 +393,7 @@ async function loadMetrics() {
   document.getElementById('today-body').innerHTML = (m.today_signups || []).map(u =>
     '<tr><td>' + esc(u.name) + '</td><td>' + esc(u.email) + '</td><td>' + tierBadge(u.tier) +
     '</td><td>' + esc(u.referral_source) + '</td><td>' + shortTime(u.created_at) + '</td></tr>'
-  ).join('') || '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:1rem">No signups today</td></tr>';
+  ).join('') || '<tr><td colspan="5" class="empty">No signups today</td></tr>';
 }
 
 // ---- Users ----
@@ -374,15 +413,15 @@ async function loadUsers() {
     '<td>' + esc(u.email) + '</td>' +
     '<td>' + tierSelect(u.id, u.tier) + '</td>' +
     '<td>' + esc(u.referral_source) + '</td>' +
-    '<td>' + (u.stripe_customer_id ? '<span style="color:var(--green)" title="' + esc(u.stripe_customer_id) + '">Yes</span>' : '<span style="color:var(--muted)">-</span>') + '</td>' +
+    '<td>' + (u.stripe_customer_id ? '<span class="green" title="' + esc(u.stripe_customer_id) + '">Yes</span>' : '<span class="muted">-</span>') + '</td>' +
     '<td>' + u.conversations + '</td>' +
     '<td>' + u.total_messages + '</td>' +
-    '<td><button class="btn btn-sm" onclick="checkStripe(\\'' + idAttr(u.id) + '\\')">Stripe</button>' +
-    ' <button class="btn btn-sm btn-danger" onclick="deleteUser(\\'' + idAttr(u.id) + '\\')">Del</button>' +
-    ' <button class="btn btn-sm" onclick="loadAuditFor(\\'' + idAttr(u.id) + '\\')">Audit</button>' +
-    ' <button class="btn btn-sm" onclick="loadKeysFor(\\'' + idAttr(u.id) + '\\')">Keys</button></td>' +
+    '<td><button class="btn btn-sm" data-action="stripe" data-id="' + idAttr(u.id) + '">Stripe</button>' +
+    ' <button class="btn btn-sm btn-danger" data-action="delete" data-id="' + idAttr(u.id) + '">Del</button>' +
+    ' <button class="btn btn-sm" data-action="audit" data-id="' + idAttr(u.id) + '">Audit</button>' +
+    ' <button class="btn btn-sm" data-action="keys" data-id="' + idAttr(u.id) + '">Keys</button></td>' +
     '</tr>'
-  ).join('') || '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:1rem">No users</td></tr>';
+  ).join('') || '<tr><td colspan="9" class="empty">No users</td></tr>';
 
   const page = Math.floor(currentOffset / PAGE_SIZE) + 1;
   const pages = Math.ceil(totalUsers / PAGE_SIZE);
@@ -443,12 +482,12 @@ async function loadAudit() {
   const orgId = document.getElementById('audit-org-input').value.trim();
   if (!orgId) return;
   const data = await api('/audit/' + orgId);
-  document.getElementById('audit-wrap').style.display = 'block';
+  document.getElementById('audit-wrap').hidden = false;
   document.getElementById('audit-body').innerHTML = (data.logs || []).map(l =>
-    '<tr><td>' + esc(l.action) + '</td><td>' + esc(l.actor_id) + '</td><td style="max-width:300px;overflow:hidden;text-overflow:ellipsis">' +
+    '<tr><td>' + esc(l.action) + '</td><td>' + esc(l.actor_id) + '</td><td class="details">' +
     esc(typeof l.details === 'string' ? l.details : JSON.stringify(l.details)) +
     '</td><td>' + shortTime(l.created_at) + '</td></tr>'
-  ).join('') || '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:1rem">No audit logs</td></tr>';
+  ).join('') || '<tr><td colspan="4" class="empty">No audit logs</td></tr>';
 }
 
 // ---- API keys (engram#506) ----
@@ -464,17 +503,17 @@ async function loadKeys() {
   const data = await api('/users/' + orgId + '/keys');
   KEYS.clear();
   for (const k of data.keys || []) KEYS.set(k.id, k);
-  document.getElementById('keys-wrap').style.display = 'block';
+  document.getElementById('keys-wrap').hidden = false;
   document.getElementById('keys-body').innerHTML = (data.keys || []).map(k =>
     '<tr><td><code>' + esc(k.prefix || '') + '…</code></td>' +
     '<td>' + esc(k.name || '') + '</td>' +
     '<td>' + esc(k.scopes || '') + '</td>' +
-    '<td>' + (k.seat_id ? esc(k.seat_id) : '<span style="color:var(--muted)">owner</span>') + '</td>' +
-    '<td>' + (k.last_used_at ? shortTime(k.last_used_at) : '<span style="color:var(--muted)">never</span>') + '</td>' +
+    '<td>' + (k.seat_id ? esc(k.seat_id) : '<span class="muted">owner</span>') + '</td>' +
+    '<td>' + (k.last_used_at ? shortTime(k.last_used_at) : '<span class="muted">never</span>') + '</td>' +
     '<td>' + shortTime(k.created_at) + '</td>' +
-    '<td>' + (k.revoked_at ? '<span style="color:var(--muted)">revoked ' + shortTime(k.revoked_at) + '</span>' : '<span style="color:var(--green)">active</span>') + '</td>' +
-    '<td>' + (k.revoked_at ? '' : '<button class="btn btn-sm btn-danger" onclick="revokeKey(\\'' + idAttr(orgId) + '\\', \\'' + idAttr(k.id) + '\\')">Revoke</button>') + '</td></tr>'
-  ).join('') || '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:1rem">No keys</td></tr>';
+    '<td>' + (k.revoked_at ? '<span class="muted">revoked ' + shortTime(k.revoked_at) + '</span>' : '<span class="green">active</span>') + '</td>' +
+    '<td>' + (k.revoked_at ? '' : '<button class="btn btn-sm btn-danger" data-action="revoke" data-org="' + idAttr(orgId) + '" data-id="' + idAttr(k.id) + '">Revoke</button>') + '</td></tr>'
+  ).join('') || '<tr><td colspan="8" class="empty">No keys</td></tr>';
 }
 
 async function revokeKey(orgId, keyId) {
@@ -491,42 +530,42 @@ async function checkStripe(userId) {
   status('Checking Stripe...');
   try {
     const data = await api('/users/' + userId + '/stripe');
-    let html = '<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.5rem;max-width:600px;margin:0 auto;max-height:80vh;overflow-y:auto">';
-    html += '<h3 style="margin-bottom:1rem">Stripe Status: ' + esc(data.db.name) + '</h3>';
+    let html = '<div class="modal">';
+    html += '<h3>Stripe Status: ' + esc(data.db.name) + '</h3>';
 
     if (data.mismatch) {
-      html += '<div style="background:rgba(239,68,68,.15);border:1px solid var(--red);border-radius:6px;padding:.75rem;margin-bottom:1rem">';
-      html += '<strong style="color:var(--red)">MISMATCH:</strong> DB says <strong>' + esc(data.db.tier) + '</strong> but Stripe says <strong>' + esc(data.expected_tier) + '</strong>';
-      html += '<br><button class="btn btn-primary btn-sm" style="margin-top:.5rem" onclick="syncStripe(\\'' + idAttr(userId) + '\\')">Sync from Stripe</button>';
+      html += '<div class="mismatch">';
+      html += '<strong class="red">MISMATCH:</strong> DB says <strong>' + esc(data.db.tier) + '</strong> but Stripe says <strong>' + esc(data.expected_tier) + '</strong>';
+      html += '<br><button class="btn btn-primary btn-sm mt-sm" data-action="sync-stripe" data-id="' + idAttr(userId) + '">Sync from Stripe</button>';
       html += '</div>';
     }
 
-    html += '<table style="width:100%;font-size:.85rem"><tbody>';
-    html += '<tr><td style="color:var(--muted);padding:.3rem .5rem">DB Tier</td><td style="padding:.3rem .5rem">' + tierBadge(data.db.tier) + '</td></tr>';
-    html += '<tr><td style="color:var(--muted);padding:.3rem .5rem">Stripe Customer</td><td style="padding:.3rem .5rem;font-family:monospace;font-size:.8rem">' + esc(data.db.stripe_customer_id) + '</td></tr>';
-    html += '<tr><td style="color:var(--muted);padding:.3rem .5rem">Stripe Sub ID</td><td style="padding:.3rem .5rem;font-family:monospace;font-size:.8rem">' + esc(data.db.stripe_subscription_id) + '</td></tr>';
+    html += '<table class="kv"><tbody>';
+    html += '<tr><td class="muted">DB Tier</td><td>' + tierBadge(data.db.tier) + '</td></tr>';
+    html += '<tr><td class="muted">Stripe Customer</td><td class="mono">' + esc(data.db.stripe_customer_id) + '</td></tr>';
+    html += '<tr><td class="muted">Stripe Sub ID</td><td class="mono">' + esc(data.db.stripe_subscription_id) + '</td></tr>';
     html += '</tbody></table>';
 
     if (data.stripe && data.stripe.subscriptions) {
-      html += '<h4 style="margin:.75rem 0 .5rem">Stripe Subscriptions (' + data.stripe.subscriptions.length + ')</h4>';
+      html += '<h4>Stripe Subscriptions (' + data.stripe.subscriptions.length + ')</h4>';
       if (data.stripe.subscriptions.length === 0) {
-        html += '<p style="color:var(--muted);font-size:.85rem">No subscriptions found in Stripe</p>';
+        html += '<p class="note">No subscriptions found in Stripe</p>';
       }
       for (const sub of data.stripe.subscriptions) {
-        const statusColor = sub.status === 'active' ? 'var(--green)' : sub.status === 'trialing' ? 'var(--accent)' : sub.status === 'canceled' ? 'var(--red)' : 'var(--muted)';
-        html += '<div style="border:1px solid var(--border);border-radius:6px;padding:.75rem;margin-bottom:.5rem;font-size:.8rem">';
-        html += '<div><strong style="color:' + statusColor + '">' + esc(String(sub.status || '').toUpperCase()) + '</strong> <span style="color:var(--muted);font-family:monospace">' + esc(sub.id) + '</span></div>';
-        html += '<div style="margin-top:.3rem">Price: <code>' + esc(sub.price_id) + '</code> x' + esc(sub.quantity) + '</div>';
+        const statusClass = sub.status === 'active' ? 'green' : sub.status === 'trialing' ? 'blue' : sub.status === 'canceled' ? 'red' : 'muted';
+        html += '<div class="sub">';
+        html += '<div><strong class="' + statusClass + '">' + esc(String(sub.status || '').toUpperCase()) + '</strong> <span class="muted mono">' + esc(sub.id) + '</span></div>';
+        html += '<div class="mt-xs">Price: <code>' + esc(sub.price_id) + '</code> x' + esc(sub.quantity) + '</div>';
         html += '<div>Created: ' + shortTime(sub.created) + '</div>';
         if (sub.trial_start) html += '<div>Trial: ' + shortTime(sub.trial_start) + ' - ' + shortTime(sub.trial_end) + '</div>';
         if (sub.metadata && Object.keys(sub.metadata).length) html += '<div>Metadata: ' + esc(JSON.stringify(sub.metadata)) + '</div>';
         html += '</div>';
       }
     } else if (!data.db.stripe_customer_id) {
-      html += '<p style="color:var(--muted);font-size:.85rem;margin-top:.75rem">No Stripe customer linked</p>';
+      html += '<p class="note mt">No Stripe customer linked</p>';
     }
 
-    html += '<div style="margin-top:1rem;text-align:right"><button class="btn" onclick="closeModal()">Close</button></div>';
+    html += '<div class="modal-actions"><button class="btn" data-action="close-modal">Close</button></div>';
     html += '</div>';
     showModal(html);
   } catch (e) {
@@ -551,7 +590,7 @@ function showModal(html) {
   if (!overlay) {
     overlay = document.createElement('div');
     overlay.id = 'modal-overlay';
-    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:1000;padding:1rem';
+    overlay.className = 'modal-overlay';
     overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
     document.body.appendChild(overlay);
   }
@@ -584,6 +623,49 @@ document.getElementById('auto-refresh').addEventListener('change', (e) => {
   }
 });
 
+// ---- Event delegation (engram#514) ----
+// The CSP allows only this script block, by hash, so the page has no inline
+// handlers: a control names what it does in data-action and the ids it needs
+// in data-id / data-org, and one listener per event type dispatches it.
+const ACTIONS = {
+  'login': () => doLogin(),
+  'refresh': () => refresh(),
+  'logout': () => logout(),
+  'prev-page': () => prevPage(),
+  'next-page': () => nextPage(),
+  'load-audit': () => loadAudit(),
+  'load-keys': () => loadKeys(),
+  'close-modal': () => closeModal(),
+  'stripe': (id) => checkStripe(id),
+  'delete': (id) => deleteUser(id),
+  'audit': (id) => loadAuditFor(id),
+  'keys': (id) => loadKeysFor(id),
+  'sync-stripe': (id) => syncStripe(id),
+  'revoke': (id, org) => revokeKey(org, id),
+};
+const NEEDS_ID = new Set(['stripe', 'delete', 'audit', 'keys', 'sync-stripe', 'revoke']);
+
+document.addEventListener('click', (e) => {
+  const el = e.target instanceof Element ? e.target.closest('[data-action]') : null;
+  if (!el) return;
+  const action = el.dataset.action;
+  if (!Object.prototype.hasOwnProperty.call(ACTIONS, action)) return;
+  // Validated again here, the last step before an id becomes a URL segment.
+  const id = idAttr(el.dataset.id);
+  const org = idAttr(el.dataset.org);
+  if (NEEDS_ID.has(action) && !id) return;
+  if (action === 'revoke' && !org) return;
+  e.preventDefault();
+  ACTIONS[action](id, org);
+});
+
+document.addEventListener('change', (e) => {
+  const el = e.target;
+  if (!(el instanceof HTMLSelectElement) || !el.classList.contains('tier-select')) return;
+  const id = idAttr(el.dataset.id);
+  if (id) changeTier(id, el.value);
+});
+
 // ---- Init ----
 const saved = sessionStorage.getItem('engram_admin');
 if (saved) {
@@ -596,3 +678,50 @@ if (saved) {
 </script>
 </body>
 </html>`;
+
+/**
+ * Content-Security-Policy for the console (engram#514).
+ *
+ * The page is one inline <script> and one inline <style>, each allowed by its
+ * SHA-256 hash rather than by 'unsafe-inline'. A script or style attribute
+ * that reaches the page any other way — through a future escaping bug in the
+ * rendering above, say — is refused by the browser. That is why the page has
+ * no on*= handlers (one delegated listener dispatches data-action controls)
+ * and no style= attributes (classes only; CSSOM writes such as
+ * el.style.display are not subject to CSP). Everything else is as tight as
+ * the shared HTML policy: nothing loads from anywhere, the page may only talk
+ * to its own origin, cannot be framed, cannot submit a form, cannot have its
+ * base URL rewritten.
+ *
+ * The hashes are computed from the served template on the first request and
+ * memoised, not at module load: the worker must boot without doing work
+ * (engram#528), and a failure here must fail /admin, not the whole worker.
+ */
+let policy: Promise<string> | undefined;
+
+export function adminConsoleSecurityPolicy(): Promise<string> {
+  if (!policy) {
+    policy = buildAdminConsolePolicy().catch((err: unknown) => {
+      policy = undefined;
+      throw err;
+    });
+  }
+  return policy;
+}
+
+async function buildAdminConsolePolicy(): Promise<string> {
+  const [script, style] = await Promise.all([
+    inlineHashSources(dashboardHtml, "script"),
+    inlineHashSources(dashboardHtml, "style"),
+  ]);
+  return [
+    "default-src 'none'",
+    `script-src ${script}`,
+    `style-src ${style}`,
+    "connect-src 'self'",
+    "img-src 'self' data:",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+  ].join("; ");
+}

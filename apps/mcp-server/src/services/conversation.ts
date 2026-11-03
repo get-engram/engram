@@ -147,11 +147,22 @@ export interface VaultEntryInput {
  */
 export function assertWritesEnabled(env: Env): void {
   if (env.WRITES_FROZEN === "1") {
-    throw new Error(
+    const message =
       "Engram is paused for a few minutes of scheduled maintenance. " +
-        "Nothing already saved is affected, and nothing is lost — retry shortly, " +
-        "or let your client retry automatically.",
-    );
+      "Nothing already saved is affected, and nothing is lost — retry shortly, " +
+      "or let your client retry automatically.";
+    // An HTTPException, like the 404 in appendMessages, so both layers answer
+    // with this text instead of masking it: a bare Error reached app.onError
+    // as a generic 500 on the REST path, and the tool guard (engram#513) would
+    // now hide it as an internal failure on the MCP path. 503 + Retry-After
+    // is what the CLI daemon already backs off on.
+    throw new HTTPException(503, {
+      message,
+      res: new Response(JSON.stringify({ error: "writes_paused", message }), {
+        status: 503,
+        headers: { "Content-Type": "application/json", "Retry-After": "60" },
+      }),
+    });
   }
 }
 

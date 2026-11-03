@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { HTTPException } from "hono/http-exception";
 import { assertWritesEnabled } from "../services/conversation.js";
 import type { Env } from "../types.js";
 
@@ -24,6 +25,22 @@ describe("assertWritesEnabled", () => {
     for (const v of ["0", "false", "", "true", "yes"]) {
       expect(() => assertWritesEnabled(env(v))).not.toThrow();
     }
+  });
+
+  it("is a 503 with Retry-After on the REST path, so onError honours it instead of masking it as a 500", async () => {
+    let thrown: unknown;
+    try {
+      assertWritesEnabled(env("1"));
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(HTTPException);
+    const res = (thrown as HTTPException).getResponse();
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Retry-After")).toBe("60");
+    const body = (await res.json()) as { error: string; message: string };
+    expect(body.error).toBe("writes_paused");
+    expect(body.message).toMatch(/nothing is lost/i);
   });
 
   it("tells the user nothing is lost, since clients surface this text", () => {

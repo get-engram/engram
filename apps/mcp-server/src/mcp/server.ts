@@ -15,6 +15,7 @@ import { registerVaultDelete } from "./tools/vault-delete.js";
 import { registerManageSubscription } from "./tools/manage-subscription.js";
 import { registerAdminMetrics } from "./tools/admin-metrics.js";
 import { isExternalOAuthClient } from "./auth-kind.js";
+import { guardToolErrors } from "./tool-guard.js";
 import { MAX_MESSAGES_PER_APPEND } from "@getengram/shared";
 import type { Env, AuthContext } from "../types.js";
 
@@ -77,6 +78,12 @@ export function createMcpServer(env: Env, auth: AuthContext): McpServer {
     },
     { instructions, maxToolInputElements: MAX_TOOL_INPUT_ELEMENTS },
   );
+
+  // Every tool registered below runs under the failure policy (engram#513):
+  // a thrown D1/Vectorize/Stripe error is logged here and answered with a
+  // generic isError result, never its raw message. Must precede the first
+  // register* call — the guard wraps registration, not execution.
+  guardToolErrors(server);
 
   // Core memory tools — available to every client (incl. OAuth-connected
   // apps like ChatGPT).

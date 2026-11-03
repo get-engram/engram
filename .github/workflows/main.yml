@@ -45,7 +45,9 @@ jobs:
 
   # Worker deploy dry-run — catches wrangler config errors, missing bindings,
   # bundle size limits, and compatibility issues that only surface at deploy
-  # time. Runs after the main gate.
+  # time. The dry-run never evaluates the bundle, so it is then booted in
+  # workerd (Miniflare) to catch module-load failures, which otherwise surface
+  # only when Cloudflare validates the upload (#528). Runs after the main gate.
   worker-deploy-check:
     name: Worker deploy dry-run
     runs-on: ubuntu-latest
@@ -76,6 +78,10 @@ jobs:
       - name: Build worker (wrangler deploy --dry-run)
         working-directory: apps/mcp-server
         run: pnpm build
+
+      - name: Boot worker bundle in workerd
+        working-directory: apps/mcp-server
+        run: pnpm smoke:bundle
 
       - name: Upload worker bundle
         uses: actions/upload-artifact@v4

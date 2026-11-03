@@ -38,7 +38,7 @@ import { pruneExpiredOAuthTokens } from "./cron/prune-oauth-tokens.js";
 import { enforceAuditRetention } from "./cron/audit-retention.js";
 import { reconcileStripeToD1 } from "./cron/reconcile-stripe.js";
 export { DrainerDO } from "./services/drainer-do.js";
-import { sendWeeklyDigests } from "./cron/weekly-digest.js";
+import { sendWeeklyDigests, unsubscribeSig } from "./cron/weekly-digest.js";
 import { sendShareNudge } from "./cron/share-nudge.js";
 import { sendDailyReport } from "./services/daily-report.js";
 import { oauth } from "./oauth/router.js";
@@ -190,7 +190,6 @@ app.get("/email/unsubscribe", async (c) => {
   const sig = c.req.query("sig") ?? "";
   const secret = (c.env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET;
   if (!org || !sig || !secret) return c.text("Invalid link.", 400);
-  const { unsubscribeSig } = await import("./cron/weekly-digest.js");
   const expected = await unsubscribeSig(org, secret);
   if (sig !== expected) return c.text("Invalid link.", 400);
   await c.env.DB.prepare(

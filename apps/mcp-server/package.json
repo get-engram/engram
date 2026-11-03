@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "build": "wrangler deploy --dry-run --outdir=dist",
+    "smoke:bundle": "node scripts/boot-bundle.mjs",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
@@ -25,6 +26,7 @@
     "@cloudflare/workers-types": "^4.20260423.1",
     "@getengram/sdk": "workspace:*",
     "@types/node": "^20.19.39",
+    "miniflare": "4.20260421.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.12",

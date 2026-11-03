@@ -90,6 +90,9 @@ importers:
       '@types/node':
         specifier: ^20.19.39
         version: 20.19.39
+      miniflare:
+        specifier: 4.20260421.0
+        version: 4.20260421.0(@types/node@20.19.39)
       tsx:
         specifier: ^4.19.0
         version: 4.21.0

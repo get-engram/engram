@@ -42,3 +42,11 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      # `pnpm build` runs `wrangler deploy --dry-run`, which only bundles the
+      # worker; nothing evaluates the result. Boot it in workerd so an error
+      # thrown while the module graph loads blocks the merge instead of failing
+      # the production upload (#528).
+      - name: Boot worker bundle in workerd
+        working-directory: apps/mcp-server
+        run: pnpm smoke:bundle

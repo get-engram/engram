@@ -1,4 +1,5 @@
 import type { Env } from "../types.js";
+import { unsubscribeSig } from "./weekly-digest.js";
 
 /**
  * Import-first onboarding, email leg (engram#253): orgs that signed up
@@ -26,8 +27,6 @@ export async function sendImportNudges(env: Env): Promise<number> {
        AND created_at > datetime('now', '-4 days')
      LIMIT 100`,
   ).all<{ id: string; name: string; email: string }>();
-
-  const { unsubscribeSig } = await import("./weekly-digest.js");
 
   let sent = 0;
   for (const org of idle.results ?? []) {

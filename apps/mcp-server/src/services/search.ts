@@ -138,7 +138,7 @@ export async function searchConversations(
       ? getChunksByVectorizeIds(env.DB, vectorizeIds, organizationId)
       : { results: [] },
     ftsChunkIds.length > 0
-      ? getChunksByIds(env.DB, ftsChunkIds)
+      ? getChunksByIds(env.DB, ftsChunkIds, organizationId)
       : { results: [] },
   ]);
 
@@ -191,9 +191,9 @@ export async function searchConversations(
     string,
     { title: string; tags: string[]; updatedAt: string | null }
   >();
-  // Conversations the caller may NOT see (engram#264) — explicit
-  // blocklist so chunks with merely-missing metadata keep the legacy
-  // behavior of passing through.
+  // Conversations the caller may NOT see (engram#264). Kept as an explicit
+  // set for the log line and the test, even though a blocked conversation
+  // also has no entry in convMeta and would be dropped by that rule alone.
   const blockedConvIds = new Set<string>();
 
   if (uniqueConvIds.length > 0) {
@@ -241,20 +241,26 @@ export async function searchConversations(
   for (const [chunkId, rawScore] of rrfScores) {
     const chunk = chunkMap.get(chunkId);
     if (!chunk) continue;
-    const meta = convMeta.get(chunk.conversation_id);
     if (blockedConvIds.has(chunk.conversation_id)) continue; // private to another seat (engram#264)
+    const meta = convMeta.get(chunk.conversation_id);
+    // No conversation resolved inside this org means the chunk is an orphan
+    // of a deleted conversation, or something hydration should never have
+    // returned. Either way its text is not a result (engram#452). Until now
+    // such chunks passed through with no title — which is also how a
+    // cross-tenant row would have surfaced, had one ever reached chunkMap.
+    if (!meta) continue;
     const titleHit =
-      !!meta?.title &&
+      !!meta.title &&
       terms.some((t) => meta.title.toLowerCase().includes(t));
     const boosted =
       (rawScore / RRF_MAX) *
-      recencyMultiplier(meta?.updatedAt) *
+      recencyMultiplier(meta.updatedAt) *
       (titleHit ? TITLE_BOOST : 1);
     results.push({
       chunk_id: chunk.id,
       conversation_id: chunk.conversation_id,
-      conversation_title: meta?.title,
-      tags: meta?.tags,
+      conversation_title: meta.title,
+      tags: meta.tags,
       chunk_text: truncateSnippet(chunk.chunk_text, cappedSnippet),
       chunk_summary: chunk.chunk_summary ?? undefined,
       score: boosted,

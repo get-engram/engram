@@ -3,16 +3,21 @@ import { generateId, generateWebhookSecret } from "@getengram/shared";
 import {
   insertWebhookEndpoint,
   getWebhookEndpointsByOrg,
+  getWebhookEndpointCount,
   deleteWebhookEndpoint,
 } from "@getengram/db";
 import { checkFeatureAccess } from "../services/tier.js";
+import { validateWebhookUrl, WEBHOOK_MAX_PER_ORG } from "../services/webhook-url.js";
+import { denyUnlessOwner } from "./guards.js";
 import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
 
 const webhooks = new Hono<HonoEnv>();
 
-// Gate: webhooks are Team+ only
+// Gate: webhooks are Team+ only, and owner-only within the org (the #441
+// floor). A webhook is org-wide integration config: it is told about every
+// seat's activity, and its URL routinely carries the receiver's own secret.
 webhooks.use("*", async (c, next) => {
   const auth = c.get("auth");
   if (!checkFeatureAccess(auth.tier, "webhooks")) {
@@ -22,6 +27,8 @@ webhooks.use("*", async (c, next) => {
       tier: auth.tier,
     }, 403);
   }
+  const denied = denyUnlessOwner(c, "Only the organization owner can manage webhooks.");
+  if (denied) return denied;
   await next();
 });
 
@@ -43,25 +50,51 @@ webhooks.get("/", async (c) => {
 // Register a webhook endpoint
 webhooks.post("/", async (c) => {
   const auth = c.get("auth");
-  const body = await c.req.json<{ url: string; events: string[] }>();
+  const body = (await c.req.json().catch(() => null)) as { url?: unknown; events?: unknown } | null;
+  if (!body || typeof body !== "object") {
+    return c.json({ error: "invalid_body", message: "Body must be a JSON object." }, 400);
+  }
 
-  if (!body.url) {
-    return c.json({ error: "URL is required" }, 400);
+  // The destination is the SSRF surface (engram#448); the policy lives in
+  // one place and is applied again at fire time.
+  const target = validateWebhookUrl(body.url);
+  if (!target.ok) {
+    return c.json({ error: "invalid_url", message: target.reason }, 400);
   }
 
   const validEvents = ["messages.appended", "conversation.created", "conversation.deleted"];
-  const events = (body.events || []).filter((e) => validEvents.includes(e));
+  const events = (Array.isArray(body.events) ? body.events : []).filter(
+    (e): e is string => typeof e === "string" && validEvents.includes(e),
+  );
   if (events.length === 0) {
-    return c.json({ error: `At least one valid event required. Valid events: ${validEvents.join(", ")}` }, 400);
+    return c.json(
+      { error: "invalid_events", message: `At least one valid event required. Valid events: ${validEvents.join(", ")}` },
+      400,
+    );
+  }
+
+  // Every event fans out to every active endpoint, so an unbounded list is
+  // an amplifier: one append becomes N signed POSTs from our egress.
+  const existing = await getWebhookEndpointCount(c.env.DB, auth.organizationId);
+  if ((existing?.count ?? 0) >= WEBHOOK_MAX_PER_ORG) {
+    return c.json(
+      {
+        error: "webhook_limit_reached",
+        message: `An organization can have at most ${WEBHOOK_MAX_PER_ORG} active webhook endpoints. Delete one to add another.`,
+      },
+      409,
+    );
   }
 
   const id = generateId("whk");
   const secret = generateWebhookSecret();
 
-  await insertWebhookEndpoint(c.env.DB, id, auth.organizationId, body.url, events, secret);
+  // Stored in its canonical form (lowercased host, resolved dot segments) so
+  // what we fire is exactly what was validated.
+  await insertWebhookEndpoint(c.env.DB, id, auth.organizationId, target.url, events, secret);
 
   // Return secret ONCE — can never be retrieved again
-  return c.json({ id, url: body.url, events, secret }, 201);
+  return c.json({ id, url: target.url, events, secret }, 201);
 });
 
 // Delete a webhook endpoint

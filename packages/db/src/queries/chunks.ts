@@ -88,14 +88,25 @@ export function getChunksByVectorizeIds(
 
 export function getChunksByIds(
   db: D1Database,
-  chunkIds: string[]
+  chunkIds: string[],
+  organizationId: string,
 ) {
+  // Same SQL-level fence as getChunksByVectorizeIds (engram#452). The ids
+  // come from the org-scoped FTS query today; hydration must not depend on
+  // that staying true for every future caller, because what it returns is
+  // verbatim chunk_text.
+  //
+  // INDEXED BY is load-bearing here exactly as above: given
+  // `id IN (...) AND organization_id = ?`, production's planner chooses
+  // idx_chunks_org and walks the whole org before filtering by id (EXPLAIN
+  // QUERY PLAN against prod, 2026-11-02) — the #469 regression in a new
+  // coat. Forcing the primary-key index makes this ≤N point lookups.
   const placeholders = chunkIds.map(() => "?").join(",");
   return db
     .prepare(
-      `SELECT * FROM conversation_chunks WHERE id IN (${placeholders})`
+      `SELECT * FROM conversation_chunks INDEXED BY sqlite_autoindex_conversation_chunks_1 WHERE id IN (${placeholders}) AND organization_id = ?`
     )
-    .bind(...chunkIds)
+    .bind(...chunkIds, organizationId)
     .all();
 }
 

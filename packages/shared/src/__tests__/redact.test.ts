@@ -284,3 +284,79 @@ describe("redactMessages", () => {
     expect(totalRedactions).toBe(0);
   });
 });
+
+describe("redact: formats added for engram#455", () => {
+  it("redacts OpenAI project, service-account and admin keys", () => {
+    for (const key of [
+      "sk-proj-abcDEF123456789_ghiJKL-mnoPQR987654321stu",
+      "sk-svcacct-abcDEF123456789ghiJKLmnoPQR987654321stu",
+      "sk-admin-abcDEF123456789ghiJKLmnoPQR987654321stu",
+    ]) {
+      const { text, redactionCount } = redact(`my key is ${key}`);
+      expect(text).toBe(`my key is ${R}`);
+      expect(redactionCount).toBe(1);
+    }
+  });
+
+  it("redacts GitHub fine-grained personal access tokens", () => {
+    const pat =
+      "github_pat_11ABCDEFG0abcdefghijklmnop_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuv";
+    expect(redact(`token ${pat}`).text).toBe(`token ${R}`);
+  });
+
+  it("redacts GitLab tokens", () => {
+    expect(redact("glpat-ABCdef1234567890xyzQ").text).toBe(R);
+    expect(redact("runner glrt-abcdefghijklmnopqrstuvwxyz").text).toBe(`runner ${R}`);
+    expect(redact("deploy gldt-abcdefghijklmnopqrstuvwxyz").text).toBe(`deploy ${R}`);
+  });
+
+  it("redacts a GitLab token inside a git remote and keeps the repo path", () => {
+    const { text } = redact(
+      "git remote add origin https://oauth2:glpat-ABCdef1234567890xyzQ@gitlab.com/acme/repo.git",
+    );
+    expect(text).not.toContain("glpat-");
+    expect(text).toContain("gitlab.com/acme/repo.git");
+  });
+
+  it("redacts Google OAuth refresh and access tokens", () => {
+    const refresh = "1//0gAbCdEfGhIjKlMnOpQrStUvWxYz-_1234567890abcdefghijklmnop";
+    const access =
+      "ya29.a0AfH6SMBxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_abcdefghijklmnopqrstuvwxyz";
+    expect(redact(`got ${refresh} back`).text).toBe(`got ${R} back`);
+    expect(redact(`got ${access} back`).text).toBe(`got ${R} back`);
+  });
+
+  it("redacts credentials embedded in any URL but keeps the host and path", () => {
+    const { text, redactionCount } = redact("curl https://admin:S3cretPass9@internal.corp/api/v1");
+    expect(text).toBe(`curl https://${R}@internal.corp/api/v1`);
+    expect(redactionCount).toBe(1);
+    expect(redact("proxy http://alice:hunter2@10.0.0.5:3128").text).toBe(
+      `proxy http://${R}@10.0.0.5:3128`,
+    );
+  });
+
+  it("still redacts database URLs whole", () => {
+    expect(redact("postgres://user:pass@host.com:5432/db").text).toBe(R);
+  });
+
+  it("redacts Hugging Face and Slack app tokens", () => {
+    // Assembled at runtime: a literal hf_ fixture trips GitHub push protection.
+    const hf = "hf_" + "abcdefghijklmnopqrstuvwxyz0123456789";
+    expect(redact(hf).text).toBe(R);
+    expect(redact("xapp-1-A0123456789-0123456789012-abcdefghijklmnopqrstuvwxyz").text).toBe(R);
+  });
+
+  it("leaves ordinary URLs, ports and identifiers alone", () => {
+    for (const input of [
+      "see https://example.com:8080/path?x=1",
+      "re_render_component_tree_now_please",
+      "step 1//2 of the plan",
+      "v1//0abc",
+      "sk-proj is the prefix OpenAI uses",
+    ]) {
+      const { text, redactionCount } = redact(input);
+      expect(text).toBe(input);
+      expect(redactionCount).toBe(0);
+    }
+  });
+});

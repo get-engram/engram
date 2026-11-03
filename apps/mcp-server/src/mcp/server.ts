@@ -15,6 +15,7 @@ import { registerVaultDelete } from "./tools/vault-delete.js";
 import { registerManageSubscription } from "./tools/manage-subscription.js";
 import { registerAdminMetrics } from "./tools/admin-metrics.js";
 import { isExternalOAuthClient } from "./auth-kind.js";
+import { MAX_MESSAGES_PER_APPEND } from "@getengram/shared";
 import type { Env, AuthContext } from "../types.js";
 
 // Surfaced to clients in the MCP `initialize` response. Directory policy
@@ -51,6 +52,18 @@ The vault is not accessible from this connector (app-platform rules prohibit col
 export const VAULT_INSTRUCTIONS_FIRST_PARTY = `${VAULT_INSTRUCTIONS_SHARED}
 The vault tools (vault_set / vault_get / vault_list / resolve_vault) apply when the user asks to store or retrieve a secret. vault_set accepts values already encrypted client-side with the user's vault key (from \`engram vault keygen\`) — the server only stores ciphertext. Without the vault key, the Engram CLI (\`engram vault set <NAME>\`) handles encryption locally.`;
 
+// Ceiling on the combined number of array elements and object members a
+// single tools/call arguments payload may carry (`maxToolInputElements`,
+// @modelcontextprotocol/sdk >= 1.32). The Worker caps the request body at
+// 8 MB, which bounds bytes, not shape: 8 MB of JSON can hold ~4 million
+// elements, and schema-validating a payload that size is a CPU-time sink
+// per request. Sized from the largest legitimate call, a 200-message daemon
+// batch (MAX_MESSAGES_PER_APPEND), at 500 elements per message: a real
+// message is role/content plus a small metadata bag (`tools_used`, a few
+// dozen entries at most). The SDK counts before Zod runs and refuses the
+// call with InvalidParams, so an oversized payload never reaches a handler.
+export const MAX_TOOL_INPUT_ELEMENTS = MAX_MESSAGES_PER_APPEND * 500;
+
 export function createMcpServer(env: Env, auth: AuthContext): McpServer {
   const instructions =
     SERVER_INSTRUCTIONS +
@@ -62,7 +75,7 @@ export function createMcpServer(env: Env, auth: AuthContext): McpServer {
       name: "Engram",
       version: "0.1.0",
     },
-    { instructions },
+    { instructions, maxToolInputElements: MAX_TOOL_INPUT_ELEMENTS },
   );
 
   // Core memory tools — available to every client (incl. OAuth-connected

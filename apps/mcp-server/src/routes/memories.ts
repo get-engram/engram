@@ -7,6 +7,9 @@ import {
 import {
   checkAndTrackStorage,
   checkAndTrackMessages,
+  checkAndTrackIndexing,
+  checkAndTrackSearch,
+  estimateIndexingUnits,
   releaseStorage,
 } from "../services/tier.js";
 import { searchConversations } from "../services/search.js";
@@ -60,6 +63,21 @@ memories.post("/", async (c) => {
     );
   }
 
+  // Indexing budget (engram#445/#450), same as the other append paths.
+  const indexCheck = await checkAndTrackIndexing(
+    c.env.DB,
+    auth.organizationId,
+    auth.tier,
+    estimateIndexingUnits([{ role: "user", content: text }]),
+  );
+  if (!indexCheck.allowed) {
+    await releaseStorage(c.env.DB, auth.organizationId, 1);
+    return c.json(
+      { error: indexCheck.error ?? "indexing_quota_exceeded", limit: indexCheck.limit, used: indexCheck.used },
+      429,
+    );
+  }
+
   const conversationId =
     conversation_id ?? (await getOrCreateDefaultConversation(c.env.DB, auth.organizationId));
 
@@ -109,6 +127,16 @@ memories.get("/search", async (c) => {
   const privacy = await loadPrivacy(c.env.DB, auth.organizationId);
   if (!privacy.canReadCrossConversation) {
     return c.json({ results: [], total: 0, privacy_notice: PRIVACY_CROSS_CONVERSATION_NOTICE });
+  }
+
+  // Search budget (engram#451) — the dashboard path was the one search
+  // surface that never counted at all.
+  const searchCheck = await checkAndTrackSearch(c.env.DB, auth.organizationId, auth.tier);
+  if (!searchCheck.allowed) {
+    return c.json(
+      { error: searchCheck.error ?? "search_quota_exceeded", limit: searchCheck.limit, used: searchCheck.used },
+      429,
+    );
   }
 
   const raw = await searchConversations(c.env, auth.organizationId, query, limit, undefined, undefined, undefined, undefined, undefined, undefined, auth.seatId);

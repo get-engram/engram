@@ -1,8 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { searchConversations } from "../../services/search.js";
-import { trackSearchRun } from "../../services/tier.js";
+import { checkAndTrackSearch } from "../../services/tier.js";
 import { audit } from "../../services/audit.js";
+import { isExternalOAuthClient } from "../auth-kind.js";
+import { limitMessage } from "../usage-messaging.js";
 import {
   loadPrivacy,
   PRIVACY_BODIES_NOTICE,
@@ -94,6 +96,37 @@ export function registerSearch(
         };
       }
 
+      // Search budget (engram#451): counted BEFORE the query embedding —
+      // that and the vector/FTS query are the cost being bounded.
+      const searchCheck = await checkAndTrackSearch(env.DB, auth.organizationId, auth.tier);
+      if (!searchCheck.allowed) {
+        const isOAuth = isExternalOAuthClient(auth);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                error: searchCheck.error,
+                message: limitMessage({
+                  unit: "searches",
+                  tier: searchCheck.tier,
+                  limit: searchCheck.limit,
+                  used: searchCheck.used,
+                  isOAuth,
+                }),
+                limit: searchCheck.limit,
+                used: searchCheck.used,
+                tier: searchCheck.tier,
+                upgrade_url: isOAuth
+                  ? "https://getengram.app/dashboard"
+                  : "https://getengram.app/pricing",
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+
       const raw = await searchConversations(
         env,
         auth.organizationId,
@@ -112,8 +145,6 @@ export function registerSearch(
       // metadata (title, tags, score) but drop the verbatim snippet.
       const results = privacy.canReadBodies ? raw : stripBodyFields(raw);
 
-      // Track usage
-      await trackSearchRun(env.DB, auth.organizationId).catch(() => {});
       await audit(env.DB, auth.organizationId, auth.apiKeyId, "search", undefined, undefined, {
         query: params.query,
         results: results.length,

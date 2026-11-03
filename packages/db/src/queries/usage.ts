@@ -36,6 +36,55 @@ export function incrementMessagesStored(db: D1Database, organizationId: string, 
 }
 
 /**
+ * The per-period counters that can be capped. Interpolated into SQL below,
+ * so the set is closed: only these names, never caller input.
+ */
+type CappedCounter = "messages_stored" | "searches_run" | "chunks_indexed";
+
+/**
+ * Atomically add `count` to a counter only if the new total stays within
+ * `limit`. Returns the updated value, or null if the limit would be
+ * exceeded (the row is left untouched). One statement, so concurrent
+ * requests cannot both pass the check and together exceed the limit.
+ */
+function atomicIncrementCounter(
+  db: D1Database,
+  column: CappedCounter,
+  organizationId: string,
+  count: number,
+  limit: number,
+) {
+  const period = getCurrentPeriod();
+  return db
+    .prepare(
+      `UPDATE usage
+       SET ${column} = ${column} + ?, updated_at = datetime('now')
+       WHERE organization_id = ? AND period = ?
+         AND ${column} + ? <= ?
+       RETURNING ${column}`
+    )
+    .bind(count, organizationId, period, count, limit)
+    .first<Record<CappedCounter, number>>();
+}
+
+/** Unconditional add — for tiers with no cap on the counter. */
+function incrementCounter(
+  db: D1Database,
+  column: CappedCounter,
+  organizationId: string,
+  count: number,
+) {
+  const period = getCurrentPeriod();
+  return db
+    .prepare(
+      `UPDATE usage SET ${column} = ${column} + ?, updated_at = datetime('now')
+       WHERE organization_id = ? AND period = ?`
+    )
+    .bind(count, organizationId, period)
+    .run();
+}
+
+/**
  * Atomically increment messages_stored only if the new total stays within
  * the given limit. Returns the updated row if successful, null if the
  * limit would be exceeded. Prevents race conditions between concurrent
@@ -46,29 +95,46 @@ export function atomicIncrementMessages(
   organizationId: string,
   count: number,
   limit: number,
-) {
-  const period = getCurrentPeriod();
-  return db
-    .prepare(
-      `UPDATE usage
-       SET messages_stored = messages_stored + ?, updated_at = datetime('now')
-       WHERE organization_id = ? AND period = ?
-         AND messages_stored + ? <= ?
-       RETURNING messages_stored`
-    )
-    .bind(count, organizationId, period, count, limit)
-    .first<{ messages_stored: number }>();
+): Promise<{ messages_stored: number } | null> {
+  return atomicIncrementCounter(db, "messages_stored", organizationId, count, limit);
 }
 
 export function incrementSearchesRun(db: D1Database, organizationId: string) {
-  const period = getCurrentPeriod();
-  return db
-    .prepare(
-      `UPDATE usage SET searches_run = searches_run + 1, updated_at = datetime('now')
-       WHERE organization_id = ? AND period = ?`
-    )
-    .bind(organizationId, period)
-    .run();
+  return incrementCounter(db, "searches_run", organizationId, 1);
+}
+
+/**
+ * Count one search only if the period's search budget allows it
+ * (engram#451). Null = budget exhausted; the caller must not run the
+ * search (the query embedding is the cost being bounded).
+ */
+export function atomicIncrementSearches(
+  db: D1Database,
+  organizationId: string,
+  limit: number,
+): Promise<{ searches_run: number } | null> {
+  return atomicIncrementCounter(db, "searches_run", organizationId, 1, limit);
+}
+
+/** Unconditional indexing count — tiers with no indexing cap. */
+export function incrementChunksIndexed(db: D1Database, organizationId: string, count: number) {
+  return incrementCounter(db, "chunks_indexed", organizationId, count);
+}
+
+/**
+ * Reserve `count` chunks of this period's indexing budget (engram#445,
+ * #450). Null = the budget would be exceeded; nothing was counted and the
+ * caller must not embed. Never decremented: a delete frees storage, not
+ * indexing, so a save/delete loop cannot re-run the embedding model for
+ * free.
+ */
+export function atomicIncrementChunksIndexed(
+  db: D1Database,
+  organizationId: string,
+  count: number,
+  limit: number,
+): Promise<{ chunks_indexed: number } | null> {
+  return atomicIncrementCounter(db, "chunks_indexed", organizationId, count, limit);
 }
 
 /**

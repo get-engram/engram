@@ -21,8 +21,11 @@ import {
   checkConversationLimit,
   checkAndTrackMessages,
   checkAndTrackStorage,
+  checkAndTrackIndexing,
+  checkAndTrackSearch,
+  estimateIndexingUnits,
   releaseStorage,
-  trackSearchRun,
+  IndexingQuotaError,
 } from "../services/tier.js";
 import { searchConversations } from "../services/search.js";
 import {
@@ -326,6 +329,29 @@ v1.post("/messages", async (c) => {
     );
   }
 
+  // Tertiary gate (engram#445/#450): the indexing budget, charged in the
+  // unit that costs money — chunks embedded — and never refunded by a
+  // delete, so a save/delete loop can't farm the embedding model.
+  const indexCheck = await checkAndTrackIndexing(
+    c.env.DB,
+    auth.organizationId,
+    auth.tier,
+    estimateIndexingUnits(parsed.data.messages),
+  );
+  if (!indexCheck.allowed) {
+    await releaseStorage(c.env.DB, auth.organizationId, count);
+    return c.json(
+      {
+        error: indexCheck.error,
+        limit: indexCheck.limit,
+        used: indexCheck.used,
+        tier: indexCheck.tier,
+        upgrade_url: "https://getengram.app/pricing",
+      },
+      429,
+    );
+  }
+
   const conversationId =
     parsed.data.conversation_id ??
     (await getOrCreateDefaultConversation(c.env.DB, auth.organizationId));
@@ -371,8 +397,10 @@ v1.post("/messages", async (c) => {
 // ---------------------------------------------------------------------------
 // PATCH /api/v1/conversations/:id/messages/:messageId — update a message
 // in place (REST-first, no MCP mirror yet — requested by the community
-// Obsidian plugin). Same redaction pipeline as append; the affected
-// search-index window is rebuilt so recall matches what's stored.
+// Obsidian plugin). Same bound + redaction pipeline as append; the affected
+// search-index window is rebuilt so recall matches what's stored, and that
+// rebuild is charged to the indexing budget before anything is written
+// (429 when exhausted — engram#445).
 // ---------------------------------------------------------------------------
 
 const updateMessageSchema = z.object({
@@ -393,14 +421,31 @@ v1.patch("/conversations/:id/messages/:messageId", async (c) => {
     );
   }
 
-  const updated = await updateMessage(
-    c.env,
-    auth.organizationId,
-    conversationId,
-    messageId,
-    parsed.data.content,
-    auth,
-  );
+  let updated;
+  try {
+    updated = await updateMessage(
+      c.env,
+      auth.organizationId,
+      conversationId,
+      messageId,
+      parsed.data.content,
+      auth,
+    );
+  } catch (err) {
+    if (err instanceof IndexingQuotaError) {
+      return c.json(
+        {
+          error: err.result.error,
+          limit: err.result.limit,
+          used: err.result.used,
+          tier: err.result.tier,
+          upgrade_url: "https://getengram.app/pricing",
+        },
+        429,
+      );
+    }
+    throw err;
+  }
   if (!updated) {
     return c.json({ error: "not_found", message: "Conversation or message not found" }, 404);
   }
@@ -567,6 +612,22 @@ v1.get("/search", async (c) => {
     return c.json({ results: [], total: 0, privacy_notice: PRIVACY_CROSS_CONVERSATION_NOTICE });
   }
 
+  // Search budget (engram#451): counted BEFORE the query embedding — that
+  // and the vector/FTS query are the cost being bounded.
+  const searchCheck = await checkAndTrackSearch(c.env.DB, auth.organizationId, auth.tier);
+  if (!searchCheck.allowed) {
+    return c.json(
+      {
+        error: searchCheck.error,
+        limit: searchCheck.limit,
+        used: searchCheck.used,
+        tier: searchCheck.tier,
+        upgrade_url: "https://getengram.app/pricing",
+      },
+      429,
+    );
+  }
+
   const raw = await searchConversations(
     c.env,
     auth.organizationId,
@@ -582,7 +643,6 @@ v1.get("/search", async (c) => {
   );
   const results = privacy.canReadBodies ? raw : stripBodyFields(raw);
 
-  await trackSearchRun(c.env.DB, auth.organizationId).catch(() => {});
   await audit(c.env.DB, auth.organizationId, auth.apiKeyId, "search", undefined, undefined, {
     query,
     results: results.length,

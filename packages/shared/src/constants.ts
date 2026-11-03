@@ -92,6 +92,21 @@ export const TIER_LIMITS: Record<Tier, {
    * -1 = unlimited.
    */
   messages_per_month: number;
+  /**
+   * Monthly indexing budget in chunks embedded (engram#445/#450/#451): the
+   * unit that actually costs money (Workers AI + Vectorize), counted on
+   * append and on edit/delete re-index. Monotonic per period — deletes free
+   * storage but never refund indexing. Sized as an abuse guard, well above
+   * any legitimate month: a free org filling its whole 10k-message cap in
+   * one month embeds ~10k–30k chunks. -1 = unlimited.
+   */
+  chunks_indexed_per_month: number;
+  /**
+   * Monthly search budget (engram#451): each search embeds the query and
+   * runs a vector + FTS query. Abuse guard only; ~8x a heavy agent user on
+   * free. -1 = unlimited.
+   */
+  searches_per_month: number;
   conversations: number;
   seats: number;
   api_keys: number;
@@ -101,6 +116,8 @@ export const TIER_LIMITS: Record<Tier, {
   free: {
     storage_messages: 10_000,
     messages_per_month: -1, // replaced by the storage cap — full speed until full
+    chunks_indexed_per_month: 100_000, // abuse guard only (3–10x a full 10k cap)
+    searches_per_month: 50_000, // abuse guard only
     conversations: -1,
     seats: 1,
     api_keys: -1, // unlimited — usage caps are the billing gate, not key count
@@ -110,6 +127,8 @@ export const TIER_LIMITS: Record<Tier, {
   pro: {
     storage_messages: 1_000_000,
     messages_per_month: 100_000, // abuse guard only
+    chunks_indexed_per_month: 2_000_000, // abuse guard only
+    searches_per_month: 500_000, // abuse guard only
     conversations: -1,
     seats: 1,
     api_keys: -1,
@@ -120,6 +139,8 @@ export const TIER_LIMITS: Record<Tier, {
   student: {
     storage_messages: 1_000_000,
     messages_per_month: 100_000, // abuse guard only
+    chunks_indexed_per_month: 2_000_000, // abuse guard only
+    searches_per_month: 500_000, // abuse guard only
     conversations: -1,
     seats: 1,
     api_keys: -1,
@@ -129,6 +150,8 @@ export const TIER_LIMITS: Record<Tier, {
   team: {
     storage_messages: 1_000_000, // per seat, pooled across the org
     messages_per_month: 500_000, // abuse guard only
+    chunks_indexed_per_month: 10_000_000, // abuse guard only
+    searches_per_month: 2_000_000, // abuse guard only
     conversations: -1,
     seats: -1, // dynamic — enforced via org.seat_limit from Stripe quantity
     api_keys: -1,
@@ -138,6 +161,8 @@ export const TIER_LIMITS: Record<Tier, {
   enterprise: {
     storage_messages: -1, // unlimited
     messages_per_month: -1, // unlimited
+    chunks_indexed_per_month: -1, // unlimited
+    searches_per_month: -1, // unlimited
     conversations: -1,
     seats: -1,
     api_keys: -1,

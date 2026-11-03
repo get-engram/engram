@@ -95,6 +95,24 @@ export function setOrganizationStripeCustomer(
     .run();
 }
 
+/**
+ * Unlink a cached Stripe customer, but only while the row still points at the
+ * customer the caller verified (engram#443). A checkout that cached a fresh
+ * customer in the meantime is not undone.
+ */
+export function clearOrganizationStripeCustomer(
+  db: D1Database,
+  id: string,
+  expectedCustomerId: string,
+) {
+  return db
+    .prepare(
+      "UPDATE organizations SET stripe_customer_id = NULL WHERE id = ? AND stripe_customer_id = ?",
+    )
+    .bind(id, expectedCustomerId)
+    .run();
+}
+
 export function setOrganizationTier(
   db: D1Database,
   id: string,

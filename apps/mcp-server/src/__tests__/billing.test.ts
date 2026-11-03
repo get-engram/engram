@@ -1,6 +1,14 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Hono } from "hono";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { billing, billingWebhook } from "../routes/billing.js";
+import { registerManageSubscription } from "../mcp/tools/manage-subscription.js";
+import {
+  createOrGetCustomer,
+  createPortalSession,
+  getCustomer,
+  type StripeCustomer,
+} from "../services/stripe.js";
 import { insertOrganizationWithEmail } from "@getengram/db";
 import { createMockD1, createMockEnv } from "./helpers.js";
 import type { Env, AuthContext } from "../types.js";
@@ -112,6 +120,13 @@ vi.mock("../services/stripe.js", async (importOriginal) => {
     createOrGetCustomer: vi.fn(async () => ({
       id: "cus_test_123",
       email: "test@example.com",
+    })),
+    // The cached customer is verified against Stripe before use (engram#443);
+    // by default it is the org's own.
+    getCustomer: vi.fn(async (_key: string, id: string) => ({
+      id,
+      email: "test@example.com",
+      metadata: { organization_id: "org_test" },
     })),
     createCheckoutSession: vi.fn(async () => ({
       id: "cs_test_session",
@@ -717,5 +732,324 @@ describe("webhook: unknown events", () => {
     expect(res.status).toBe(200);
     const data = await res.json() as { received: boolean };
     expect(data.received).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: Webhook — idempotency ledger (engram#454)
+// ---------------------------------------------------------------------------
+
+/** Record every statement the handler prepares, with the values it binds. */
+function tapStatements(db: D1Database) {
+  const log: Array<{ sql: string; args: unknown[] }> = [];
+  const target = db as unknown as { prepare: (sql: string) => D1PreparedStatement };
+  const prepare = target.prepare.bind(target);
+  target.prepare = (sql: string) => {
+    const entry = { sql, args: [] as unknown[] };
+    log.push(entry);
+    const stmt = prepare(sql);
+    const bind = stmt.bind.bind(stmt);
+    stmt.bind = (...args: unknown[]) => {
+      entry.args = args;
+      return bind(...args);
+    };
+    return stmt;
+  };
+  return log;
+}
+
+const checkoutCompleted = (id: string) => ({
+  id,
+  type: "checkout.session.completed",
+  data: { object: { customer: "cus_once", metadata: { organization_id: "org_idem" } } },
+});
+
+const customerWrites = (log: Array<{ sql: string }>) =>
+  log.filter((s) => /UPDATE organizations SET stripe_customer_id/.test(s.sql));
+
+describe("webhook: idempotency (engram#454)", () => {
+  it("applies an event once and acknowledges a repeat delivery without re-applying it", async () => {
+    const db = createMockD1();
+    const env = createBillingEnv(db);
+    await insertOrganizationWithEmail(db, "org_idem", "Idem Org", "idem@example.com");
+    const log = tapStatements(db);
+    const app = createWebhookApp();
+
+    const first = await sendWebhookEvent(app, env, checkoutCompleted("evt_once"));
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({ received: true });
+    expect(customerWrites(log)).toHaveLength(1);
+
+    // Stripe's retry, or a captured signed body replayed inside the
+    // signature window: acknowledged, nothing applied.
+    const second = await sendWebhookEvent(app, env, checkoutCompleted("evt_once"));
+    expect(second.status).toBe(200);
+    expect(await second.json()).toEqual({ received: true, duplicate: true });
+    expect(customerWrites(log)).toHaveLength(1);
+
+    const ledger = await db.prepare("SELECT event_id FROM stripe_webhook_events").all();
+    expect(ledger.results).toHaveLength(1);
+
+    // A different event is not a duplicate of the first.
+    const third = await sendWebhookEvent(app, env, checkoutCompleted("evt_other"));
+    expect(await third.json()).toEqual({ received: true });
+    expect(customerWrites(log)).toHaveLength(2);
+  });
+
+  it("refuses a signed body that is not shaped like an event, before touching the ledger", async () => {
+    const db = createMockD1();
+    const env = createBillingEnv(db);
+    const log = tapStatements(db);
+    const app = createWebhookApp();
+
+    const bodies = [
+      // id that is not a Stripe event id
+      { id: "not-an-event-id", type: "checkout.session.completed", data: { object: {} } },
+      // no data
+      { id: "evt_nodata", type: "checkout.session.completed" },
+      // object that is not an object
+      { id: "evt_array", type: "checkout.session.completed", data: { object: [] } },
+      // no type
+      { id: "evt_notype", data: { object: {} } },
+      // not an object at all
+      [],
+    ];
+    for (const parsed of bodies) {
+      const body = JSON.stringify(parsed);
+      const sig = await signStripePayload(TEST_WEBHOOK_SECRET, body);
+      const res = await app.request(
+        "/billing/webhook",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "stripe-signature": sig },
+          body,
+        },
+        env,
+      );
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: "invalid_event" });
+    }
+    expect(log.filter((s) => /stripe_webhook_events/.test(s.sql))).toHaveLength(0);
+  });
+
+  it("releases the claim when the handler fails, so Stripe's retry is processed", async () => {
+    const db = createMockD1();
+    const env = createBillingEnv(db);
+    await insertOrganizationWithEmail(db, "org_idem", "Idem Org", "idem@example.com");
+    const log = tapStatements(db);
+
+    // The first customer write fails with a D1-style error; later ones succeed.
+    const target = db as unknown as { prepare: (sql: string) => D1PreparedStatement };
+    const prepare = target.prepare.bind(target);
+    let failed = false;
+    target.prepare = (sql: string) => {
+      const stmt = prepare(sql);
+      if (!failed && /SET stripe_customer_id/.test(sql)) {
+        const bind = stmt.bind.bind(stmt);
+        stmt.bind = (...args: unknown[]) => {
+          const bound = bind(...args);
+          bound.run = async () => {
+            failed = true;
+            throw new Error("D1_ERROR: boom");
+          };
+          return bound;
+        };
+      }
+      return stmt;
+    };
+
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const app = createWebhookApp();
+      const first = await sendWebhookEvent(app, env, checkoutCompleted("evt_flaky"));
+      expect(first.status).toBe(500);
+      const release = log.find((s) => /DELETE FROM stripe_webhook_events/.test(s.sql));
+      expect(release).toBeDefined();
+      expect(release!.args[0]).toBe("evt_flaky");
+      expect(log.filter((s) => /SET processed_at/.test(s.sql))).toHaveLength(0);
+
+      // Stripe retries the non-2xx: the id was given back, so the retry runs
+      // the handler, and this time the id becomes final.
+      const retry = await sendWebhookEvent(app, env, checkoutCompleted("evt_flaky"));
+      expect(retry.status).toBe(200);
+      expect(await retry.json()).toEqual({ received: true });
+      expect(customerWrites(log)).toHaveLength(2);
+      expect(log.filter((s) => /SET processed_at/.test(s.sql))).toHaveLength(1);
+    } finally {
+      quiet.mockRestore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The cached customer id (engram#443, second half). A row's stripe_customer_id
+// is a cache that the old email lookup could fill with another org's customer.
+// Every surface that acts on it resolves it against Stripe first: a foreign or
+// vanished customer is unlinked and never used, the org's own is used, and an
+// unstamped (hand-attached) one is tolerated.
+// ---------------------------------------------------------------------------
+
+const customerOf = (id: string, org: string | null): StripeCustomer => ({
+  id,
+  email: "test@example.com",
+  metadata: org === null ? {} : { organization_id: org },
+});
+const unlinks = (log: Array<{ sql: string; args: unknown[] }>) =>
+  log.filter((s) =>
+    /UPDATE organizations SET stripe_customer_id = NULL WHERE id = \? AND stripe_customer_id = \?/.test(s.sql),
+  );
+const relinks = (log: Array<{ sql: string; args: unknown[] }>) =>
+  log.filter((s) => /UPDATE organizations SET stripe_customer_id = \? WHERE id = \?/.test(s.sql));
+
+describe("cached Stripe customer ownership (engram#443)", () => {
+  const auth: AuthContext = {
+    organizationId: "org_test",
+    apiKeyId: "key_test",
+    tier: "pro",
+    scopes: ["read", "write", "search", "delete"],
+    seatId: null,
+  };
+  let db: D1Database;
+  let env: Env;
+  let log: Array<{ sql: string; args: unknown[] }>;
+
+  beforeEach(async () => {
+    db = createMockD1();
+    env = createBillingEnv(db);
+    await db.exec(
+      "INSERT INTO organizations (id, name, email, stripe_customer_id) VALUES ('org_test', 'Test Org', 'test@example.com', 'cus_cached')",
+    );
+    log = tapStatements(db);
+    vi.mocked(getCustomer).mockClear();
+    vi.mocked(createPortalSession).mockClear();
+    vi.mocked(createOrGetCustomer).mockClear();
+    // The raw subscription lookups in checkout/upgrade must not reach the network.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ data: [] }) })),
+    );
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  const post = (path: string, body: unknown) =>
+    createAuthedApp(env, auth).request(
+      path,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+      env,
+    );
+  const portal = () => post("/api/billing/portal", {});
+  const checkout = () => post("/api/billing/checkout", { plan: "pro" });
+
+  it("portal: a customer stamped for another org is unlinked and refused", async () => {
+    vi.mocked(getCustomer).mockResolvedValueOnce(customerOf("cus_cached", "org_victim"));
+    const res = await portal();
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("no_subscription");
+    expect(getCustomer).toHaveBeenCalledWith(TEST_STRIPE_SECRET, "cus_cached");
+    expect(unlinks(log).map((s) => s.args)).toEqual([["org_test", "cus_cached"]]);
+    expect(createPortalSession).not.toHaveBeenCalled();
+  });
+
+  it("portal: a customer Stripe no longer has is unlinked and refused", async () => {
+    vi.mocked(getCustomer).mockResolvedValueOnce(null);
+    const res = await portal();
+    expect(res.status).toBe(400);
+    expect(unlinks(log)).toHaveLength(1);
+    expect(createPortalSession).not.toHaveBeenCalled();
+  });
+
+  it("portal: the org's own customer opens the portal, untouched", async () => {
+    vi.mocked(getCustomer).mockResolvedValueOnce(customerOf("cus_cached", "org_test"));
+    const res = await portal();
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { url: string }).url).toContain("billing.stripe.com");
+    expect(unlinks(log)).toHaveLength(0);
+    expect(createPortalSession).toHaveBeenCalledWith(
+      TEST_STRIPE_SECRET,
+      expect.objectContaining({ customerId: "cus_cached" }),
+    );
+  });
+
+  it("portal: an unstamped (hand-attached) customer is tolerated", async () => {
+    vi.mocked(getCustomer).mockResolvedValueOnce(customerOf("cus_cached", null));
+    const res = await portal();
+    expect(res.status).toBe(200);
+    expect(unlinks(log)).toHaveLength(0);
+  });
+
+  it("portal: a Stripe outage is an error, not a verdict", async () => {
+    vi.mocked(getCustomer).mockRejectedValueOnce(new Error("stripe: Stripe API 500"));
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const res = await portal();
+      expect(res.status).toBe(500);
+    } finally {
+      quiet.mockRestore();
+    }
+    expect(unlinks(log)).toHaveLength(0);
+    expect(createPortalSession).not.toHaveBeenCalled();
+  });
+
+  it("checkout: a foreign cached customer is unlinked and replaced by the org's own", async () => {
+    vi.mocked(getCustomer).mockResolvedValueOnce(customerOf("cus_cached", "org_victim"));
+    const res = await checkout();
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { url: string }).url).toContain("checkout.stripe.com");
+    expect(unlinks(log).map((s) => s.args)).toEqual([["org_test", "cus_cached"]]);
+    expect(createOrGetCustomer).toHaveBeenCalledWith(TEST_STRIPE_SECRET, "test@example.com", "org_test");
+    expect(relinks(log).map((s) => s.args)).toEqual([["cus_test_123", "org_test"]]);
+  });
+
+  it("checkout: the org's own cached customer is kept", async () => {
+    vi.mocked(getCustomer).mockResolvedValueOnce(customerOf("cus_cached", "org_test"));
+    const res = await checkout();
+    expect(res.status).toBe(200);
+    expect(createOrGetCustomer).not.toHaveBeenCalled();
+    expect(unlinks(log)).toHaveLength(0);
+    expect(relinks(log)).toHaveLength(0);
+  });
+
+  // The MCP tool is the second portal/checkout path; it used to check only
+  // that the cached customer EXISTED.
+  type Handler = (
+    params: Record<string, unknown>,
+  ) => Promise<{ isError?: boolean; content: Array<{ text: string }> }>;
+  function tool(): Handler {
+    let handler: Handler | undefined;
+    const server = {
+      tool: (...args: unknown[]) => {
+        handler = args[args.length - 1] as Handler;
+      },
+    } as unknown as McpServer;
+    registerManageSubscription(server, env, auth);
+    if (!handler) throw new Error("tool not registered");
+    return handler;
+  }
+
+  it("manage_subscription portal: a foreign customer is unlinked and refused", async () => {
+    vi.mocked(getCustomer).mockResolvedValueOnce(customerOf("cus_cached", "org_victim"));
+    const res = await tool()({ action: "portal" });
+    expect(res.isError).toBe(true);
+    expect(JSON.parse(res.content[0].text)).toMatchObject({ error: "no_subscription" });
+    expect(unlinks(log)).toHaveLength(1);
+    expect(createPortalSession).not.toHaveBeenCalled();
+  });
+
+  it("manage_subscription portal: the org's own customer opens the portal", async () => {
+    vi.mocked(getCustomer).mockResolvedValueOnce(customerOf("cus_cached", "org_test"));
+    const res = await tool()({ action: "portal" });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(res.content[0].text).url).toContain("billing.stripe.com");
+    expect(unlinks(log)).toHaveLength(0);
+  });
+
+  it("manage_subscription upgrade: a foreign customer is replaced before checkout", async () => {
+    vi.mocked(getCustomer).mockResolvedValueOnce(customerOf("cus_cached", "org_victim"));
+    const res = await tool()({ action: "upgrade", plan: "pro" });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(res.content[0].text).url).toContain("checkout.stripe.com");
+    expect(unlinks(log)).toHaveLength(1);
+    expect(createOrGetCustomer).toHaveBeenCalledWith(TEST_STRIPE_SECRET, "test@example.com", "org_test");
+    expect(relinks(log).map((s) => s.args)).toEqual([["cus_test_123", "org_test"]]);
   });
 });

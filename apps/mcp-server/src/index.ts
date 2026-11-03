@@ -36,6 +36,7 @@ import { sendRecallNudges } from "./cron/recall-nudge.js";
 import { sendStudentReverifyReminders } from "./cron/student-reverify.js";
 import { pruneExpiredOAuthTokens } from "./cron/prune-oauth-tokens.js";
 import { enforceAuditRetention } from "./cron/audit-retention.js";
+import { pruneStripeWebhookEvents } from "./cron/prune-stripe-events.js";
 import { reconcileStripeToD1 } from "./cron/reconcile-stripe.js";
 export { DrainerDO } from "./services/drainer-do.js";
 import { sendWeeklyDigests, unsubscribeSig } from "./cron/weekly-digest.js";
@@ -406,9 +407,11 @@ export default {
         console.error(`[d1-latency] probe FAILED: ${err instanceof Error ? err.message : err}`);
       }
       try {
-        const { checked, changed, errors } = await reconcileStripeToD1(env);
+        const { checked, changed, errors, unlinked } = await reconcileStripeToD1(env);
         if (changed > 0 || errors > 0)
-          console.log(`[reconcile] ${changed}/${checked} tier(s) updated, ${errors} error(s)`);
+          console.log(
+            `[reconcile] ${changed}/${checked} tier(s) updated, ${unlinked} foreign customer(s) unlinked, ${errors} error(s)`,
+          );
       } catch (err) {
         console.error(`[reconcile] FAILED: ${err instanceof Error ? err.message : err}`);
       }
@@ -477,6 +480,9 @@ export default {
     // must not be able to starve data hygiene.
     await runJob("prune oauth tokens", () => pruneExpiredOAuthTokens(env));
     await runJob("audit retention", () => enforceAuditRetention(env));
+    // Stripe webhook idempotency ledger (engram#454): rows past the retry
+    // horizon are dead weight; see cron/prune-stripe-events.ts.
+    await runJob("prune stripe events", () => pruneStripeWebhookEvents(env));
     // Import-first onboarding (engram#253): one nudge per org that signed up
     // yesterday and hasn't stored anything yet.
     await runJob("import nudges", () => sendImportNudges(env));

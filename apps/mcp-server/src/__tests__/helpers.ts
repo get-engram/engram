@@ -32,6 +32,19 @@ export function createMockD1(): D1Database {
             cols.forEach((col, i) => {
               row[col] = bindings[i] ?? null;
             });
+            // An explicit conflict target behaves as it does in SQLite: a row
+            // that already matches on those columns is not inserted again, and
+            // meta.changes reports it (0) the way a claim-style upsert reads
+            // it. The DO UPDATE branch is not modelled here; code that depends
+            // on it is tested against real SQLite (stripe-webhook-events.d1).
+            const target = sql.match(/ON\s+CONFLICT\s*\(([^)]+)\)/i);
+            if (target) {
+              const keys = target[1].split(",").map((k) => k.trim());
+              const clash = table.some((r) => keys.every((k) => r[k] === row[k]));
+              if (clash) return { results: [], success: true, meta: { changes: 0 } };
+              table.push(row);
+              return { results: [], success: true, meta: { changes: 1 } };
+            }
             table.push(row);
           }
           return { results: [], success: true, meta: {} };
@@ -47,10 +60,11 @@ export function createMockD1(): D1Database {
             const tableName = tableMatch[1];
             // Simple: clear entries matching first binding as an ID field
             tables[tableName] = (tables[tableName] || []).filter((row) => {
-              // Check conversation_id or id
+              // Check conversation_id, id, or event_id (stripe_webhook_events)
               return (
                 row.conversation_id !== bindings[0] &&
-                row.id !== bindings[0]
+                row.id !== bindings[0] &&
+                row.event_id !== bindings[0]
               );
             });
           }

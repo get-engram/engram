@@ -9,6 +9,7 @@ import {
 
   resolvePlanPrice,
 } from "../../services/stripe.js";
+import { resolveCachedCustomer } from "../../services/stripe-customer.js";
 import { setOrganizationStripeCustomer } from "@getengram/db";
 import { audit } from "../../services/audit.js";
 import { isSeatMember } from "../auth-kind.js";
@@ -111,7 +112,10 @@ export function registerManageSubscription(
 
       // --- PORTAL ---
       if (params.action === "portal") {
-        if (!org.stripe_customer_id) {
+        // Only this org's own customer opens the portal (engram#443); a cached
+        // id that is another org's, or gone, is unlinked and refused.
+        const cached = await resolveCachedCustomer(env, org);
+        if (!cached.ok) {
           return {
             content: [{
               type: "text" as const,
@@ -125,7 +129,7 @@ export function registerManageSubscription(
         }
 
         const session = await createPortalSession(env.STRIPE_SECRET_KEY, {
-          customerId: org.stripe_customer_id,
+          customerId: cached.customerId,
           returnUrl: `${env.APP_URL}/dashboard`,
         });
 
@@ -156,18 +160,10 @@ export function registerManageSubscription(
         };
       }
 
-      let customerId = org.stripe_customer_id;
-
-      // Verify cached customer still exists in Stripe; clear if stale
-      if (customerId) {
-        const check = await fetch(
-          `https://api.stripe.com/v1/customers/${customerId}`,
-          { headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` } },
-        );
-        if (!check.ok) {
-          customerId = null;
-        }
-      }
+      // The cached customer must still exist AND be this org's own
+      // (engram#443); anything else is unlinked and replaced.
+      const cached = await resolveCachedCustomer(env, org);
+      let customerId: string | null = cached.ok ? cached.customerId : null;
 
       if (!customerId) {
         const customer = await createOrGetCustomer(env.STRIPE_SECRET_KEY, org.email, org.id);
@@ -177,7 +173,7 @@ export function registerManageSubscription(
 
       // If already subscribed, redirect to portal instead
       const subsRes = await fetch(
-        `https://api.stripe.com/v1/subscriptions?customer=${customerId}&status=active&limit=1`,
+        `https://api.stripe.com/v1/subscriptions?customer=${encodeURIComponent(customerId)}&status=active&limit=1`,
         { headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` } },
       );
       if (subsRes.ok) {

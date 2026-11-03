@@ -1,7 +1,10 @@
 import { Hono } from "hono";
 import {
+  claimStripeWebhookEvent,
   getOrganizationById,
   getOrganizationByStripeCustomer,
+  markStripeWebhookEventProcessed,
+  releaseStripeWebhookEvent,
   setOrganizationStripeCustomer,
   setOrganizationTier,
 } from "@getengram/db";
@@ -14,6 +17,7 @@ import {
 
   resolvePlanPrice,
 } from "../services/stripe.js";
+import { resolveCachedCustomer } from "../services/stripe-customer.js";
 import { denyUnlessOwner } from "./guards.js";
 import type { Env, AuthContext } from "../types.js";
 
@@ -171,8 +175,11 @@ billing.post("/checkout", async (c) => {
     );
   }
 
-  // Ensure a Stripe customer exists and is cached on the org row
-  let customerId = org.stripe_customer_id;
+  // Ensure a Stripe customer exists and is cached on the org row. The cached
+  // one must be this org's own (engram#443): a foreign or vanished customer is
+  // unlinked and replaced, never checked out against.
+  const cached = await resolveCachedCustomer(c.env, org);
+  let customerId: string | null = cached.ok ? cached.customerId : null;
   if (!customerId) {
     const customer = await createOrGetCustomer(
       c.env.STRIPE_SECRET_KEY,
@@ -190,7 +197,7 @@ billing.post("/checkout", async (c) => {
   if (customerId) {
     for (const status of ["active", "trialing"] as const) {
       const subsRes = await fetch(
-        `https://api.stripe.com/v1/subscriptions?customer=${customerId}&status=${status}&limit=1`,
+        `https://api.stripe.com/v1/subscriptions?customer=${encodeURIComponent(customerId)}&status=${status}&limit=1`,
         { headers: { Authorization: `Bearer ${c.env.STRIPE_SECRET_KEY}` } },
       );
       if (subsRes.ok) {
@@ -250,9 +257,13 @@ billing.post("/portal", async (c) => {
     .catch(() => ({}) as Record<string, string>);
 
   const org = (await getOrganizationById(c.env.DB, auth.organizationId)) as
-    | { stripe_customer_id: string | null }
+    | { id: string; stripe_customer_id: string | null }
     | null;
-  if (!org?.stripe_customer_id) {
+  // The portal shows the card, the invoices and the cancel button, so only
+  // this org's own customer opens it (engram#443): a cached id that turns out
+  // to be another org's is unlinked and refused.
+  const cached = org ? await resolveCachedCustomer(c.env, org) : null;
+  if (!cached?.ok) {
     return c.json(
       {
         error: "no_subscription",
@@ -265,7 +276,7 @@ billing.post("/portal", async (c) => {
   const returnUrl = body.return_url || `${c.env.APP_URL}/dashboard`;
 
   const session = await createPortalSession(c.env.STRIPE_SECRET_KEY, {
-    customerId: org.stripe_customer_id,
+    customerId: cached.customerId,
     returnUrl,
   });
 
@@ -349,6 +360,24 @@ type StripeEvent = {
   data: { object: Record<string, unknown> };
 };
 
+/**
+ * A Stripe event id is `evt_` plus an opaque body. The idempotency ledger
+ * keys on it, so a signed body that is not shaped like an event is refused
+ * before it can touch D1.
+ */
+const STRIPE_EVENT_ID = /^evt_[A-Za-z0-9_]{1,250}$/;
+
+function asStripeEvent(parsed: unknown): StripeEvent | null {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const e = parsed as { id?: unknown; type?: unknown; data?: unknown };
+  if (typeof e.id !== "string" || !STRIPE_EVENT_ID.test(e.id)) return null;
+  if (typeof e.type !== "string" || e.type.length === 0 || e.type.length > 100) return null;
+  if (!e.data || typeof e.data !== "object") return null;
+  const obj = (e.data as { object?: unknown }).object;
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+  return { id: e.id, type: e.type, data: { object: obj as Record<string, unknown> } };
+}
+
 async function resolveOrgIdFromEvent(
   env: Env,
   obj: Record<string, unknown>,
@@ -366,6 +395,93 @@ async function resolveOrgIdFromEvent(
     if (org) return org.id;
   }
   return null;
+}
+
+/**
+ * Apply one verified, claimed event to D1. Every branch is idempotent (the
+ * ledger in front of it makes that a defence in depth rather than the only
+ * guard), and an unknown type is a no-op so Stripe stops retrying it.
+ */
+async function applyStripeEvent(env: Env, event: StripeEvent): Promise<void> {
+  const obj = event.data.object;
+
+  switch (event.type) {
+    case "checkout.session.completed": {
+      // Cache the customer id on the org (usually already done at /checkout
+      // time, but defensive).
+      const orgId = await resolveOrgIdFromEvent(env, obj);
+      const customer = obj.customer as string | undefined;
+      if (orgId && customer) {
+        await setOrganizationStripeCustomer(env.DB, orgId, customer);
+      }
+      break;
+    }
+
+    case "customer.subscription.created":
+    case "customer.subscription.updated": {
+      const orgId = await resolveOrgIdFromEvent(env, obj);
+      if (!orgId) break;
+
+      const status = obj.status as string;
+      const subscriptionId = obj.id as string;
+      const items = (obj.items as { data?: Array<{ price?: { id?: string }; quantity?: number }> })
+        ?.data;
+      const priceId = items?.[0]?.price?.id;
+      const quantity = items?.[0]?.quantity ?? 1;
+
+      const newTier = priceToTier(env, priceId);
+
+      if (
+        (status === "active" || status === "trialing") &&
+        newTier
+      ) {
+        const seatLimit = newTier === "team" ? quantity : 1;
+        await setOrganizationTier(env.DB, orgId, newTier, subscriptionId, seatLimit);
+        // Track scheduled cancellation ("pro but cancelling" in admin). An
+        // active sub also clears any past churn stamp — they came back.
+        // Stripe records a scheduled cancel two ways: cancel_at_period_end
+        // (bool) or cancel_at (timestamp, e.g. portal "cancel on <date>").
+        // Reading only the bool missed real cancellations (anar3nata,
+        // 2026-08 — dashboard showed "Cancels Aug 15", admin showed
+        // healthy).
+        const cancelling = Boolean(obj.cancel_at_period_end) || (typeof obj.cancel_at === "number" && obj.cancel_at > 0);
+        await env.DB.prepare(
+          "UPDATE organizations SET cancel_at_period_end = ?, churned_at = CASE WHEN ? = 0 THEN NULL ELSE churned_at END WHERE id = ?",
+        )
+          .bind(cancelling ? 1 : 0, cancelling ? 1 : 0, orgId)
+          .run();
+      } else if (
+        status === "canceled" ||
+        status === "incomplete_expired" ||
+        status === "unpaid"
+      ) {
+        // Only downgrade if this event is for the org's current sub (guards
+        // against out-of-order events from a superseded subscription).
+        //
+        // NOTE: `past_due` is deliberately NOT in this list. It means a
+        // renewal charge failed and Stripe is still retrying (dunning runs for
+        // weeks and usually recovers) — the customer intends to pay and
+        // yanking their plan mid-retry is both wrong and a good way to lose
+        // them. Stripe escalates to `unpaid` or `canceled` when dunning is
+        // exhausted, and those DO churn here. Observed: a paying customer's
+        // card bounced and they were instantly downgraded to free.
+        await churnIfCurrentSub(env.DB, orgId, subscriptionId);
+      }
+      break;
+    }
+
+    case "customer.subscription.deleted": {
+      const orgId = await resolveOrgIdFromEvent(env, obj);
+      if (orgId) {
+        await churnIfCurrentSub(env.DB, orgId, obj.id as string);
+      }
+      break;
+    }
+
+    default:
+      // Acknowledge unknown events with 200 so Stripe doesn't keep retrying
+      break;
+  }
 }
 
 billingWebhook.post("/", async (c) => {
@@ -386,92 +502,39 @@ billingWebhook.post("/", async (c) => {
     return c.json({ error: "invalid_signature" }, 400);
   }
 
-  let event: StripeEvent;
+  let parsed: unknown;
   try {
-    event = JSON.parse(rawBody) as StripeEvent;
+    parsed = JSON.parse(rawBody);
   } catch {
     return c.json({ error: "invalid_json" }, 400);
   }
-
-  const obj = event.data.object;
-
-  switch (event.type) {
-    case "checkout.session.completed": {
-      // Cache the customer id on the org (usually already done at /checkout
-      // time, but defensive).
-      const orgId = await resolveOrgIdFromEvent(c.env, obj);
-      const customer = obj.customer as string | undefined;
-      if (orgId && customer) {
-        await setOrganizationStripeCustomer(c.env.DB, orgId, customer);
-      }
-      break;
-    }
-
-    case "customer.subscription.created":
-    case "customer.subscription.updated": {
-      const orgId = await resolveOrgIdFromEvent(c.env, obj);
-      if (!orgId) break;
-
-      const status = obj.status as string;
-      const subscriptionId = obj.id as string;
-      const items = (obj.items as { data?: Array<{ price?: { id?: string }; quantity?: number }> })
-        ?.data;
-      const priceId = items?.[0]?.price?.id;
-      const quantity = items?.[0]?.quantity ?? 1;
-
-      const newTier = priceToTier(c.env, priceId);
-
-      if (
-        (status === "active" || status === "trialing") &&
-        newTier
-      ) {
-        const seatLimit = newTier === "team" ? quantity : 1;
-        await setOrganizationTier(c.env.DB, orgId, newTier, subscriptionId, seatLimit);
-        // Track scheduled cancellation ("pro but cancelling" in admin). An
-        // active sub also clears any past churn stamp — they came back.
-        // Stripe records a scheduled cancel two ways: cancel_at_period_end
-        // (bool) or cancel_at (timestamp, e.g. portal "cancel on <date>").
-        // Reading only the bool missed real cancellations (anar3nata,
-        // 2026-08 — dashboard showed "Cancels Aug 15", admin showed
-        // healthy).
-        const cancelling = Boolean(obj.cancel_at_period_end) || (typeof obj.cancel_at === "number" && obj.cancel_at > 0);
-        await c.env.DB.prepare(
-          "UPDATE organizations SET cancel_at_period_end = ?, churned_at = CASE WHEN ? = 0 THEN NULL ELSE churned_at END WHERE id = ?",
-        )
-          .bind(cancelling ? 1 : 0, cancelling ? 1 : 0, orgId)
-          .run();
-      } else if (
-        status === "canceled" ||
-        status === "incomplete_expired" ||
-        status === "unpaid"
-      ) {
-        // Only downgrade if this event is for the org's current sub (guards
-        // against out-of-order events from a superseded subscription).
-        //
-        // NOTE: `past_due` is deliberately NOT in this list. It means a
-        // renewal charge failed and Stripe is still retrying (dunning runs for
-        // weeks and usually recovers) — the customer intends to pay and
-        // yanking their plan mid-retry is both wrong and a good way to lose
-        // them. Stripe escalates to `unpaid` or `canceled` when dunning is
-        // exhausted, and those DO churn here. Observed: a paying customer's
-        // card bounced and they were instantly downgraded to free.
-        await churnIfCurrentSub(c.env.DB, orgId, subscriptionId);
-      }
-      break;
-    }
-
-    case "customer.subscription.deleted": {
-      const orgId = await resolveOrgIdFromEvent(c.env, obj);
-      if (orgId) {
-        await churnIfCurrentSub(c.env.DB, orgId, obj.id as string);
-      }
-      break;
-    }
-
-    default:
-      // Acknowledge unknown events with 200 so Stripe doesn't keep retrying
-      break;
+  const event = asStripeEvent(parsed);
+  if (!event) {
+    return c.json({ error: "invalid_event" }, 400);
   }
+
+  // Idempotency (engram#454): claim the id before doing anything. A repeat
+  // delivery, whether Stripe's own retry or a captured signed body replayed
+  // inside the signature window, is acknowledged and otherwise ignored.
+  const claimed = await claimStripeWebhookEvent(c.env.DB, event.id, event.type);
+  if (!claimed) {
+    console.log(`[billing] webhook ${event.type} ${event.id}: already handled, ignored`);
+    return c.json({ received: true, duplicate: true });
+  }
+
+  try {
+    await applyStripeEvent(c.env, event);
+  } catch (err) {
+    // Give the id back so the retry Stripe sends for the non-2xx runs the
+    // handler again instead of being dropped as a duplicate.
+    await releaseStripeWebhookEvent(c.env.DB, event.id).catch((releaseErr: unknown) => {
+      console.error(
+        `[billing] webhook ${event.id}: release failed: ${releaseErr instanceof Error ? releaseErr.message : String(releaseErr)}`,
+      );
+    });
+    throw err;
+  }
+  await markStripeWebhookEventProcessed(c.env.DB, event.id);
 
   return c.json({ received: true });
 });

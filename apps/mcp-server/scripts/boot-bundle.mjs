@@ -14,6 +14,10 @@
 // are left out (a stub answers 503). Module evaluation and /health touch no
 // binding, so that does not weaken the check.
 //
+// GET /admin is requested too: the console's Content-Security-Policy hashes
+// its inline script and style with WebCrypto on first request (engram#514),
+// so this proves that path in workerd rather than only under Node.
+//
 // Usage: pnpm smoke:bundle [path/to/bundle.js]   (default: dist/index.js)
 
 import { existsSync, statSync } from "node:fs";
@@ -76,6 +80,16 @@ try {
   } else {
     code = 1;
     console.error(`boot-bundle: FAILED, GET /health -> ${res.status} ${body}`);
+  }
+
+  const admin = await mf.dispatchFetch("http://localhost/admin");
+  const csp = admin.headers.get("Content-Security-Policy") ?? "";
+  await admin.arrayBuffer();
+  if (admin.status === 200 && csp.includes("'sha256-") && !csp.includes("'unsafe-inline'")) {
+    console.log("boot-bundle: OK, GET /admin -> 200 with a hash-based Content-Security-Policy");
+  } else {
+    code = 1;
+    console.error(`boot-bundle: FAILED, GET /admin -> ${admin.status}; Content-Security-Policy: ${csp || "(none)"}`);
   }
 } catch (err) {
   code = 1;

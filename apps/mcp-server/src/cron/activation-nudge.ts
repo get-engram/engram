@@ -1,4 +1,5 @@
 import type { Env } from "../types.js";
+import { unsubscribeSig } from "./weekly-digest.js";
 import { TIER_LIMITS } from "@getengram/shared";
 
 /**
@@ -55,8 +56,6 @@ export async function sendActivationNudges(env: Env): Promise<number> {
     saved: number;
     days_old: number;
   }>();
-
-  const { unsubscribeSig } = await import("./weekly-digest.js");
 
   let sent = 0;
   for (const org of dormant.results ?? []) {

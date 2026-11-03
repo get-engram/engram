@@ -12,7 +12,7 @@ import { compressContent, ENCODING_GZIP } from "../utils/compress.js";
 import { audit } from "../services/audit.js";
 import { purgeDeletedOrganizations } from "../cron/purge-deleted.js";
 import { pruneExpiredOAuthTokens } from "../cron/prune-oauth-tokens.js";
-import { enforceAuditRetention } from "../cron/audit-retention.js";
+import { enforceAuditRetention, AUDIT_RETENTION_DAYS } from "../cron/audit-retention.js";
 import type { Env } from "../types.js";
 import { sendDailyReport } from "../services/daily-report.js";
 import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
@@ -1522,10 +1522,15 @@ admin.get("/db-stats", async (c) => {
 admin.post("/reclaim-space", async (c) => {
   const scope = c.req.query("scope") ?? "logs";
   const result: Record<string, unknown> = { scope };
-  // audit_log — pure observability, safe to wipe entirely.
+  // audit_log — held to its stated retention floor, never wiped. This was an
+  // unfiltered `DELETE FROM audit_log`: one click on the space lever erased
+  // every auth and access event the product had ever recorded, the opposite
+  // of the retention window a reviewer is promised and the nightly cron
+  // enforces. The lever now runs that same bounded job on demand, so the
+  // most it can remove is what retention would have removed tonight anyway.
   try {
-    const r = await c.env.DB.prepare("DELETE FROM audit_log").run();
-    result.audit_log_deleted = r.meta?.changes ?? 0;
+    result.audit_log_deleted = await enforceAuditRetention(c.env);
+    result.audit_log_retention_days = AUDIT_RETENTION_DAYS;
   } catch (e) {
     result.audit_log_error = e instanceof Error ? e.message : String(e);
   }
@@ -1553,6 +1558,8 @@ admin.post("/reclaim-space", async (c) => {
       result.chunks_fts_error = e instanceof Error ? e.message : String(e);
     }
   }
+  // An operator just deleted data on purpose; that belongs in the log line.
+  console.log(`[admin] reclaim-space ${JSON.stringify(result)}`);
   return c.json({ reclaimed: true, ...result });
 });
 

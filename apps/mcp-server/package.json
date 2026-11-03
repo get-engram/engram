@@ -17,8 +17,8 @@
   "dependencies": {
     "@getengram/db": "workspace:*",
     "@getengram/shared": "workspace:*",
-    "@modelcontextprotocol/sdk": "^1.6.0",
-    "hono": "^4.12.34",
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "hono": "^4.13.11",
     "zod": "^3.24.0"
   },
   "devDependencies": {

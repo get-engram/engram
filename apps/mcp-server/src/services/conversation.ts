@@ -9,6 +9,7 @@ import {
   type MessageInput,
   type Message,
   type Conversation,
+  type ChunkResult,
 } from "@getengram/shared";
 import {
   insertConversation,
@@ -38,7 +39,13 @@ import {
   getR2RevisionIdsByConversation,
 } from "@getengram/db";
 import { generateEmbeddings } from "./embedding.js";
-import { releaseStorage } from "./tier.js";
+import {
+  releaseStorage,
+  checkAndTrackIndexing,
+  boundContent,
+  IndexingQuotaError,
+  type TierCheckResult,
+} from "./tier.js";
 import { storeContent, deleteContent, loadContent } from "./content-store.js";
 import { deleteVectorsByIds } from "./vectorize.js";
 import type { Env, AuthContext } from "../types.js";
@@ -179,14 +186,7 @@ export function assertWritesEnabled(env: Env): void {
  */
 export function boundMessageContent(messageInputs: MessageInput[]): MessageInput[] {
   return messageInputs.map((m) =>
-    m.content.length > MAX_MESSAGE_CONTENT_CHARS
-      ? {
-          ...m,
-          content:
-            m.content.slice(0, MAX_MESSAGE_CONTENT_CHARS) +
-            `\n\n…[truncated: message exceeded ${MAX_MESSAGE_CONTENT_CHARS.toLocaleString()} characters]`,
-        }
-      : m,
+    m.content.length > MAX_MESSAGE_CONTENT_CHARS ? { ...m, content: boundContent(m.content) } : m,
   );
 }
 
@@ -460,13 +460,18 @@ export async function updateMessage(
     | null;
   if (!existing || existing.conversation_id !== conversationId) return null;
 
-  // Same hygiene as append: redact, then compress for storage.
+  // Same hygiene as append: bound (engram#445 — an edit used to take
+  // 1,000,000 characters straight into the embedding model, ~10x append's
+  // per-message ceiling), redact, then compress for storage.
+  const [bounded] = boundMessageContent([
+    { role: existing.role as MessageInput["role"], content: newContent },
+  ]);
   const candidate: Message = {
     id: existing.id as string,
     conversation_id: conversationId,
     organization_id: organizationId,
     role: existing.role as Message["role"],
-    content: newContent,
+    content: bounded.content,
     tool_call_id: (existing.tool_call_id as string | null) ?? null,
     tool_name: (existing.tool_name as string | null) ?? null,
     sequence: existing.sequence,
@@ -480,6 +485,18 @@ export async function updateMessage(
     );
   }
   const updated = redacted[0];
+
+  // Plan the re-index BEFORE writing anything (engram#445): an edit
+  // re-embeds the chunk window it sits in, and the indexing budget is
+  // checked against that exact count. A refusal leaves the message, its
+  // history and the index untouched — the caller gets a 429 instead of an
+  // edit that is stored but silently unsearchable.
+  const plan = await planReindex(env, conversationId, organizationId, existing.sequence, {
+    id: messageId,
+    content: updated.content,
+  });
+  const indexCheck = await meterReindex(env, organizationId, viewer, plan);
+  if (!indexCheck.allowed) throw new IndexingQuotaError(indexCheck);
 
   // Preserve the body we are about to destroy.
   //
@@ -520,11 +537,10 @@ export async function updateMessage(
     stored.encoding
   );
 
-  // Rebuild the affected slice of the search index. Chunk boundaries are
-  // per-append-batch, so re-chunking just the window spanned by the
-  // invalidated chunks can't shift neighbours.
+  // Rebuild the affected slice of the search index — planned above, before
+  // the write, so the budget could refuse first.
   try {
-    await reindexSequenceWindow(env, conversationId, organizationId, existing.sequence);
+    await applyReindex(env, conversationId, organizationId, plan);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(
@@ -536,116 +552,156 @@ export async function updateMessage(
 }
 
 /**
- * Rebuild the search index for the chunk window that spans `sequence`:
- * overlapping chunks are deleted (D1 + FTS + Vectorize) and regenerated from
- * the CURRENT message rows in that window. Shared by message edit (content
- * changed) and message delete (row gone — the window regenerates without it).
- * Chunk boundaries are per-append-batch, so re-chunking only the spanned
- * window can't shift neighbouring chunks.
+ * A search-index rebuild for the chunk window that spans one sequence: the
+ * chunks currently covering it (stale once a message in it changed or went
+ * away) and what the window's CURRENT message rows re-chunk to. Chunk
+ * boundaries are per-append-batch, so re-chunking only the spanned window
+ * can't shift neighbouring chunks. Shared by message edit and delete.
  */
-async function reindexSequenceWindow(
+interface ReindexPlan {
+  old: Array<{ id: string; vectorize_id: string }>;
+  chunks: ChunkResult[];
+}
+
+/**
+ * Work out the plan without touching anything. `override` stands in for a
+ * message whose new body is not written yet — the edit path plans before
+ * it writes, so the indexing budget (engram#445) can refuse first.
+ */
+async function planReindex(
   env: Env,
   conversationId: string,
   organizationId: string,
-  sequence: number
+  sequence: number,
+  override?: { id: string; content: string }
+): Promise<ReindexPlan> {
+  const overlapping = await getChunksOverlappingSequence(
+    env.DB,
+    conversationId,
+    organizationId,
+    sequence
+  );
+  const old = overlapping.results ?? [];
+  const startSeq = old.length
+    ? Math.min(...old.map((c) => c.start_sequence))
+    : sequence;
+  const endSeq = old.length
+    ? Math.max(...old.map((c) => c.end_sequence))
+    : sequence;
+
+  const windowResult = await getMessagesBySequenceRange(
+    env.DB,
+    conversationId,
+    organizationId,
+    startSeq,
+    endSeq
+  );
+  const windowMessages = (await Promise.all(
+    (windowResult.results as Array<Record<string, unknown>>).map(
+      async (m) => ({
+        ...m,
+        content:
+          override && m.id === override.id
+            ? override.content
+            : await loadContent(env, {
+                id: m.id as string,
+                content: m.content as string,
+                content_encoding: m.content_encoding as string | null,
+              }),
+        metadata: JSON.parse((m.metadata as string) || "{}"),
+      })
+    )
+  )) as Message[];
+
+  return { old, chunks: chunkMessages(windowMessages) };
+}
+
+/**
+ * Charge a plan's new chunks to the period's indexing budget (engram#445).
+ * Unmetered without a viewer (internal callers). The caller decides what a
+ * refusal means: the edit path refuses before writing; the delete path
+ * proceeds but drops the stale chunks without regenerating.
+ */
+async function meterReindex(
+  env: Env,
+  organizationId: string,
+  viewer: AuthContext | undefined,
+  plan: ReindexPlan
+): Promise<TierCheckResult> {
+  if (!viewer || plan.chunks.length === 0) return { allowed: true };
+  return checkAndTrackIndexing(env.DB, organizationId, viewer.tier, plan.chunks.length);
+}
+
+/**
+ * Apply a plan: embed the new chunks, drop the stale ones (D1 + FTS +
+ * Vectorize), insert the new ones. A plan with no chunks is a pure drop.
+ */
+async function applyReindex(
+  env: Env,
+  conversationId: string,
+  organizationId: string,
+  plan: ReindexPlan
 ): Promise<void> {
-  {
-    const overlapping = await getChunksOverlappingSequence(
+  const { old, chunks } = plan;
+  const texts = chunks.map((c) => c.text);
+  const embeddings = texts.length
+    ? await generateEmbeddings(env.AI, texts)
+    : [];
+
+  if (old.length > 0) {
+    await deleteVectorsByIds(env, old.map((c) => c.vectorize_id));
+    await deleteChunksByIds(
       env.DB,
-      conversationId,
-      organizationId,
-      sequence
+      old.map((c) => c.id),
+      organizationId
     );
-    const old = overlapping.results ?? [];
-    const startSeq = old.length
-      ? Math.min(...old.map((c) => c.start_sequence))
-      : sequence;
-    const endSeq = old.length
-      ? Math.max(...old.map((c) => c.end_sequence))
-      : sequence;
+  }
 
-    const windowResult = await getMessagesBySequenceRange(
+  if (chunks.length > 0) {
+    const chunkRecords = chunks.map((chunk, i) => {
+      const cid = chunkId(
+        conversationId,
+        chunk.startSequence,
+        chunk.endSequence,
+        chunk.index,
+      );
+      return {
+        id: cid,
+        conversationId,
+        organizationId,
+        chunkText: chunk.text,
+        chunkSummary: summarizeChunk(chunk.text),
+        startSequence: chunk.startSequence,
+        endSequence: chunk.endSequence,
+        vectorizeId: cid,
+        embedding: embeddings[i],
+      };
+    });
+    await insertChunks(
       env.DB,
-      conversationId,
-      organizationId,
-      startSeq,
-      endSeq
+      chunkRecords.map((c) => ({
+        id: c.id,
+        conversationId: c.conversationId,
+        organizationId: c.organizationId,
+        chunkText: c.chunkText,
+        chunkSummary: c.chunkSummary,
+        startSequence: c.startSequence,
+        endSequence: c.endSequence,
+        vectorizeId: c.vectorizeId,
+      }))
     );
-    const windowMessages = (await Promise.all(
-      (windowResult.results as Array<Record<string, unknown>>).map(
-        async (m) => ({
-          ...m,
-          content: await loadContent(env, {
-            id: m.id as string,
-            content: m.content as string,
-            content_encoding: m.content_encoding as string | null,
-          }),
-          metadata: JSON.parse((m.metadata as string) || "{}"),
-        })
-      )
-    )) as Message[];
-
-    const chunks = chunkMessages(windowMessages);
-    const texts = chunks.map((c) => c.text);
-    const embeddings = texts.length
-      ? await generateEmbeddings(env.AI, texts)
-      : [];
-
-    if (old.length > 0) {
-      await deleteVectorsByIds(env, old.map((c) => c.vectorize_id));
-      await deleteChunksByIds(
-        env.DB,
-        old.map((c) => c.id),
-        organizationId
-      );
-    }
-
-    if (chunks.length > 0) {
-      const chunkRecords = chunks.map((chunk, i) => {
-        const cid = chunkId(
-          conversationId,
-          chunk.startSequence,
-          chunk.endSequence,
-          chunk.index,
-        );
-        return {
-          id: cid,
-          conversationId,
-          organizationId,
-          chunkText: chunk.text,
-          chunkSummary: summarizeChunk(chunk.text),
-          startSequence: chunk.startSequence,
-          endSequence: chunk.endSequence,
-          vectorizeId: cid,
-          embedding: embeddings[i],
-        };
-      });
-      await insertChunks(
-        env.DB,
-        chunkRecords.map((c) => ({
-          id: c.id,
-          conversationId: c.conversationId,
-          organizationId: c.organizationId,
-          chunkText: c.chunkText,
-          chunkSummary: c.chunkSummary,
-          startSequence: c.startSequence,
-          endSequence: c.endSequence,
-          vectorizeId: c.vectorizeId,
-        }))
-      );
-      await env.VECTORIZE.upsert(
-        chunkRecords.map((c) => ({
-          id: c.vectorizeId,
-          values: c.embedding,
-          metadata: {
-            organization_id: organizationId,
-            conversation_id: conversationId,
-            start_sequence: c.startSequence,
-            end_sequence: c.endSequence,
-          },
-        }))
-      );
-    }
+    await env.VECTORIZE.upsert(
+      chunkRecords.map((c) => ({
+        id: c.vectorizeId,
+        values: c.embedding,
+        metadata: {
+          organization_id: organizationId,
+          conversation_id: conversationId,
+          start_sequence: c.startSequence,
+          end_sequence: c.endSequence,
+        },
+      }))
+    );
   }
 }
 
@@ -698,7 +754,18 @@ export async function deleteMessage(
   // Reindex is best-effort like edit — but a failure here means the deleted
   // text may still be recalled from a stale chunk, so log it loudly.
   try {
-    await reindexSequenceWindow(env, conversationId, organizationId, existing.sequence);
+    let plan = await planReindex(env, conversationId, organizationId, existing.sequence);
+    const indexCheck = await meterReindex(env, organizationId, viewer, plan);
+    if (!indexCheck.allowed) {
+      // Deletes are never refused. Past the budget the stale chunks still
+      // go — the deleted text must not stay recallable — but the window is
+      // not re-embedded.
+      console.warn(
+        `[index] Indexing budget exhausted for ${organizationId}; dropping stale chunks after delete of ${messageId} without regenerating`
+      );
+      plan = { old: plan.old, chunks: [] };
+    }
+    await applyReindex(env, conversationId, organizationId, plan);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(

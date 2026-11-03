@@ -115,3 +115,19 @@ Requests are rate limited per organization with a token bucket. Limits scale by 
 | Enterprise | 600 |
 
 Every response includes an `X-RateLimit-Limit` header. When you exceed the limit, the request returns `429 Too Many Requests` with a `retry_after` of 60 seconds. Billing endpoints are exempt. For self-hosted instances, Cloudflare's platform limits also apply.
+
+## Monthly cost budgets
+
+Two operations cost real compute — generating embeddings and running a search — so each plan carries a monthly budget for both. They are sized far above any legitimate use; they are abuse guards, not feature gates.
+
+| Plan | Chunks indexed per month | Searches per month |
+|------|--------------------------|--------------------|
+| Free | 100,000 | 50,000 |
+| Pro | 2,000,000 | 500,000 |
+| Student | 2,000,000 | 500,000 |
+| Team | 10,000,000 | 2,000,000 |
+| Enterprise | Unlimited | Unlimited |
+
+A chunk is one embedded window of a conversation: roughly five messages, or one slice of a long message. Every path that generates embeddings is charged — `append_messages`, the REST and dashboard save endpoints, and the search-index rebuild after a message edit or delete — in the number of chunks it actually embeds. The indexing counter is monotonic: deleting a message frees storage but never refunds indexing, so a save/delete loop cannot run the embedding model for free. The search counter is charged before the query runs, on every surface (MCP, REST, dashboard).
+
+When a budget is exhausted the request returns `429` with `error` set to `indexing_quota_exceeded` or `search_quota_exceeded`, plus `limit`, `used` and `tier`. A message edit is refused before anything is written. A message delete always completes: the stale index entries are dropped, the window is just not re-embedded. Both counters reset with the monthly period and are reported by `GET /api/usage` as `indexing` and `searches`.

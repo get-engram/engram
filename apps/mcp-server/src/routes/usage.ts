@@ -29,6 +29,7 @@ usage.get("/", async (c) => {
     messages_stored: number;
     searches_run: number;
     api_requests?: number;
+    chunks_indexed?: number;
     period: string;
   } | null;
   // For team tier, seat limit comes from Stripe subscription quantity
@@ -50,8 +51,16 @@ usage.get("/", async (c) => {
       used: org?.messages_stored_total ?? 0,
       limit: storageLimit,
     },
+    // Monthly abuse guards on the two metered costs (engram#445/#451):
+    // searches run, and chunks embedded (append + edit/delete re-index;
+    // never refunded by deletes). -1 limit = unlimited.
     searches: {
       used: u?.searches_run ?? 0,
+      limit: limits.searches_per_month,
+    },
+    indexing: {
+      used: u?.chunks_indexed ?? 0,
+      limit: limits.chunks_indexed_per_month,
     },
     // Data-plane requests (/mcp + /api/v1) this period (engram#287).
     api_requests: {

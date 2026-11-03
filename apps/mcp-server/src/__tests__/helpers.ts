@@ -7,6 +7,13 @@ interface D1Result {
   meta: Record<string, unknown>;
 }
 
+// Counter columns that real SQLite defaults to 0 but a hand-rolled INSERT
+// leaves undefined. Applied when the mock hands back a usage row so the
+// tier gates read numbers, as they do in production.
+const COUNTER_DEFAULTS: Record<string, Record<string, number>> = {
+  usage: { messages_stored: 0, searches_run: 0, api_requests: 0, chunks_indexed: 0 },
+};
+
 // Create a mock D1 database that stores data in memory
 export function createMockD1(): D1Database {
   const tables: Record<string, Record<string, unknown>[]> = {};
@@ -21,9 +28,9 @@ export function createMockD1(): D1Database {
       bind: (...args: unknown[]) => mockStatement(sql, args),
       run: vi.fn(async (): Promise<D1Result> => {
         // Simple INSERT handler
-        const insertMatch = sql.match(/INSERT\s+(?:OR\s+IGNORE\s+)?INTO\s+(\w+)/i);
+        const insertMatch = sql.match(/INSERT\s+(?:OR\s+(IGNORE|REPLACE)\s+)?INTO\s+(\w+)/i);
         if (insertMatch) {
-          const table = getTable(insertMatch[1]);
+          const table = getTable(insertMatch[2]);
           // Extract column names
           const colMatch = sql.match(/\(([^)]+)\)\s+VALUES/i);
           if (colMatch) {
@@ -44,6 +51,13 @@ export function createMockD1(): D1Database {
               if (clash) return { results: [], success: true, meta: { changes: 0 } };
               table.push(row);
               return { results: [], success: true, meta: { changes: 1 } };
+            }
+            // INSERT OR REPLACE (chunk rows on re-index): the row with the
+            // same primary key is replaced, so a re-index of the same window
+            // upserts instead of duplicating.
+            if (/replace/i.test(insertMatch[1] ?? "") && row.id !== undefined) {
+              const dup = table.findIndex((r) => r.id === row.id);
+              if (dup !== -1) table.splice(dup, 1);
             }
             table.push(row);
           }
@@ -73,9 +87,62 @@ export function createMockD1(): D1Database {
         return { results: [], success: true, meta: {} };
       }),
       first: vi.fn(async () => {
+        // Upserts and atomic counters hand their row back via RETURNING and
+        // have no FROM clause. The two shapes the tier gates rely on are
+        // modelled here — INSERT … ON CONFLICT(keys) … RETURNING *, and
+        // UPDATE t SET c = c + ? … WHERE … [AND c + ? <= ?] RETURNING c —
+        // so limited tiers run their real gates in tests instead of reading
+        // every reservation as "exceeded".
+        const upsert = sql.match(
+          /INSERT\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES[\s\S]*ON\s+CONFLICT\s*\(([^)]+)\)[\s\S]*RETURNING\s+\*/i
+        );
+        if (upsert) {
+          const table = getTable(upsert[1]);
+          const cols = upsert[2].split(",").map((c) => c.trim());
+          const keys = upsert[3].split(",").map((k) => k.trim());
+          const input: Record<string, unknown> = {};
+          cols.forEach((col, i) => {
+            input[col] = bindings[i] ?? null;
+          });
+          let row = table.find((r) => keys.every((k) => r[k] === input[k]));
+          if (!row) {
+            row = { ...(COUNTER_DEFAULTS[upsert[1]] ?? {}), ...input };
+            table.push(row);
+          }
+          return { ...(COUNTER_DEFAULTS[upsert[1]] ?? {}), ...row };
+        }
+        const counter = sql.match(
+          /UPDATE\s+(\w+)\s+SET\s+(\w+)\s*=\s*\2\s*\+\s*\?[\s\S]*?WHERE\s+([\s\S]*?)\s+RETURNING\s+(\w+)/i
+        );
+        if (counter) {
+          const [, tableName, col, where, ret] = counter;
+          const table = getTable(tableName);
+          // Equality terms bind in order after the delta; a `c + ? <= ?`
+          // guard binds (delta, limit) after them, as in the real queries.
+          const eqCols = [...where.matchAll(/(\w+)\s*=\s*\?/g)].map((m) => m[1]);
+          const guarded = /\w+\s*\+\s*\?\s*<=\s*\?/.test(where);
+          const delta = Number(bindings[0]);
+          const row = table.find((r) => eqCols.every((c, i) => r[c] === bindings[1 + i]));
+          if (!row) return null;
+          const current = Number(row[col] ?? 0);
+          if (guarded && current + delta > Number(bindings[1 + eqCols.length + 1])) {
+            return null;
+          }
+          row[col] = current + delta;
+          return { [ret]: row[col] };
+        }
+
         const tableMatch = sql.match(/FROM\s+(\w+)/i);
         if (!tableMatch) return null;
         const table = getTable(tableMatch[1]);
+
+        // Period row lookup (getUsage) — keyed by org + period, not id.
+        if (sql.includes("organization_id = ? AND period = ?") && bindings.length >= 2) {
+          const row = table.find(
+            (r) => r.organization_id === bindings[0] && r.period === bindings[1]
+          );
+          return row ? { ...(COUNTER_DEFAULTS[tableMatch[1]] ?? {}), ...row } : null;
+        }
 
         // COUNT(*) query
         if (sql.includes("COUNT(*)")) {
@@ -150,10 +217,17 @@ export function createMockD1(): D1Database {
           return { results, success: true, meta: {} };
         }
 
-        // Filter by organization_id
-        if (sql.includes("organization_id = ?") && bindings[0]) {
+        // Filter by organization_id. The queries that scope a conversation
+        // first (`WHERE conversation_id = ? AND organization_id = ?` — the
+        // sequence-window reads behind message edit/delete) bind the org
+        // second, so take the placeholder order from the SQL.
+        const orgPos = sql.indexOf("organization_id = ?");
+        const convPos = sql.indexOf("conversation_id = ?");
+        const convFirst = convPos !== -1 && orgPos !== -1 && convPos < orgPos;
+        const orgIdx = convFirst ? 1 : 0;
+        if (orgPos !== -1 && bindings[orgIdx]) {
           results = results.filter(
-            (r) => r.organization_id === bindings[0]
+            (r) => r.organization_id === bindings[orgIdx]
           );
         }
 
@@ -166,8 +240,8 @@ export function createMockD1(): D1Database {
         }
 
         // Filter by conversation_id
-        if (sql.includes("conversation_id = ?")) {
-          const convIdx = sql.includes("organization_id = ?") ? 1 : 0;
+        if (convPos !== -1) {
+          const convIdx = convFirst ? 0 : orgPos !== -1 ? 1 : 0;
           results = results.filter(
             (r) => r.conversation_id === (bindings[convIdx] ?? bindings[0])
           );

@@ -451,14 +451,21 @@ describe("MCP tool contract — wire field names", () => {
       const shapeOf = (a: AuthContext) => {
         const { server, tools } = createCaptureServer();
         registerAppendMessages(server, env, a);
-        const schema = tools.get("append_messages")!.schema as Record<string, z.ZodTypeAny>;
-        const messages = schema.messages as z.ZodArray<z.ZodObject<z.ZodRawShape>>;
-        const item = messages.element.shape;
+        // Read the shape the way a client does: through the JSON Schema that
+        // tools/list publishes, not through zod internals.
+        const shape = tools.get("append_messages")!.schema as z.ZodRawShape;
+        const json = z.toJSONSchema(z.object(shape), { io: "input" }) as {
+          properties: Record<
+            string,
+            { maxItems?: number; items?: { properties: Record<string, { enum?: string[] }> } }
+          >;
+        };
+        const messages = json.properties.messages;
         return {
-          keys: Object.keys(schema).sort(),
-          itemKeys: Object.keys(item).sort(),
-          roles: (item.role as z.ZodEnum<[string, ...string[]]>).options,
-          max: messages._def.maxLength?.value,
+          keys: Object.keys(json.properties).sort(),
+          itemKeys: Object.keys(messages.items!.properties).sort(),
+          roles: messages.items!.properties.role.enum,
+          max: messages.maxItems,
         };
       };
       const connector = shapeOf({ ...auth, apiKeyId: "oauth:client_contract" });

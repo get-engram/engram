@@ -38,6 +38,14 @@ describe("search service", () => {
   beforeAll(() => {
     db = createMockD1();
 
+    // The chunks' conversation must resolve inside the org, or search drops
+    // them (engram#452).
+    db.prepare(
+      "INSERT INTO conversations (id, organization_id, title, tags, updated_at) VALUES (?,?,?,?,?)"
+    )
+      .bind("conv_1", organizationId, "Greeting", "[]", "2026-04-11")
+      .run();
+
     // Seed two chunks: one short, one very long.
     const longText = "a".repeat(6000);
     db.prepare(

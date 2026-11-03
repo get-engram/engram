@@ -65,7 +65,7 @@ export function registerAppendMessages(
         tool_call_id: z.string().optional(),
         tool_name: z.string().optional(),
         metadata: z
-          .record(z.unknown())
+          .record(z.string(), z.unknown())
           .refine((m) => JSON.stringify(m).length <= MAX_MESSAGE_METADATA_CHARS, {
             message: `metadata exceeds ${MAX_MESSAGE_METADATA_CHARS} serialized characters`,
           })

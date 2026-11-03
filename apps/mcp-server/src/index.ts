@@ -15,7 +15,7 @@ import { signup } from "./routes/signup.js";
 import { billing, billingSession, billingWebhook } from "./routes/billing.js";
 import { admin } from "./routes/admin.js";
 import { mergeOrgs } from "./routes/merge-orgs.js";
-import { dashboardHtml } from "./routes/admin-dashboard.js";
+import { adminConsoleSecurityPolicy, dashboardHtml } from "./routes/admin-dashboard.js";
 import { account } from "./routes/account.js";
 import { privacy } from "./routes/privacy.js";
 import { student, studentPublic } from "./routes/student.js";
@@ -274,7 +274,13 @@ app.use(
 app.route("/billing/verify-session", billingSession);
 
 // Admin dashboard — serves SPA HTML (auth handled client-side via sessionStorage).
-app.get("/admin", (c) => c.html(dashboardHtml));
+// The console's own CSP allows its inline script and style by hash
+// (engram#514); securityHeaders is set-if-absent, so this header wins over
+// the shared HTML policy.
+app.get("/admin", async (c) => {
+  c.header("Content-Security-Policy", await adminConsoleSecurityPolicy());
+  return c.html(dashboardHtml);
+});
 
 // Admin API routes — protected by ADMIN_SECRET, not API key auth.
 app.use(

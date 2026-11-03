@@ -21,7 +21,10 @@ const BASE64_TOKEN = /(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/]
 
 // Provider API keys — each has a distinctive prefix
 const PROVIDER_KEYS = [
-  // OpenAI
+  // OpenAI. Project, service-account and admin keys carry a second
+  // hyphenated segment, which the legacy pattern's [A-Za-z0-9] run stopped
+  // at — so the most common current format was stored verbatim (engram#455).
+  /\bsk-(proj|svcacct|admin)-[A-Za-z0-9_-]{20,}\b/g,
   /\bsk-[A-Za-z0-9]{20,}\b/g,
   // Anthropic
   /\bsk-ant-[A-Za-z0-9_-]{20,}\b/g,
@@ -31,8 +34,16 @@ const PROVIDER_KEYS = [
   // Google / Gemini API keys (AIza + 35 chars) — a notable prior gap given
   // Engram's own users connect Gemini clients.
   /\bAIza[0-9A-Za-z_-]{35}\b/g,
+  // Google OAuth refresh tokens (1//…) and access tokens (ya29.…). Both
+  // contain '-' and '_', which keeps them out of the base64 net below.
+  /\b1\/\/[A-Za-z0-9_-]{20,}/g,
+  /\bya29\.[A-Za-z0-9_-]{30,}/g,
   // GitHub
   /\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b/g,
+  /\bgithub_pat_[A-Za-z0-9_]{30,}\b/g,
+  // GitLab: personal, pipeline-trigger, runner, deploy, feed, service-account,
+  // OAuth-app and agent tokens share one prefix convention.
+  /\bgl(pat|ptt|rt|dt|ft|soat|oas|agent)-[A-Za-z0-9_-]{20,}\b/g,
   // Stripe
   /\b[rs]k_(test|live)_[A-Za-z0-9]{10,}\b/g,
   // Cloudflare
@@ -41,6 +52,9 @@ const PROVIDER_KEYS = [
   /\bsbp_[A-Za-z0-9]{30,}\b/g,
   // Slack
   /\bxox[bpras]-[A-Za-z0-9-]{10,}\b/g,
+  /\bxapp-[A-Za-z0-9-]{10,}\b/g,
+  // Hugging Face
+  /\bhf_[A-Za-z0-9]{30,}\b/g,
   // npm
   /\bnpm_[A-Za-z0-9]{30,}\b/g,
   // Vercel (account/access tokens). Older Vercel tokens are bare 24-char
@@ -58,6 +72,13 @@ const PROVIDER_KEYS = [
 // Connection strings (postgres, mysql, redis, mongodb, amqp)
 const CONNECTION_STRING =
   /\b(postgres|postgresql|mysql|redis|rediss|mongodb|mongodb\+srv|amqp|amqps):\/\/[^\s"'`]+/gi;
+
+// Credentials embedded in any other URL (https://user:token@host/…): git
+// remotes, private registries, proxies. The db-scheme list above redacts
+// the whole string; here only the user:password pair goes, so the host and
+// path stay readable in the memory (engram#455). The username goes too,
+// because for several services it IS the key.
+const URL_BASIC_AUTH = /\b([a-z][a-z0-9+.-]*:\/\/)([^\s/@:]+:[^\s/@]+)@/gi;
 
 // Private keys (PEM blocks)
 const PRIVATE_KEY =
@@ -112,6 +133,12 @@ export function redact(input: string): RedactResult {
 
   // 4. Connection strings
   apply(CONNECTION_STRING);
+
+  // 4b. user:password@ inside any other URL — the credential only
+  text = text.replace(URL_BASIC_AUTH, (_m: string, scheme: string) => {
+    count++;
+    return `${scheme}${REDACTED}@`;
+  });
 
   // 5. Secret assignments (password=..., token:..., etc.)
   apply(SECRET_ASSIGNMENT);

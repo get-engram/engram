@@ -224,6 +224,19 @@ const PAGE_SIZE = 50;
 let totalUsers = 0;
 let refreshTimer = null;
 
+// Rows from the last render, keyed by id. An inline handler carries only an
+// id; anything shown to the operator afterwards (a name in a confirm box)
+// is looked up here rather than threaded through markup (engram#512).
+const USERS = new Map();
+const KEYS = new Map();
+
+// The only value that may be interpolated into an inline event handler.
+// Ids are server-minted (org_..., key_...) and never contain a quote;
+// anything else is not an id, and '' inside the handler's quotes is inert.
+function idAttr(id) {
+  return typeof id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(id) ? id : '';
+}
+
 function getHeaders() {
   return { 'Authorization': 'Bearer ' + secret, 'Content-Type': 'application/json' };
 }
@@ -241,15 +254,17 @@ function status(msg) {
   setTimeout(() => bar.style.opacity = '0', 2000);
 }
 
+// HTML-escapes for text AND attribute context. The old textContent-to-
+// innerHTML trick left both quote characters alone, which is right for a
+// text node and wrong inside title="..." (engram#512).
 function esc(s) {
   if (s == null) return '<span style="color:var(--muted)">-</span>';
-  const d = document.createElement('div');
-  d.textContent = String(s);
-  return d.innerHTML;
+  return String(s).replace(/[&<>"']/g, ch =>
+    ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '>' ? '&gt;' : ch === '"' ? '&quot;' : '&#39;');
 }
 
 function tierBadge(tier) {
-  const t = tier || 'free';
+  const t = esc(tier || 'free');
   return '<span class="tier-badge tier-' + t + '">' + t + '</span>';
 }
 
@@ -262,7 +277,7 @@ function shortTime(iso) {
 
 function tierSelect(userId, currentTier) {
   const tiers = ['free', 'pro', 'student', 'team', 'enterprise'];
-  let html = '<select class="tier-select" onchange="changeTier(\\'' + userId + '\\', this.value)">';
+  let html = '<select class="tier-select" onchange="changeTier(\\'' + idAttr(userId) + '\\', this.value)">';
   for (const t of tiers) {
     html += '<option value="' + t + '"' + (t === (currentTier || 'free') ? ' selected' : '') + '>' + t + '</option>';
   }
@@ -347,6 +362,8 @@ async function loadUsers() {
   const params = '?sort=' + sortField + '&order=' + sortOrder + '&limit=' + PAGE_SIZE + '&offset=' + currentOffset;
   const data = await api('/users' + params);
   totalUsers = data.total;
+  USERS.clear();
+  for (const u of data.users || []) USERS.set(u.id, u);
 
   document.getElementById('user-count').textContent = totalUsers + ' total';
 
@@ -360,10 +377,10 @@ async function loadUsers() {
     '<td>' + (u.stripe_customer_id ? '<span style="color:var(--green)" title="' + esc(u.stripe_customer_id) + '">Yes</span>' : '<span style="color:var(--muted)">-</span>') + '</td>' +
     '<td>' + u.conversations + '</td>' +
     '<td>' + u.total_messages + '</td>' +
-    '<td><button class="btn btn-sm" onclick="checkStripe(\\'' + u.id + '\\')">Stripe</button>' +
-    ' <button class="btn btn-sm btn-danger" onclick="deleteUser(\\'' + u.id + '\\', \\'' + esc(u.name).replace(/'/g, "\\\\'") + '\\')">Del</button>' +
-    ' <button class="btn btn-sm" onclick="loadAuditFor(\\'' + u.id + '\\')">Audit</button>' +
-    ' <button class="btn btn-sm" onclick="loadKeysFor(\\'' + u.id + '\\')">Keys</button></td>' +
+    '<td><button class="btn btn-sm" onclick="checkStripe(\\'' + idAttr(u.id) + '\\')">Stripe</button>' +
+    ' <button class="btn btn-sm btn-danger" onclick="deleteUser(\\'' + idAttr(u.id) + '\\')">Del</button>' +
+    ' <button class="btn btn-sm" onclick="loadAuditFor(\\'' + idAttr(u.id) + '\\')">Audit</button>' +
+    ' <button class="btn btn-sm" onclick="loadKeysFor(\\'' + idAttr(u.id) + '\\')">Keys</button></td>' +
     '</tr>'
   ).join('') || '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:1rem">No users</td></tr>';
 
@@ -406,7 +423,9 @@ async function changeTier(userId, tier) {
   status('Tier updated to ' + tier);
 }
 
-async function deleteUser(userId, name) {
+async function deleteUser(userId) {
+  const u = USERS.get(userId);
+  const name = u && u.name ? u.name : userId;
   if (!confirm('Delete user "' + name + '"? This is a soft delete.')) return;
   await api('/users/' + userId, { method: 'DELETE' });
   status('User deleted');
@@ -443,6 +462,8 @@ async function loadKeys() {
   const orgId = document.getElementById('keys-org-input').value.trim();
   if (!orgId) return;
   const data = await api('/users/' + orgId + '/keys');
+  KEYS.clear();
+  for (const k of data.keys || []) KEYS.set(k.id, k);
   document.getElementById('keys-wrap').style.display = 'block';
   document.getElementById('keys-body').innerHTML = (data.keys || []).map(k =>
     '<tr><td><code>' + esc(k.prefix || '') + '…</code></td>' +
@@ -452,11 +473,13 @@ async function loadKeys() {
     '<td>' + (k.last_used_at ? shortTime(k.last_used_at) : '<span style="color:var(--muted)">never</span>') + '</td>' +
     '<td>' + shortTime(k.created_at) + '</td>' +
     '<td>' + (k.revoked_at ? '<span style="color:var(--muted)">revoked ' + shortTime(k.revoked_at) + '</span>' : '<span style="color:var(--green)">active</span>') + '</td>' +
-    '<td>' + (k.revoked_at ? '' : '<button class="btn btn-sm btn-danger" onclick="revokeKey(\\'' + orgId + '\\', \\'' + k.id + '\\', \\'' + esc(k.prefix || '') + '\\')">Revoke</button>') + '</td></tr>'
+    '<td>' + (k.revoked_at ? '' : '<button class="btn btn-sm btn-danger" onclick="revokeKey(\\'' + idAttr(orgId) + '\\', \\'' + idAttr(k.id) + '\\')">Revoke</button>') + '</td></tr>'
   ).join('') || '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:1rem">No keys</td></tr>';
 }
 
-async function revokeKey(orgId, keyId, prefix) {
+async function revokeKey(orgId, keyId) {
+  const k = KEYS.get(keyId);
+  const prefix = k && k.prefix ? k.prefix : keyId;
   if (!confirm('Revoke key ' + prefix + '…? Anything still using it stops authenticating immediately.')) return;
   await api('/users/' + orgId + '/keys/' + keyId, { method: 'DELETE' });
   status('Key revoked');
@@ -473,8 +496,8 @@ async function checkStripe(userId) {
 
     if (data.mismatch) {
       html += '<div style="background:rgba(239,68,68,.15);border:1px solid var(--red);border-radius:6px;padding:.75rem;margin-bottom:1rem">';
-      html += '<strong style="color:var(--red)">MISMATCH:</strong> DB says <strong>' + data.db.tier + '</strong> but Stripe says <strong>' + data.expected_tier + '</strong>';
-      html += '<br><button class="btn btn-primary btn-sm" style="margin-top:.5rem" onclick="syncStripe(\\'' + userId + '\\')">Sync from Stripe</button>';
+      html += '<strong style="color:var(--red)">MISMATCH:</strong> DB says <strong>' + esc(data.db.tier) + '</strong> but Stripe says <strong>' + esc(data.expected_tier) + '</strong>';
+      html += '<br><button class="btn btn-primary btn-sm" style="margin-top:.5rem" onclick="syncStripe(\\'' + idAttr(userId) + '\\')">Sync from Stripe</button>';
       html += '</div>';
     }
 
@@ -492,8 +515,8 @@ async function checkStripe(userId) {
       for (const sub of data.stripe.subscriptions) {
         const statusColor = sub.status === 'active' ? 'var(--green)' : sub.status === 'trialing' ? 'var(--accent)' : sub.status === 'canceled' ? 'var(--red)' : 'var(--muted)';
         html += '<div style="border:1px solid var(--border);border-radius:6px;padding:.75rem;margin-bottom:.5rem;font-size:.8rem">';
-        html += '<div><strong style="color:' + statusColor + '">' + sub.status.toUpperCase() + '</strong> <span style="color:var(--muted);font-family:monospace">' + sub.id + '</span></div>';
-        html += '<div style="margin-top:.3rem">Price: <code>' + esc(sub.price_id) + '</code> x' + sub.quantity + '</div>';
+        html += '<div><strong style="color:' + statusColor + '">' + esc(String(sub.status || '').toUpperCase()) + '</strong> <span style="color:var(--muted);font-family:monospace">' + esc(sub.id) + '</span></div>';
+        html += '<div style="margin-top:.3rem">Price: <code>' + esc(sub.price_id) + '</code> x' + esc(sub.quantity) + '</div>';
         html += '<div>Created: ' + shortTime(sub.created) + '</div>';
         if (sub.trial_start) html += '<div>Trial: ' + shortTime(sub.trial_start) + ' - ' + shortTime(sub.trial_end) + '</div>';
         if (sub.metadata && Object.keys(sub.metadata).length) html += '<div>Metadata: ' + esc(JSON.stringify(sub.metadata)) + '</div>';

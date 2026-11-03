@@ -5,6 +5,7 @@ import { HTTPException } from "hono/http-exception";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { authMiddleware, timingSafeEqual } from "./middleware/auth.js";
 import { rateLimitMiddleware } from "./middleware/rate-limit.js";
+import { securityHeaders } from "./middleware/security-headers.js";
 import { createMcpServer } from "./mcp/server.js";
 import { keys } from "./routes/keys.js";
 import { seats } from "./routes/seats.js";
@@ -54,6 +55,11 @@ type HonoEnv = {
 };
 
 const app = new Hono<HonoEnv>();
+
+// Response hardening on every route (engram#459) — the policy is documented
+// on the middleware. Registered first so it wraps everything below it,
+// including the responses onError and bodyLimit produce.
+app.use("*", securityHeaders);
 
 // Global request body cap. The append schemas bound per-message content, but
 // this is the transport-level backstop against a multi-megabyte payload
@@ -146,9 +152,15 @@ app.post("/mcp", authMiddleware, rateLimitMiddleware, meterApiRequest, async (c)
     await server.connect(transport);
     return await transport.handleRequest(c.req.raw);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[mcp] transport error: ${msg}`);
-    return c.json({ error: "mcp_error", message: msg }, 500);
+    // Hand the failure to app.onError so the transport path gets exactly the
+    // policy every other route has: transient D1 pressure becomes a 503 with
+    // Retry-After, anything else is logged server-side and answered with a
+    // generic body. This catch used to echo err.message to the caller — a
+    // D1 fragment or an SDK internal, verbatim — which the global handler
+    // was written specifically never to do (engram#458). A non-Error throw
+    // is wrapped so Hono routes it to onError instead of letting the isolate
+    // surface scriptThrewException.
+    throw err instanceof Error ? err : new Error(String(err));
   }
 });
 

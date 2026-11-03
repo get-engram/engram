@@ -1,8 +1,8 @@
 import { Hono } from "hono";
 import { generateId, generateApiKeyRaw, hashApiKey, TIER_LIMITS } from "@getengram/shared";
-import { insertApiKey, getApiKeysByOrg, getApiKeyCount, revokeApiKey } from "@getengram/db";
+import { insertApiKey, getApiKeysByOrg, getApiKeyById, getApiKeyCount, revokeApiKey } from "@getengram/db";
 import { ALL_SCOPES, hasScope, mintableScopes } from "../mcp/scopes.js";
-import { isExternalOAuthClient } from "../mcp/auth-kind.js";
+import { isExternalOAuthClient, isSeatMember } from "../mcp/auth-kind.js";
 import { audit } from "../services/audit.js";
 import type { Env, AuthContext } from "../types.js";
 
@@ -10,10 +10,14 @@ type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
 
 const keys = new Hono<HonoEnv>();
 
-// List API keys (prefix only, never full key)
+// List API keys (prefix only, never full key). A Team member sees only the
+// keys bound to their own seat (engram#441) — the owner's and other members'
+// credentials are not theirs to enumerate.
 keys.get("/", async (c) => {
   const auth = c.get("auth");
-  const result = await getApiKeysByOrg(c.env.DB, auth.organizationId);
+  const result = await getApiKeysByOrg(c.env.DB, auth.organizationId, {
+    seatId: isSeatMember(auth) ? auth.seatId : null,
+  });
   return c.json({ keys: result.results });
 });
 
@@ -68,11 +72,16 @@ keys.post("/", async (c) => {
   const keyHash = await hashApiKey(raw);
   const name = body.name || "default";
 
-  await insertApiKey(c.env.DB, id, auth.organizationId, keyHash, prefix, name, scopes.join(","));
+  // A key inherits the minter's seat (engram#441). Before this, a Team
+  // member's seat key minted a NULL-seat key — which authenticates as the
+  // organization owner — so any member could escalate to owner in one call.
+  const seatId = isSeatMember(auth) ? auth.seatId : null;
+  await insertApiKey(c.env.DB, id, auth.organizationId, keyHash, prefix, name, scopes.join(","), seatId);
   await audit(c.env.DB, auth.organizationId, auth.apiKeyId, "key.create", "api_key", id, {
     name,
     scopes,
     prefix,
+    seat_id: seatId,
   });
 
   // Return the raw key ONCE — it can never be retrieved again
@@ -95,6 +104,19 @@ keys.delete("/:id", async (c) => {
   // Don't allow revoking the key being used for this request
   if (keyId === auth.apiKeyId) {
     return c.json({ error: "Cannot revoke the API key currently in use" }, 400);
+  }
+
+  // A Team member may revoke only keys bound to their own seat (engram#441).
+  // Unknown ids get the same 403 as someone else's key, so a member cannot
+  // probe which key ids exist in the org.
+  if (isSeatMember(auth)) {
+    const row = await getApiKeyById(c.env.DB, keyId, auth.organizationId);
+    if (!row || row.seat_id !== auth.seatId) {
+      return c.json(
+        { error: "forbidden", message: "Only the organization owner can revoke other members' keys." },
+        403,
+      );
+    }
   }
 
   await revokeApiKey(c.env.DB, keyId, auth.organizationId);

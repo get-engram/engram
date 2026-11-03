@@ -1,5 +1,13 @@
 import { Hono } from "hono";
-import { getAuditLogs, revokeApiKeysByOrg, clearOAuthTokensByOrg, reconcileOrgCounters } from "@getengram/db";
+import {
+  getAuditLogs,
+  revokeApiKeysByOrg,
+  clearOAuthTokensByOrg,
+  reconcileOrgCounters,
+  listApiKeysForAdmin,
+  getApiKeyById,
+  revokeApiKey,
+} from "@getengram/db";
 import { compressContent, ENCODING_GZIP } from "../utils/compress.js";
 import { audit } from "../services/audit.js";
 import { purgeDeletedOrganizations } from "../cron/purge-deleted.js";
@@ -398,6 +406,39 @@ admin.delete("/users/:id", async (c) => {
   await clearOAuthTokensByOrg(c.env.DB, id);
   await audit(c.env.DB, id, "admin", "admin.user.delete");
   return c.json({ deleted: true, id, credentials_revoked: true });
+});
+
+// ---------------------------------------------------------------------------
+// GET /admin/users/:id/keys — an org's API keys for support (engram#506).
+// Prefix, name, seat, usage and revoked state only — the hash never leaves
+// the row, and the raw key was never stored.
+// ---------------------------------------------------------------------------
+admin.get("/users/:id/keys", async (c) => {
+  const id = c.req.param("id");
+  const result = await listApiKeysForAdmin(c.env.DB, id);
+  return c.json({ keys: result.results, count: result.results.length });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /admin/users/:id/keys/:keyId — revoke ONE key (engram#506).
+// The proportionate answer to "I leaked a key and can't revoke it": before
+// this the only operator lever was DELETE /users/:id, which soft-deletes the
+// whole org. Org-scoped lookup first, so a key id from some other org 404s
+// instead of being revoked under the wrong audit trail.
+// ---------------------------------------------------------------------------
+admin.delete("/users/:id/keys/:keyId", async (c) => {
+  const id = c.req.param("id");
+  const keyId = c.req.param("keyId");
+  const row = await getApiKeyById(c.env.DB, keyId, id);
+  if (!row) return c.json({ error: "not_found", message: "No such key in this organization." }, 404);
+  if (row.revoked_at) {
+    return c.json({ revoked: true, id: keyId, already_revoked: true, revoked_at: row.revoked_at });
+  }
+  await revokeApiKey(c.env.DB, keyId, id);
+  await audit(c.env.DB, id, "admin", "admin.key.revoke", "api_key", keyId, {
+    seat_id: row.seat_id,
+  });
+  return c.json({ revoked: true, id: keyId, already_revoked: false });
 });
 
 // ---------------------------------------------------------------------------

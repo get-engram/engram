@@ -14,7 +14,7 @@ import type { Env, AuthContext } from "../types.js";
 /** Constant-time string compare, so the admin-secret check doesn't leak the
  *  secret's length or a matching prefix through response-timing. Compares a
  *  fixed number of bytes regardless of where (or whether) they differ. */
-function timingSafeEqual(a: string, b: string): boolean {
+export function timingSafeEqual(a: string, b: string): boolean {
   const enc = new TextEncoder();
   const ab = enc.encode(a);
   const bb = enc.encode(b);

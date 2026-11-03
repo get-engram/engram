@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { getPrivacySettings, updatePrivacySettings } from "@getengram/db";
 import { audit } from "../services/audit.js";
+import { denyUnlessFirstPartyWrite, denyUnlessOwner } from "./guards.js";
 import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
@@ -21,6 +22,17 @@ privacy.get("/", async (c) => {
 
 // PATCH /api/privacy — update either/both toggles. Omitted fields are left as-is.
 privacy.patch("/", async (c) => {
+  // The privacy policy governs what every assistant connected to the org can
+  // read. It is the owner's call, made from a first-party surface (engram#441):
+  // not a Team member's, and never a connector's — a connector relaxing the
+  // policy that restricts it would be the fox editing the henhouse rules.
+  const denied =
+    denyUnlessFirstPartyWrite(
+      c,
+      "Privacy settings are managed from the Engram dashboard or CLI, not from a connected app.",
+    ) ?? denyUnlessOwner(c, "Only the organization owner can change privacy settings.");
+  if (denied) return denied;
+
   const auth = c.get("auth");
   const orgId = auth.organizationId;
   const body = await c.req

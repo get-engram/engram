@@ -56,7 +56,10 @@ export type AuditAction =
   | "admin.user.delete"
   | "admin.user.tier_change"
   | "admin.user.retention_change"
-  | "admin.user.grant_pro";
+  | "admin.user.grant_pro"
+  // Per-key revoke by support (engram#506) — the proportionate response to
+  // "I leaked one key", instead of soft-deleting the whole org.
+  | "admin.key.revoke";
 
 /**
  * Audit log entry. Never throws — audit logging should not break the

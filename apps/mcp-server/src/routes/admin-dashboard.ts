@@ -196,6 +196,20 @@ export const dashboardHtml = `<!DOCTYPE html>
       </table>
     </div>
   </div>
+
+  <div class="section">
+    <div class="section-header"><h2>API Keys</h2></div>
+    <div class="audit-input">
+      <input type="text" id="keys-org-input" placeholder="Organization ID">
+      <button class="btn" onclick="loadKeys()">Load</button>
+    </div>
+    <div class="table-wrap" id="keys-wrap" style="display:none">
+      <table>
+        <thead><tr><th>Prefix</th><th>Name</th><th>Scopes</th><th>Seat</th><th>Last used</th><th>Created</th><th>State</th><th></th></tr></thead>
+        <tbody id="keys-body"></tbody>
+      </table>
+    </div>
+  </div>
 </div>
 
 <div id="status-bar" class="status-bar" style="opacity:0"></div>
@@ -348,7 +362,8 @@ async function loadUsers() {
     '<td>' + u.total_messages + '</td>' +
     '<td><button class="btn btn-sm" onclick="checkStripe(\\'' + u.id + '\\')">Stripe</button>' +
     ' <button class="btn btn-sm btn-danger" onclick="deleteUser(\\'' + u.id + '\\', \\'' + esc(u.name).replace(/'/g, "\\\\'") + '\\')">Del</button>' +
-    ' <button class="btn btn-sm" onclick="loadAuditFor(\\'' + u.id + '\\')">Audit</button></td>' +
+    ' <button class="btn btn-sm" onclick="loadAuditFor(\\'' + u.id + '\\')">Audit</button>' +
+    ' <button class="btn btn-sm" onclick="loadKeysFor(\\'' + u.id + '\\')">Keys</button></td>' +
     '</tr>'
   ).join('') || '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:1rem">No users</td></tr>';
 
@@ -415,6 +430,37 @@ async function loadAudit() {
     esc(typeof l.details === 'string' ? l.details : JSON.stringify(l.details)) +
     '</td><td>' + shortTime(l.created_at) + '</td></tr>'
   ).join('') || '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:1rem">No audit logs</td></tr>';
+}
+
+// ---- API keys (engram#506) ----
+async function loadKeysFor(orgId) {
+  document.getElementById('keys-org-input').value = orgId;
+  await loadKeys();
+  document.getElementById('keys-wrap').scrollIntoView({ behavior: 'smooth' });
+}
+
+async function loadKeys() {
+  const orgId = document.getElementById('keys-org-input').value.trim();
+  if (!orgId) return;
+  const data = await api('/users/' + orgId + '/keys');
+  document.getElementById('keys-wrap').style.display = 'block';
+  document.getElementById('keys-body').innerHTML = (data.keys || []).map(k =>
+    '<tr><td><code>' + esc(k.prefix || '') + '…</code></td>' +
+    '<td>' + esc(k.name || '') + '</td>' +
+    '<td>' + esc(k.scopes || '') + '</td>' +
+    '<td>' + (k.seat_id ? esc(k.seat_id) : '<span style="color:var(--muted)">owner</span>') + '</td>' +
+    '<td>' + (k.last_used_at ? shortTime(k.last_used_at) : '<span style="color:var(--muted)">never</span>') + '</td>' +
+    '<td>' + shortTime(k.created_at) + '</td>' +
+    '<td>' + (k.revoked_at ? '<span style="color:var(--muted)">revoked ' + shortTime(k.revoked_at) + '</span>' : '<span style="color:var(--green)">active</span>') + '</td>' +
+    '<td>' + (k.revoked_at ? '' : '<button class="btn btn-sm btn-danger" onclick="revokeKey(\\'' + orgId + '\\', \\'' + k.id + '\\', \\'' + esc(k.prefix || '') + '\\')">Revoke</button>') + '</td></tr>'
+  ).join('') || '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:1rem">No keys</td></tr>';
+}
+
+async function revokeKey(orgId, keyId, prefix) {
+  if (!confirm('Revoke key ' + prefix + '…? Anything still using it stops authenticating immediately.')) return;
+  await api('/users/' + orgId + '/keys/' + keyId, { method: 'DELETE' });
+  status('Key revoked');
+  loadKeys();
 }
 
 // ---- Stripe Check ----

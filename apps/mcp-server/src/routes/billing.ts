@@ -14,9 +14,12 @@ import {
 
   resolvePlanPrice,
 } from "../services/stripe.js";
+import { denyUnlessOwner } from "./guards.js";
 import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
+
+const BILLING_OWNER_ONLY = "Only the organization owner can manage billing.";
 
 /**
  * Stamp churned_at when a PAYING org loses its subscription (migration
@@ -102,6 +105,12 @@ async function academicallyVerified(db: D1Database, orgId: string): Promise<bool
 //   success_url — override redirect on success
 //   cancel_url  — override redirect on cancel
 billing.post("/checkout", async (c) => {
+  // Checkout changes what the org is charged — owner only (engram#441). A
+  // Team member reaching this would have been able to put the owner's card
+  // through a plan change.
+  const denied = denyUnlessOwner(c, BILLING_OWNER_ONLY);
+  if (denied) return denied;
+
   const auth = c.get("auth");
   const body = await c.req
     .json<{
@@ -230,6 +239,11 @@ billing.post("/checkout", async (c) => {
 // POST /api/billing/portal
 // Authed. Creates a Billing Portal session and returns its URL.
 billing.post("/portal", async (c) => {
+  // The Stripe portal exposes the payment method, invoices, and cancel —
+  // owner only (engram#441).
+  const denied = denyUnlessOwner(c, BILLING_OWNER_ONLY);
+  if (denied) return denied;
+
   const auth = c.get("auth");
   const body = await c.req
     .json<{ return_url?: string }>()

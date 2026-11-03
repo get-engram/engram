@@ -11,6 +11,7 @@ import {
 } from "../../services/stripe.js";
 import { setOrganizationStripeCustomer } from "@getengram/db";
 import { audit } from "../../services/audit.js";
+import { isSeatMember } from "../auth-kind.js";
 import type { Env, AuthContext } from "../../types.js";
 
 /** Active academic verification — grants the Education price on Team seats. */
@@ -89,6 +90,22 @@ export function registerManageSubscription(
               upgrade_available: auth.tier === "free" || auth.tier === "pro",
             }),
           }],
+        };
+      }
+
+      // Billing changes are the owner's alone (engram#441). "status" stays
+      // open — a member seeing the plan's limits is not a billing act — but
+      // the portal (payment method, invoices, cancel) and checkout are.
+      if (isSeatMember(auth)) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: "forbidden",
+              message: "Only the organization owner can manage billing.",
+            }),
+          }],
+          isError: true,
         };
       }
 

@@ -1,8 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { readdirSync, readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join, resolve } from "node:path";
 import { Miniflare } from "miniflare";
+import { applyMigration } from "./miniflare.js";
 import {
   getOrCreateUsage,
   getUsage,
@@ -22,24 +20,6 @@ import {
  * table — 0003 itself drags in seats/webhooks/organizations ALTERs the
  * budgets do not need).
  */
-
-const MIGRATIONS_DIR = resolve(
-  dirname(fileURLToPath(import.meta.url)),
-  "../../../../packages/db/migrations",
-);
-
-/** D1's exec() splits on newlines, so apply the file one statement at a time. */
-async function applyMigration(db: D1Database, suffix: string): Promise<void> {
-  const file = readdirSync(MIGRATIONS_DIR).find((f) => f.endsWith(suffix));
-  if (!file) throw new Error(`no migration ending in ${suffix}`);
-  const sql = readFileSync(join(MIGRATIONS_DIR, file), "utf8")
-    .split("\n")
-    .filter((line) => !line.trim().startsWith("--"))
-    .join("\n");
-  for (const stmt of sql.split(";").map((s) => s.trim()).filter(Boolean)) {
-    await db.prepare(stmt).run();
-  }
-}
 
 // 0003's usage table, verbatim (the rest of 0003 is unrelated to this test).
 const USAGE_TABLE_0003 = `CREATE TABLE IF NOT EXISTS usage (

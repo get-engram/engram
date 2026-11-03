@@ -5,7 +5,6 @@ import {
   getOrganizationByStripeCustomer,
   markStripeWebhookEventProcessed,
   releaseStripeWebhookEvent,
-  setOrganizationStripeCustomer,
   setOrganizationTier,
 } from "@getengram/db";
 import {
@@ -17,7 +16,7 @@ import {
 
   resolvePlanPrice,
 } from "../services/stripe.js";
-import { resolveCachedCustomer } from "../services/stripe-customer.js";
+import { bindStripeCustomer, resolveCachedCustomer } from "../services/stripe-customer.js";
 import { denyUnlessOwner } from "./guards.js";
 import type { Env, AuthContext } from "../types.js";
 
@@ -187,7 +186,19 @@ billing.post("/checkout", async (c) => {
       org.id,
     );
     customerId = customer.id;
-    await setOrganizationStripeCustomer(c.env.DB, org.id, customerId);
+    // Refused when another org already holds this customer (engram#536):
+    // never create a checkout session against a customer that is not
+    // provably this org's alone.
+    if ((await bindStripeCustomer(c.env.DB, org.id, customerId)) === "conflict") {
+      return c.json(
+        {
+          error: "stripe_customer_conflict",
+          message:
+            "This billing identity is already attached to another organization. Contact support.",
+        },
+        409,
+      );
+    }
   }
 
   // One subscription per customer. If they already have any active or
@@ -412,7 +423,9 @@ async function applyStripeEvent(env: Env, event: StripeEvent): Promise<void> {
       const orgId = await resolveOrgIdFromEvent(env, obj);
       const customer = obj.customer as string | undefined;
       if (orgId && customer) {
-        await setOrganizationStripeCustomer(env.DB, orgId, customer);
+        // A refused bind (engram#536) is logged by the binder; the event
+        // still completes — a 500 here would only make Stripe retry it.
+        await bindStripeCustomer(env.DB, orgId, customer);
       }
       break;
     }

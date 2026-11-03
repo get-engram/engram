@@ -1,14 +1,16 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from "vitest";
 import { Hono } from "hono";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { billing, billingWebhook } from "../routes/billing.js";
 import { registerManageSubscription } from "../mcp/tools/manage-subscription.js";
 import {
+  createCheckoutSession,
   createOrGetCustomer,
   createPortalSession,
   getCustomer,
   type StripeCustomer,
 } from "../services/stripe.js";
+import { bindStripeCustomer } from "../services/stripe-customer.js";
 import { insertOrganizationWithEmail } from "@getengram/db";
 import { createMockD1, createMockEnv } from "./helpers.js";
 import type { Env, AuthContext } from "../types.js";
@@ -1051,5 +1053,146 @@ describe("cached Stripe customer ownership (engram#443)", () => {
     expect(unlinks(log)).toHaveLength(1);
     expect(createOrGetCustomer).toHaveBeenCalledWith(TEST_STRIPE_SECRET, "test@example.com", "org_test");
     expect(relinks(log).map((s) => s.args)).toEqual([["cus_test_123", "org_test"]]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: one organization per Stripe customer (engram#536)
+// ---------------------------------------------------------------------------
+
+const UNIQUE_VIOLATION =
+  "D1_ERROR: UNIQUE constraint failed: organizations.stripe_customer_id: SQLITE_CONSTRAINT";
+
+/**
+ * The mock D1 cannot refuse a write, so migration 0045's partial unique
+ * index is stood in for: the cache write of a customer id is rejected the
+ * way D1 rejects it. The index itself, and that the binder reads the real
+ * error, are proven in stripe-customer-unique.d1.test.ts.
+ */
+function refuseCustomerBind(db: D1Database) {
+  const target = db as unknown as { prepare: (sql: string) => D1PreparedStatement };
+  const prepare = target.prepare.bind(target);
+  target.prepare = (sql: string) => {
+    if (!/UPDATE organizations SET stripe_customer_id = \?/.test(sql)) return prepare(sql);
+    const refusing: { bind: (...args: unknown[]) => unknown; run: () => Promise<never> } = {
+      bind: () => refusing,
+      run: async () => {
+        throw new Error(UNIQUE_VIOLATION);
+      },
+    };
+    return refusing as unknown as D1PreparedStatement;
+  };
+}
+
+describe("one organization per Stripe customer (engram#536)", () => {
+  const auth: AuthContext = {
+    organizationId: "org_test",
+    apiKeyId: "key_test",
+    tier: "free",
+    scopes: ["read", "write", "search", "delete"],
+    seatId: null,
+  };
+  let db: D1Database;
+  let env: Env;
+  let errors: MockInstance<typeof console.error>;
+
+  beforeEach(async () => {
+    db = createMockD1();
+    env = createBillingEnv(db);
+    // No cached customer, so checkout must create one and cache it.
+    await insertOrganizationWithEmail(db, "org_test", "Test Org", "test@example.com");
+    refuseCustomerBind(db);
+    vi.mocked(createOrGetCustomer).mockClear();
+    vi.mocked(createCheckoutSession).mockClear();
+    // The raw subscription lookups in checkout/upgrade must not reach the network.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ data: [] }) })),
+    );
+    errors = vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    errors.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  const refusals = () =>
+    errors.mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes("already bound to another organization"));
+
+  it("checkout: a customer another organization holds is refused with 409 and no session is created", async () => {
+    const res = await createAuthedApp(env, auth).request(
+      "/api/billing/checkout",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ plan: "pro" }),
+      },
+      env,
+    );
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: "stripe_customer_conflict" });
+    expect(createOrGetCustomer).toHaveBeenCalledTimes(1);
+    expect(createCheckoutSession).not.toHaveBeenCalled();
+    expect(refusals()).toHaveLength(1);
+    expect(refusals()[0]).toContain("cus_test_123");
+    expect(refusals()[0]).toContain("org_test");
+  });
+
+  it("manage_subscription upgrade: the same refusal, as a tool error", async () => {
+    type Handler = (
+      params: Record<string, unknown>,
+    ) => Promise<{ isError?: boolean; content: Array<{ text: string }> }>;
+    let handler: Handler | undefined;
+    const server = {
+      tool: (...args: unknown[]) => {
+        handler = args[args.length - 1] as Handler;
+      },
+    } as unknown as McpServer;
+    registerManageSubscription(server, env, auth);
+    if (!handler) throw new Error("tool not registered");
+
+    const res = await handler({ action: "upgrade", plan: "pro" });
+    expect(res.isError).toBe(true);
+    expect(JSON.parse(res.content[0].text)).toMatchObject({ error: "stripe_customer_conflict" });
+    expect(createCheckoutSession).not.toHaveBeenCalled();
+    expect(refusals()).toHaveLength(1);
+  });
+
+  it("webhook checkout.session.completed: a refused cache write is logged and the event still completes", async () => {
+    const res = await sendWebhookEvent(createWebhookApp(), env, {
+      id: "evt_checkout_conflict",
+      type: "checkout.session.completed",
+      data: {
+        object: { customer: "cus_taken", metadata: { organization_id: "org_test" } },
+      },
+    });
+    expect(res.status).toBe(200);
+    expect(refusals()).toHaveLength(1);
+    expect(refusals()[0]).toContain("cus_taken");
+  });
+
+  it("bindStripeCustomer: only this column's UNIQUE violation is a conflict; anything else propagates", async () => {
+    const failing = (message: string) => {
+      const stmt: { bind: (...args: unknown[]) => unknown; run: () => Promise<never> } = {
+        bind: () => stmt,
+        run: async () => {
+          throw new Error(message);
+        },
+      };
+      return { prepare: () => stmt } as unknown as D1Database;
+    };
+    expect(await bindStripeCustomer(failing(UNIQUE_VIOLATION), "org_x", "cus_x")).toBe("conflict");
+    await expect(
+      bindStripeCustomer(
+        failing("D1_ERROR: UNIQUE constraint failed: organizations.email: SQLITE_CONSTRAINT"),
+        "org_x",
+        "cus_x",
+      ),
+    ).rejects.toThrow(/organizations\.email/);
+    await expect(
+      bindStripeCustomer(failing("D1_ERROR: database is locked"), "org_x", "cus_x"),
+    ).rejects.toThrow(/locked/);
   });
 });

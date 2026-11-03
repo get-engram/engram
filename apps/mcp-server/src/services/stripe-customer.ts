@@ -1,4 +1,4 @@
-import { clearOrganizationStripeCustomer } from "@getengram/db";
+import { clearOrganizationStripeCustomer, setOrganizationStripeCustomer } from "@getengram/db";
 import { customerOwnership, getCustomer } from "./stripe.js";
 import type { Env } from "../types.js";
 
@@ -65,4 +65,39 @@ export async function resolveCachedCustomer(
     console.warn(`[stripe] org ${org.id}: customer ${cached} carries no organization_id stamp`);
   }
   return { ok: true, customerId: cached, ownership };
+}
+
+export type BindResult = "bound" | "conflict";
+
+/**
+ * Point the org row at `customerId`. The partial unique index on
+ * organizations(stripe_customer_id) (migration 0045, engram#536) is the
+ * D1-side backstop for #443: when another organization already holds this
+ * customer the write is refused and nothing changes, and the caller must
+ * stop rather than check out against it — a subscription event for a
+ * customer two orgs share would land on whichever org the customer lookup
+ * returns. Binding an org to the customer it already holds is a no-op
+ * success (the webhook re-caches defensively). Any other failure propagates.
+ */
+export async function bindStripeCustomer(
+  db: D1Database,
+  orgId: string,
+  customerId: string,
+): Promise<BindResult> {
+  try {
+    await setOrganizationStripeCustomer(db, orgId, customerId);
+    return "bound";
+  } catch (err) {
+    if (!isStripeCustomerUniqueViolation(err)) throw err;
+    console.error(
+      `[stripe] org ${orgId}: customer ${customerId} is already bound to another organization, refusing to cache it`,
+    );
+    return "conflict";
+  }
+}
+
+/** D1 surfaces SQLite's constraint failure by message; the column name pins it to our index. */
+function isStripeCustomerUniqueViolation(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /UNIQUE constraint failed: organizations\.stripe_customer_id/.test(message);
 }

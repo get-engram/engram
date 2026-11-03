@@ -112,11 +112,14 @@ See the [API reference](https://getengram.app/docs/api-reference) for full param
 
 ## Pricing
 
-| Plan | Price | Messages/month |
-|------|-------|----------------|
-| Free | $0 | 1,000 |
-| Pro | $9/mo | 100,000 |
-| Team | $27/seat/mo | 500,000 |
+Memory is permanent. The limits below are how many messages a plan can hold, not a monthly quota: nothing expires, and deleting conversations frees space.
+
+| Plan | Price | Memory |
+|------|-------|--------|
+| Free | $0 | 10,000 messages |
+| Pro | $9/mo | 1,000,000 messages |
+| Team | $9/seat/mo, minimum 2 seats | 1,000,000 messages per seat, pooled |
+| Education | $3/mo per student, $3/seat for academic teams | Pro or Team features with a verified university email |
 | Enterprise | Custom | Unlimited |
 
 [View pricing](https://getengram.app/pricing)

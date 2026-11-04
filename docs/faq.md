@@ -40,7 +40,7 @@ No. Every query is scoped by `organization_id`. The ID is determined by the API 
 
 ### Can I export my data?
 
-You can retrieve all conversations via `list_conversations` and `get_conversation` with pagination. Full export tooling is planned for a future release.
+Yes. `GET https://mcp.getengram.app/api/v1/export` with your API key returns every conversation and message as JSON, paged with `cursor` / `next_cursor` — see the [API reference](api-reference.md#export). The dashboard's export download produces the same data as a single file.
 
 ### Can I delete all my data?
 

@@ -338,6 +338,10 @@ app.route("/api/account", account);
 app.route("/api/privacy", privacy);
 app.route("/api/student", student);
 app.route("/api/export", dataExport);
+// Same export under the REST prefix the docs and the REST error table
+// describe (engram#544) — mounted before meterApiRequest on purpose: a
+// portability export is not API usage.
+app.route("/api/v1/export", dataExport);
 app.route("/api/oauth/connections", oauthConnections);
 app.route("/api/memories", memories);
 

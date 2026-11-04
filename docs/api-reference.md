@@ -425,6 +425,7 @@ Common errors:
 | `Conversation not found` | Invalid conversation_id or doesn't belong to your organization |
 | `401 Unauthorized` | Missing or invalid API key |
 | `403 Forbidden` | API key expired or revoked |
+| `403` with body `error code: 1010` | Cloudflare's Browser Integrity Check rejected the `User-Agent` (Python `urllib`'s default is blocked). Send any `User-Agent` header — see [Troubleshooting](troubleshooting.md#403-with-body-error-code-1010) |
 
 ---
 

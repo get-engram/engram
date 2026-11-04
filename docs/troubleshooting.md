@@ -18,6 +18,29 @@ Your API key exists but is expired or revoked.
 - Check if the key has an expiration date that has passed
 - Check if the key was revoked by an admin
 
+### 403 with body `error code: 1010`
+
+The request never reached Engram. Cloudflare's Browser Integrity Check in
+front of `mcp.getengram.app` rejected it because of its `User-Agent` header.
+You can tell it apart from an API 403 because the body is Cloudflare's plain
+text `error code: 1010` rather than JSON. Your key is fine.
+
+Python's `urllib` is the usual trigger: its default `User-Agent` is
+`Python-urllib/3.x`, which the check blocks. `requests`, `httpx`, Go's
+`net/http`, Node's `fetch` and `curl` pass with their defaults.
+
+- Send any `User-Agent` of your own, for example `my-agent/1.0`:
+
+```python
+req = urllib.request.Request(url, headers={
+    "Authorization": f"Bearer {key}",
+    "User-Agent": "my-agent/1.0",
+})
+```
+
+- The check is being switched off for the API hostname (engram#543); until
+  then the header is the workaround.
+
 ### "Conversation not found"
 
 The conversation ID doesn't exist or belongs to a different organization.

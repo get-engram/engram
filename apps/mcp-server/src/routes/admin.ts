@@ -10,6 +10,11 @@ import {
 } from "@getengram/db";
 import { compressContent, ENCODING_GZIP } from "../utils/compress.js";
 import { audit } from "../services/audit.js";
+import {
+  scanContentIntegrity,
+  SCAN_BATCH_DEFAULT,
+  SCAN_BATCH_MAX,
+} from "../services/content-integrity.js";
 import { purgeDeletedOrganizations } from "../cron/purge-deleted.js";
 import { pruneExpiredOAuthTokens } from "../cron/prune-oauth-tokens.js";
 import { enforceAuditRetention, AUDIT_RETENTION_DAYS } from "../cron/audit-retention.js";
@@ -1411,6 +1416,46 @@ admin.post("/backfill-content-to-r2", async (c) => {
     put_failed: outcomes.length - toSwap.length,
     next_after: maxRid,
     done: list.length === 0,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /admin/content-integrity?org=<org_id>[&conversation=<conv_id>]
+//      [&after=<msg_id>][&batch=500][&repair=1]
+//
+// Find R2-backed messages whose object is gone (engram#541) and, with
+// repair=1, rebuild them from the search index. Report-only by default.
+// Cursor-paged on message id — follow `hint` until `done`. The response
+// carries ids and counts only, never message text.
+// ---------------------------------------------------------------------------
+admin.post("/content-integrity", async (c) => {
+  const organizationId = c.req.query("org");
+  if (!organizationId) return c.json({ error: "org is required" }, 400);
+  const batchRaw = c.req.query("batch");
+  const batch = batchRaw === undefined ? SCAN_BATCH_DEFAULT : Number(batchRaw);
+  if (!Number.isInteger(batch) || batch < 1 || batch > SCAN_BATCH_MAX) {
+    return c.json({ error: `batch must be an integer between 1 and ${SCAN_BATCH_MAX}` }, 400);
+  }
+  const conversationId = c.req.query("conversation") || undefined;
+  const repairRaw = c.req.query("repair");
+  const repair = repairRaw === "1" || repairRaw === "true";
+
+  const result = await scanContentIntegrity(c.env, {
+    organizationId,
+    conversationId,
+    after: c.req.query("after") || null,
+    batch,
+    repair,
+  });
+
+  const next = new URLSearchParams({ org: organizationId });
+  if (conversationId) next.set("conversation", conversationId);
+  if (result.next_after) next.set("after", result.next_after);
+  next.set("batch", String(batch));
+  if (repair) next.set("repair", "1");
+  return c.json({
+    ...result,
+    ...(result.done ? {} : { hint: `POST /admin/content-integrity?${next.toString()}` }),
   });
 });
 

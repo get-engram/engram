@@ -49,32 +49,49 @@ export async function storeContent(
 
 /**
  * Load a message's verbatim content, transparently handling both R2-backed
- * (new) and inline (legacy) storage.
+ * (new) and inline (legacy) storage. Resolves to null — never a placeholder
+ * — when the row points at an R2 object that is not there, so callers that
+ * must tell "missing" from "text" (the integrity scan, engram#541) can.
  */
-export async function loadContent(
+export async function loadContentOrNull(
   env: Env,
   msg: { id: string; content: string; content_encoding: string | null },
-): Promise<string> {
+): Promise<string | null> {
   const enc = msg.content_encoding;
   if (enc && enc.startsWith("r2:")) {
     const obj = await env.CONTENT.get(r2Key(msg.id));
-    if (!obj) {
-      // A row marked r2:* should always have an object. This used to throw —
-      // but one orphaned row then made the ENTIRE conversation unreadable
-      // (get_conversation 500s) and, for connector users who can't call
-      // delete, un-fixable: a permanent brick (real case: an imported
-      // conversation, Sept 2026 support). Degrade to an explicit placeholder
-      // instead: the conversation stays readable, exportable, and deletable,
-      // and the log line keeps the inconsistency observable.
-      console.error(`[content-store] R2 object missing for message ${msg.id} — serving placeholder`);
-      return `[Message content unavailable: the stored copy of this message (${msg.id}) is missing. The rest of the conversation is unaffected.]`;
-    }
+    if (!obj) return null;
     const stored = await obj.text();
     const realEnc = enc.slice(3); // strip "r2:"
     return decompressContent(stored, realEnc === "raw" ? null : realEnc);
   }
   // Legacy inline content (or short raw content).
   return decompressContent(msg.content, enc);
+}
+
+/**
+ * Load a message's verbatim content for serving. A missing R2 object comes
+ * back as an explicit placeholder rather than an error.
+ */
+export async function loadContent(
+  env: Env,
+  msg: { id: string; content: string; content_encoding: string | null },
+): Promise<string> {
+  const text = await loadContentOrNull(env, msg);
+  if (text === null) {
+    // A row marked r2:* should always have an object. This used to throw —
+    // but one orphaned row then made the ENTIRE conversation unreadable
+    // (get_conversation 500s) and, for connector users who can't call
+    // delete, un-fixable: a permanent brick (real case: an imported
+    // conversation, Sept 2026 support). Degrade to an explicit placeholder
+    // instead: the conversation stays readable, exportable, and deletable,
+    // and the log line keeps the inconsistency observable. The admin
+    // content-integrity scan (engram#541) finds such rows and rebuilds the
+    // body from the search index where it can.
+    console.error(`[content-store] R2 object missing for message ${msg.id} — serving placeholder`);
+    return `[Message content unavailable: the stored copy of this message (${msg.id}) is missing. The rest of the conversation is unaffected.]`;
+  }
+  return text;
 }
 
 /**

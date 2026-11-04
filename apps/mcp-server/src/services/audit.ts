@@ -59,7 +59,11 @@ export type AuditAction =
   | "admin.user.grant_pro"
   // Per-key revoke by support (engram#506) — the proportionate response to
   // "I leaked one key", instead of soft-deleting the whole org.
-  | "admin.key.revoke";
+  | "admin.key.revoke"
+  // A message body rebuilt from the search index after its R2 object went
+  // missing (engram#541). Metadata records the source chunk id and the
+  // character count — never the text.
+  | "admin.message.restore";
 
 /**
  * Audit log entry. Never throws — audit logging should not break the

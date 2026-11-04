@@ -291,3 +291,5 @@ engram search "deploy" --json | jq '.results[] | {score, text: .chunkText[:80]}'
 ```bash
 engram conversations get conv_abc --json > conversation-backup.json
 ```
+
+For the whole account, use the paged [export endpoint](api-reference.md#export) with your API key, or the dashboard's export download.

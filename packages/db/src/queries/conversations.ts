@@ -131,6 +131,33 @@ export function listConversations(
 }
 
 /**
+ * Conversations in id order, starting after (or, when `inclusive`, at)
+ * `afterId` — keyset paging for the data export (engram#546). Ids are
+ * random, so the order is arbitrary but total and stable: a conversation
+ * created or deleted mid-export cannot shift the others the way an OFFSET
+ * would. `afterId` null starts from the beginning.
+ */
+export function listConversationsAfterId(
+  db: D1Database,
+  organizationId: string,
+  afterId: string | null,
+  limit: number,
+  opts: ConversationFilter & { inclusive?: boolean } = {}
+) {
+  const where = conversationFilter(organizationId, opts);
+  let sql = where.sql;
+  const params = [...where.params];
+  if (afterId !== null) {
+    sql += opts.inclusive ? " AND id >= ?" : " AND id > ?";
+    params.push(afterId);
+  }
+  return db
+    .prepare(`SELECT * FROM conversations${sql} ORDER BY id ASC LIMIT ?`)
+    .bind(...params, limit)
+    .all();
+}
+
+/**
  * How many conversations the same filters match — the `total` of a list
  * response. A page holds at most `limit` rows; `total` is how many rows the
  * caller can page through with `offset`.

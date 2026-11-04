@@ -247,6 +247,24 @@ export function createMockD1(): D1Database {
           );
         }
 
+        // Keyset paging on id (`AND id > ?` / `AND id >= ?`), resolved by
+        // placeholder ordinal — the export walks conversations this way
+        // (engram#546).
+        const keyset = sql.match(/\bid (>=?) \?/);
+        if (keyset) {
+          const before = sql.slice(0, keyset.index);
+          const ordinal = (before.match(/\?/g) ?? []).length;
+          const bound = bindings[ordinal] as string;
+          const inclusive = keyset[1] === ">=";
+          results = results.filter((r) =>
+            inclusive ? String(r.id) >= bound : String(r.id) > bound
+          );
+        }
+
+        if (/ORDER BY id ASC/i.test(sql)) {
+          results = [...results].sort((a, b) => String(a.id).localeCompare(String(b.id)));
+        }
+
         // LIMIT ? OFFSET ? — bound as the last two parameters by every
         // paging query (list conversations, messages, audit log). Honouring
         // them lets tests tell a page apart from the whole table (engram#540).
@@ -256,6 +274,9 @@ export function createMockD1(): D1Database {
           if (Number.isFinite(limit) && Number.isFinite(offset)) {
             results = results.slice(offset, offset + limit);
           }
+        } else if (/LIMIT \?\s*$/i.test(sql) && bindings.length >= 1) {
+          const limit = Number(bindings[bindings.length - 1]);
+          if (Number.isFinite(limit)) results = results.slice(0, limit);
         }
 
         return { results, success: true, meta: {} };

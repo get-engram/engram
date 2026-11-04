@@ -445,6 +445,7 @@ All requests require the same `Authorization: Bearer engram_sk_live_...` header.
 | `PATCH /api/v1/conversations/:id/messages/:messageId` | — (REST only) | Update a message's content. Body: `{ content }` → `200 { updated, message }`. The edit runs the same redaction pipeline as append, and the affected slice of the search index is rebuilt so recall matches the stored text. **The superseded body is kept** — see the revisions endpoint below. Requires the `write` scope. |
 | `GET /api/v1/conversations/:id/messages/:messageId/revisions` | — (REST only) | Full edit history for one message → `200 { message_id, conversation_id, current, revisions[], total }`, oldest revision first. Every body a message has ever had is retained; nothing is pruned. Honours the org's "share full message bodies" privacy setting — with it off, revision metadata is returned without text. Requires the `read` scope. |
 | `GET /api/v1/search` | `search` | Hybrid search. Query: `q` (required), `limit`, `conversation_id`, `tags`, `project` |
+| `GET /api/v1/export` | — (REST only) | Everything the key can see as JSON, one page per request (GDPR Art. 20 portability). Query: `limit` (messages per page, 1–400, default 400), `cursor` (the previous page's `next_cursor`). Not metered as API usage. See [Export](#export) |
 
 ### Example
 
@@ -461,3 +462,56 @@ curl "https://mcp.getengram.app/api/v1/search?q=billing+database+choice" \
 ```
 
 REST error responses use conventional status codes: `400` invalid body/query, `401` bad key, `403` missing scope, `402` storage or plan limit, `404` not found, `429` a monthly budget (`message_limit_exceeded`, `indexing_quota_exceeded`, `search_quota_exceeded` — see [limits](limits.md#monthly-cost-budgets)) or the per-minute rate limit.
+
+### Export
+
+`GET /api/v1/export` returns everything the key can see — every conversation with its tags, metadata and verbatim messages — as JSON, one page per request. `GET /api/export` is the same endpoint at its original path. It is owner tooling: a connected OAuth app gets `403`, and a Team seat key exports only the conversations that seat can see.
+
+| Query | Meaning |
+|-------|---------|
+| `limit` | Messages per page, 1–400. Default 400 |
+| `cursor` | Where to continue: the `next_cursor` of the previous page, passed back as-is. Omit it for the first page |
+
+```json
+{
+  "export_version": "1.1",
+  "exported_at": "2026-11-03T20:00:00.000Z",
+  "organization": { "id": "org_...", "name": "...", "email": "...", "tier": "pro", "created_at": "..." },
+  "total_conversations": 648,
+  "page": { "cursor": null, "limit": 400 },
+  "next_cursor": "conv_abc:400",
+  "conversations": [
+    {
+      "id": "conv_abc",
+      "title": "...",
+      "agent_id": "claude-code",
+      "tags": [],
+      "metadata": {},
+      "message_count": 1200,
+      "created_at": "...",
+      "updated_at": "...",
+      "message_offset": 0,
+      "messages": [
+        { "role": "user", "content": "...", "sequence": 1, "created_at": "..." }
+      ]
+    }
+  ]
+}
+```
+
+Keep requesting with `cursor=<next_cursor>` until `next_cursor` is `null`, and concatenate the `conversations` arrays. A conversation with more messages than fit in one page continues on the next page under the same `id`: `message_offset` is the position of the slice's first message, so append its `messages` to the earlier slice. Conversations arrive in `id` order, which is stable while you page — one created or deleted mid-export cannot shift the rest.
+
+```bash
+cursor=""
+while :; do
+  page=$(curl -s "https://mcp.getengram.app/api/v1/export?limit=400&cursor=$cursor" \
+    -H "Authorization: Bearer engram_sk_live_...")
+  echo "$page" >> engram-export.pages.jsonl
+  cursor=$(echo "$page" | jq -r '.next_cursor // empty')
+  [ -z "$cursor" ] && break
+done
+```
+
+Every page is recorded as a `data.export` audit event. The dashboard's export download (`https://getengram.app/api/export`) walks the pages for you and streams one merged file; it accepts the same `Authorization: Bearer` header, or the signed-in session.
+
+Why pages: a Worker request has about a minute and ~1000 subrequests, and an account can hold tens of thousands of conversations with hundreds of thousands of messages in one of them. The 1.0 export tried to return all of it in one response and was cancelled by the platform for anything but a small account.

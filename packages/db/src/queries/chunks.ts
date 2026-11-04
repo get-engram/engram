@@ -201,6 +201,25 @@ export function getChunksOverlappingSequence(
     .all<{ id: string; vectorize_id: string; start_sequence: number; end_sequence: number }>();
 }
 
+/**
+ * The chunks covering one message sequence, WITH their text — the raw
+ * material the content-integrity repair rebuilds a lost message body from
+ * (engram#541). Same window as getChunksOverlappingSequence.
+ */
+export function getChunkTextsCoveringSequence(
+  db: D1Database,
+  conversationId: string,
+  organizationId: string,
+  sequence: number
+) {
+  return db
+    .prepare(
+      "SELECT id, chunk_text, start_sequence, end_sequence FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ? AND start_sequence <= ? AND end_sequence >= ?"
+    )
+    .bind(conversationId, organizationId, sequence, sequence)
+    .all<{ id: string; chunk_text: string; start_sequence: number; end_sequence: number }>();
+}
+
 export function deleteChunksByIds(
   db: D1Database,
   ids: string[],

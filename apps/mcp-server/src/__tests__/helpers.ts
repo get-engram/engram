@@ -63,6 +63,27 @@ export function createMockD1(): D1Database {
           }
           return { results: [], success: true, meta: {} };
         }
+        // UPDATE t SET a = ?, b = ? WHERE id = ? [AND organization_id = ?] —
+        // a plain column rewrite (updateMessageContent after a content
+        // restore, engram#541) is applied, so tests can read the row back.
+        // Anything with an expression in SET stays a no-op, as before.
+        const plainUpdate = sql.match(
+          /^\s*UPDATE\s+(\w+)\s+SET\s+(.+?)\s+WHERE\s+id = \?(\s+AND\s+organization_id = \?)?\s*$/is
+        );
+        if (plainUpdate) {
+          const sets = plainUpdate[2].split(",").map((part) => part.trim());
+          if (sets.every((part) => /^\w+\s*=\s*\?$/.test(part))) {
+            const cols = sets.map((part) => part.split("=")[0].trim());
+            const id = bindings[cols.length];
+            const org = plainUpdate[3] ? bindings[cols.length + 1] : undefined;
+            for (const row of getTable(plainUpdate[1])) {
+              if (row.id === id && (org === undefined || row.organization_id === org)) {
+                cols.forEach((col, i) => (row[col] = bindings[i]));
+              }
+            }
+          }
+          return { results: [], success: true, meta: {} };
+        }
         // Simple UPDATE handler
         if (sql.match(/UPDATE/i)) {
           return { results: [], success: true, meta: {} };
@@ -353,7 +374,9 @@ export function createMockEnv(db: D1Database) {
       delete: vi.fn(async (key: string | string[]) => {
         for (const k of Array.isArray(key) ? key : [key]) r2store.delete(k);
       }),
-      head: vi.fn(async () => null),
+      // HEAD answers from the same store as get, so the content-integrity
+      // scan (engram#541) sees exactly the objects a test put or deleted.
+      head: vi.fn(async (key: string) => (r2store.has(key) ? { key } : null)),
       list: vi.fn(async () => ({ objects: [] })),
     } as unknown as R2Bucket,
     AI: {

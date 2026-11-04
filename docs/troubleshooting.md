@@ -89,6 +89,18 @@ Sequence numbers are assigned automatically based on the order messages appear i
 
 Tags and metadata are stored as JSON strings in D1. When retrieved via `get_conversation` or `list_conversations`, they're parsed back into arrays/objects. If tags appear as a string like `"[\"tag1\"]"`, there may be a double-encoding issue.
 
+### A message reads "[Message content unavailable …]"
+
+The conversation is intact, but the stored copy of that one message is
+missing, so the API serves a placeholder for it instead of failing the whole
+conversation. Nothing else in the conversation is affected, and it can still
+be exported and deleted.
+
+It can usually be restored: the search index keeps a verbatim copy of indexed
+text, and support can rebuild the message from it. Email hello@getengram.app
+with the conversation id (and the message id from the placeholder, if you
+have it).
+
 ### Can't delete a conversation
 
 `delete_conversation` cascades: it removes the conversation, all its messages, all chunks, and all vectors from the search index. If it returns "Conversation not found", verify the ID and that it belongs to your organization.

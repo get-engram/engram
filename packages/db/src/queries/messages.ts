@@ -197,6 +197,45 @@ export function getR2MessageIdsByConversation(
     .all<{ id: string }>();
 }
 
+/**
+ * One keyset page of an organization's R2-backed message pointers (id,
+ * conversation, sequence, role, encoding — no content), for the
+ * content-integrity scan (engram#541). Ordered by id so a scan can resume
+ * from the last id it checked; optionally limited to one conversation.
+ */
+export function getR2PointerPage(
+  db: D1Database,
+  organizationId: string,
+  afterId: string | null,
+  limit: number,
+  conversationId?: string
+) {
+  const params: unknown[] = [];
+  let where = "";
+  if (conversationId) {
+    where += "conversation_id = ? AND ";
+    params.push(conversationId);
+  }
+  where += "organization_id = ? AND content_encoding LIKE 'r2:%'";
+  params.push(organizationId);
+  if (afterId !== null) {
+    where += " AND id > ?";
+    params.push(afterId);
+  }
+  return db
+    .prepare(
+      `SELECT id, conversation_id, sequence, role, content_encoding FROM messages WHERE ${where} ORDER BY id ASC LIMIT ?`
+    )
+    .bind(...params, limit)
+    .all<{
+      id: string;
+      conversation_id: string;
+      sequence: number;
+      role: string;
+      content_encoding: string | null;
+    }>();
+}
+
 /** Same, for every message in an organization (hard-purge after account deletion). */
 export function getR2MessageIdsByOrganization(
   db: D1Database,

@@ -749,7 +749,25 @@ export async function deleteMessage(
   const revIds = await getR2RevisionIdsByMessage(env.DB, messageId);
   await deleteContent(env, [messageId, ...(revIds.results ?? []).map((r) => r.id)]);
 
-  await deleteMessageWithCount(env.DB, messageId, conversationId, organizationId);
+  // From here until the row is gone the row points at nothing — exactly the
+  // dangling `r2:*` pointer engram#541 diagnosed (placeholder served, no
+  // error, no trace). A D1 hiccup here is rare, so retry once; if it still
+  // fails, name the row so the content-integrity scan or a human can finish
+  // the job, then surface the error so the caller knows to retry.
+  try {
+    await deleteMessageWithCount(env.DB, messageId, conversationId, organizationId);
+  } catch {
+    try {
+      await deleteMessageWithCount(env.DB, messageId, conversationId, organizationId);
+      console.warn(`[delete] row delete for ${messageId} succeeded on retry`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[delete] R2 body purged but row delete failed twice for ${messageId} in ${conversationId} — row now points at a missing object (engram#541): ${msg}`
+      );
+      throw err;
+    }
+  }
 
   // Reindex is best-effort like edit — but a failure here means the deleted
   // text may still be recalled from a stale chunk, so log it loudly.

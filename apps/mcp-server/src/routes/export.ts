@@ -8,6 +8,7 @@ import {
 import { loadContent } from "../services/content-store.js";
 import { audit } from "../services/audit.js";
 import { isExternalOAuthClient } from "../mcp/auth-kind.js";
+import { mapConcurrent } from "../utils/map-concurrent.js";
 import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
@@ -52,23 +53,6 @@ export function decodeCursor(raw: string | undefined): ExportCursor | null {
   if (!Number.isInteger(off) || off < 0) return null;
   if (id === "" && off !== 0) return null;
   return { conversationId: id === "" ? null : id, messageOffset: off };
-}
-
-async function mapConcurrent<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const out = new Array<R>(items.length);
-  let next = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const i = next++;
-      out[i] = await fn(items[i]);
-    }
-  });
-  await Promise.all(workers);
-  return out;
 }
 
 // GET /api/export and GET /api/v1/export — the account's data as JSON

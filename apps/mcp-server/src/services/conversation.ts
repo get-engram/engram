@@ -830,8 +830,28 @@ export async function deleteConversation(
 
   // Delete from Vectorize (chunked to the 100-id limit — a large conversation
   // has >100 chunks and would otherwise throw code 40007).
+  //
+  // Best-effort by design (engram#542). This runs AFTER the R2 purge, so a
+  // throw here used to produce the worst of both worlds: bodies gone, the
+  // conversation still listed with every message a placeholder, and the
+  // retry failing the same way — a half-deleted conversation the user could
+  // neither read nor remove. Vectors are an index, not the record: search
+  // resolves hits through the chunk rows, which the D1 delete below removes,
+  // so an orphaned vector is unreachable and costs us, not the user. Retry
+  // once, then log loudly and finish the delete.
   if (vectorizeIds.length > 0) {
-    await deleteVectorsByIds(env, vectorizeIds);
+    try {
+      await deleteVectorsByIds(env, vectorizeIds);
+    } catch {
+      try {
+        await deleteVectorsByIds(env, vectorizeIds);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[delete] Vectorize delete failed twice for conversation ${conversationId}; continuing with the D1 delete (${vectorizeIds.length} vector id(s) orphaned): ${msg}`
+        );
+      }
+    }
   }
 
   // Delete from D1 (cascading: chunks, messages, conversation)

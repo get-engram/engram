@@ -10,6 +10,7 @@
 | Search results (`limit` param) | 50 max | Default: 10 |
 | Messages per `get_conversation` (`message_limit`) | 500 max | Default: 100. Use pagination for longer conversations |
 | Conversations per `list_conversations` (`limit`) | 100 max | Default: 20. Larger values are capped to 100, not rejected. `total` reports the full count — page with `offset` |
+| Messages per export page (`GET /api/v1/export` `limit`) | 400 max | Default: 400. Follow `next_cursor` until it is `null` — see [Export](api-reference.md#export) |
 
 ### Data Limits
 

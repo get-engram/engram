@@ -28,6 +28,11 @@ import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
 import { priceToTier } from "../services/stripe.js";
 import { findPriceByLookupKey, createRecurringPrice, reconcileProduct } from "../services/stripe.js";
 import { computeMrr } from "../services/mrr.js";
+import {
+  ADMIN_TZ_OFFSET,
+  loadFastMetrics,
+  loadSlowMetrics,
+} from "../services/admin-metrics.js";
 import { ftsRowid, orgFtsToken } from "@getengram/db";
 import { PAID_TIERS, sqlTierList } from "@getengram/shared";
 
@@ -35,163 +40,47 @@ type AdminEnv = { Bindings: Env };
 
 export const admin = new Hono<AdminEnv>();
 
-/**
- * The admin dashboard reports days in the operator's timezone, not UTC.
- *
- * Timestamps are stored in UTC; SQLite's bare `date('now')` is also UTC, so
- * "today" used to roll over at 18:00 local. Between 6pm and midnight the
- * board showed "0 signups today" while people were signing up during the
- * operator's actual day.
- *
- * Mexico abolished DST in October 2022, so America/Mexico_City is a fixed
- * UTC-6 year-round and a constant offset is exact — no tz database needed
- * (D1/SQLite has no timezone support beyond fixed modifiers anyway). If the
- * operator ever moves to a zone that observes DST, this must become a real
- * timezone conversion rather than a fixed offset.
- */
-const ADMIN_TZ_OFFSET = "-6 hours";
-
 // ---------------------------------------------------------------------------
 // GET /admin/metrics — Business metrics dashboard
+//
+// Two groups (engram#551): the cheap figures go to D1 as ONE batch, and the
+// activation funnel + chunk count — ~1.7 s and ~6.5M rows read per run —
+// come from a per-isolate cache refreshed every ten minutes that serves its
+// last good figures while D1 is overloaded. The admin page polls this every
+// 30 s; before, each poll was eight parallel statements including the
+// heaviest in the codebase, and the resulting queue rejections (503) took
+// the page down (engram-web#274).
 // ---------------------------------------------------------------------------
 admin.get("/metrics", async (c) => {
-  const [orgs, active, tiers, totals, dbSize, referrals, todaySignups, activation] = await Promise.all([
-    c.env.DB.prepare(`
-      SELECT
-        COUNT(*) as total,
-        SUM(CASE WHEN created_at >= datetime('now', '-1 days') THEN 1 ELSE 0 END) as last_1d,
-        SUM(CASE WHEN created_at >= datetime('now', '-7 days') THEN 1 ELSE 0 END) as last_7d,
-        SUM(CASE WHEN created_at >= datetime('now', '-30 days') THEN 1 ELSE 0 END) as last_30d
-      FROM organizations WHERE deleted_at IS NULL
-    `).first<{ total: number; last_1d: number; last_7d: number; last_30d: number }>(),
-
-    c.env.DB.prepare(`
-      SELECT COUNT(DISTINCT o.id) as active
-      FROM organizations o
-      JOIN conversations c ON c.organization_id = o.id
-      WHERE c.updated_at >= datetime('now', '-30 days')
-        AND c.message_count > 0
-        AND o.deleted_at IS NULL
-    `).first<{ active: number }>(),
-
-    c.env.DB.prepare(`
-      SELECT COALESCE(tier, 'free') as tier, COUNT(*) as count
-      FROM organizations WHERE deleted_at IS NULL
-      GROUP BY tier
-    `).all<{ tier: string; count: number }>(),
-
-    c.env.DB.prepare(`
-      SELECT
-        COUNT(*) as conversations,
-        COALESCE(SUM(message_count), 0) as messages
-      FROM conversations
-    `).first<{ conversations: number; messages: number }>(),
-
-    c.env.DB.prepare(`
-      SELECT
-        (SELECT COUNT(*) FROM conversation_chunks) as chunks,
-        (SELECT COUNT(*) FROM api_keys) as api_keys
-    `).first<{ chunks: number; api_keys: number }>(),
-
-    c.env.DB.prepare(`
-      SELECT COALESCE(referral_source, 'unknown') as source, COUNT(*) as count
-      FROM organizations WHERE deleted_at IS NULL
-      GROUP BY referral_source
-      ORDER BY count DESC
-    `).all<{ source: string; count: number }>(),
-
-    c.env.DB.prepare(`
-      SELECT id, name, email, tier, referral_source, created_at
-      FROM organizations
-      WHERE date(created_at, '${ADMIN_TZ_OFFSET}') = date('now', '${ADMIN_TZ_OFFSET}')
-        AND deleted_at IS NULL
-      ORDER BY created_at DESC
-    `).all<{ id: string; name: string; email: string | null; tier: string; referral_source: string | null; created_at: string }>(),
-
-    // Activation funnel (engram#onboarding) — replaces the misleading
-    // "active in the last 30 days" framing (which was ~true for any org
-    // that merely signed up recently) with events that actually predict
-    // whether someone experienced the product: saved something beyond
-    // the auto-seeded welcome note, searched, got a real recall back,
-    // and came back later.
-    c.env.DB.prepare(`
-      SELECT
-        (SELECT COUNT(*) FROM organizations
-           WHERE deleted_at IS NULL AND COALESCE(referral_source,'') != 'internal') AS connected,
-        (SELECT COUNT(*) FROM organizations
-           WHERE deleted_at IS NULL AND COALESCE(referral_source,'') != 'internal'
-             AND messages_stored_total > 1) AS first_memory_saved,
-        (SELECT COUNT(DISTINCT a.organization_id) FROM audit_log a
-           JOIN organizations o ON o.id = a.organization_id
-           WHERE a.action = 'search' AND o.deleted_at IS NULL
-             AND COALESCE(o.referral_source,'') != 'internal') AS first_search,
-        (SELECT COUNT(DISTINCT a.organization_id) FROM audit_log a
-           JOIN organizations o ON o.id = a.organization_id
-           WHERE a.action = 'search'
-             AND CAST(json_extract(a.metadata, '$.results') AS INTEGER) > 0
-             AND o.deleted_at IS NULL
-             AND COALESCE(o.referral_source,'') != 'internal') AS first_successful_recall,
-        (SELECT COUNT(*) FROM (
-           SELECT a.organization_id FROM audit_log a
-             JOIN organizations o ON o.id = a.organization_id
-             WHERE o.deleted_at IS NULL AND COALESCE(o.referral_source,'') != 'internal'
-             GROUP BY a.organization_id
-             HAVING COUNT(DISTINCT date(a.created_at)) >= 2
-         )) AS second_session,
-        (SELECT COUNT(DISTINCT a.organization_id) FROM audit_log a
-           JOIN organizations o ON o.id = a.organization_id
-           WHERE o.deleted_at IS NULL AND COALESCE(o.referral_source,'') != 'internal'
-             AND a.created_at >= datetime(o.created_at, '+7 days')) AS returned_after_7_days
-    `).first<{
-      connected: number;
-      first_memory_saved: number;
-      first_search: number;
-      first_successful_recall: number;
-      second_session: number;
-      returned_after_7_days: number;
-    }>(),
+  const [{ fast, slow }, mrr] = await Promise.all([
+    (async () => {
+      // Sequential on purpose: one D1 request in flight per call, not eight.
+      const fast = await loadFastMetrics(c.env.DB);
+      const slow = await loadSlowMetrics(c.env.DB);
+      return { fast, slow };
+    })(),
+    // Live MRR from Stripe. Shared with the daily report so the email and the
+    // dashboard cannot drift apart — see services/mrr.ts for the at-risk logic.
+    computeMrr(c.env),
   ]);
-
-  const tierMap: Record<string, number> = {};
-  for (const row of tiers?.results ?? []) {
-    tierMap[row.tier] = row.count;
-  }
-
-  const referralMap: Record<string, number> = {};
-  for (const row of referrals?.results ?? []) {
-    referralMap[row.source] = row.count;
-  }
-
-  // Live MRR from Stripe. Shared with the daily report so the email and the
-  // dashboard cannot drift apart — see services/mrr.ts for the at-risk logic.
-  const mrr = await computeMrr(c.env);
 
   return c.json({
     mrr,
-    signups: {
-      total: orgs?.total ?? 0,
-      last_1d: orgs?.last_1d ?? 0,
-      last_7d: orgs?.last_7d ?? 0,
-      last_30d: orgs?.last_30d ?? 0,
-    },
-    active_users_30d: active?.active ?? 0,
-    activation: {
-      connected: activation?.connected ?? 0,
-      first_memory_saved: activation?.first_memory_saved ?? 0,
-      first_search: activation?.first_search ?? 0,
-      first_successful_recall: activation?.first_successful_recall ?? 0,
-      second_session: activation?.second_session ?? 0,
-      returned_after_7_days: activation?.returned_after_7_days ?? 0,
-    },
-    tiers: tierMap,
-    referrals: referralMap,
+    signups: fast.signups,
+    active_users_30d: fast.active_users_30d,
+    activation: slow.activation,
+    // When the funnel (and storage.chunks) were computed: up to ten minutes
+    // old normally, older while D1 is refusing the recompute.
+    activation_computed_at: slow.computed_at,
+    tiers: fast.tiers,
+    referrals: fast.referrals,
     storage: {
-      conversations: totals?.conversations ?? 0,
-      messages: totals?.messages ?? 0,
-      chunks: dbSize?.chunks ?? 0,
-      api_keys: dbSize?.api_keys ?? 0,
+      conversations: fast.conversations,
+      messages: fast.messages,
+      chunks: slow.chunks,
+      api_keys: fast.api_keys,
     },
-    today_signups: todaySignups?.results ?? [],
+    today_signups: fast.today_signups,
   });
 });
 

@@ -1,0 +1,16 @@
+-- Chunk text moves to R2 (engram#384), stage 1 of 3: expand.
+--
+-- conversation_chunks.chunk_text is the largest thing left in D1 and the
+-- second copy of every indexed message (the bodies are in R2 since the
+-- content drain). This release starts writing every chunk's text to the
+-- engram-chunks bucket as well, at <conversation_id>/<chunk_id>, and adds
+-- this column so the readers can already tell where a chunk's text lives.
+--
+-- Nothing reads or writes it yet except those readers: every row stays NULL
+-- and keeps its text inline until stage 2. Stage 2 clears a row only after
+-- reading its R2 object back and comparing it byte for byte with the inline
+-- text, and sets this to 'r2:raw' in the same statement that empties
+-- chunk_text. The readers treat a row as "text in R2" only when chunk_text is
+-- '' AND this starts with 'r2:', so a NULL here always means "inline is the
+-- text". ADD COLUMN only rewrites the schema, so this is instant.
+ALTER TABLE conversation_chunks ADD COLUMN chunk_encoding TEXT;

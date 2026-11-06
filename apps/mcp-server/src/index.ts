@@ -39,6 +39,7 @@ import { enforceAuditRetention } from "./cron/audit-retention.js";
 import { pruneStripeWebhookEvents } from "./cron/prune-stripe-events.js";
 import { reconcileStripeToD1 } from "./cron/reconcile-stripe.js";
 export { DrainerDO } from "./services/drainer-do.js";
+export { ChunkMoverDO } from "./services/chunk-mover-do.js";
 import { sendWeeklyDigests, unsubscribeSig } from "./cron/weekly-digest.js";
 import { sendShareNudge } from "./cron/share-nudge.js";
 import { sendDailyReport } from "./services/daily-report.js";

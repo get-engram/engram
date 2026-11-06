@@ -204,7 +204,9 @@ export function getChunksOverlappingSequence(
 /**
  * The chunks covering one message sequence, WITH their text — the raw
  * material the content-integrity repair rebuilds a lost message body from
- * (engram#541). Same window as getChunksOverlappingSequence.
+ * (engram#541). Same window as getChunksOverlappingSequence. Carries
+ * conversation_id and chunk_encoding so the caller can resolve a chunk
+ * whose text has moved to R2 (engram#384).
  */
 export function getChunkTextsCoveringSequence(
   db: D1Database,
@@ -214,10 +216,105 @@ export function getChunkTextsCoveringSequence(
 ) {
   return db
     .prepare(
-      "SELECT id, chunk_text, start_sequence, end_sequence FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ? AND start_sequence <= ? AND end_sequence >= ?"
+      "SELECT id, conversation_id, chunk_text, chunk_encoding, start_sequence, end_sequence FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ? AND start_sequence <= ? AND end_sequence >= ?"
     )
     .bind(conversationId, organizationId, sequence, sequence)
-    .all<{ id: string; chunk_text: string; start_sequence: number; end_sequence: number }>();
+    .all<{
+      id: string;
+      conversation_id: string;
+      chunk_text: string;
+      chunk_encoding: string | null;
+      start_sequence: number;
+      end_sequence: number;
+    }>();
+}
+
+/** One row of the engram#384 copy/verify job's walk over conversation_chunks. */
+export interface ChunkCopyRow {
+  rid: number;
+  id: string;
+  conversation_id: string;
+  organization_id: string;
+  chunk_text: string;
+  chunk_encoding: string | null;
+}
+
+/**
+ * The next `limit` chunks after rowid `after`, in rowid order, with their
+ * text: one page of the job that copies chunk text to R2 and verifies the
+ * copies (engram#384).
+ *
+ * Paged on rowid alone, so every statement reads `limit` rows however far
+ * the walk has got. Filtering on chunk_encoding instead would make each page
+ * a scan over every row already done, and D1 runs one statement at a time:
+ * a multi-second statement stalls every user (engram#552). With an org the
+ * walk follows idx_chunks_org, whose entries are (organization_id, rowid),
+ * so it is the same bounded range read; INDEXED BY keeps the planner from
+ * taking idx_chunks_org_conv, which would need a sort of the whole org.
+ */
+export function getChunkCopyPage(
+  db: D1Database,
+  after: number,
+  limit: number,
+  organizationId?: string | null
+) {
+  if (organizationId) {
+    return db
+      .prepare(
+        `SELECT rowid AS rid, id, conversation_id, organization_id, chunk_text, chunk_encoding
+           FROM conversation_chunks INDEXED BY idx_chunks_org
+          WHERE organization_id = ? AND rowid > ?
+          ORDER BY rowid LIMIT ?`
+      )
+      .bind(organizationId, after, limit)
+      .all<ChunkCopyRow>();
+  }
+  return db
+    .prepare(
+      `SELECT rowid AS rid, id, conversation_id, organization_id, chunk_text, chunk_encoding
+         FROM conversation_chunks
+        WHERE rowid > ?
+        ORDER BY rowid LIMIT ?`
+    )
+    .bind(after, limit)
+    .all<ChunkCopyRow>();
+}
+
+// Bound parameters per IN(...) statement — D1 refuses more than 100.
+const ID_IN_CHUNK = 90;
+
+/** A chunk as it is now, for checking a copy against the row. */
+export interface ChunkTextNow {
+  id: string;
+  conversation_id: string;
+  chunk_text: string;
+  chunk_encoding: string | null;
+}
+
+/**
+ * These chunks as they are now, by id; a chunk with no row is simply absent
+ * (engram#384). The copy job reads a page, then writes an object per chunk.
+ * A save or delete can land in between, so it reads the rows again
+ * afterwards: an object whose row is gone is removed rather than left behind
+ * after the user deleted it, and one whose row changed is rewritten from the
+ * row's current text.
+ */
+export async function getChunkTextsByIds(
+  db: D1Database,
+  ids: string[]
+): Promise<ChunkTextNow[]> {
+  const out: ChunkTextNow[] = [];
+  for (let i = 0; i < ids.length; i += ID_IN_CHUNK) {
+    const slice = ids.slice(i, i + ID_IN_CHUNK);
+    const res = await db
+      .prepare(
+        `SELECT id, conversation_id, chunk_text, chunk_encoding FROM conversation_chunks WHERE id IN (${slice.map(() => "?").join(",")})`
+      )
+      .bind(...slice)
+      .all<ChunkTextNow>();
+    out.push(...(res.results ?? []));
+  }
+  return out;
 }
 
 export function deleteChunksByIds(

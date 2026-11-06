@@ -20,9 +20,17 @@ vi.mock("@getengram/db", () => ({
     db.chunkFetches++;
     const h = db.heavy.get(org)!;
     const take = Math.min(1000, h.chunks);
-    return { results: Array.from({ length: take }, (_, i) => ({ id: `c${i}`, vectorize_id: `v${i}`, fts_rowid: i })) };
+    return {
+      results: Array.from({ length: take }, (_, i) => ({
+        id: `c${i}`,
+        conversation_id: `conv_${i % 3}`,
+        vectorize_id: `v${i}`,
+        fts_rowid: i,
+      })),
+    };
   }),
   deleteChunkRowsAndFts: vi.fn(async (_d: unknown, ids: string[]) => {
+    db.order.push("chunk-rows");
     // decrement the org currently being drained (last fetched)
     for (const [, h] of db.heavy) if (h.chunks > 0) { h.chunks -= ids.length; break; }
   }),
@@ -57,12 +65,26 @@ vi.mock("../services/content-store.js", () => ({ deleteContent: vi.fn(async (_e:
 
 import { purgeDeletedOrganizations } from "../cron/purge-deleted.js";
 
+// Chunk text copies (engram#384): every key the purge deletes, in order.
+const chunkKeysDeleted: string[] = [];
+
 function env() {
-  return { DB: {}, VECTORIZE: { deleteByIds: vi.fn(async () => {}) }, CONTENT: {} } as never;
+  return {
+    DB: {},
+    VECTORIZE: { deleteByIds: vi.fn(async () => { db.order.push("vectors"); }) },
+    CONTENT: {},
+    CHUNKS: {
+      delete: vi.fn(async (keys: string | string[]) => {
+        db.order.push("chunk-copies");
+        chunkKeysDeleted.push(...(Array.isArray(keys) ? keys : [keys]));
+      }),
+    },
+  } as never;
 }
 
 beforeEach(() => {
   db.expired = []; db.heavy = new Map(); db.finalized = []; db.chunkFetches = 0; db.msgFetches = 0; db.order = [];
+  chunkKeysDeleted.length = 0;
 });
 
 describe("resumable purge", () => {
@@ -98,6 +120,60 @@ describe("resumable purge", () => {
     const purged = await purgeDeletedOrganizations(env());
     expect(purged).toBe(2);
     expect(db.finalized).toEqual(["org_ok1", "org_ok2"]);
+  });
+
+  it("deletes each chunk's R2 text copy before its vector and its row, and again after (engram#384)", async () => {
+    db.expired = [{ id: "org_chunks" }];
+    db.heavy.set("org_chunks", { messages: 0, chunks: 1500, revisions: 0 });
+    await purgeDeletedOrganizations(env());
+    // The rows are the only record of the copy keys, so the copies go first
+    // in every batch: a failure then leaves the rows for the next run. A
+    // second pass after the rows are gone removes a copy the chunk-copy job
+    // put back in between.
+    expect(chunkKeysDeleted).toHaveLength(3000);
+    expect(chunkKeysDeleted[0]).toBe("conv_0/c0");
+    expect(chunkKeysDeleted[1]).toBe("conv_1/c1");
+    // Each batch's second pass names exactly the keys of its first.
+    expect(chunkKeysDeleted.slice(1000, 2000)).toEqual(chunkKeysDeleted.slice(0, 1000));
+    expect(chunkKeysDeleted.slice(2500, 3000)).toEqual(chunkKeysDeleted.slice(2000, 2500));
+    // Vectors go out 100 ids per call, so collapse their repeats into one step.
+    const steps = db.order
+      .filter((s) => s !== "revisions" && s !== "messages")
+      .filter((s, i, all) => !(s === "vectors" && all[i - 1] === "vectors"));
+    expect(steps).toEqual([
+      "chunk-copies", "vectors", "chunk-rows", "chunk-copies",
+      "chunk-copies", "vectors", "chunk-rows", "chunk-copies",
+    ]);
+    expect(db.finalized).toEqual(["org_chunks"]);
+  });
+
+  it("leaves the org's chunk rows for the next run when a copy delete fails", async () => {
+    db.expired = [{ id: "org_r2down" }];
+    db.heavy.set("org_r2down", { messages: 0, chunks: 10, revisions: 0 });
+    const e = env() as unknown as { CHUNKS: { delete: ReturnType<typeof vi.fn> } };
+    e.CHUNKS.delete.mockImplementation(async () => { throw new Error("R2 unavailable"); });
+    const purged = await purgeDeletedOrganizations(e as never);
+    expect(purged).toBe(0);
+    expect(db.heavy.get("org_r2down")!.chunks).toBe(10);
+    expect(db.order).not.toContain("chunk-rows");
+    expect(db.finalized).toEqual([]);
+  });
+
+  it("finishes the erasure when only the second copy pass fails", async () => {
+    db.expired = [{ id: "org_flaky" }];
+    db.heavy.set("org_flaky", { messages: 0, chunks: 10, revisions: 0 });
+    const e = env() as unknown as { CHUNKS: { delete: ReturnType<typeof vi.fn> } };
+    let calls = 0;
+    e.CHUNKS.delete.mockImplementation(async () => {
+      calls++;
+      if (calls % 2 === 0) throw new Error("R2 unavailable");
+    });
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const purged = await purgeDeletedOrganizations(e as never);
+    expect(purged).toBe(1);
+    expect(db.finalized).toEqual(["org_flaky"]);
+    expect(err).toHaveBeenCalledWith(expect.stringContaining("second chunk-copy delete failed"));
+    err.mockRestore();
   });
 
   it("drains edit history BEFORE messages, so revision R2 objects are never orphaned", async () => {

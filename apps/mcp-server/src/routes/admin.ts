@@ -34,6 +34,7 @@ import {
   loadSlowMetrics,
 } from "../services/admin-metrics.js";
 import { ftsRowid, orgFtsToken } from "@getengram/db";
+import { loadChunkTexts } from "../services/chunk-store.js";
 import { PAID_TIERS, sqlTierList } from "@getengram/shared";
 
 type AdminEnv = { Bindings: Env };
@@ -1213,20 +1214,34 @@ admin.post("/backfill-fts", async (c) => {
   const after = parseInt(c.req.query("after") ?? "0", 10);
 
   const rows = await c.env.DB.prepare(
-    `SELECT rowid AS rid, id, organization_id, chunk_text
+    `SELECT rowid AS rid, id, conversation_id, organization_id, chunk_text, chunk_encoding
        FROM conversation_chunks
       WHERE rowid > ? AND fts_rowid IS NULL
       ORDER BY rowid LIMIT ?`,
   )
     .bind(after, batch)
-    .all<{ rid: number; id: string; organization_id: string; chunk_text: string }>();
+    .all<{
+      rid: number;
+      id: string;
+      conversation_id: string;
+      organization_id: string;
+      chunk_text: string;
+      chunk_encoding: string | null;
+    }>();
 
   const list = rows.results ?? [];
   if (list.length === 0) {
     return c.json({ done: true, indexed: 0, next_after: after });
   }
 
-  const stmts = list.flatMap((r) => {
+  // The text is in the column, or only in R2 once moved (engram#384). A row
+  // whose copy cannot be read is left unstamped (fts_rowid stays NULL), so
+  // a later run picks it up instead of indexing it as empty.
+  const texts = await loadChunkTexts(c.env, list);
+  const ready = list.filter((r) => texts.has(r.id));
+  const unavailable = list.length - ready.length;
+
+  const stmts = ready.flatMap((r) => {
     const rid = ftsRowid(r.id);
     return [
       // Clear any prior entry first: a re-run must overwrite, not duplicate
@@ -1234,7 +1249,7 @@ admin.post("/backfill-fts", async (c) => {
       c.env.DB.prepare("DELETE FROM chunks_fts_v2 WHERE rowid = ?").bind(rid),
       c.env.DB.prepare(
         "INSERT INTO chunks_fts_v2(rowid, chunk_text, org) VALUES (?, ?, ?)",
-      ).bind(rid, r.chunk_text, orgFtsToken(r.organization_id)),
+      ).bind(rid, texts.get(r.id) as string, orgFtsToken(r.organization_id)),
       // Stamped LAST in the batch so a partial failure leaves fts_rowid NULL
       // and the row is simply picked up again on the next run.
       c.env.DB.prepare("UPDATE conversation_chunks SET fts_rowid = ? WHERE id = ?").bind(
@@ -1244,12 +1259,13 @@ admin.post("/backfill-fts", async (c) => {
     ];
   });
 
-  await c.env.DB.batch(stmts);
+  if (stmts.length > 0) await c.env.DB.batch(stmts);
 
   const nextAfter = list[list.length - 1].rid;
   return c.json({
     done: false,
-    indexed: list.length,
+    indexed: ready.length,
+    unavailable,
     next_after: nextAfter,
     hint: `POST /admin/backfill-fts?batch=${batch}&after=${nextAfter}`,
   });
@@ -1430,6 +1446,30 @@ admin.get("/drain-do/status", async (c) => {
   const activeCount = results.filter((r) => (r as {active?:boolean}).active).length;
   return c.json({ active: activeCount, total_moved: totalMoved, workers: results });
 });
+
+// Chunk text copy (engram#384) — POST /admin/chunk-mover/start|stop,
+// GET /admin/chunk-mover/status. One ChunkMoverDO walks conversation_chunks
+// by rowid (optionally one org), copying text into CHUNKS ("copy") or
+// checking every copy against D1 ("verify", optionally {repair: true}).
+// Stage 1 never writes to D1; the status reports counts and chunk ids only.
+const chunkMover = (env: Env) => env.CHUNK_MOVER.get(env.CHUNK_MOVER.idFromName("chunk-mover"));
+const passThrough = async (r: Response) =>
+  new Response(await r.text(), {
+    status: r.status,
+    headers: { "content-type": "application/json" },
+  });
+admin.post("/chunk-mover/start", async (c) => {
+  const body = await c.req.text();
+  return passThrough(
+    await chunkMover(c.env).fetch("https://do/start", { method: "POST", body: body || "{}" }),
+  );
+});
+admin.post("/chunk-mover/stop", async (c) =>
+  passThrough(await chunkMover(c.env).fetch("https://do/stop", { method: "POST" })),
+);
+admin.get("/chunk-mover/status", async (c) =>
+  passThrough(await chunkMover(c.env).fetch("https://do/status")),
+);
 
 // GET /admin/db-stats — real page-level D1 size + free space, plus per-table
 // byte sizes when dbstat is available. freelist_bytes is the actual headroom

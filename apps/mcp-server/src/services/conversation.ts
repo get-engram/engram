@@ -47,6 +47,12 @@ import {
   type TierCheckResult,
 } from "./tier.js";
 import { storeContent, deleteContent, loadContent } from "./content-store.js";
+import {
+  copyChunkTextsToR2,
+  chunkObjectKey,
+  deleteChunkObjects,
+  deleteConversationChunkObjects,
+} from "./chunk-store.js";
 import { deleteVectorsByIds } from "./vectorize.js";
 import type { Env, AuthContext } from "../types.js";
 import { canAccessConversation } from "./spaces.js";
@@ -349,6 +355,16 @@ export async function appendMessages(
         }))
       );
 
+      // Second copy of each chunk's text in R2 (engram#384), written only
+      // after the D1 rows exist and overlapped with the Vectorize upsert.
+      // Best-effort and never throws: D1 still holds the text, and the
+      // chunk mover copies anything this misses.
+      const copied = copyChunkTextsToR2(
+        env,
+        conversationId,
+        chunkRecords.map((c) => ({ id: c.id, text: c.chunkText })),
+      );
+
       // Upsert vectors to Vectorize
       const vectors = chunkRecords.map((c) => ({
         id: c.vectorizeId,
@@ -361,7 +377,11 @@ export async function appendMessages(
         },
       }));
 
-      await env.VECTORIZE.upsert(vectors);
+      try {
+        await env.VECTORIZE.upsert(vectors);
+      } finally {
+        await copied;
+      }
     } catch (err) {
       // Log but don't fail — messages are already stored above.
       const msg = err instanceof Error ? err.message : String(err);
@@ -647,8 +667,34 @@ async function applyReindex(
   const embeddings = texts.length
     ? await generateEmbeddings(env.AI, texts)
     : [];
+  const chunkRecords = chunks.map((chunk, i) => {
+    const cid = chunkId(
+      conversationId,
+      chunk.startSequence,
+      chunk.endSequence,
+      chunk.index,
+    );
+    return {
+      id: cid,
+      conversationId,
+      organizationId,
+      chunkText: chunk.text,
+      chunkSummary: summarizeChunk(chunk.text),
+      startSequence: chunk.startSequence,
+      endSequence: chunk.endSequence,
+      vectorizeId: cid,
+      embedding: embeddings[i],
+    };
+  });
+  const oldKeys = old.map((c) => chunkObjectKey(conversationId, c.id));
 
   if (old.length > 0) {
+    // The replaced chunks' R2 copies (engram#384) go first, and a failure
+    // aborts the rebuild. An edit is often a redaction: the old wording
+    // must not outlive it in the bucket, and once the rows below are gone
+    // nothing would point at those objects again. Aborting here leaves the
+    // index exactly as it was.
+    await deleteChunkObjects(env, oldKeys);
     await deleteVectorsByIds(env, old.map((c) => c.vectorize_id));
     await deleteChunksByIds(
       env.DB,
@@ -657,26 +703,7 @@ async function applyReindex(
     );
   }
 
-  if (chunks.length > 0) {
-    const chunkRecords = chunks.map((chunk, i) => {
-      const cid = chunkId(
-        conversationId,
-        chunk.startSequence,
-        chunk.endSequence,
-        chunk.index,
-      );
-      return {
-        id: cid,
-        conversationId,
-        organizationId,
-        chunkText: chunk.text,
-        chunkSummary: summarizeChunk(chunk.text),
-        startSequence: chunk.startSequence,
-        endSequence: chunk.endSequence,
-        vectorizeId: cid,
-        embedding: embeddings[i],
-      };
-    });
+  if (chunkRecords.length > 0) {
     await insertChunks(
       env.DB,
       chunkRecords.map((c) => ({
@@ -690,18 +717,48 @@ async function applyReindex(
         vectorizeId: c.vectorizeId,
       }))
     );
-    await env.VECTORIZE.upsert(
-      chunkRecords.map((c) => ({
-        id: c.vectorizeId,
-        values: c.embedding,
-        metadata: {
-          organization_id: organizationId,
-          conversation_id: conversationId,
-          start_sequence: c.startSequence,
-          end_sequence: c.endSequence,
-        },
-      }))
+  }
+
+  if (old.length > 0) {
+    // Second pass, now that the rows hold the new text. A chunk-copy job
+    // page read before this edit can put the old wording back after the
+    // first pass; the job removes or rewrites a copy it put after the rows
+    // changed, and this removes one it put in between. It runs before the
+    // new copies below, so it never deletes one of them. Best-effort: the
+    // rebuild is not failed over an object that is almost never there.
+    try {
+      await deleteChunkObjects(env, oldKeys);
+    } catch (err) {
+      console.error(
+        `[reindex] second chunk-copy delete failed for ${conversationId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  }
+
+  if (chunkRecords.length > 0) {
+    const copied = copyChunkTextsToR2(
+      env,
+      conversationId,
+      chunkRecords.map((c) => ({ id: c.id, text: c.chunkText })),
     );
+    try {
+      await env.VECTORIZE.upsert(
+        chunkRecords.map((c) => ({
+          id: c.vectorizeId,
+          values: c.embedding,
+          metadata: {
+            organization_id: organizationId,
+            conversation_id: conversationId,
+            start_sequence: c.startSequence,
+            end_sequence: c.endSequence,
+          },
+        }))
+      );
+    } finally {
+      await copied;
+    }
   }
 }
 
@@ -829,6 +886,13 @@ export async function deleteConversation(
   // caller can abort, and aborting is only clean while nothing else has been
   // destroyed. Purging vectors first would leave a conversation that still
   // exists but has silently stopped being searchable.
+  //
+  // Chunk text copies (engram#384) go first of all. They live under
+  // `<conversation_id>/`, so a prefix sweep finds every one without reading
+  // the chunk rows, and it throws. Ahead of the bodies, a failed sweep
+  // leaves the conversation whole and readable for the retry; behind them,
+  // it would strand a conversation whose messages are already gone.
+  await deleteConversationChunkObjects(env, conversationId);
   const r2Ids = await getR2MessageIdsByConversation(
     env.DB,
     conversationId,
@@ -874,6 +938,18 @@ export async function deleteConversation(
 
   // Delete from D1 (cascading: chunks, messages, conversation)
   await deleteConversationById(env.DB, conversationId, organizationId);
+
+  // Sweep the chunk prefix once more. An append racing this delete can put
+  // a chunk copy after the first sweep; with the rows now gone nothing else
+  // would ever remove it. Best-effort: the delete itself has succeeded.
+  try {
+    await deleteConversationChunkObjects(env, conversationId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[delete] second chunk-copy sweep failed for conversation ${conversationId}: ${msg}`
+    );
+  }
 
   if (purged > 0) {
     console.log(`[delete] purged ${purged} R2 object(s) for conversation ${conversationId}`);

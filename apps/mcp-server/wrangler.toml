@@ -25,6 +25,13 @@ migrations_dir = "../../packages/db/migrations"
 binding = "CONTENT"
 bucket_name = "engram-content"
 
+# Chunk text (engram#384), keyed `<conversation_id>/<chunk_id>`. A second,
+# independent copy of every chunk's text while D1 still holds the first;
+# D1's column is only cleared, row by row, once its copy here is verified.
+[[r2_buckets]]
+binding = "CHUNKS"
+bucket_name = "engram-chunks"
+
 [[vectorize]]
 binding = "VECTORIZE"
 index_name = "engram-vectors"
@@ -45,6 +52,16 @@ class_name = "DrainerDO"
 [[migrations]]
 tag = "v1-drainer"
 new_sqlite_classes = ["DrainerDO"]
+
+# Chunk mover (engram#384) — one named instance that copies and verifies
+# chunk text into CHUNKS a page at a time, paced for single-statement D1.
+[[durable_objects.bindings]]
+name = "CHUNK_MOVER"
+class_name = "ChunkMoverDO"
+
+[[migrations]]
+tag = "v2-chunk-mover"
+new_sqlite_classes = ["ChunkMoverDO"]
 
 [ai]
 binding = "AI"

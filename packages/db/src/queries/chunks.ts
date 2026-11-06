@@ -317,6 +317,41 @@ export async function getChunkTextsByIds(
   return out;
 }
 
+/** A chunk row's identity, without its text. */
+export interface ChunkOwner {
+  id: string;
+  conversation_id: string;
+}
+
+/**
+ * Which of these chunk ids still have a row, and in which conversation —
+ * ids only, never text (engram#557). The orphan sweep asks this of every
+ * object it lists in the CHUNKS bucket, so it must stay a primary-key
+ * lookup: one bounded IN (...) per 90 ids.
+ *
+ * An id missing from the answer is read as "no row", and the sweep deletes
+ * on that, so this fails closed: a response without a result set throws
+ * instead of passing for an empty one.
+ */
+export async function getChunkOwnersByIds(
+  db: D1Database,
+  ids: string[]
+): Promise<ChunkOwner[]> {
+  const out: ChunkOwner[] = [];
+  for (let i = 0; i < ids.length; i += ID_IN_CHUNK) {
+    const slice = ids.slice(i, i + ID_IN_CHUNK);
+    const res = await db
+      .prepare(
+        `SELECT id, conversation_id FROM conversation_chunks WHERE id IN (${slice.map(() => "?").join(",")})`
+      )
+      .bind(...slice)
+      .all<ChunkOwner>();
+    if (!Array.isArray(res?.results)) throw new Error("chunk owner lookup returned no result set");
+    out.push(...res.results);
+  }
+  return out;
+}
+
 export function deleteChunksByIds(
   db: D1Database,
   ids: string[],

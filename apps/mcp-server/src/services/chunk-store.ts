@@ -74,6 +74,21 @@ export function conversationChunkPrefix(conversationId: string): string {
   return `${conversationId}/`;
 }
 
+/**
+ * A key back into the ids chunkObjectKey made it from, or null for any key
+ * it would not have made: no slash, more than one, an empty conversation,
+ * or a second part that is not a chunk id. The orphan sweep (engram#557)
+ * only ever judges keys this accepts; anything else in the bucket is left
+ * alone.
+ */
+export function parseChunkObjectKey(key: string): { conversationId: string; chunkId: string } | null {
+  const slash = key.indexOf("/");
+  if (slash <= 0 || slash !== key.lastIndexOf("/")) return null;
+  const chunkId = key.slice(slash + 1);
+  if (!chunkId.startsWith("chk_") || chunkId.length === "chk_".length) return null;
+  return { conversationId: key.slice(0, slash), chunkId };
+}
+
 export async function sha256Hex(text: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");

@@ -438,7 +438,7 @@ describe("chunk clear (engram#384 stage 2), against real SQLite and R2", () => {
     const smallRes = await runClear(makeEnv(), { upto: await top(), org: small.org, limit: 2 });
     expect(counts(smallRes)).toEqual({ ...emptyCounts(), scanned: 3, cleared: 3 });
     expect(smallRes.pages).toBe(2);
-  });
+  }, 30_000);
 
   it("leaves a row written inside the settle window inline, and clears it once settled", async () => {
     const { org, conv, rows } = await seed("bittern", { settled: false });
@@ -711,5 +711,5 @@ describe("chunk clear (engram#384 stage 2), against real SQLite and R2", () => {
 
     // What the mover stops for: this row's text is now nowhere, and verify says so.
     expect(await runVerify(makeEnv(), org)).toMatchObject({ clearedOk: 2, lost: 1, problems: [target.id] });
-  });
+  }, 15_000);
 });

@@ -1,4 +1,5 @@
 import { createTtlMemo } from "../utils/ttl-memo.js";
+import { RECALL_EVIDENCE, SEARCH_EVIDENCE } from "./activation-milestones.js";
 
 /**
  * The queries behind GET /admin/metrics, split by cost (engram#551).
@@ -206,25 +207,32 @@ export function loadSlowMetrics(db: D1Database): Promise<SlowMetrics> {
       // on production, during which D1 answered nothing else. Same six
       // numbers (verified side by side on production), 14k rows, <0.5 s.
       // Keep every subquery correlated on o.id; the cache test pins the shape.
+      //
+      // audit_log keeps 90 days (engram#555), so each milestone is its stamp
+      // on organizations (which outlives the rows, see activation-milestones)
+      // OR the live probe (anything since the last nightly stamp). The stamp
+      // comes first so a stamped org never runs the probe.
       db.prepare(`
         SELECT
           COUNT(*) AS connected,
           SUM(CASE WHEN o.messages_stored_total > 1 THEN 1 ELSE 0 END) AS first_memory_saved,
-          SUM(CASE WHEN EXISTS (
+          SUM(CASE WHEN o.first_search_at IS NOT NULL OR EXISTS (
             SELECT 1 FROM audit_log a
-             WHERE a.organization_id = o.id AND a.action = 'search'
+             WHERE a.organization_id = o.id AND ${SEARCH_EVIDENCE}
           ) THEN 1 ELSE 0 END) AS first_search,
-          SUM(CASE WHEN EXISTS (
+          SUM(CASE WHEN o.first_recall_at IS NOT NULL OR EXISTS (
             SELECT 1 FROM audit_log a
-             WHERE a.organization_id = o.id AND a.action = 'search'
-               AND CAST(json_extract(a.metadata, '$.results') AS INTEGER) > 0
+             WHERE a.organization_id = o.id AND ${RECALL_EVIDENCE}
           ) THEN 1 ELSE 0 END) AS first_successful_recall,
           -- "active on at least two distinct days" without counting days:
-          -- the earliest and latest audit rows fall on different dates.
-          SUM(CASE WHEN date((SELECT MIN(a.created_at) FROM audit_log a WHERE a.organization_id = o.id))
-                   != date((SELECT MAX(a.created_at) FROM audit_log a WHERE a.organization_id = o.id))
+          -- the first activity (stamped, else the earliest row) and the
+          -- latest row fall on different dates.
+          SUM(CASE WHEN o.second_session_at IS NOT NULL
+                     OR date(COALESCE(o.first_activity_at,
+                                      (SELECT MIN(a.created_at) FROM audit_log a WHERE a.organization_id = o.id)))
+                        != date((SELECT MAX(a.created_at) FROM audit_log a WHERE a.organization_id = o.id))
               THEN 1 ELSE 0 END) AS second_session,
-          SUM(CASE WHEN EXISTS (
+          SUM(CASE WHEN o.returned_7d_at IS NOT NULL OR EXISTS (
             SELECT 1 FROM audit_log a
              WHERE a.organization_id = o.id
                AND a.created_at >= datetime(o.created_at, '+7 days')

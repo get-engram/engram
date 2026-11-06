@@ -7,6 +7,7 @@ import {
   listApiKeysForAdmin,
   getApiKeyById,
   revokeApiKey,
+  reindexConversationTagsRange,
 } from "@getengram/db";
 import { compressContent, ENCODING_GZIP } from "../utils/compress.js";
 import { audit } from "../services/audit.js";
@@ -1470,6 +1471,54 @@ admin.post("/chunk-mover/stop", async (c) =>
 admin.get("/chunk-mover/status", async (c) =>
   passThrough(await chunkMover(c.env).fetch("https://do/status")),
 );
+
+// POST /admin/reindex-tags?after=<rowid>&pages=<n> — rebuild missing
+// conversation_tags rows from conversations.tags (engram#562).
+//
+// Tag filters read the junction index, not the JSON column, so a
+// conversation whose index rows are missing is invisible to every tag
+// filter while its data is intact. Two paths left rows missing: the
+// organization merge, which repointed conversations but not their index
+// rows (the purge of the source then deleted them), and the welcome
+// conversation seeded at signup before it wrote its index rows
+// (engram#248, fixed in #427).
+//
+// Insert-only and idempotent: the JSON column is the source of truth, and
+// INSERT OR IGNORE never touches a row that exists. Paged by conversation
+// rowid, one statement per page, instead of a migration: D1 runs one
+// statement at a time and a migration file runs as one request, so a
+// whole-table backfill would hold the database for seconds while every
+// other request waits. Call again with `after=next_after` until `done`.
+// ---------------------------------------------------------------------------
+const TAG_REINDEX_PAGE = 500;
+admin.post("/reindex-tags", async (c) => {
+  const after = Math.max(0, parseInt(c.req.query("after") ?? "0", 10) || 0);
+  const pages = Math.min(40, Math.max(1, parseInt(c.req.query("pages") ?? "10", 10) || 10));
+
+  const top =
+    (await c.env.DB.prepare("SELECT MAX(rowid) AS top FROM conversations").first<{
+      top: number | null;
+    }>())?.top ?? 0;
+
+  let next = after;
+  let inserted = 0;
+  for (let i = 0; i < pages && next < top; i++) {
+    const upto = Math.min(next + TAG_REINDEX_PAGE, top);
+    const res = await reindexConversationTagsRange(c.env.DB, next, upto);
+    inserted += (res.meta as { changes?: number } | undefined)?.changes ?? 0;
+    next = upto;
+  }
+
+  const done = next >= top;
+  return c.json({
+    after,
+    next_after: next,
+    top,
+    inserted,
+    done,
+    ...(done ? {} : { hint: `POST /admin/reindex-tags?after=${next}&pages=${pages}` }),
+  });
+});
 
 // GET /admin/db-stats — real page-level D1 size + free space, plus per-table
 // byte sizes when dbstat is available. freelist_bytes is the actual headroom

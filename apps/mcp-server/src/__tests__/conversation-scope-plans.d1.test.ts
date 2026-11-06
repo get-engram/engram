@@ -5,6 +5,7 @@ import {
   getR2MessageIdsByConversation,
   getR2PointerPage,
   getR2RevisionIdsByConversation,
+  reindexConversationTagsRange,
 } from "@getengram/db";
 import { moveConversation } from "../routes/merge-orgs.js";
 import { applyAllMigrations } from "./miniflare.js";
@@ -30,7 +31,13 @@ import type { Env } from "../types.js";
  */
 
 /** Tables whose org index must never serve a conversation-scoped statement. */
-const SCOPED_TABLES = ["messages", "message_revisions", "conversation_tags", "conversation_chunks"];
+const SCOPED_TABLES = [
+  "messages",
+  "message_revisions",
+  "conversation_tags",
+  "conversation_chunks",
+  "secrets_vault",
+];
 
 function recording(db: D1Database): { db: D1Database; sql: string[] } {
   const sql: string[] = [];
@@ -133,10 +140,23 @@ describe("conversation-scoped statements seek the conversation (engram#559)", ()
     const rec = recording(db);
     const env = { DB: rec.db } as unknown as Env;
     // No chunk rows, so the move skips R2, FTS and Vectorize and issues only
-    // the chunk read and the row updates.
+    // the chunk read and the row updates — every table the purge deletes by
+    // organization_id (engram#562).
     await moveConversation(env, "conv_x", "org_from", "org_to");
     await expectConversationSeeks(rec.sql, {
       "UPDATE messages": /SEARCH messages USING (COVERING )?INDEX idx_messages_conv_seq \(conversation_id=\?\)/,
+      "UPDATE conversation_tags": /SEARCH conversation_tags USING (COVERING )?INDEX sqlite_autoindex_conversation_tags_1 \(conversation_id=\?\)/,
+      "UPDATE message_revisions": /SEARCH message_revisions USING (COVERING )?INDEX idx_message_revisions_conv \(conversation_id=\?\)/,
+      "UPDATE secrets_vault": /SEARCH secrets_vault USING (COVERING )?INDEX idx_vault_org_conv \(organization_id=\? AND conversation_id=\?\)/,
     });
+  });
+
+  it("tag reindex: one bounded rowid range of conversations per statement (engram#562)", async () => {
+    const rec = recording(db);
+    await reindexConversationTagsRange(rec.db, 0, 500);
+    expect(rec.sql.length).toBe(1);
+    const plan = await planOf(db, rec.sql[0]);
+    expect(plan.join(" | ")).toMatch(/SEARCH c USING INTEGER PRIMARY KEY \(rowid>\? AND rowid<\?\)/);
+    expect(plan.filter((line) => /^SCAN c\b/.test(line))).toEqual([]);
   });
 });

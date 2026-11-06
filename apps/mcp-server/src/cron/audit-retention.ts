@@ -1,4 +1,5 @@
 import type { Env } from "../types.js";
+import { stampActivationMilestones } from "../services/activation-milestones.js";
 
 /**
  * audit_log retention (engram#469 / #475 audit, finding R5).
@@ -31,8 +32,19 @@ const MAX_BATCHES_PER_RUN = 60; // 30k rows/night, ~2x inflow
  * `too many SQL variables` on every run — see prune-oauth-tokens.ts, where
  * the same bug silently did nothing for two nights. This job had not yet hit
  * it only because nothing in the table is older than the floor.
+ *
+ * Before anything is deleted, the activation milestones the admin funnel and
+ * the recall nudge read out of this table are stamped onto organizations
+ * (engram#555), so a deleted row can't un-happen "this org once searched".
+ * If stamping throws, this deletes nothing. Every caller (the nightly cron,
+ * /admin/hygiene/run, /admin/reclaim-space) goes through here.
  */
 export async function enforceAuditRetention(env: Env): Promise<number> {
+  const stamped = await stampActivationMilestones(env.DB);
+  if (Object.values(stamped).some((n) => n > 0)) {
+    console.log(`[audit-retention] activation milestones stamped ${JSON.stringify(stamped)}`);
+  }
+
   let total = 0;
   for (let i = 0; i < MAX_BATCHES_PER_RUN; i++) {
     const r = await env.DB.prepare(

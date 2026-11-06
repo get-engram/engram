@@ -1,5 +1,6 @@
 import type { Env } from "../types.js";
 import { unsubscribeSig } from "./weekly-digest.js";
+import { RECALL_EVIDENCE } from "../services/activation-milestones.js";
 
 /**
  * Recall nudge: the save -> recall gap is the funnel's biggest measured leak.
@@ -16,6 +17,10 @@ import { unsubscribeSig } from "./weekly-digest.js";
  * they already engaged, they just haven't closed the loop. Capped at 100/run,
  * stamped after a successful send, respects digest_opt_out, signed unsubscribe
  * link — same contract as every other lifecycle email.
+ *
+ * "No successful recall" is the stamp AND the live probe (engram#555): audit
+ * rows age out after 90 days, and without first_recall_at everyone whose
+ * last hit aged out would look like they had never seen recall work.
  */
 export async function sendRecallNudges(env: Env): Promise<number> {
   if (!env.APP_URL) return 0;
@@ -31,11 +36,11 @@ export async function sendRecallNudges(env: Env): Promise<number> {
        AND o.digest_opt_out = 0
        AND COALESCE(o.referral_source,'') != 'internal'
        AND o.created_at <= datetime('now', '-1 day')
+       AND o.first_recall_at IS NULL
        AND NOT EXISTS (
          SELECT 1 FROM audit_log a
          WHERE a.organization_id = o.id
-           AND a.action = 'search'
-           AND CAST(json_extract(a.metadata, '$.results') AS INTEGER) > 0
+           AND ${RECALL_EVIDENCE}
        )
      LIMIT 100`,
   ).all<{ id: string; name: string; email: string }>();

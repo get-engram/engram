@@ -257,12 +257,13 @@ export function getExpiredOrganizations(db: D1Database, limit = 50) {
 /** A bounded batch of an org's chunk rows, with the ids needed to also remove
  *  their FTS rows and Vectorize vectors. */
 export function getChunkPurgeBatch(db: D1Database, organizationId: string, limit: number) {
+  // conversation_id is half of each chunk's R2 key (engram#384).
   return db
     .prepare(
-      "SELECT id, vectorize_id, fts_rowid FROM conversation_chunks WHERE organization_id = ? LIMIT ?",
+      "SELECT id, conversation_id, vectorize_id, fts_rowid FROM conversation_chunks WHERE organization_id = ? LIMIT ?",
     )
     .bind(organizationId, limit)
-    .all<{ id: string; vectorize_id: string | null; fts_rowid: number | null }>();
+    .all<{ id: string; conversation_id: string; vectorize_id: string | null; fts_rowid: number | null }>();
 }
 
 // D1 caps bound parameters per statement (a large IN(...) throws "too many SQL

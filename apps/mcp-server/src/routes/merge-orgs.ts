@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { orgFtsToken, reconcileOrgCounters } from "@getengram/db";
 import type { Env } from "../types.js";
+import { loadChunkTexts } from "../services/chunk-store.js";
 
 /**
  * Merge one organization's data into another.
@@ -89,13 +90,35 @@ async function moveConversation(
   // silently skip the vector rewrite, and strand those memories outside
   // semantic search forever.
   const chunkRows = await env.DB.prepare(
-    "SELECT id, vectorize_id, fts_rowid, chunk_text FROM conversation_chunks WHERE conversation_id = ? AND organization_id IN (?, ?)",
+    "SELECT id, vectorize_id, fts_rowid, chunk_text, chunk_encoding FROM conversation_chunks WHERE conversation_id = ? AND organization_id IN (?, ?)",
   )
     .bind(conversationId, fromOrg, toOrg)
-    .all<{ id: string; vectorize_id: string | null; fts_rowid: number | null; chunk_text: string }>();
+    .all<{
+      id: string;
+      vectorize_id: string | null;
+      fts_rowid: number | null;
+      chunk_text: string;
+      chunk_encoding: string | null;
+    }>();
   const chunks = chunkRows.results ?? [];
 
   if (chunks.length > 0) {
+    // A chunk's text is in its column, or only in R2 once moved
+    // (engram#384); the FTS rebuild below needs it either way. Resolved
+    // before anything changes, and a gap aborts the move: reinserting ''
+    // would drop that chunk from keyword search. R2 keys carry no org, so
+    // the copies themselves stay where they are.
+    const texts = await loadChunkTexts(
+      env,
+      chunks.map((c) => ({ ...c, conversation_id: conversationId })),
+    );
+    const unresolved = chunks.filter((c) => !texts.has(c.id)).length;
+    if (unresolved > 0) {
+      throw new Error(
+        `chunk text unavailable for ${unresolved} chunk(s) of ${conversationId}; nothing moved`,
+      );
+    }
+
     await env.DB.prepare(
       "UPDATE conversation_chunks SET organization_id = ? WHERE conversation_id = ? AND organization_id = ?",
     )
@@ -120,7 +143,7 @@ async function moveConversation(
         ...withRowids.map((c) =>
           env.DB.prepare(
             "INSERT INTO chunks_fts_v2(rowid, chunk_text, org) VALUES (?, ?, ?)",
-          ).bind(c.fts_rowid as number, c.chunk_text, newToken),
+          ).bind(c.fts_rowid as number, texts.get(c.id) as string, newToken),
         ),
       ];
       await env.DB.batch(stmts);

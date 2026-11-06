@@ -189,9 +189,15 @@ export function getR2MessageIdsByConversation(
   conversationId: string,
   organizationId: string
 ) {
+  // INDEXED BY is load-bearing (engram#559), as in chunks.ts (#477). Given
+  // `conversation_id = ? AND organization_id = ?` and no planner statistics,
+  // production picks idx_messages_org and walks every message the
+  // organization owns to find one conversation's — seconds on the largest
+  // accounts, with D1 answering nothing else meanwhile. The conversation
+  // index reads that conversation's rows; the org check runs on them.
   return db
     .prepare(
-      "SELECT id FROM messages WHERE conversation_id = ? AND organization_id = ? AND content_encoding LIKE 'r2:%'"
+      "SELECT id FROM messages INDEXED BY idx_messages_conv_seq WHERE conversation_id = ? AND organization_id = ? AND content_encoding LIKE 'r2:%'"
     )
     .bind(conversationId, organizationId)
     .all<{ id: string }>();
@@ -222,9 +228,14 @@ export function getR2PointerPage(
     where += " AND id > ?";
     params.push(afterId);
   }
+  // Limited to one conversation, force the conversation index for the reason
+  // getR2MessageIdsByConversation does (engram#559). The org-wide form has no
+  // index that yields id order within an org and sorts the org's pointers on
+  // every page; it wants a rowid keyset (see #559).
+  const from = conversationId ? "messages INDEXED BY idx_messages_conv_seq" : "messages";
   return db
     .prepare(
-      `SELECT id, conversation_id, sequence, role, content_encoding FROM messages WHERE ${where} ORDER BY id ASC LIMIT ?`
+      `SELECT id, conversation_id, sequence, role, content_encoding FROM ${from} WHERE ${where} ORDER BY id ASC LIMIT ?`
     )
     .bind(...params, limit)
     .all<{

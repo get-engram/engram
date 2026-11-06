@@ -210,8 +210,12 @@ export function deleteConversationById(db: D1Database, id: string, organizationI
     // cannot be addressed by chunk_id, and the old chunks_fts is being dropped.
     db.prepare("DELETE FROM chunks_fts_v2 WHERE rowid IN (SELECT fts_rowid FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ? AND fts_rowid IS NOT NULL)").bind(id, organizationId),
     db.prepare("DELETE FROM conversation_chunks WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),
-    db.prepare("DELETE FROM messages WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),
-    db.prepare("DELETE FROM conversation_tags WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),
+    // INDEXED BY on these two is load-bearing (engram#559): given both
+    // predicates, production seeks the single-column org index and walks
+    // every message / tag the organization owns. conversation_chunks needs
+    // no hint — idx_chunks_org_conv covers both columns and wins on cost.
+    db.prepare("DELETE FROM messages INDEXED BY idx_messages_conv_seq WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),
+    db.prepare("DELETE FROM conversation_tags INDEXED BY sqlite_autoindex_conversation_tags_1 WHERE conversation_id = ? AND organization_id = ?").bind(id, organizationId),
     db.prepare("DELETE FROM conversations WHERE id = ? AND organization_id = ?").bind(id, organizationId),
     // Keep the denormalized org counter in sync; clamp at 0 defensively.
     db.prepare("UPDATE organizations SET conversation_count = MAX(conversation_count - 1, 0) WHERE id = ?").bind(organizationId),

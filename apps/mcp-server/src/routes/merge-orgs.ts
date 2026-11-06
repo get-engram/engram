@@ -187,9 +187,11 @@ async function moveConversation(
 
   // --- 4. messages ---------------------------------------------------------
   // R2 objects are keyed by message id, which is unchanged, so the verbatim
-  // bodies need no work at all.
+  // bodies need no work at all. INDEXED BY: without it the planner seeks
+  // idx_messages_org and walks the whole source organization per
+  // conversation moved (engram#559).
   const msgRes = await env.DB.prepare(
-    "UPDATE messages SET organization_id = ? WHERE conversation_id = ? AND organization_id = ?",
+    "UPDATE messages INDEXED BY idx_messages_conv_seq SET organization_id = ? WHERE conversation_id = ? AND organization_id = ?",
   )
     .bind(toOrg, conversationId, fromOrg)
     .run();

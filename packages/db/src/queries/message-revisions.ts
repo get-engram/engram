@@ -97,7 +97,9 @@ export function getR2RevisionIdsByConversation(
 ) {
   return db
     .prepare(
-      `SELECT id FROM message_revisions
+      // INDEXED BY: without it production seeks idx_message_revisions_org
+      // and walks the organization's whole history (engram#559).
+      `SELECT id FROM message_revisions INDEXED BY idx_message_revisions_conv
         WHERE conversation_id = ? AND organization_id = ?
           AND content_encoding LIKE 'r2:%'`,
     )

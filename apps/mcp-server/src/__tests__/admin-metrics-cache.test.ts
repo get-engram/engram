@@ -161,6 +161,23 @@ describe("GET /admin/metrics (engram#551)", () => {
     expect(st.maxInFlight).toBe(1);
   });
 
+  it("keeps the funnel one scan of organizations with per-org index probes (engram#553)", async () => {
+    const st = state();
+    await app(fakeDb(st))();
+    const funnel = st.log.find((s) => /AS connected/.test(s)) ?? "";
+    expect(funnel).not.toBe("");
+    // The whole-table form (audit_log JOIN organizations, COUNT(DISTINCT …),
+    // GROUP BY … HAVING) read 5.5M rows and held D1 for 2–13 s per run. Every
+    // audit_log subquery must stay correlated on o.id so the
+    // (organization_id, …) indexes answer it per org.
+    expect(funnel).toMatch(/FROM organizations o\s+WHERE o\.deleted_at IS NULL/);
+    expect(funnel).not.toMatch(/JOIN organizations/);
+    expect(funnel).not.toMatch(/COUNT\(DISTINCT/);
+    expect(funnel).not.toMatch(/GROUP BY/);
+    const probes = funnel.match(/FROM audit_log a\s+WHERE a\.organization_id = o\.id/g) ?? [];
+    expect(probes.length).toBeGreaterThanOrEqual(5);
+  });
+
   it("computes the funnel once per TTL while the cheap figures stay live", async () => {
     const st = state();
     const call = app(fakeDb(st));

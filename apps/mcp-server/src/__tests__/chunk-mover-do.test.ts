@@ -2,12 +2,14 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock(import("../services/chunk-mover.js"), async (importOriginal) => {
   const mod = await importOriginal();
-  return { ...mod, runChunkMoverBatch: vi.fn(), runOrphanSweepBatch: vi.fn() };
+  return { ...mod, runChunkMoverBatch: vi.fn(), runChunkClearBatch: vi.fn(), runOrphanSweepBatch: vi.fn() };
 });
 
 import { ChunkMoverDO, parseStart, type ChunkMoverState } from "../services/chunk-mover-do.js";
 import {
+  ChunkRestoreError,
   emptyCounts,
+  runChunkClearBatch,
   runChunkMoverBatch,
   runOrphanSweepBatch,
   type ChunkMoverBatch,
@@ -17,15 +19,18 @@ import {
 import type { Env } from "../types.js";
 
 /**
- * engram#384: the Durable Object that drives the chunk copy/verify job and
- * the orphan sweep (engram#557). The page logic is tested against real
- * SQLite and R2 in chunk-text-r2.d1.test.ts and chunk-orphan-sweep.d1.test.ts;
- * this covers the driver — validation, the cursor, counts, pacing,
- * back-off, the delete cap, and that a stop or a forced restart arriving
- * while a page is in flight is never overwritten by that page.
+ * engram#384: the Durable Object that drives the chunk copy/verify job, the
+ * clear (stage 2) and the orphan sweep (engram#557). The page logic is
+ * tested against real SQLite and R2 in chunk-text-r2.d1.test.ts,
+ * chunk-clear.d1.test.ts and chunk-orphan-sweep.d1.test.ts; this covers the
+ * driver — validation, the cursor, counts, pacing, back-off, the delete and
+ * clear caps, the clear's ceiling and its stops, and that a stop or a
+ * forced restart arriving while a page is in flight is never overwritten by
+ * that page.
  */
 
 const batch = vi.mocked(runChunkMoverBatch);
+const clear = vi.mocked(runChunkClearBatch);
 const sweep = vi.mocked(runOrphanSweepBatch);
 
 /** In-memory DurableObjectState: storage round-trips through structuredClone like the real one. */
@@ -88,6 +93,7 @@ describe("ChunkMoverDO (engram#384)", () => {
     fs = fakeState();
     mover = new ChunkMoverDO(fs.state, env);
     batch.mockReset();
+    clear.mockReset();
     sweep.mockReset();
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -105,6 +111,7 @@ describe("ChunkMoverDO (engram#384)", () => {
       repair: true,
       deleteOrphans: false,
       maxDeletes: 0,
+      maxClears: 0,
       force: false,
     });
     expect(parseStart({ mode: "copy" })).toEqual({
@@ -114,12 +121,13 @@ describe("ChunkMoverDO (engram#384)", () => {
       repair: false,
       deleteOrphans: false,
       maxDeletes: 0,
+      maxClears: 0,
       force: false,
     });
     expect(parseStart({ mode: "copy", force: true })).toMatchObject({ force: true });
 
     expect(parseStart({})).toMatch(/mode/);
-    expect(parseStart({ mode: "clear" })).toMatch(/mode/); // stage 2 is not this job
+    expect(parseStart({ mode: "move" })).toMatch(/mode/);
     expect(parseStart({ mode: "copy", repair: true })).toMatch(/verify only/);
     expect(parseStart({ mode: "verify", repair: "yes" })).toMatch(/repair/);
     expect(parseStart({ mode: "copy", org: "a/b" })).toMatch(/org/);
@@ -134,7 +142,16 @@ describe("ChunkMoverDO (engram#384)", () => {
   });
 
   it("parseStart: an orphans run reports unless told to delete, and deleting needs an explicit cap", () => {
-    const report = { mode: "orphans", org: null, start: 0, repair: false, deleteOrphans: false, maxDeletes: 0, force: false };
+    const report = {
+      mode: "orphans",
+      org: null,
+      start: 0,
+      repair: false,
+      deleteOrphans: false,
+      maxDeletes: 0,
+      maxClears: 0,
+      force: false,
+    };
     expect(parseStart({ mode: "orphans" })).toEqual(report);
     expect(parseStart({ mode: "orphans", delete: false })).toEqual(report);
     expect(parseStart({ mode: "orphans", delete: true, maxDeletes: 12, force: true })).toEqual({
@@ -155,6 +172,41 @@ describe("ChunkMoverDO (engram#384)", () => {
     expect(parseStart({ mode: "orphans", org: "org_1" })).toMatch(/whole bucket/);
     expect(parseStart({ mode: "orphans", start: 5 })).toMatch(/whole bucket/);
     expect(parseStart({ mode: "orphans", repair: true })).toMatch(/whole bucket/);
+  });
+
+  it("parseStart: a clear must name maxClears, the most rows it may clear, and no other mode takes it", () => {
+    expect(parseStart({ mode: "clear", maxClears: 25 })).toEqual({
+      mode: "clear",
+      org: null,
+      start: 0,
+      repair: false,
+      deleteOrphans: false,
+      maxDeletes: 0,
+      maxClears: 25,
+      force: false,
+    });
+    expect(parseStart({ mode: "clear", maxClears: 10_000_000, org: "org_1", start: 812_751, force: true })).toEqual({
+      mode: "clear",
+      org: "org_1",
+      start: 812_751,
+      repair: false,
+      deleteOrphans: false,
+      maxDeletes: 0,
+      maxClears: 10_000_000,
+      force: true,
+    });
+
+    expect(parseStart({ mode: "clear" })).toMatch(/clear needs maxClears/);
+    for (const bad of [0, -1, 1.5, "5", null, true, 10_000_001, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(parseStart({ mode: "clear", maxClears: bad })).toMatch(/clear needs maxClears/);
+    }
+    for (const mode of ["copy", "verify", "orphans"]) {
+      expect(parseStart({ mode, maxClears: 5 })).toMatch(/maxClears applies to clear only/);
+    }
+    expect(parseStart({ mode: "clear", maxClears: 5, repair: true })).toMatch(/verify only/);
+    expect(parseStart({ mode: "clear", maxClears: 5, delete: true })).toMatch(/orphans only/);
+    expect(parseStart({ mode: "clear", maxClears: 5, org: "a/b" })).toMatch(/org/);
+    expect(parseStart({ mode: "clear", maxClears: 5, start: -1 })).toMatch(/start/);
   });
 
   it("before any run: status says never started, stop is a no-op, unknown paths 404", async () => {
@@ -412,6 +464,175 @@ describe("ChunkMoverDO (engram#384)", () => {
     await fire();
     expect(sweep.mock.calls[2][1]).toMatchObject({ after: "m/chk_5" });
     expect(fs.saved()).toMatchObject({ active: false, stoppedReason: "finished", listAfter: "z/chk_1", live: 1003 });
+  });
+
+  // ── Clear (engram#384 stage 2) ───────────────────────────────────────────
+
+  /** A mover whose database answers the highest-rowid read with `top`, or fails it; `seen` gets each SQL. */
+  function clearMover(top: number | Error, seen: string[] = []): ChunkMoverDO {
+    const db = {
+      prepare: (sql: string) => ({
+        first: async () => {
+          seen.push(sql);
+          if (top instanceof Error) throw top;
+          return { top };
+        },
+      }),
+    };
+    return new ChunkMoverDO(fs.state, { DB: db } as unknown as Env);
+  }
+
+  it("clear: start records the highest rowid as the run's ceiling; no other mode reads it", async () => {
+    const seen: string[] = [];
+    mover = clearMover(9_000, seen);
+    const started = await start({ mode: "clear", maxClears: 120, org: "org_1" });
+    expect(started.status).toBe(200);
+    expect(started.body).toMatchObject({ mode: "clear", org: "org_1", cur: 0, upto: 9_000, maxClears: 120, cleared: 0, active: true });
+    expect(fs.saved()).toMatchObject({ upto: 9_000, maxClears: 120 });
+    expect(seen).toEqual(["SELECT MAX(rowid) AS top FROM conversation_chunks"]);
+
+    const copy = await start({ mode: "copy", force: true });
+    expect(copy.body).toMatchObject({ mode: "copy", upto: null, maxClears: 0 });
+    expect(seen).toHaveLength(1);
+  });
+
+  it("clear: a start that cannot read the ceiling starts nothing", async () => {
+    mover = clearMover(new Error("D1_ERROR: no such table (test)"));
+    const refused = await start({ mode: "clear", maxClears: 5 });
+    expect(refused).toMatchObject({
+      status: 503,
+      body: { error: "could not read the highest rowid: D1_ERROR: no such table (test)" },
+    });
+    expect(fs.saved()).toBeUndefined();
+    expect(fs.alarmAt()).toBeNull();
+  });
+
+  it("clear: pages under the ceiling, never asks for more rows than the cap has left, and stops at the cap with where to resume", async () => {
+    mover = clearMover(9_000);
+    await start({ mode: "clear", maxClears: 120, org: "org_1" });
+    clear
+      .mockResolvedValueOnce(page({ scanned: 50, cleared: 48, young: 1, skipped: 1, nextAfter: 300 }))
+      .mockResolvedValueOnce(page({ scanned: 50, cleared: 50, nextAfter: 420 }))
+      .mockResolvedValueOnce(page({ scanned: 22, cleared: 22, nextAfter: 450 }));
+    await fire();
+
+    expect(batch).not.toHaveBeenCalled();
+    expect(sweep).not.toHaveBeenCalled();
+    expect(clear.mock.calls.map((c) => c[1])).toEqual([
+      { after: 0, upto: 9_000, org: "org_1", limit: 50 },
+      { after: 300, upto: 9_000, org: "org_1", limit: 50 },
+      { after: 420, upto: 9_000, org: "org_1", limit: 22 },
+    ]);
+    const s = fs.saved()!;
+    expect(s).toMatchObject({ active: false, cur: 450, cleared: 120, young: 1, skipped: 1, scanned: 122, batches: 3 });
+    expect(s.stoppedReason).toBe("clear cap: cleared 120 rows, the maxClears of this run; resume with start 450");
+    expect(s.finishedAt).not.toBeNull();
+    expect(fs.alarmAt()).toBeNull();
+
+    // Resuming where it stopped, under a new ceiling, with a new cap.
+    mover = clearMover(9_200);
+    await start({ mode: "clear", maxClears: 1_000, org: "org_1", start: 450 });
+    clear.mockResolvedValueOnce(page({ scanned: 40, cleared: 40, nextAfter: 9_200, done: true }));
+    await fire();
+    expect(clear.mock.calls[3][1]).toEqual({ after: 450, upto: 9_200, org: "org_1", limit: 50 });
+    expect(fs.saved()).toMatchObject({ active: false, stoppedReason: "finished", cleared: 40, cur: 9_200 });
+  });
+
+  it("clear: a page that finds a cleared row with no object stops the run, its id in samples", async () => {
+    mover = clearMover(9_000);
+    await start({ mode: "clear", maxClears: 1_000 });
+    clear
+      .mockResolvedValueOnce(page({ scanned: 50, cleared: 50, nextAfter: 100 }))
+      .mockResolvedValueOnce(page({ scanned: 50, clearedOk: 49, lost: 1, problems: ["chk_gone"], nextAfter: 180 }));
+    await fire();
+
+    expect(clear).toHaveBeenCalledTimes(2);
+    const s = fs.saved()!;
+    expect(s).toMatchObject({ active: false, cur: 180, cleared: 50, clearedOk: 49, lost: 1, samples: ["chk_gone"] });
+    expect(s.stoppedReason).toBe(
+      "lost: the page after rowid 100 found 1 cleared rows with no object (their ids are in samples); clearing stopped",
+    );
+    expect(fs.alarmAt()).toBeNull();
+  });
+
+  it("clear: a restore that keeps failing stops the run at once, the rows' ids in samples", async () => {
+    mover = clearMover(9_000);
+    await start({ mode: "clear", maxClears: 1_000 });
+    clear
+      .mockResolvedValueOnce(page({ scanned: 50, cleared: 50, nextAfter: 100 }))
+      .mockRejectedValueOnce(new ChunkRestoreError(["chk_a", "chk_b"], new Error("D1 down (test)")));
+    await fire();
+
+    expect(clear).toHaveBeenCalledTimes(2);
+    const s = fs.saved()!;
+    expect(s).toMatchObject({ active: false, cur: 100, cleared: 50, errors: 1, samples: ["chk_a", "chk_b"] });
+    expect(s.stoppedReason).toBe(
+      "restore failed after rowid 100: 2 cleared rows whose objects went missing or changed could not be " +
+        "given their text back (their ids are in samples); clearing stopped",
+    );
+    expect(s.lastError).toContain("could not restore 2 cleared chunks");
+    expect(fs.alarmAt()).toBeNull();
+  });
+
+  it("clear: any other failure retries the same page under the same ceiling", async () => {
+    mover = clearMover(9_000);
+    await start({ mode: "clear", maxClears: 1_000 });
+    clear
+      .mockResolvedValueOnce(page({ scanned: 50, cleared: 50, nextAfter: 100 }))
+      .mockRejectedValueOnce(new Error("Network connection lost (test)"));
+    await fire();
+    expect(fs.saved()).toMatchObject({ active: true, cur: 100, cleared: 50, errors: 1, consecutiveErrors: 1 });
+
+    clear.mockResolvedValueOnce(page({ scanned: 3, cleared: 3, nextAfter: 103, done: true }));
+    await fire();
+    expect(clear.mock.calls[2][1]).toEqual({ after: 100, upto: 9_000, org: null, limit: 50 });
+    expect(fs.saved()).toMatchObject({ active: false, stoppedReason: "finished", cleared: 53 });
+  });
+
+  it("clear: a stop that lands mid-page wins, and what that page cleared is logged rather than lost", async () => {
+    mover = clearMover(9_000);
+    await start({ mode: "clear", maxClears: 1_000 });
+    clear.mockImplementationOnce(async () => {
+      await call("/stop", { method: "POST" });
+      return page({ scanned: 50, cleared: 47, restored: 1, nextAfter: 100 });
+    });
+    await fire();
+
+    expect(clear).toHaveBeenCalledTimes(1);
+    expect(fs.saved()).toMatchObject({ active: false, stoppedReason: "stopped by admin", cur: 0, cleared: 0 });
+    expect(fs.alarmAt()).toBeNull();
+    const logged = vi.mocked(console.log).mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logged).toMatch(/that page cleared 47 and restored 1 rows, which are not in the run's counts/);
+  });
+
+  it("clear: a stored run without its ceiling or cap is stopped, never walked", async () => {
+    const base = {
+      ...emptyCounts(),
+      runId: "run-odd",
+      mode: "clear",
+      org: null,
+      repair: false,
+      cur: 0,
+      listAfter: null,
+      deleteOrphans: false,
+      maxDeletes: 0,
+      active: true,
+      startedAt: "2026-11-06T21:00:00.000Z",
+      finishedAt: null,
+      stoppedReason: null,
+      batches: 0,
+      errors: 0,
+      consecutiveErrors: 0,
+      lastError: null,
+      samples: [],
+    };
+    for (const odd of [{ upto: null, maxClears: 5 }, { maxClears: 5 }, { upto: 9_000 }]) {
+      await fs.state.storage.put("s", { ...base, ...odd });
+      mover = new ChunkMoverDO(fs.state, env);
+      await fire();
+      expect(fs.saved()).toMatchObject({ active: false, stoppedReason: "clear run has no upto or maxClears; start it again" });
+    }
+    expect(clear).not.toHaveBeenCalled();
   });
 
   it("a run persisted before the orphan counts existed keeps counting after the upgrade, without NaN", async () => {

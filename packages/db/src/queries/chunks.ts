@@ -280,6 +280,171 @@ export function getChunkCopyPage(
     .all<ChunkCopyRow>();
 }
 
+/** One row of the engram#384 clear job's walk: a copy-page row, and whether it has settled. */
+export interface ChunkClearRow extends ChunkCopyRow {
+  /** 1 when the row was last written more than the settle window ago, by D1's clock. */
+  settled: number;
+}
+
+/** SQLite datetime() modifier for "this many seconds ago". */
+function secondsAgo(seconds: number): string {
+  if (!Number.isSafeInteger(seconds) || seconds < 1) {
+    throw new Error(`[chunks] settle window must be a positive whole number of seconds, got ${seconds}`);
+  }
+  return `-${seconds} seconds`;
+}
+
+/** The highest rowid in conversation_chunks, or 0 when the table is empty. */
+export async function getMaxChunkRowid(db: D1Database): Promise<number> {
+  const row = await db
+    .prepare("SELECT MAX(rowid) AS top FROM conversation_chunks")
+    .first<{ top: number | null }>();
+  return row?.top ?? 0;
+}
+
+/**
+ * One page of the engram#384 clear job: getChunkCopyPage's bounded rowid
+ * walk, capped above at `upto`, with whether each row has settled.
+ *
+ * `upto` is the highest rowid when the run started. Clearing a row moves it
+ * above every other row (see clearChunkTexts), so without the cap a run
+ * would reach its own work again. A row only ever moves up, so an ascending
+ * walk never skips one.
+ *
+ * `settled` is judged by D1's clock against created_at, exactly as the
+ * clear's own guard is, so the page and the guard cannot disagree about a
+ * row through clock skew.
+ */
+export function getChunkClearPage(
+  db: D1Database,
+  opts: {
+    after: number;
+    upto: number;
+    limit: number;
+    settleSeconds: number;
+    organizationId?: string | null;
+  },
+) {
+  const settle = secondsAgo(opts.settleSeconds);
+  if (opts.organizationId) {
+    return db
+      .prepare(
+        `SELECT rowid AS rid, id, conversation_id, organization_id, chunk_text, chunk_encoding,
+                created_at <= datetime('now', ?) AS settled
+           FROM conversation_chunks INDEXED BY idx_chunks_org
+          WHERE organization_id = ? AND rowid > ? AND rowid <= ?
+          ORDER BY rowid LIMIT ?`
+      )
+      .bind(settle, opts.organizationId, opts.after, opts.upto, opts.limit)
+      .all<ChunkClearRow>();
+  }
+  return db
+    .prepare(
+      `SELECT rowid AS rid, id, conversation_id, organization_id, chunk_text, chunk_encoding,
+              created_at <= datetime('now', ?) AS settled
+         FROM conversation_chunks
+        WHERE rowid > ? AND rowid <= ?
+        ORDER BY rowid LIMIT ?`
+    )
+    .bind(settle, opts.after, opts.upto, opts.limit)
+    .all<ChunkClearRow>();
+}
+
+/**
+ * Most rows clearChunkTexts or restoreChunkTexts takes in one call. A call
+ * is one D1 batch, so one transaction: each statement binds one chunk's
+ * whole text (a few KB), and the transaction holds a database that runs one
+ * statement at a time (engram#552).
+ */
+export const CHUNK_CLEAR_MAX_ROWS = 50;
+
+function clearBatchSize(n: number): void {
+  if (n > CHUNK_CLEAR_MAX_ROWS) {
+    throw new Error(`[chunks] at most ${CHUNK_CLEAR_MAX_ROWS} rows per clear or restore, got ${n}`);
+  }
+}
+
+/**
+ * Empty these rows' chunk_text, now that their text is in R2 (engram#384,
+ * stage 2). One statement per row, and a row is cleared only if, at that
+ * moment, it still holds exactly `text`, nothing has marked it already, and
+ * it was last written more than the settle window ago. The caller passes
+ * the text it has just compared with the row's R2 object, so a row that
+ * changed since cannot be cleared on the strength of the old comparison.
+ *
+ * The same statement moves the row to a new rowid above every other.
+ * Shrinking a row in place frees almost nothing — rows sit a few to a page
+ * and SQLite never merges the pages back — while a row that moves leaves its
+ * page behind to empty out, and a page that empties is freed. Measured on
+ * D1: clearing in place freed about 3% of the text's size, clearing and
+ * moving freed all of it. Rows only ever move up, so an ascending rowid walk
+ * (this job, the GDPR purge's vector pages, backfill-fts) can see a row
+ * twice but never miss one; nothing references conversation_chunks by
+ * rowid (the FTS index is keyed by the fts_rowid column). Never move by a
+ * fixed offset (rowid + K): a save in between takes MAX+1 and a later move
+ * collides with it.
+ *
+ * INDEXED BY: the update seeks the primary-key index by id, never a scan.
+ *
+ * One D1 batch, so one transaction: every statement ran or none did. A
+ * caller whose call failed can read the rows back to learn which. Returns,
+ * per row in order, whether it was cleared.
+ */
+export async function clearChunkTexts(
+  db: D1Database,
+  rows: Array<{ id: string; text: string }>,
+  opts: { encoding: string; settleSeconds: number },
+): Promise<boolean[]> {
+  const settle = secondsAgo(opts.settleSeconds);
+  if (!opts.encoding.startsWith("r2:")) {
+    throw new Error(`[chunks] refusing to clear chunks to encoding ${JSON.stringify(opts.encoding)}`);
+  }
+  clearBatchSize(rows.length);
+  if (rows.length === 0) return [];
+  const results = await db.batch(
+    rows.map((r) =>
+      db
+        .prepare(
+          `UPDATE conversation_chunks INDEXED BY sqlite_autoindex_conversation_chunks_1
+              SET chunk_text = '', chunk_encoding = ?,
+                  rowid = (SELECT MAX(rowid) FROM conversation_chunks) + 1
+            WHERE id = ? AND chunk_text = ? AND chunk_encoding IS NULL
+              AND created_at <= datetime('now', ?)`
+        )
+        .bind(opts.encoding, r.id, r.text, settle)
+    ),
+  );
+  return results.map((res) => (res.meta?.changes ?? 0) === 1);
+}
+
+/**
+ * Undo clearChunkTexts for these rows: put their text back in the column.
+ * Only a row still cleared to `encoding` is touched, so a row deleted or
+ * rewritten since is left as it is, and running it twice is harmless. One
+ * transaction, like clearChunkTexts. Returns, per row in order, whether it
+ * was restored.
+ */
+export async function restoreChunkTexts(
+  db: D1Database,
+  rows: Array<{ id: string; text: string }>,
+  encoding: string,
+): Promise<boolean[]> {
+  clearBatchSize(rows.length);
+  if (rows.length === 0) return [];
+  const results = await db.batch(
+    rows.map((r) =>
+      db
+        .prepare(
+          `UPDATE conversation_chunks INDEXED BY sqlite_autoindex_conversation_chunks_1
+              SET chunk_text = ?, chunk_encoding = NULL
+            WHERE id = ? AND chunk_text = '' AND chunk_encoding = ?`
+        )
+        .bind(r.text, r.id, encoding)
+    ),
+  );
+  return results.map((res) => (res.meta?.changes ?? 0) === 1);
+}
+
 // Bound parameters per IN(...) statement — D1 refuses more than 100.
 const ID_IN_CHUNK = 90;
 

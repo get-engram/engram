@@ -1448,11 +1448,15 @@ admin.get("/drain-do/status", async (c) => {
   return c.json({ active: activeCount, total_moved: totalMoved, workers: results });
 });
 
-// Chunk text copy (engram#384) — POST /admin/chunk-mover/start|stop,
+// Chunk text to R2 (engram#384) — POST /admin/chunk-mover/start|stop,
 // GET /admin/chunk-mover/status. One ChunkMoverDO walks conversation_chunks
-// by rowid (optionally one org), copying text into CHUNKS ("copy") or
-// checking every copy against D1 ("verify", optionally {repair: true}).
-// Stage 1 never writes to D1; the status reports counts and chunk ids only.
+// by rowid (optionally one org), copying text into CHUNKS ("copy"),
+// checking every copy against D1 ("verify", optionally {repair: true}), or
+// emptying the column of rows whose copy it has just checked ("clear",
+// {maxClears} required); or it lists CHUNKS for objects no row points at
+// ("orphans", engram#557). Only clear writes to D1. The body goes to the
+// object as sent and is validated there (parseStart); the status reports
+// counts and chunk ids only.
 const chunkMover = (env: Env) => env.CHUNK_MOVER.get(env.CHUNK_MOVER.idFromName("chunk-mover"));
 const passThrough = async (r: Response) =>
   new Response(await r.text(), {

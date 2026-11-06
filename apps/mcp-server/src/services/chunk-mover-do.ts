@@ -1,5 +1,9 @@
+import { getMaxChunkRowid } from "@getengram/db";
 import {
+  ChunkRestoreError,
+  CLEAR_PAGE,
   emptyCounts,
+  runChunkClearBatch,
   runChunkMoverBatch,
   runOrphanSweepBatch,
   type ChunkMoverCounts,
@@ -21,9 +25,19 @@ import type { Env } from "../types.js";
  *
  * Control via fetch (behind /admin/chunk-mover/*):
  *   POST /start {mode: "copy"|"verify", org?, start?, repair?, force?}
+ *   POST /start {mode: "clear", maxClears, org?, start?, force?}
  *   POST /start {mode: "orphans", delete?, maxDeletes?, force?}
  *   POST /stop
  *   GET  /status
+ *
+ * A clear run must name `maxClears`, the most rows it may clear, so the
+ * clear can roll out in steps: a few rows of one organization, then more.
+ * It walks only the rows that existed when it started (up to `upto`, the
+ * highest rowid then) and stops when it has cleared maxClears rows; resume
+ * with `start` set to the stopped run's `cur`. It also stops at the first
+ * page that finds a cleared row with no object (`lost`), and when it could
+ * not give a row its text back (ChunkRestoreError): either means some text
+ * may exist nowhere, and nothing more is cleared until that is understood.
  *
  * An orphans run reports unless `delete` is true, and a deleting run must
  * name `maxDeletes`, the most objects it may remove — set it from a report
@@ -38,14 +52,20 @@ const MAX_CONSECUTIVE_ERRORS = 50;
 const MAX_SAMPLES = 20;
 /** Upper bound on an orphans run's maxDeletes. */
 const MAX_DELETES_LIMIT = 100_000;
+/** Upper bound on a clear run's maxClears. */
+const MAX_CLEARS_LIMIT = 10_000_000;
 
 export interface ChunkMoverState extends ChunkMoverCounts {
   runId: string;
   mode: ChunkMoverMode;
   org: string | null;
   repair: boolean;
-  /** copy, verify: last rowid done. */
+  /** copy, verify, clear: last rowid done. */
   cur: number;
+  /** clear: the highest rowid when the run started; the walk stops there. */
+  upto: number | null;
+  /** clear: most rows the run may clear. */
+  maxClears: number;
   /** orphans: last object key done; null before the first page. */
   listAfter: string | null;
   /** orphans: delete what the sweep finds (report only otherwise). */
@@ -60,7 +80,7 @@ export interface ChunkMoverState extends ChunkMoverCounts {
   errors: number;
   consecutiveErrors: number;
   lastError: string | null;
-  /** First problem chunk ids (copy, verify) or object keys (orphans) seen — ids only, never text. */
+  /** First problem chunk ids (copy, verify, clear) or object keys (orphans) seen — ids only, never text. */
   samples: string[];
 }
 
@@ -71,6 +91,7 @@ interface StartBody {
   repair?: unknown;
   delete?: unknown;
   maxDeletes?: unknown;
+  maxClears?: unknown;
   force?: unknown;
 }
 
@@ -81,6 +102,7 @@ export interface StartOptions {
   repair: boolean;
   deleteOrphans: boolean;
   maxDeletes: number;
+  maxClears: number;
   force: boolean;
 }
 
@@ -91,8 +113,24 @@ function resilient(env: Env): Env {
 
 export function parseStart(body: StartBody): StartOptions | string {
   if (body.mode === "orphans") return parseOrphansStart(body);
-  if (body.mode !== "copy" && body.mode !== "verify") return 'mode must be "copy", "verify" or "orphans"';
+  if (body.mode !== "copy" && body.mode !== "verify" && body.mode !== "clear") {
+    return 'mode must be "copy", "verify", "clear" or "orphans"';
+  }
   if (body.delete !== undefined || body.maxDeletes !== undefined) return "delete and maxDeletes apply to orphans only";
+  let maxClears = 0;
+  if (body.mode === "clear") {
+    if (
+      typeof body.maxClears !== "number" ||
+      !Number.isSafeInteger(body.maxClears) ||
+      body.maxClears < 1 ||
+      body.maxClears > MAX_CLEARS_LIMIT
+    ) {
+      return `clear needs maxClears, an integer from 1 to ${MAX_CLEARS_LIMIT}: the most rows this run may clear`;
+    }
+    maxClears = body.maxClears;
+  } else if (body.maxClears !== undefined) {
+    return "maxClears applies to clear only";
+  }
   let org: string | null = null;
   if (body.org !== undefined && body.org !== null) {
     if (typeof body.org !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(body.org)) return "org must be an organization id";
@@ -114,6 +152,7 @@ export function parseStart(body: StartBody): StartOptions | string {
     repair: body.repair === true,
     deleteOrphans: false,
     maxDeletes: 0,
+    maxClears,
     force: body.force === true,
   };
 }
@@ -128,6 +167,7 @@ function parseOrphansStart(body: StartBody): StartOptions | string {
   if (body.org !== undefined || body.start !== undefined || body.repair !== undefined) {
     return "org, start and repair do not apply to orphans: the sweep lists the whole bucket";
   }
+  if (body.maxClears !== undefined) return "maxClears applies to clear only";
   if (body.delete !== undefined && typeof body.delete !== "boolean") return "delete must be a boolean";
   const deleteOrphans = body.delete === true;
   let maxDeletes = 0;
@@ -151,6 +191,7 @@ function parseOrphansStart(body: StartBody): StartOptions | string {
     repair: false,
     deleteOrphans,
     maxDeletes,
+    maxClears: 0,
     force: body.force === true,
   };
 }
@@ -197,6 +238,18 @@ export class ChunkMoverDO {
       if (s?.active && !parsed.force) {
         return Response.json({ error: "a run is active; stop it or pass force", status: s }, { status: 409 });
       }
+      // A clear walks only the rows there now: each row it clears moves
+      // above all of them (clearChunkTexts), and rows saved after the start
+      // are inside the settle window anyway.
+      let upto: number | null = null;
+      if (parsed.mode === "clear") {
+        try {
+          upto = await getMaxChunkRowid(this.env.DB);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return Response.json({ error: `could not read the highest rowid: ${message}` }, { status: 503 });
+        }
+      }
       const next: ChunkMoverState = {
         ...emptyCounts(),
         runId: crypto.randomUUID(),
@@ -204,6 +257,8 @@ export class ChunkMoverDO {
         org: parsed.org,
         repair: parsed.repair,
         cur: parsed.start,
+        upto,
+        maxClears: parsed.maxClears,
         listAfter: null,
         deleteOrphans: parsed.deleteOrphans,
         maxDeletes: parsed.maxDeletes,
@@ -253,7 +308,8 @@ export class ChunkMoverDO {
 
     for (let i = 0; i < BATCHES_PER_ALARM; i++) {
       try {
-        let capped = false;
+        // Set when this page ends the run for a reason of its own.
+        let halted = false;
         let done: boolean;
         let counts: ChunkMoverCounts;
         let problems: string[];
@@ -276,12 +332,54 @@ export class ChunkMoverDO {
             return;
           }
           if (b.capped) {
-            capped = true;
+            halted = true;
             s.stoppedReason =
               `delete cap: the page after ${position(s)} has ${b.orphans} orphans and ${left} of maxDeletes ${s.maxDeletes} ` +
               `are left; nothing on that page was deleted`;
           }
           s.listAfter = b.nextAfterKey;
+          ({ done, problems } = b);
+          counts = b;
+        } else if (s.mode === "clear") {
+          // Only a run /start set up has both its ceiling and its cap; a
+          // stored run without them is stopped, never walked.
+          const upto = s.upto;
+          const setUp = typeof upto === "number" && Number.isSafeInteger(s.maxClears);
+          // Never read more rows than the run may still clear, so a page
+          // cannot take it past maxClears.
+          const left = setUp ? Math.max(0, s.maxClears - (s.cleared ?? 0)) : 0;
+          if (typeof upto !== "number" || left === 0) {
+            s.active = false;
+            s.finishedAt = new Date().toISOString();
+            s.stoppedReason = setUp
+              ? `clear cap: cleared ${s.cleared ?? 0} rows, the maxClears of this run; resume with start ${s.cur}`
+              : "clear run has no upto or maxClears; start it again";
+            await this.save(s);
+            break;
+          }
+          const b = await runChunkClearBatch(this.env, {
+            after: s.cur,
+            upto,
+            org: s.org,
+            limit: Math.min(CLEAR_PAGE, left),
+          });
+          if (!live()) {
+            // The page's clears happened; only its counts go with it.
+            if (b.cleared > 0 || b.restored > 0) {
+              console.log(
+                `[chunk-mover] clear run ${runId} ended while a page was in flight; ` +
+                  `that page cleared ${b.cleared} and restored ${b.restored} rows, which are not in the run's counts`,
+              );
+            }
+            return;
+          }
+          if (b.lost > 0) {
+            halted = true;
+            s.stoppedReason =
+              `lost: the page after ${position(s)} found ${b.lost} cleared rows with no object ` +
+              `(their ids are in samples); clearing stopped`;
+          }
+          s.cur = b.nextAfter;
           ({ done, problems } = b);
           counts = b;
         } else {
@@ -304,10 +402,10 @@ export class ChunkMoverDO {
         for (const id of problems) if (s.samples.length < MAX_SAMPLES) s.samples.push(id);
         s.batches++;
         s.consecutiveErrors = 0;
-        if (capped || done) {
+        if (halted || done) {
           s.active = false;
           s.finishedAt = new Date().toISOString();
-          if (!capped) s.stoppedReason = "finished";
+          if (!halted) s.stoppedReason = "finished";
         }
         await this.save(s);
         if (!s.active) break;
@@ -317,7 +415,14 @@ export class ChunkMoverDO {
         s.consecutiveErrors++;
         s.lastError = (err instanceof Error ? err.message : String(err)).slice(0, 300);
         console.error(`[chunk-mover] page after ${position(s)} failed (${s.consecutiveErrors} in a row): ${s.lastError}`);
-        if (s.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        if (err instanceof ChunkRestoreError) {
+          for (const id of err.chunkIds) if (s.samples.length < MAX_SAMPLES) s.samples.push(id);
+          s.active = false;
+          s.finishedAt = new Date().toISOString();
+          s.stoppedReason =
+            `restore failed after ${position(s)}: ${err.chunkIds.length} cleared rows whose objects went missing ` +
+            `or changed could not be given their text back (their ids are in samples); clearing stopped`;
+        } else if (s.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
           s.active = false;
           s.finishedAt = new Date().toISOString();
           s.stoppedReason = `stopped after ${MAX_CONSECUTIVE_ERRORS} consecutive errors`;

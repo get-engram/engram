@@ -19,14 +19,16 @@ import type { Env } from "../types.js";
  * listing, including any no row points at any more.
  *
  * Stages, each its own change:
- *   1. Copy (this one). Every save puts each new chunk here as well as in
- *      D1, and the mover (chunk-mover-do.ts) copies and verifies the rows
- *      that already exist. D1 stays authoritative: chunk_encoding is NULL on
- *      every row and every reader uses the column, exactly as before.
- *   2. Clear. A row's column is emptied only after its object has been read
- *      back and compared with the column at that moment, in one guarded
- *      statement:
- *        UPDATE conversation_chunks SET chunk_text = '', chunk_encoding = 'r2:raw'
+ *   1. Copy. Every save puts each new chunk here as well as in D1, and the
+ *      mover (chunk-mover-do.ts) copies and verifies the rows that already
+ *      exist. A row stays inline, its chunk_encoding NULL and its readers
+ *      on the column, until the clear empties it.
+ *   2. Clear (the mover's "clear" mode, runChunkClearBatch). A row's column
+ *      is emptied only after its object has been read back and compared
+ *      with the column, and then in one guarded statement per row:
+ *        UPDATE conversation_chunks INDEXED BY sqlite_autoindex_conversation_chunks_1
+ *           SET chunk_text = '', chunk_encoding = 'r2:raw',
+ *               rowid = (SELECT MAX(rowid) FROM conversation_chunks) + 1
  *         WHERE id = ? AND chunk_text = ? AND chunk_encoding IS NULL
  *           AND created_at <= <now - settle window>
  *      The guard compares content, not rowid: a rowid can be reused once the
@@ -36,6 +38,11 @@ import type { Env } from "../types.js";
  *      object. Every rewrite goes through INSERT OR REPLACE, which resets
  *      created_at, and puts its object in the same request; a row unchanged
  *      for the whole window has no put in flight.
+ *      The row moves to a new, highest rowid in the same statement: emptying
+ *      a cell where it sits frees almost no pages, moving the row frees them
+ *      (clearChunkTexts has the measurements). Straight after the update
+ *      each object is checked again, and a row whose object went missing or
+ *      changed in between gets its text back.
  *   3. Rebuild the FTS index dense, once the rows are small.
  *
  * Readers: a row's text is in R2 only when chunk_text = '' AND

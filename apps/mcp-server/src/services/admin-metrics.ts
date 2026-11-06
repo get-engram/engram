@@ -3,19 +3,26 @@ import { createTtlMemo } from "../utils/ttl-memo.js";
 /**
  * The queries behind GET /admin/metrics, split by cost (engram#551).
  *
- * Measured on production D1 (2026-11-05): the activation funnel is ~1.7 s
- * and ~5.5M rows read per run, the chunk count reads another ~1M rows, and
- * the other seven statements together take ~50 ms and ~50k rows. The admin
- * page polls the endpoint every 30 s. Firing all of that as eight parallel
- * statements is what pushed D1 into "requests queued for too long", which
- * the worker reports as 503 and which blanked the admin page
- * (engram-web#274).
+ * Measured on production D1 (2026-11-05): the activation funnel was ~2 s
+ * (13 s on a bad run) and ~5.5M rows read per run, the chunk count reads
+ * another ~1M rows, and the other seven statements together take ~50 ms and
+ * ~50k rows. The admin page polls the endpoint every 30 s. Firing all of
+ * that as eight parallel statements is what pushed D1 into "requests queued
+ * for too long", which the worker reports as 503 and which blanked the
+ * admin page (engram-web#274).
  *
  * So: the cheap group goes to D1 as ONE batch (one request, one queue
  * slot), and the expensive group is cached per isolate for ten minutes and
  * served stale when D1 refuses the recompute. The funnel counts are
  * lifetime cohorts that move by single digits a day; the chunk count is a
  * capacity figure. Neither needs to be live.
+ *
+ * The cache alone was not enough (engram#553): D1 runs one statement at a
+ * time per database, so every cold isolate's first funnel run still held
+ * the whole database for seconds and the users pages queued behind it into
+ * a 503. The funnel is now one scan of organizations with index probes —
+ * ~14k rows and well under a second on production for the same six
+ * numbers — so a cold isolate costs nothing anyone can notice.
  */
 
 /**
@@ -190,34 +197,40 @@ export function loadSlowMetrics(db: D1Database): Promise<SlowMetrics> {
       // whether someone experienced the product: saved something beyond
       // the auto-seeded welcome note, searched, got a real recall back,
       // and came back later.
+      //
+      // Shape matters here (engram#553): ONE scan of organizations (~2.6k
+      // rows) with correlated probes that idx_audit_log_action and
+      // idx_audit_log_org_created answer in O(1) per org. The previous form
+      // joined audit_log (~900k rows) to organizations four times and
+      // aggregated the whole table each time — 5.5M rows and 2–13 s per run
+      // on production, during which D1 answered nothing else. Same six
+      // numbers (verified side by side on production), 14k rows, <0.5 s.
+      // Keep every subquery correlated on o.id; the cache test pins the shape.
       db.prepare(`
         SELECT
-          (SELECT COUNT(*) FROM organizations
-             WHERE deleted_at IS NULL AND COALESCE(referral_source,'') != 'internal') AS connected,
-          (SELECT COUNT(*) FROM organizations
-             WHERE deleted_at IS NULL AND COALESCE(referral_source,'') != 'internal'
-               AND messages_stored_total > 1) AS first_memory_saved,
-          (SELECT COUNT(DISTINCT a.organization_id) FROM audit_log a
-             JOIN organizations o ON o.id = a.organization_id
-             WHERE a.action = 'search' AND o.deleted_at IS NULL
-               AND COALESCE(o.referral_source,'') != 'internal') AS first_search,
-          (SELECT COUNT(DISTINCT a.organization_id) FROM audit_log a
-             JOIN organizations o ON o.id = a.organization_id
-             WHERE a.action = 'search'
+          COUNT(*) AS connected,
+          SUM(CASE WHEN o.messages_stored_total > 1 THEN 1 ELSE 0 END) AS first_memory_saved,
+          SUM(CASE WHEN EXISTS (
+            SELECT 1 FROM audit_log a
+             WHERE a.organization_id = o.id AND a.action = 'search'
+          ) THEN 1 ELSE 0 END) AS first_search,
+          SUM(CASE WHEN EXISTS (
+            SELECT 1 FROM audit_log a
+             WHERE a.organization_id = o.id AND a.action = 'search'
                AND CAST(json_extract(a.metadata, '$.results') AS INTEGER) > 0
-               AND o.deleted_at IS NULL
-               AND COALESCE(o.referral_source,'') != 'internal') AS first_successful_recall,
-          (SELECT COUNT(*) FROM (
-             SELECT a.organization_id FROM audit_log a
-               JOIN organizations o ON o.id = a.organization_id
-               WHERE o.deleted_at IS NULL AND COALESCE(o.referral_source,'') != 'internal'
-               GROUP BY a.organization_id
-               HAVING COUNT(DISTINCT date(a.created_at)) >= 2
-           )) AS second_session,
-          (SELECT COUNT(DISTINCT a.organization_id) FROM audit_log a
-             JOIN organizations o ON o.id = a.organization_id
-             WHERE o.deleted_at IS NULL AND COALESCE(o.referral_source,'') != 'internal'
-               AND a.created_at >= datetime(o.created_at, '+7 days')) AS returned_after_7_days
+          ) THEN 1 ELSE 0 END) AS first_successful_recall,
+          -- "active on at least two distinct days" without counting days:
+          -- the earliest and latest audit rows fall on different dates.
+          SUM(CASE WHEN date((SELECT MIN(a.created_at) FROM audit_log a WHERE a.organization_id = o.id))
+                   != date((SELECT MAX(a.created_at) FROM audit_log a WHERE a.organization_id = o.id))
+              THEN 1 ELSE 0 END) AS second_session,
+          SUM(CASE WHEN EXISTS (
+            SELECT 1 FROM audit_log a
+             WHERE a.organization_id = o.id
+               AND a.created_at >= datetime(o.created_at, '+7 days')
+          ) THEN 1 ELSE 0 END) AS returned_after_7_days
+        FROM organizations o
+        WHERE o.deleted_at IS NULL AND COALESCE(o.referral_source,'') != 'internal'
       `),
       db.prepare(`SELECT COUNT(*) as chunks FROM conversation_chunks`),
     ]);

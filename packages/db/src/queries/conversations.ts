@@ -36,6 +36,42 @@ export function insertConversation(
   return db.batch(statements);
 }
 
+/**
+ * Add the conversation_tags rows that conversations.tags says should exist
+ * and do not, for conversations with rowid in (afterRowid, uptoRowid]
+ * (engram#562). The JSON column is the source of truth and the junction
+ * table only an index of it, so this rebuilds the index from the column and
+ * never the other way round.
+ *
+ * Indexes exactly what insertConversation does: each non-empty string, under
+ * the conversation's current organization. INSERT OR IGNORE leaves existing
+ * rows alone, so a re-run adds nothing. Malformed or non-array JSON is read
+ * as no tags rather than failing the whole page: CASE evaluates lazily, so
+ * json_type and json_each only ever see valid JSON.
+ *
+ * Paged by rowid because a single statement over every conversation holds
+ * D1, which runs one statement at a time, for seconds.
+ */
+export function reindexConversationTagsRange(
+  db: D1Database,
+  afterRowid: number,
+  uptoRowid: number,
+) {
+  return db
+    .prepare(
+      `INSERT OR IGNORE INTO conversation_tags (conversation_id, organization_id, tag)
+       SELECT c.id, c.organization_id, je.value
+         FROM conversations c,
+              json_each(CASE WHEN json_valid(c.tags)
+                             THEN CASE WHEN json_type(c.tags) = 'array' THEN c.tags ELSE '[]' END
+                             ELSE '[]' END) je
+        WHERE c.rowid > ? AND c.rowid <= ?
+          AND je.type = 'text' AND je.value != ''`,
+    )
+    .bind(afterRowid, uptoRowid)
+    .run();
+}
+
 export function getConversationById(db: D1Database, id: string, organizationId: string) {
   return db
     .prepare("SELECT * FROM conversations WHERE id = ? AND organization_id = ?")

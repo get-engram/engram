@@ -10,6 +10,7 @@ import {
   deleteOrganizationById,
 } from "@getengram/db";
 import { deleteContent } from "../services/content-store.js";
+import { chunkObjectKey, deleteChunkObjects } from "../services/chunk-store.js";
 import { deleteVectorsByIds } from "../services/vectorize.js";
 import type { Env } from "../types.js";
 
@@ -49,14 +50,18 @@ export async function purgeDeletedOrganizations(
 
   for (const { id } of expired.results) {
     try {
-      // ── Drain chunks: Vectorize vectors + FTS rows + chunk rows ──────────
-      // Vectors and FTS go before the chunk rows so a mid-batch failure just
-      // retries next run (deleting an already-gone vector/row is a no-op).
+      // ── Drain chunks: R2 text copies + Vectorize vectors + FTS rows + chunk rows
+      // Copies, vectors and FTS go before the chunk rows so a mid-batch
+      // failure just retries next run (deleting an already-gone object,
+      // vector or row is a no-op). The rows are the only record of the
+      // chunk-copy keys (engram#384), so the copies must go first.
       let chunkDone = 0;
       while (chunkDone < MAX_PER_STORE_PER_RUN) {
         const batch = await getChunkPurgeBatch(env.DB, id, BATCH);
         const rows = batch.results ?? [];
         if (rows.length === 0) break;
+        const copyKeys = rows.map((r) => chunkObjectKey(r.conversation_id, r.id));
+        await deleteChunkObjects(env, copyKeys);
         const vectorIds = rows.map((r) => r.vectorize_id).filter((v): v is string => !!v);
         if (vectorIds.length > 0) await deleteVectorsByIds(env, vectorIds);
         await deleteChunkRowsAndFts(
@@ -64,6 +69,18 @@ export async function purgeDeletedOrganizations(
           rows.map((r) => r.id),
           rows.map((r) => r.fts_rowid).filter((n): n is number => n != null),
         );
+        // Second pass once the rows are gone: a chunk-copy job page read
+        // before this batch can put a copy back after the first pass. The job
+        // removes a copy it put after the rows went; this removes one it put
+        // in between. Best-effort — the rows are gone, so a failure here
+        // cannot be retried from them.
+        try {
+          await deleteChunkObjects(env, copyKeys);
+        } catch (err) {
+          console.error(
+            `[purge] org ${id}: second chunk-copy delete failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
         chunkDone += rows.length;
         if (rows.length < BATCH) break;
       }

@@ -29,3 +29,21 @@ export async function applyMigration(db: D1Database, suffix: string): Promise<vo
     await db.prepare(stmt).run();
   }
 }
+
+/**
+ * Apply every migration file in order, for tests that drive whole service
+ * paths and so touch most tables. Production gained organizations.email from
+ * an out-of-band deploy before 0003, which indexes it, so it is added here at
+ * the same point.
+ */
+export async function applyAllMigrations(db: D1Database): Promise<void> {
+  const files = readdirSync(MIGRATIONS_DIR)
+    .filter((f) => f.endsWith(".sql"))
+    .sort();
+  for (const file of files) {
+    if (file.startsWith("0003_")) {
+      await db.prepare("ALTER TABLE organizations ADD COLUMN email TEXT").run();
+    }
+    await applyMigration(db, file);
+  }
+}

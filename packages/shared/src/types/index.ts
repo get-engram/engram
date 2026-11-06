@@ -51,11 +51,18 @@ export interface ConversationChunk {
   id: string;
   conversation_id: string;
   organization_id: string;
+  /** '' when the text lives only in R2 — see chunk_encoding. */
   chunk_text: string;
   start_sequence: number;
   end_sequence: number;
   vectorize_id: string;
   created_at: string;
+  /**
+   * engram#384: 'r2:raw' once the text has been verified in the CHUNKS
+   * bucket and cleared from D1. NULL (the only value before stage 2) means
+   * chunk_text is the text.
+   */
+  chunk_encoding?: string | null;
 }
 
 export interface Usage {

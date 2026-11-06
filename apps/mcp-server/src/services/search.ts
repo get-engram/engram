@@ -2,6 +2,7 @@ import type { Env } from "../types.js";
 import type { SearchResult } from "@getengram/shared";
 import { generateEmbedding } from "./embedding.js";
 import { getChunksByVectorizeIds, getChunksByIds, searchChunksFts } from "@getengram/db";
+import { isTextInR2Only, loadChunkTexts } from "./chunk-store.js";
 
 interface VectorizeMatch {
   id: string;
@@ -147,6 +148,8 @@ export async function searchConversations(
     conversation_id: string;
     organization_id: string;
     chunk_text: string;
+    /** 'r2:raw' once the text lives only in R2 (engram#384); chunk_text is '' then. */
+    chunk_encoding?: string | null;
     chunk_summary: string | null;
     start_sequence: number;
     end_sequence: number;
@@ -311,5 +314,25 @@ export async function searchConversations(
     });
   }
 
-  return results.slice(0, limit);
+  const page = results.slice(0, limit);
+
+  // A row whose text lives only in R2 (engram#384) carries '' in
+  // chunk_text, so its snippet above is empty. Fetch the text for the rows
+  // actually returned — never for the whole candidate set. A copy that
+  // cannot be read degrades to the summary rather than failing the search.
+  const inR2 = page
+    .map((r) => chunkMap.get(r.chunk_id))
+    .filter((row): row is ChunkRow => !!row && isTextInR2Only(row));
+  if (inR2.length > 0) {
+    const texts = await loadChunkTexts(env, inR2);
+    for (const r of page) {
+      const row = chunkMap.get(r.chunk_id);
+      if (!row || !isTextInR2Only(row)) continue;
+      const text = texts.get(row.id);
+      r.chunk_text =
+        text !== undefined ? truncateSnippet(text, cappedSnippet) : (row.chunk_summary ?? "");
+    }
+  }
+
+  return page;
 }

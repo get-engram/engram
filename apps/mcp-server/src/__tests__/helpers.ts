@@ -347,10 +347,13 @@ export function createMockD1(): D1Database {
 export function createMockEnv(db: D1Database) {
   // In-memory R2 mock so content write-then-read round-trips in tests.
   const r2store = new Map<string, string>();
+  // Chunk-text copies (engram#384), a separate bucket like production.
+  const chunkStore = new Map<string, string>();
   return {
     // Exposed so tests can assert what is actually left in the bucket,
     // rather than trusting that delete was called.
     __r2store: r2store,
+    __chunkStore: chunkStore,
     // Bindings no test exercises, present so the returned object is a
     // complete Env. Without them, callers that spread this and cast to Env
     // (billing.test.ts, seats.test.ts) rely on TypeScript's comparability
@@ -358,6 +361,7 @@ export function createMockEnv(db: D1Database) {
     // as the rest of the shape gets closer to the real types.
     SELF: {} as Fetcher,
     DRAINER: {} as DurableObjectNamespace,
+    CHUNK_MOVER: {} as DurableObjectNamespace,
     SUPABASE_ANON_KEY: "test-anon-key",
     DB: db,
     CONTENT: {
@@ -378,6 +382,36 @@ export function createMockEnv(db: D1Database) {
       // scan (engram#541) sees exactly the objects a test put or deleted.
       head: vi.fn(async (key: string) => (r2store.has(key) ? { key } : null)),
       list: vi.fn(async () => ({ objects: [] })),
+    } as unknown as R2Bucket,
+    CHUNKS: {
+      put: vi.fn(async (key: string, val: unknown) => {
+        chunkStore.set(key, typeof val === "string" ? val : String(val));
+        return {};
+      }),
+      get: vi.fn(async (key: string) => {
+        const v = chunkStore.get(key);
+        return v == null ? null : { text: async () => v };
+      }),
+      head: vi.fn(async (key: string) => {
+        const v = chunkStore.get(key);
+        return v == null ? null : { key, size: v.length };
+      }),
+      delete: vi.fn(async (key: string | string[]) => {
+        for (const k of Array.isArray(key) ? key : [key]) chunkStore.delete(k);
+      }),
+      // Prefix listing, sorted like R2, so the conversation sweep runs
+      // against what a test actually stored.
+      list: vi.fn(async (opts?: { prefix?: string; limit?: number }) => {
+        const prefix = opts?.prefix ?? "";
+        const limit = opts?.limit ?? 1000;
+        const keys = [...chunkStore.keys()].filter((k) => k.startsWith(prefix)).sort();
+        const page = keys.slice(0, limit);
+        return {
+          objects: page.map((key) => ({ key })),
+          truncated: keys.length > limit,
+          cursor: keys.length > limit ? page[page.length - 1] : undefined,
+        };
+      }),
     } as unknown as R2Bucket,
     AI: {
       run: vi.fn(async () => ({

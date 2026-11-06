@@ -1,9 +1,14 @@
 export interface Env {
   DB: D1Database;
   CONTENT: R2Bucket;
+  /** Chunk text copies (engram#384), keyed `<conversation_id>/<chunk_id>`.
+   *  See services/chunk-store.ts for the stages. */
+  CHUNKS: R2Bucket;
   VECTORIZE: VectorizeIndex;
   SELF: Fetcher;
   DRAINER: DurableObjectNamespace;
+  /** Copies/verifies chunk text into CHUNKS (engram#384). */
+  CHUNK_MOVER: DurableObjectNamespace;
   AI: Ai;
   // Stripe (wrangler secrets)
   STRIPE_SECRET_KEY: string;

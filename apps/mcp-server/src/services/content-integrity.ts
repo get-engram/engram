@@ -5,6 +5,7 @@ import {
   updateMessageContent,
 } from "@getengram/db";
 import { loadContentOrNull, storeContent } from "./content-store.js";
+import { loadChunkTexts } from "./chunk-store.js";
 import { audit } from "./audit.js";
 import { mapConcurrent } from "../utils/map-concurrent.js";
 import type { Env } from "../types.js";
@@ -207,6 +208,8 @@ async function reconstructFromChunks(
   if (covering.length === 0) {
     return { reason: "no chunk covers this message (never indexed, or its chunks were dropped)" };
   }
+  // A chunk's text is in its column, or only in R2 once moved (engram#384).
+  const texts = await loadChunkTexts(env, covering);
 
   // Chunks sharing a [start,end] range are the pieces of one oversized
   // message, split by characters; in piece order they concatenate back to
@@ -218,20 +221,27 @@ async function reconstructFromChunks(
     if (list) list.push(c);
     else byRange.set(key, [c]);
   }
-  const windows: ChunkWindow[] = [...byRange.values()]
-    .map((pieces) => {
-      pieces.sort((a, b) => pieceIndex(a.id) - pieceIndex(b.id));
-      return {
-        id: pieces[0].id,
-        start: pieces[0].start_sequence,
-        end: pieces[0].end_sequence,
-        text: pieces.map((p) => p.chunk_text).join(""),
-      };
-    })
-    // Fewest neighbours first: a narrow window has the least that can fail.
-    .sort((a, b) => a.end - a.start - (b.end - b.start));
-
   const failures: string[] = [];
+  const windows: ChunkWindow[] = [];
+  for (const pieces of byRange.values()) {
+    pieces.sort((a, b) => pieceIndex(a.id) - pieceIndex(b.id));
+    // A window missing any piece's text would rebuild a truncated message,
+    // and a restore writes what it rebuilds. Skip it rather than guess.
+    const missing = pieces.filter((p) => !texts.has(p.id));
+    if (missing.length > 0) {
+      failures.push(`${pieces[0].id}: chunk text unavailable for ${missing.length} piece(s)`);
+      continue;
+    }
+    windows.push({
+      id: pieces[0].id,
+      start: pieces[0].start_sequence,
+      end: pieces[0].end_sequence,
+      text: pieces.map((p) => texts.get(p.id)!).join(""),
+    });
+  }
+  // Fewest neighbours first: a narrow window has the least that can fail.
+  windows.sort((a, b) => a.end - a.start - (b.end - b.start));
+
   for (const w of windows) {
     const outcome = await extractFromWindow(env, organizationId, row, w);
     if (typeof outcome === "string") return { content: outcome, sourceChunk: w.id };

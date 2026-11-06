@@ -16,8 +16,11 @@ import type { Env } from "../types.js";
  */
 const D1_MAX_BOUND_PARAMS = 100;
 
-/** Stub D1 that enforces the bound-parameter cap and serves rows per DELETE. */
-function stubDb(rowsPerTable: Record<string, number>) {
+/**
+ * Stub D1 that enforces the bound-parameter cap and serves rows per DELETE.
+ * `refuse` makes matching statements fail the way an overloaded D1 does.
+ */
+function stubDb(rowsPerTable: Record<string, number>, refuse?: RegExp) {
   const log: Array<{ sql: string; args: unknown[] }> = [];
   const remaining = { ...rowsPerTable };
   const db = {
@@ -33,6 +36,7 @@ function stubDb(rowsPerTable: Record<string, number>) {
             // The exact failure the real database produced.
             throw new Error("D1_ERROR: too many SQL variables: SQLITE_ERROR");
           }
+          if (refuse?.test(sql)) throw new Error("D1_ERROR: Requests queued for too long");
           log.push({ sql, args });
           const table = /DELETE FROM (\w+)/.exec(sql)?.[1];
           const limit = Number(/LIMIT (\d+)/.exec(sql)?.[1] ?? 0);
@@ -95,13 +99,45 @@ describe("pruneExpiredOAuthTokens", () => {
 });
 
 describe("enforceAuditRetention", () => {
+  const deletes = (log: Array<{ sql: string; args: unknown[] }>) =>
+    log.filter((l) => /DELETE FROM audit_log/.test(l.sql));
+
   it("uses the stated floor, binds exactly one parameter, and never exceeds the cap", async () => {
     const { env, log } = stubDb({ audit_log: 1 });
     await enforceAuditRetention(env);
     expect(AUDIT_RETENTION_DAYS).toBeGreaterThanOrEqual(90);
-    expect(log[0].args).toEqual([`-${AUDIT_RETENTION_DAYS} days`]);
+    const [first] = deletes(log);
+    expect(first.args).toEqual([`-${AUDIT_RETENTION_DAYS} days`]);
     expect(binds(log)).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMS);
-    expect(log[0].sql).toMatch(/created_at < datetime\('now', \?\)/);
+    expect(first.sql).toMatch(/created_at < datetime\('now', \?\)/);
+  });
+
+  // engram#555: the funnel and the recall nudge read "ever happened" facts
+  // out of audit_log; they are copied onto organizations before any row goes.
+  it("stamps every activation milestone before the first delete, one request each", async () => {
+    const { env, log } = stubDb({ audit_log: 1 });
+    await enforceAuditRetention(env);
+    const firstDelete = log.findIndex((l) => /DELETE FROM audit_log/.test(l.sql));
+    const stamps = log.slice(0, firstDelete);
+    expect(stamps.map((l) => /SET (\w+) =/.exec(l.sql)?.[1])).toEqual([
+      "first_activity_at",
+      "first_search_at",
+      "first_recall_at",
+      "second_session_at",
+      "returned_7d_at",
+    ]);
+    for (const l of stamps) {
+      expect(l.sql).toMatch(/^UPDATE organizations\b/);
+      // Never overwrites a stamp, and writes only orgs with evidence.
+      expect(l.sql).toMatch(/WHERE (\w+) IS NULL[\s\S]*AND EXISTS \(/);
+      expect(l.args).toEqual([]);
+    }
+  });
+
+  it("deletes nothing when stamping fails", async () => {
+    const { env, log } = stubDb({ audit_log: 750 }, /SET first_recall_at/);
+    await expect(enforceAuditRetention(env)).rejects.toThrow(/queued for too long/);
+    expect(deletes(log)).toEqual([]);
   });
 
   it("caps a run above daily inflow so retention can actually catch up", async () => {
@@ -115,7 +151,7 @@ describe("enforceAuditRetention", () => {
   it("stops as soon as a batch comes back short", async () => {
     const { env, log } = stubDb({ audit_log: 750 });
     expect(await enforceAuditRetention(env)).toBe(750);
-    expect(log.length).toBe(2);
+    expect(deletes(log).length).toBe(2);
   });
 });
 

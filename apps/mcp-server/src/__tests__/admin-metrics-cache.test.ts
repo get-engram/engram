@@ -178,6 +178,21 @@ describe("GET /admin/metrics (engram#551)", () => {
     expect(probes.length).toBeGreaterThanOrEqual(5);
   });
 
+  it("reads each milestone's stamp before probing audit_log (engram#555)", async () => {
+    const st = state();
+    await app(fakeDb(st))();
+    const funnel = st.log.find((s) => /AS connected/.test(s)) ?? "";
+    // audit_log keeps 90 days. A milestone proved by rows that retention has
+    // since deleted survives only as its stamp on organizations, so every
+    // column must accept the stamp, and check it before the probe so a
+    // stamped org never runs one. activation-milestones.d1.test.ts proves the
+    // numbers; this keeps the funnel from quietly dropping the stamps.
+    for (const stamp of ["first_search_at", "first_recall_at", "second_session_at", "returned_7d_at"]) {
+      expect(funnel).toMatch(new RegExp(`WHEN o\\.${stamp} IS NOT NULL\\s+OR\\b`));
+    }
+    expect(funnel).toMatch(/COALESCE\(o\.first_activity_at,/);
+  });
+
   it("computes the funnel once per TTL while the cheap figures stay live", async () => {
     const st = state();
     const call = app(fakeDb(st));

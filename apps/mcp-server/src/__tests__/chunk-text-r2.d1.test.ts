@@ -28,9 +28,9 @@ import type { Env } from "../types.js";
  * save, edit and delete keeps the CHUNKS bucket in step with
  * conversation_chunks; the mover copies, verifies and repairs without
  * writing to D1; and every reader that needs chunk text still gets it when a
- * row's column has been cleared to R2, as stage 2 will do. Nothing here
- * clears a row through production code — stage 1 has none — so a cleared
- * row is made by hand with the exact UPDATE stage 2 will run.
+ * row's column has been cleared to R2. A cleared row is made here by hand,
+ * emptied and marked where it sits, so these tests do not lean on the
+ * clear's own guards; chunk-clear.d1.test.ts runs the real clear (stage 2).
  */
 
 type Bucket = R2Bucket;
@@ -194,7 +194,7 @@ describe("chunk text in R2 (engram#384), against real SQLite and R2", () => {
     return obj ? obj.text() : null;
   }
 
-  /** What stage 2 will do to a row once its copy is verified. */
+  /** What the clear leaves in a row's columns (it also moves the row; chunk-clear.d1.test.ts covers that). */
   async function clearRow(id: string) {
     await db
       .prepare("UPDATE conversation_chunks SET chunk_text = '', chunk_encoding = 'r2:raw' WHERE id = ?")

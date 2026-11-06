@@ -1,10 +1,15 @@
 import {
+  CHUNK_CLEAR_MAX_ROWS,
+  clearChunkTexts,
+  getChunkClearPage,
   getChunkCopyPage,
   getChunkOwnersByIds,
   getChunkTextsByIds,
+  restoreChunkTexts,
   type ChunkCopyRow,
 } from "@getengram/db";
 import {
+  CHUNK_R2_ENCODING,
   chunkObjectKey,
   deleteChunkObjects,
   isTextInR2Only,
@@ -17,28 +22,37 @@ import type { Env } from "../types.js";
 
 /**
  * One page of the engram#384 chunk job: copy chunk text to R2, verify the
- * copies against D1, or sweep the copies no row points at. Driven by
- * ChunkMoverDO; see chunk-store.ts for the plan. Nothing here writes to D1.
+ * copies against D1, clear the column once its copy is verified, or sweep
+ * the copies no row points at. Driven by ChunkMoverDO; see chunk-store.ts
+ * for the plan. Only clear writes to D1.
  *
  *   copy    — put every row's text to R2 (an existing object is overwritten
  *             with the same bytes).
  *   verify  — read every object back and compare it with the row exactly;
  *             with repair, rewrite the missing and mismatched ones.
+ *   clear   — read every settled row's object back, and empty the column of
+ *             each row whose object matches it exactly. See
+ *             runChunkClearBatch.
  *   orphans — list the bucket and find the objects whose row is gone
  *             (engram#557); with delete, remove them. See runOrphanSweepBatch.
  *
- * A row whose text has already been cleared to R2 (stage 2 onward) has no
- * other copy: copy and verify both check its object is there and report it
- * as `lost` if not. Counts, chunk ids and object keys only — no text leaves
- * this module.
+ * A row whose text has already been cleared to R2 has no other copy: every
+ * mode that walks rows checks its object is there and reports it as `lost`
+ * if not. Counts, chunk ids and object keys only — no text leaves this
+ * module.
  */
 
-/** The modes that walk conversation_chunks by rowid. */
+/** The modes that copy or compare, walking conversation_chunks by rowid. */
 export type ChunkRowMode = "copy" | "verify";
-export type ChunkMoverMode = ChunkRowMode | "orphans";
+export type ChunkMoverMode = ChunkRowMode | "clear" | "orphans";
 
 /** Rows per page: one bounded rowid-range read of D1. */
 export const MOVER_PAGE = 100;
+/**
+ * Rows per clear page: as many as one clear transaction takes, so a page's
+ * clear either committed or did not (clearChunkTexts).
+ */
+export const CLEAR_PAGE = CHUNK_CLEAR_MAX_ROWS;
 /** R2 requests in flight at once. */
 const R2_CONCURRENCY = 25;
 
@@ -51,15 +65,17 @@ export interface ChunkMoverCounts {
   putFailed: number;
   /** verify: object identical to the row. */
   ok: number;
-  /** verify: no object for a row. */
+  /** verify: no object for a row. clear: the same, so the row was not cleared. */
   missing: number;
-  /** verify: object differs from the row. */
+  /** verify: object differs from the row. clear: the same, so the row was not cleared. */
   mismatched: number;
   /** verify + repair: missing or mismatched objects rewritten. */
   repaired: number;
   /**
    * copy, verify: row rewritten while its page was in flight; object
    * rewritten from the row as it is now.
+   * clear: row rewritten or deleted between the read and the clear, so not
+   * cleared; or cleared, then rewritten or deleted before a restore.
    * orphans: orphan whose row came back, or whose object changed, before the
    * delete; kept.
    */
@@ -73,9 +89,21 @@ export interface ChunkMoverCounts {
   clearedOk: number;
   /** Cleared row whose object is NOT there: the text exists nowhere. */
   lost: number;
+  /** clear: column emptied; the row's text is now in R2 only. */
+  cleared: number;
+  /**
+   * clear: emptied, then the object was gone or different when checked
+   * again straight after; the column was given back the text just verified.
+   */
+  restored: number;
+  /** clear: nothing to clear (empty text) or an encoding it does not know. */
+  skipped: number;
   /** orphans: object a row still points at. */
   live: number;
-  /** orphans: object written inside the settle window, so not judged this run. */
+  /**
+   * orphans: object written inside the settle window, so not judged this run.
+   * clear: row written inside the settle window, so not cleared this run.
+   */
   young: number;
   /** orphans: object no row points at. Deleted only when the run deletes. */
   orphans: number;
@@ -107,6 +135,9 @@ export function emptyCounts(): ChunkMoverCounts {
     orphansRemoved: 0,
     clearedOk: 0,
     lost: 0,
+    cleared: 0,
+    restored: 0,
+    skipped: 0,
     live: 0,
     young: 0,
     orphans: 0,
@@ -138,21 +169,8 @@ export async function runChunkMoverBatch(
     problems: [],
   };
 
-  const cleared = rows.filter(isTextInR2Only);
+  await checkClearedRows(env, rows.filter(isTextInR2Only), out);
   const inline = rows.filter((r) => !isTextInR2Only(r));
-
-  if (cleared.length > 0) {
-    const present = await mapConcurrent(cleared, R2_CONCURRENCY, async (r) =>
-      (await env.CHUNKS.head(keyOf(r))) !== null,
-    );
-    cleared.forEach((r, i) => {
-      if (present[i]) out.clearedOk++;
-      else {
-        out.lost++;
-        out.problems.push(r.id);
-      }
-    });
-  }
 
   let toWrite: ChunkCopyRow[];
   if (opts.mode === "copy") {
@@ -189,6 +207,255 @@ export async function runChunkMoverBatch(
   }
 
   return out;
+}
+
+/** A cleared row's object is its only copy: count whether each is there. */
+async function checkClearedRows(
+  env: Env,
+  cleared: Array<{ id: string; conversation_id: string }>,
+  out: ChunkMoverBatch,
+): Promise<void> {
+  if (cleared.length === 0) return;
+  const present = await mapConcurrent(cleared, R2_CONCURRENCY, async (r) =>
+    (await env.CHUNKS.head(keyOf(r))) !== null,
+  );
+  cleared.forEach((r, i) => {
+    if (present[i]) out.clearedOk++;
+    else {
+      out.lost++;
+      out.problems.push(r.id);
+    }
+  });
+}
+
+/**
+ * Rows last written less recently than this are cleared; newer ones wait for
+ * a later run. Chunk ids are deterministic and R2 is last-writer-wins, so a
+ * rewrite racing the clear could pair a new row with an older object; every
+ * rewrite resets created_at (INSERT OR REPLACE) and puts its object in the
+ * same request, so a row unchanged for a whole day has no put in flight. A
+ * day is far longer than any request.
+ */
+export const CLEAR_SETTLE_SECONDS = 24 * 60 * 60;
+
+/** Tries at giving a row its text back (see runChunkClearBatch), and the pause before each retry. */
+const RESTORE_ATTEMPTS = 3;
+const RESTORE_RETRY_MS = 250;
+
+/**
+ * A clear page could not give rows their text back after their objects went
+ * missing or changed. Those rows may now have their text nowhere, so the
+ * run stops rather than clear more; the message names the chunk ids.
+ */
+export class ChunkRestoreError extends Error {
+  constructor(
+    readonly chunkIds: string[],
+    cause: unknown,
+  ) {
+    super(
+      `could not restore ${chunkIds.length} cleared chunks whose objects went missing or changed: ${chunkIds.join(",")}: ${
+        cause instanceof Error ? cause.message : String(cause)
+      }`,
+    );
+    this.name = "ChunkRestoreError";
+  }
+}
+
+/**
+ * One page of the clear (engram#384 stage 2): the step that leaves a row's
+ * text in R2 only. A row is cleared only when every one of these holds:
+ *  - it is inline (chunk_encoding NULL), its text is not empty, and it was
+ *    last written more than CLEAR_SETTLE_SECONDS ago;
+ *  - its object, read back now, holds exactly the row's text — read the way
+ *    every reader reads it (loadChunkTexts: obj.text()), so what a reader
+ *    gets after the clear is the column's text, character for character;
+ *  - at the moment of the update the row still holds that text, is still
+ *    unmarked, and is still settled (clearChunkTexts' guard).
+ * Then each cleared object is checked once more. One gone or changed since
+ * it was read means a delete or reindex of that chunk raced the clear; were
+ * that request to stop halfway, the row would be left with its text
+ * nowhere, so the row gets back the text just verified.
+ *
+ * A page clears in one transaction. If the write fails, the rows are read
+ * back to learn whether it committed: if none was cleared the page throws
+ * and runs again; if they cannot be read back, every row it tried is
+ * checked as above (a restore touches only a row that is still cleared)
+ * and then the page throws. A restore that keeps failing throws
+ * ChunkRestoreError, which stops the run.
+ *
+ * Bounded by `upto`, the highest rowid when the run started: a cleared row
+ * moves above it (see clearChunkTexts). Rows already cleared are checked as
+ * in copy and verify. Reads text from D1 and R2; writes only the column.
+ */
+export async function runChunkClearBatch(
+  env: Env,
+  opts: {
+    after: number;
+    upto: number;
+    org?: string | null;
+    limit?: number;
+    settleSeconds?: number;
+  },
+): Promise<ChunkMoverBatch> {
+  const limit = Math.min(opts.limit ?? CLEAR_PAGE, CLEAR_PAGE);
+  const settleSeconds = opts.settleSeconds ?? CLEAR_SETTLE_SECONDS;
+  const page = await getChunkClearPage(env.DB, {
+    after: opts.after,
+    upto: opts.upto,
+    limit,
+    settleSeconds,
+    organizationId: opts.org ?? null,
+  });
+  const rows = page.results ?? [];
+  const out: ChunkMoverBatch = {
+    ...emptyCounts(),
+    scanned: rows.length,
+    nextAfter: rows.length > 0 ? rows[rows.length - 1].rid : opts.after,
+    done: rows.length < limit,
+    problems: [],
+  };
+
+  await checkClearedRows(env, rows.filter(isTextInR2Only), out);
+
+  const candidates: ChunkCopyRow[] = [];
+  for (const r of rows) {
+    if (isTextInR2Only(r)) continue;
+    if (r.chunk_encoding !== null) {
+      // Text in the column but an encoding set: nothing writes this, so it
+      // is not this job's to guess at.
+      out.skipped++;
+      out.problems.push(r.id);
+    } else if (r.chunk_text === "") {
+      out.skipped++;
+    } else if (r.settled !== 1) {
+      out.young++;
+    } else {
+      candidates.push(r);
+    }
+  }
+
+  const reads = await mapConcurrent(candidates, R2_CONCURRENCY, async (r) => {
+    const obj = await env.CHUNKS.get(keyOf(r));
+    if (!obj) return null;
+    return { text: await obj.text(), etag: obj.etag };
+  });
+  const matched: Array<{ row: ChunkCopyRow; etag: string }> = [];
+  candidates.forEach((r, i) => {
+    const read = reads[i];
+    if (read === null) {
+      out.missing++;
+      out.problems.push(r.id);
+    } else if (read.text !== r.chunk_text) {
+      out.mismatched++;
+      out.problems.push(r.id);
+    } else {
+      matched.push({ row: r, etag: read.etag });
+    }
+  });
+  if (matched.length === 0) return out;
+
+  const toClear = matched.map((m) => ({ id: m.row.id, text: m.row.chunk_text }));
+  let changed: boolean[] | null;
+  let writeError: unknown = null;
+  try {
+    changed = await clearChunkTexts(env.DB, toClear, { encoding: CHUNK_R2_ENCODING, settleSeconds });
+  } catch (err) {
+    // One transaction, but a failure can still have committed with its
+    // reply lost. The rows know: one inline at the page read and cleared
+    // now was cleared here.
+    writeError = err;
+    console.error(
+      `[chunk-mover] clear write failed after rowid ${opts.after}; reading the rows back: ${errText(err)}`,
+    );
+    try {
+      const now = new Map(
+        (await getChunkTextsByIds(env.DB, toClear.map((r) => r.id))).map((r) => [r.id, r]),
+      );
+      changed = toClear.map((r) => {
+        const cur = now.get(r.id);
+        return cur !== undefined && isTextInR2Only(cur);
+      });
+    } catch (readErr) {
+      console.error(
+        `[chunk-mover] could not read them back either; checking the object of every row tried: ${errText(readErr)}`,
+      );
+      changed = null;
+    }
+    // Nothing cleared: nothing to check, and the page runs again.
+    if (changed !== null && !changed.includes(true)) throw err;
+  }
+
+  // The rows this page may have cleared: those that changed, or every row it
+  // tried when that cannot be known.
+  const known = changed;
+  const justCleared = known === null ? matched : matched.filter((_, i) => known[i]);
+  if (known !== null) out.raced += matched.length - justCleared.length;
+  if (justCleared.length === 0) return out;
+
+  // Look once more. An object deleted or replaced since it was read leaves
+  // the row with no text anywhere, so put the text back in the column. A
+  // check that fails counts as gone: restoring a row that did not need it
+  // only delays its clear to a later run.
+  const stayed = await mapConcurrent(justCleared, R2_CONCURRENCY, async (m) => {
+    try {
+      const head = await env.CHUNKS.head(keyOf(m.row));
+      return head !== null && head.etag === m.etag;
+    } catch {
+      return false;
+    }
+  });
+  const undo = justCleared.filter((_, i) => !stayed[i]);
+  if (known !== null) out.cleared += justCleared.length - undo.length;
+
+  if (undo.length > 0) {
+    const restored = await restoreWithRetry(
+      env,
+      undo.map((m) => ({ id: m.row.id, text: m.row.chunk_text })),
+    );
+    undo.forEach((m, i) => {
+      out.problems.push(m.row.id);
+      if (restored[i]) out.restored++;
+      else out.raced++;
+    });
+  }
+  // The write's outcome is unknown, so this page's counts would be guesses:
+  // fail it. Its rows that were cleared have moved past the cursor and been
+  // checked above; the rest are read again.
+  if (known === null) {
+    console.error(
+      `[chunk-mover] clear outcome unknown after rowid ${opts.after}: checked the objects of ${justCleared.length} rows, ` +
+        `${undo.length} gone or changed, ${out.restored} given their text back; failing the page`,
+    );
+    throw writeError;
+  }
+  return out;
+}
+
+/**
+ * restoreChunkTexts, retried: its guard makes a second run harmless (a row
+ * an earlier, lost-reply attempt restored just reports false, counted as
+ * raced). Throws ChunkRestoreError once every try has failed.
+ */
+async function restoreWithRetry(env: Env, rows: Array<{ id: string; text: string }>): Promise<boolean[]> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= RESTORE_ATTEMPTS; attempt++) {
+    try {
+      return await restoreChunkTexts(env.DB, rows, CHUNK_R2_ENCODING);
+    } catch (err) {
+      lastError = err;
+      if (attempt < RESTORE_ATTEMPTS) await new Promise((r) => setTimeout(r, RESTORE_RETRY_MS * attempt));
+    }
+  }
+  const failure = new ChunkRestoreError(
+    rows.map((r) => r.id),
+    lastError,
+  );
+  console.error(`[chunk-mover] ${failure.message}`);
+  throw failure;
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /**

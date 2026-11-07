@@ -1333,12 +1333,13 @@ admin.post("/backfill-content-to-r2", async (c) => {
 
 // ---------------------------------------------------------------------------
 // POST /admin/content-integrity?org=<org_id>[&conversation=<conv_id>]
-//      [&after=<msg_id>][&batch=500][&repair=1]
+//      [&after=<rowid>][&batch=500][&repair=1]
 //
 // Find R2-backed messages whose object is gone (engram#541) and, with
 // repair=1, rebuild them from the search index. Report-only by default.
-// Cursor-paged on message id — follow `hint` until `done`. The response
-// carries ids and counts only, never message text.
+// Cursor-paged on message rowid, at most `batch` rows read per call
+// (engram#561) — follow `hint` until `done`. The response carries ids and
+// counts only, never message text.
 // ---------------------------------------------------------------------------
 admin.post("/content-integrity", async (c) => {
   const organizationId = c.req.query("org");
@@ -1348,6 +1349,16 @@ admin.post("/content-integrity", async (c) => {
   if (!Number.isInteger(batch) || batch < 1 || batch > SCAN_BATCH_MAX) {
     return c.json({ error: `batch must be an integer between 1 and ${SCAN_BATCH_MAX}` }, 400);
   }
+  // The cursor is a rowid from `next_after`. A message id (the cursor before
+  // engram#561) or anything else is refused rather than read as "start over".
+  const afterRaw = c.req.query("after");
+  let after: number | null = null;
+  if (afterRaw !== undefined && afterRaw !== "") {
+    after = /^\d{1,16}$/.test(afterRaw) ? Number(afterRaw) : NaN;
+    if (!Number.isSafeInteger(after)) {
+      return c.json({ error: "after must be the next_after of a previous call (a message rowid)" }, 400);
+    }
+  }
   const conversationId = c.req.query("conversation") || undefined;
   const repairRaw = c.req.query("repair");
   const repair = repairRaw === "1" || repairRaw === "true";
@@ -1355,14 +1366,14 @@ admin.post("/content-integrity", async (c) => {
   const result = await scanContentIntegrity(c.env, {
     organizationId,
     conversationId,
-    after: c.req.query("after") || null,
+    after,
     batch,
     repair,
   });
 
   const next = new URLSearchParams({ org: organizationId });
   if (conversationId) next.set("conversation", conversationId);
-  if (result.next_after) next.set("after", result.next_after);
+  if (result.next_after !== null) next.set("after", String(result.next_after));
   next.set("batch", String(batch));
   if (repair) next.set("repair", "1");
   return c.json({

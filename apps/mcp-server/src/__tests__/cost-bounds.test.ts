@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, type Mock } from "vitest";
 import { Hono } from "hono";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { TIER_LIMITS } from "@getengram/shared";
+import { MAX_SEARCH_QUERY_CHARS, TIER_LIMITS } from "@getengram/shared";
 import { insertOrganization, getUsage, getCurrentPeriod } from "@getengram/db";
 import { v1 } from "../routes/v1.js";
 import { usage } from "../routes/usage.js";
@@ -186,6 +186,24 @@ describe("search budget (engram#451)", () => {
     expect(res.status).toBe(429);
     expect(((await res.json()) as { error: string }).error).toBe("search_quota_exceeded");
     expect(ai.run).not.toHaveBeenCalled();
+  });
+
+  it("every REST search path refuses an over-long query before metering or embedding (engram#564)", async () => {
+    const org = "org_cb_s6";
+    const { db, env, ai, vec } = await setup(org);
+    const app = restApp(authFor(org));
+    const long = encodeURIComponent("k".repeat(MAX_SEARCH_QUERY_CHARS + 1));
+    for (const path of ["/api/v1/search", "/api/memories/search"]) {
+      const res = await app.request(`${path}?q=${long}`, {}, env);
+      expect(res.status, path).toBe(400);
+      expect(((await res.json()) as { error: string }).error, path).toBe("query_too_long");
+      // At the bound is still a search.
+      const ok = await app.request(`${path}?q=${encodeURIComponent("k".repeat(MAX_SEARCH_QUERY_CHARS))}`, {}, env);
+      expect(ok.status, path).toBe(200);
+    }
+    expect(ai.run).toHaveBeenCalledTimes(2);
+    expect(vec.query).toHaveBeenCalledTimes(2);
+    expect((await usageRow(db, org))?.searches_run).toBe(2);
   });
 
   it("an unlimited tier is never refused", async () => {

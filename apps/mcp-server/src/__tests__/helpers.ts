@@ -108,6 +108,9 @@ export function createMockD1(): D1Database {
         return { results: [], success: true, meta: {} };
       }),
       first: vi.fn(async () => {
+        // Keyword-search probe (engram#564): the mock has no FTS index, so
+        // nothing matches and the ranked query is never sent.
+        if (sql.includes("chunks_fts_v2 MATCH")) return { n: 0 };
         // Upserts and atomic counters hand their row back via RETURNING and
         // have no FROM clause. The two shapes the tier gates rely on are
         // modelled here — INSERT … ON CONFLICT(keys) … RETURNING *, and

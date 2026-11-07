@@ -1,7 +1,7 @@
 import type { Env } from "../types.js";
 import type { SearchResult } from "@getengram/shared";
 import { generateEmbedding } from "./embedding.js";
-import { getChunksByVectorizeIds, getChunksByIds, searchChunksFts } from "@getengram/db";
+import { getChunksByVectorizeIds, getChunksByIds, searchChunksFts, type ChunkKeywordHit } from "@getengram/db";
 import { isTextInR2Only, loadChunkTexts } from "./chunk-store.js";
 
 interface VectorizeMatch {
@@ -62,6 +62,54 @@ export function queryTerms(query: string): string[] {
   return [...new Set(query.toLowerCase().match(/[a-z0-9]{3,}/g) ?? [])];
 }
 
+/** Why a keyword search failed, in words that are safe to log. */
+export type KeywordFailureClass = "syntax" | "overloaded" | "timeout" | "network" | "d1" | "other";
+
+// Status codes D1 and SQLite put in error messages. Only these exact strings
+// are ever logged: anything else in a message may be the user's query.
+const LOGGABLE_ERROR_CODES = new Set([
+  "D1_ERROR", "D1_EXEC_ERROR", "D1_TYPE_ERROR", "D1_COLUMN_NOTFOUND", "D1_DUMP_ERROR", "D1_RESET_DO",
+  "SQLITE_ERROR", "SQLITE_INTERNAL", "SQLITE_PERM", "SQLITE_ABORT", "SQLITE_BUSY", "SQLITE_LOCKED",
+  "SQLITE_NOMEM", "SQLITE_READONLY", "SQLITE_INTERRUPT", "SQLITE_IOERR", "SQLITE_CORRUPT", "SQLITE_NOTFOUND",
+  "SQLITE_FULL", "SQLITE_CANTOPEN", "SQLITE_PROTOCOL", "SQLITE_EMPTY", "SQLITE_SCHEMA", "SQLITE_TOOBIG",
+  "SQLITE_CONSTRAINT", "SQLITE_MISMATCH", "SQLITE_MISUSE", "SQLITE_NOLFS", "SQLITE_AUTH", "SQLITE_FORMAT",
+  "SQLITE_RANGE", "SQLITE_NOTADB", "SQLITE_NOTICE", "SQLITE_WARNING",
+]);
+
+/**
+ * Classify a keyword-search failure for the log (engram#564).
+ *
+ * A failed keyword search degrades to semantic-only and the caller never
+ * sees it, so the log line is the only record that it happened. It carries a
+ * class and the D1/SQLite status codes, never the message: FTS5 quotes the
+ * offending query text in its errors ("syntax error near ..."), and query text
+ * is user content. Exported for tests.
+ */
+export function classifyKeywordFailure(err: unknown): { class: KeywordFailureClass; codes?: string[] } {
+  const parts: string[] = [];
+  for (let e: unknown = err, depth = 0; e != null && depth < 3; depth++) {
+    if (e instanceof Error) {
+      parts.push(e.message);
+      e = (e as { cause?: unknown }).cause;
+    } else {
+      if (typeof e === "string") parts.push(e);
+      break;
+    }
+  }
+  const text = parts.join("\n");
+  const codes = [...new Set(text.match(/\b(?:D1|SQLITE)_[A-Z_]+\b/g) ?? [])].filter((c) =>
+    LOGGABLE_ERROR_CODES.has(c),
+  );
+  let cls: KeywordFailureClass;
+  if (/fts5|syntax error|unterminated string|no such column|malformed match|parse error/i.test(text)) cls = "syntax";
+  else if (/overloaded|queued for too long|too many requests/i.test(text)) cls = "overloaded";
+  else if (/timed? ?out|timeout|deadline/i.test(text)) cls = "timeout";
+  else if (/network connection lost|connection reset|socket hang up|econnreset|fetch failed/i.test(text)) cls = "network";
+  else if (codes.length > 0 || /\bD1\b/.test(text)) cls = "d1";
+  else cls = "other";
+  return codes.length > 0 ? { class: cls, codes } : { class: cls };
+}
+
 export async function searchConversations(
   env: Env,
   organizationId: string,
@@ -100,7 +148,16 @@ export async function searchConversations(
         return { ok: false as const, embedding: null };
       }),
     searchChunksFts(env.DB, query, organizationId, fetchK, conversationId)
-      .catch(() => ({ results: [] as { chunk_id: string; rank: number }[] })),
+      .then((r) => {
+        // A declined search is not a failure, but counting them is how the
+        // cap gets tuned (engram#564). Never log the query: it is user content.
+        if (r.skipped) console.log(`[search] keyword search skipped ${JSON.stringify({ reason: r.skipped })}`);
+        return r;
+      })
+      .catch((err: unknown) => {
+        console.error(`[search] keyword search failed ${JSON.stringify(classifyKeywordFailure(err))}`);
+        return { results: [] as ChunkKeywordHit[] };
+      }),
   ]);
 
   let vectorMatches: VectorizeMatch[] = [];

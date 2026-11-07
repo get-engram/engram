@@ -2,10 +2,14 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { Miniflare } from "miniflare";
 import {
   deleteConversationById,
+  getChunkForRebuild,
+  getMessagesBySequenceRange,
   getR2MessageIdsByConversation,
   getR2PointerPage,
   getR2RevisionIdsByConversation,
+  refillChunkText,
   reindexConversationTagsRange,
+  replaceChunks,
 } from "@getengram/db";
 import { moveConversation } from "../routes/merge-orgs.js";
 import { applyAllMigrations } from "./miniflare.js";
@@ -149,6 +153,52 @@ describe("conversation-scoped statements seek the conversation (engram#559)", ()
       "UPDATE message_revisions": /SEARCH message_revisions USING (COVERING )?INDEX idx_message_revisions_conv \(conversation_id=\?\)/,
       "UPDATE secrets_vault": /SEARCH secrets_vault USING (COVERING )?INDEX idx_vault_org_conv \(organization_id=\? AND conversation_id=\?\)/,
     });
+  });
+
+  it("reindex swap and lost-chunk rebuild: every statement seeks its row or the conversation (engram#567)", async () => {
+    const rec = recording(db);
+    await replaceChunks(rec.db, "conv_x", "org_x", ["chk_old_1", "chk_old_2"], [
+      { id: "chk_new_1", chunkText: "t", chunkSummary: "s", startSequence: 1, endSequence: 2, vectorizeId: "v1" },
+    ]);
+    await getChunkForRebuild(rec.db, "chk_x");
+    await getMessagesBySequenceRange(rec.db, "conv_x", "org_x", 1, 5);
+    await refillChunkText(
+      rec.db,
+      { id: "chk_x", conversationId: "conv_x", organizationId: "org_x", text: "t", summary: "s" },
+      "r2:raw",
+    );
+
+    // Every statement, not only the conversation-scoped ones: the guards
+    // look a chunk up by id with its organization beside it, and an
+    // organization equality is all the planner needs to pick the org index.
+    for (const s of rec.sql) {
+      const plan = await planOf(db, s);
+      expect({ sql: s, walks: orgWalks(plan) }).toEqual({ sql: s, walks: [] });
+    }
+    await expectConversationSeeks(rec.sql, {
+      "DELETE FROM conversation_chunks": /SEARCH conversation_chunks USING INDEX sqlite_autoindex_conversation_chunks_1 \(id=\?\)/,
+      "UPDATE conversation_chunks": /SEARCH conversation_chunks USING INDEX sqlite_autoindex_conversation_chunks_1 \(id=\?\)/,
+      "FROM messages": /SEARCH messages USING (COVERING )?INDEX idx_messages_conv_seq \(conversation_id=\?/,
+    });
+    // The refill's FTS guard reads the chunk by id and organization.
+    const guards = rec.sql.filter((q) => /^(DELETE FROM|INSERT INTO) chunks_fts_v2\b[\s\S]*FROM conversation_chunks/.test(q));
+    expect(guards.length).toBe(2);
+    for (const g of guards) {
+      expect((await planOf(db, g)).join(" | ")).toMatch(
+        /SEARCH conversation_chunks USING INDEX sqlite_autoindex_conversation_chunks_1 \(id=\?\)/,
+      );
+    }
+    expect((await planOf(db, rec.sql.find((q) => /FROM conversation_chunks WHERE id = \?$/.test(q.trim()))!)).join(" | ")).toMatch(
+      /SEARCH conversation_chunks USING (COVERING )?INDEX sqlite_autoindex_conversation_chunks_1 \(id=\?\)/,
+    );
+    // Here the planner seeks the primary key with or without INDEXED BY, so
+    // the hints are asserted too: they keep these plans from depending on
+    // the statistics production's planner has.
+    const writes = rec.sql.filter((q) => /^(DELETE FROM|UPDATE) conversation_chunks\b/.test(q.trim()));
+    expect(writes.length).toBe(2);
+    for (const q of [...writes, ...guards]) {
+      expect(q).toMatch(/conversation_chunks INDEXED BY sqlite_autoindex_conversation_chunks_1\b/);
+    }
   });
 
   it("tag reindex: one bounded rowid range of conversations per statement (engram#562)", async () => {

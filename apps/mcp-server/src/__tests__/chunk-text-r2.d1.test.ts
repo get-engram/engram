@@ -405,7 +405,7 @@ describe("chunk text in R2 (engram#384), against real SQLite and R2", () => {
     expect(await objectText(`conv_race/${rows[2].id}`)).toBe(rows[2].chunk_text);
   });
 
-  it("a cleared row is checked, never overwritten, and reported lost when its copy is gone", async () => {
+  it("a cleared row is checked, never overwritten, reported lost when its copy is gone, and rebuilt by a repair", async () => {
     await seed("org_cleared", "conv_cleared", 8, "ibis");
     const rows = await chunkRows("conv_cleared");
     const target = rows[0];
@@ -420,10 +420,21 @@ describe("chunk text in R2 (engram#384), against real SQLite and R2", () => {
     expect(verified).toMatchObject({ ok: 2, clearedOk: 1, lost: 0, missing: 0 });
 
     await chunks.delete(`conv_cleared/${target.id}`);
-    const lost = await runAll(env, { mode: "verify", org: "org_cleared", repair: true });
-    expect(lost).toMatchObject({ ok: 2, clearedOk: 0, lost: 1, repaired: 0 });
-    expect(lost.problems).toEqual([target.id]);
-    expect(await objectText(`conv_cleared/${target.id}`)).toBeNull(); // nothing to repair it from
+    const found = await runAll(env, { mode: "verify", org: "org_cleared" });
+    expect(found).toMatchObject({ ok: 2, clearedOk: 0, lost: 1, rebuilt: 0, repaired: 0 });
+    expect(found.problems).toEqual([target.id]);
+    expect(await objectText(`conv_cleared/${target.id}`)).toBeNull(); // a plain verify writes nothing
+
+    // A repair rebuilds the row from its messages (engram#567): the column
+    // holds the text again, and its copy is put back, both as they were.
+    const repaired = await runAll(env, { mode: "verify", org: "org_cleared", repair: true });
+    expect(repaired).toMatchObject({ ok: 2, clearedOk: 0, lost: 1, rebuilt: 1, repaired: 0 });
+    expect(repaired.problems).toEqual([target.id]);
+    expect(await chunkRows("conv_cleared")).toEqual(rows);
+    expect(await objectText(`conv_cleared/${target.id}`)).toBe(target.chunk_text);
+
+    const again = await runAll(env, { mode: "verify", org: "org_cleared" });
+    expect(again).toMatchObject({ ok: 3, clearedOk: 0, lost: 0, missing: 0, mismatched: 0 });
   });
 
   // ── Edits and deletes ───────────────────────────────────────────────────

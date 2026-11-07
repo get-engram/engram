@@ -17,6 +17,7 @@ import {
   putChunkTexts,
   type ChunkCopy,
 } from "./chunk-store.js";
+import { rebuildLostChunk } from "./chunk-rebuild.js";
 import { mapConcurrent } from "../utils/map-concurrent.js";
 import type { Env } from "../types.js";
 
@@ -29,7 +30,9 @@ import type { Env } from "../types.js";
  *   copy    — put every row's text to R2 (an existing object is overwritten
  *             with the same bytes).
  *   verify  — read every object back and compare it with the row exactly;
- *             with repair, rewrite the missing and mismatched ones.
+ *             with repair, rewrite the missing and mismatched ones, and
+ *             rebuild each lost row's text from its messages
+ *             (chunk-rebuild.ts, engram#567).
  *   clear   — read every settled row's object back, and empty the column of
  *             each row whose object matches it exactly. See
  *             runChunkClearBatch.
@@ -74,6 +77,8 @@ export interface ChunkMoverCounts {
   /**
    * copy, verify: row rewritten while its page was in flight; object
    * rewritten from the row as it is now.
+   * verify + repair: lost row deleted, rewritten or restored before its
+   * rebuild, so not rebuilt.
    * clear: row rewritten or deleted between the read and the clear, so not
    * cleared; or cleared, then rewritten or deleted before a restore.
    * orphans: orphan whose row came back, or whose object changed, before the
@@ -87,8 +92,16 @@ export interface ChunkMoverCounts {
   orphansRemoved: number;
   /** Cleared row whose object is there. */
   clearedOk: number;
-  /** Cleared row whose object is NOT there: the text exists nowhere. */
+  /**
+   * Cleared row whose object is NOT there: the text exists nowhere in
+   * storage. Counted when found, whether or not a repair then rebuilds it.
+   */
   lost: number;
+  /**
+   * verify + repair: lost row whose text was rebuilt from its messages and
+   * written back to the column (engram#567); its copy is put again too.
+   */
+  rebuilt: number;
   /** clear: column emptied; the row's text is now in R2 only. */
   cleared: number;
   /**
@@ -135,6 +148,7 @@ export function emptyCounts(): ChunkMoverCounts {
     orphansRemoved: 0,
     clearedOk: 0,
     lost: 0,
+    rebuilt: 0,
     cleared: 0,
     restored: 0,
     skipped: 0,
@@ -169,7 +183,7 @@ export async function runChunkMoverBatch(
     problems: [],
   };
 
-  await checkClearedRows(env, rows.filter(isTextInR2Only), out);
+  await checkClearedRows(env, rows.filter(isTextInR2Only), out, opts.mode === "verify" && opts.repair === true);
   const inline = rows.filter((r) => !isTextInR2Only(r));
 
   let toWrite: ChunkCopyRow[];
@@ -209,23 +223,65 @@ export async function runChunkMoverBatch(
   return out;
 }
 
-/** A cleared row's object is its only copy: count whether each is there. */
+/**
+ * A cleared row's object is its only copy: count whether each is there.
+ *
+ * With `rebuild` (verify + repair), each lost row is then rebuilt from its
+ * messages, one at a time, and its copy put back as a repair puts one. A
+ * row that cannot be rebuilt stays lost, and is logged by chunk id.
+ */
 async function checkClearedRows(
   env: Env,
-  cleared: Array<{ id: string; conversation_id: string }>,
+  cleared: ChunkCopyRow[],
   out: ChunkMoverBatch,
+  rebuild = false,
 ): Promise<void> {
   if (cleared.length === 0) return;
   const present = await mapConcurrent(cleared, R2_CONCURRENCY, async (r) =>
     (await env.CHUNKS.head(keyOf(r))) !== null,
   );
+  const lost: ChunkCopyRow[] = [];
   cleared.forEach((r, i) => {
     if (present[i]) out.clearedOk++;
     else {
       out.lost++;
       out.problems.push(r.id);
+      lost.push(r);
     }
   });
+  if (!rebuild || lost.length === 0) return;
+
+  const refilled: ChunkCopyRow[] = [];
+  for (const r of lost) {
+    try {
+      const result = await rebuildLostChunk(env, r.id);
+      if (result.status === "rebuilt") {
+        out.rebuilt++;
+        refilled.push({ ...r, chunk_text: result.text, chunk_encoding: null });
+        if (!result.summaryMatched) {
+          console.warn(`[chunk-mover] rebuilt lost chunk ${r.id}; its stored summary does not match the rebuilt text`);
+        }
+      } else if (result.status === "gone") {
+        out.raced++;
+      } else {
+        console.error(`[chunk-mover] lost chunk ${r.id} not rebuilt: ${result.reason}`);
+      }
+    } catch (err) {
+      console.error(`[chunk-mover] rebuilding lost chunk ${r.id} failed: ${errText(err)}`);
+    }
+  }
+  if (refilled.length === 0) return;
+
+  // The rows hold their text again, inline. Their copies are missing, which
+  // is what a repair rewrites; reconcile catches a row changed meanwhile.
+  const failed = await putChunkTexts(
+    env,
+    refilled.map((r) => ({ key: keyOf(r), text: r.chunk_text })),
+    R2_CONCURRENCY,
+  );
+  const failedKeys = new Set(failed.map((f) => f.key));
+  out.putFailed += failed.length;
+  await reconcile(env, refilled.filter((r) => !failedKeys.has(keyOf(r))), out);
 }
 
 /**

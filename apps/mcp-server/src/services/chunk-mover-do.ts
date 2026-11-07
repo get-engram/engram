@@ -39,6 +39,13 @@ import type { Env } from "../types.js";
  * not give a row its text back (ChunkRestoreError): either means some text
  * may exist nowhere, and nothing more is cleared until that is understood.
  *
+ * A verify run with `repair` rewrites the copies that are missing or differ
+ * from their rows, and rebuilds each lost row's text from its messages
+ * (engram#567), counting the row in `lost` when found and in `rebuilt`
+ * once written back. After a clear stops on `lost`, run one: when it has
+ * rebuilt every lost row and a plain verify finds none, the cause can be
+ * looked at with nothing missing.
+ *
  * An orphans run reports unless `delete` is true, and a deleting run must
  * name `maxDeletes`, the most objects it may remove — set it from a report
  * run's `orphans`. A page whose orphans would pass it deletes nothing and

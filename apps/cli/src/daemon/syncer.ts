@@ -25,6 +25,25 @@ const BILLING_BACKOFF_MS = [
   60 * 60_000,   // 1 hour (cap)
 ];
 
+/**
+ * Backoff schedule for a full memory: 1min → 2min → 5min → 5min ... The user
+ * clears it, by upgrading or deleting conversations, and capture should
+ * resume within minutes of that, not an hour. Retrying is cheap: the server
+ * refuses the send before it writes anything.
+ */
+const STORAGE_FULL_BACKOFF_MS = [60_000, 2 * 60_000, 5 * 60_000];
+
+/**
+ * How one conversation's turn in a flush ended (engram#580). Only "sent"
+ * means its queue is empty, and only a flush in which every conversation
+ * sent is a successful sync.
+ */
+type SendOutcome =
+  | "sent" // everything queued for it went out
+  | "retry" // a send failed; its rows stay queued for a later flush
+  | "backoff" // the account hit a billing or storage limit
+  | "auth"; // the API key was rejected; syncing has stopped
+
 /** Retry schedule for one session whose conversation create failed with an
  *  ordinary error (network, 5xx, rejected input). Its messages stay queued
  *  in daemon.db throughout — this only paces the retries. */
@@ -191,10 +210,8 @@ export class Syncer {
 
   /** Flush all pending messages to the API. */
   async flush(): Promise<void> {
-    if (this.flushing || this.authFailed) return;
-
-    // Skip if in billing backoff window
-    if (Date.now() < this.billingBackoffUntil) return;
+    // Nothing can send while the key is rejected or a billing backoff holds.
+    if (this.flushing || this.halted()) return;
 
     this.flushing = true;
 
@@ -217,19 +234,25 @@ export class Syncer {
         chunks.push(convIds.slice(i, i + CONCURRENCY));
       }
 
-      let hadError = false;
+      let allSent = true;
       for (const chunk of chunks) {
         const results = await Promise.allSettled(
           chunk.map((id) => this.flushConversation(id)),
         );
-        if (results.some((r) => r.status === "rejected")) hadError = true;
+        if (results.some((r) => r.status === "rejected" || r.value !== "sent")) {
+          allSent = false;
+        }
       }
 
-      // Report sync health
+      // Report sync health. Only a flush in which every create and every
+      // send went through is a successful sync: a session still waiting on
+      // its create, or a conversation whose send failed, is not synced.
+      // A failed send used to count as a success (engram#580): status read
+      // "healthy" while nothing synced, and the billing backoff a full
+      // memory had just entered was cleared again, so the account was
+      // retried every 2 s instead of backing off.
       const pending = this.db.getPendingCount();
-      // A session still waiting on its create is not synced: no "healthy",
-      // and a billing backoff entered by the create must hold.
-      if (createsOk && !hadError && !this.authFailed) {
+      if (createsOk && allSent) {
         this.resetBillingBackoff();
         recordSuccess(pending);
       }
@@ -364,11 +387,17 @@ export class Syncer {
    *  to the full batch on the next success). */
   private batchOverride = new Map<string, number>();
 
-  private async flushConversation(conversationId: string): Promise<void> {
+  private async flushConversation(conversationId: string): Promise<SendOutcome> {
     while (true) {
+      // An auth failure or a billing limit applies to the whole account.
+      // Once any conversation in this flush has hit one, no new batch is
+      // started: it could only fail the same way.
+      if (this.authFailed) return "auth";
+      if (Date.now() < this.billingBackoffUntil) return "backoff";
+
       const limit = this.batchOverride.get(conversationId) ?? BATCH_SIZE;
       let rows = this.db.dequeue(conversationId, limit);
-      if (rows.length === 0) break;
+      if (rows.length === 0) return "sent";
 
       // Byte budget: transcript messages vary wildly in size — trim the batch
       // so its total content stays inside the budget. Always send at least
@@ -399,14 +428,14 @@ export class Syncer {
           console.error(`[engram] auth error, stopping flush: ${msg}`);
           recordFailure(msg, "auth", this.db.getPendingCount());
           this.stopFlushLoop();
-          return;
+          return "auth";
         }
 
         // Billing / limit errors — exponential backoff
         const errType = classifyError(msg);
         if (errType === "billing" || errType === "storage_full") {
           this.enterBillingBackoff(msg);
-          return;
+          return "backoff";
         }
 
         // Rate limit or network/timeout — leave in queue for next cycle, but
@@ -422,13 +451,15 @@ export class Syncer {
           console.error(`[engram] send failed (will retry): ${msg}`);
         }
         recordFailure(msg, errType, this.db.getPendingCount());
-        return;
+        return "retry";
       }
     }
   }
 
   /**
-   * Enter billing backoff — escalates each time: 5min → 15min → 1hr.
+   * Enter billing backoff — escalates each time it is entered:
+   * 5min → 15min → 1hr for a plan limit, 1min → 2min → 5min for a full
+   * memory (see STORAGE_FULL_BACKOFF_MS).
    *
    * A full memory is separated out here. It arrives as a 402 like any other
    * billing error, but retrying can never clear it on its own: it needs an
@@ -438,30 +469,41 @@ export class Syncer {
    * even when the machine is offline.
    */
   private enterBillingBackoff(msg: string): void {
-    const delay = BILLING_BACKOFF_MS[
-      Math.min(this.billingBackoffStep, BILLING_BACKOFF_MS.length - 1)
-    ];
-    this.billingBackoffUntil = Date.now() + delay;
-    this.billingBackoffStep++;
-
     const storageFull = parseStorageFullError(msg);
-    const mins = Math.round(delay / 60_000);
-    if (storageFull) {
+
+    // Sends running in parallel hit the limit together. Only the first in a
+    // flush escalates (engram#580): five at once would otherwise go
+    // straight to the cap. No flush starts inside the window, so the next
+    // flush that hits the limit escalates again.
+    if (Date.now() >= this.billingBackoffUntil) {
+      const schedule = storageFull ? STORAGE_FULL_BACKOFF_MS : BILLING_BACKOFF_MS;
+      const delay = schedule[Math.min(this.billingBackoffStep, schedule.length - 1)];
+      this.billingBackoffUntil = Date.now() + delay;
+      this.billingBackoffStep++;
+
+      const mins = Math.round(delay / 60_000);
       console.error(
-        `[engram] memory full (${storageFull.used ?? "?"}/${storageFull.limit ?? "?"}), ` +
-          `pausing sync ${mins}m — new captures stay queued until space is freed`,
+        storageFull
+          ? `[engram] memory full (${storageFull.used ?? "?"}/${storageFull.limit ?? "?"}), ` +
+              `pausing sync ${mins}m — new captures stay queued until space is freed`
+          : `[engram] billing limit hit, backing off ${mins}m (attempt ${this.billingBackoffStep}): ${msg}`,
       );
+    }
+
+    if (storageFull) {
       recordFailure(msg, "storage_full", this.db.getPendingCount(), {
         used: storageFull.used,
         limit: storageFull.limit,
       });
-      return;
+    } else {
+      recordFailure(msg, "billing", this.db.getPendingCount());
     }
+  }
 
-    console.error(
-      `[engram] billing limit hit, backing off ${mins}m (attempt ${this.billingBackoffStep}): ${msg}`,
-    );
-    recordFailure(msg, "billing", this.db.getPendingCount());
+  /** True while sending can only fail: the API key was rejected, or the
+   *  account is inside a billing backoff. */
+  private halted(): boolean {
+    return this.authFailed || Date.now() < this.billingBackoffUntil;
   }
 
   /** Reset billing backoff after a successful sync. */

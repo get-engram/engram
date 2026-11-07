@@ -731,8 +731,14 @@ admin.post("/hygiene/run", async (c) => {
 
 // POST /admin/daily-report/send — manually trigger the daily ops email
 // (same path the 13:00 UTC cron takes). Useful for testing delivery.
+// One attempt and no failure email: the cron's retries wait minutes, longer
+// than an HTTP request should hang, and the caller reads the error here.
 admin.post("/daily-report/send", async (c) => {
-  await sendDailyReport(c.env);
+  try {
+    await sendDailyReport(c.env, { delays: [0], notifyOnFailure: false });
+  } catch (err) {
+    return c.json({ sent: false, error: err instanceof Error ? err.message : String(err) }, 502);
+  }
   return c.json({ sent: true });
 });
 

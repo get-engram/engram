@@ -92,23 +92,80 @@ describe("daily report — paying count", () => {
     ]));
     const r = await buildDailyReport(env(mockDb(ORGS_WITH_SUB_ID)));
     expect(r.totals.paying).toBe(3);
-    expect(r.revenue.committed_subscriptions).toBe(2);
-    expect(r.revenue.at_risk_subscriptions).toBe(1);
+    expect(r.paying_source).toBe("stripe");
+    const revenue = r.revenue!;
+    expect(revenue).not.toBeNull();
+    expect(revenue.committed_subscriptions).toBe(2);
+    expect(revenue.at_risk_subscriptions).toBe(1);
     expect(r.totals.paying).toBe(
-      r.revenue.committed_subscriptions + r.revenue.at_risk_subscriptions,
+      revenue.committed_subscriptions + revenue.at_risk_subscriptions,
     );
   });
 
   it("falls back to the database when Stripe is unreachable", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("stripe down"); }));
     const r = await buildDailyReport(env(mockDb(7)));
-    // Zero subscriptions from Stripe means "unavailable", not "nobody pays".
     expect(r.totals.paying).toBe(7);
+    // And says so, so the email can label the count.
+    expect(r.paying_source).toBe("database");
   });
 
   it("never reports zero payers just because Stripe failed", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("stripe down"); }));
     const r = await buildDailyReport(env(mockDb(11)));
     expect(r.totals.paying).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * engram#569: a morning Stripe did not answer, the report printed
+ * "Revenue: $0/mo committed from 0 customers" beside a paying count of 14.
+ * computeMrr returned zeros on failure and the report could not tell them
+ * from a real zero. A failed read must reach the email as "unavailable".
+ */
+describe("daily report — revenue when Stripe fails", () => {
+  it("sends no revenue figures, and the reason, when Stripe does not answer", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("stripe down"); }));
+    const r = await buildDailyReport(env(mockDb(14)));
+    expect(r.revenue).toBeNull();
+    expect(r.revenue_unavailable).toMatch(/stripe down/);
+  });
+
+  it("sends no revenue figures when Stripe refuses the key", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 401 })));
+    const r = await buildDailyReport(env(mockDb(14)));
+    expect(r.revenue).toBeNull();
+    expect(r.revenue_unavailable).toMatch(/401/);
+    expect(r.paying_source).toBe("database");
+  });
+
+  it("sends no revenue figures when there is no Stripe key", async () => {
+    const r = await buildDailyReport({ DB: mockDb(14) } as unknown as Env);
+    expect(r.revenue).toBeNull();
+    expect(r.revenue_unavailable).toMatch(/STRIPE_SECRET_KEY/);
+  });
+
+  it("reports a real zero when Stripe answers with no subscriptions", async () => {
+    // Stripe answering is authoritative, zero included: the D1 column
+    // outlives subscriptions, so falling back here would inflate the count.
+    vi.stubGlobal("fetch", mockStripe([]));
+    const r = await buildDailyReport(env(mockDb(ORGS_WITH_SUB_ID)));
+    expect(r.totals.paying).toBe(0);
+    expect(r.paying_source).toBe("stripe");
+    expect(r.revenue).toEqual({
+      committed_cents: 0,
+      committed_subscriptions: 0,
+      at_risk_cents: 0,
+      at_risk_subscriptions: 0,
+      external_cents: 0,
+    });
+    expect(r.revenue_unavailable).toBeUndefined();
+  });
+
+  it("never sends the Stripe key in the report", async () => {
+    const key = "sk_live_do_not_leak_0123456789";
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 401 })));
+    const r = await buildDailyReport({ DB: mockDb(1), STRIPE_SECRET_KEY: key } as unknown as Env);
+    expect(JSON.stringify(r)).not.toContain(key);
   });
 });

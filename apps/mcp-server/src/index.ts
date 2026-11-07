@@ -424,7 +424,9 @@ export default {
     }
     if (event.cron === "0 13 * * *") {
       // Isolated so a report failure can't swallow the Monday digests —
-      // and vice versa. Failures land in the worker logs with context.
+      // and vice versa. sendDailyReport retries for a few minutes, then
+      // emails a failure notice: the worker logs are not kept, and three
+      // reports once went missing with no trace (engram#569).
       try {
         await sendDailyReport(env);
       } catch (err) {

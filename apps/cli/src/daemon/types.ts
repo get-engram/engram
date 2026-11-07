@@ -16,6 +16,12 @@ export interface SessionMeta {
   version?: string;
   /** Host that produced the session (engram#261): "claude-code", "codex". */
   host?: string;
+  /**
+   * Set when the daemon rebuilt this metadata from local state because the
+   * session's own was lost — messages queued by a daemon older than
+   * engram#370 (see DaemonDb.adoptOrphanedPendingRows).
+   */
+  recovered?: boolean;
 }
 
 /** Emits fully-parsed messages for a session as they complete. */

@@ -25,6 +25,11 @@ const BILLING_BACKOFF_MS = [
   60 * 60_000,   // 1 hour (cap)
 ];
 
+/** Retry schedule for one session whose conversation create failed with an
+ *  ordinary error (network, 5xx, rejected input). Its messages stay queued
+ *  in daemon.db throughout — this only paces the retries. */
+const CREATE_RETRY_MS = [30_000, 2 * 60_000, 10 * 60_000];
+
 /**
  * Batches parsed messages and sends them to the Engram API.
  * If offline, messages sit in the SQLite queue and are retried
@@ -41,11 +46,13 @@ export class Syncer {
   private billingBackoffUntil: number = 0;
   private billingBackoffStep: number = 0;
 
-  /** Sessions awaiting conversation creation (deferred from parse time). */
-  private pendingSessions = new Map<
-    string,
-    SessionMeta
-  >();
+  /** Sessions whose conversation create failed: when to try again. The
+   *  sessions themselves live in daemon.db (engram#370) — losing this map
+   *  on a restart only means an earlier retry. */
+  private createRetry = new Map<string, { until: number; step: number }>();
+
+  /** Rows orphaned by a pre-#370 daemon are adopted once per process. */
+  private orphansAdopted = false;
 
   constructor(
     db: DaemonDb,
@@ -86,14 +93,7 @@ export class Syncer {
     }
 
     // Check if we already have a mapping
-    let conversationId = this.db.getConversationId(sessionId);
-
-    if (!conversationId) {
-      // Defer creation — store messages under the sessionId temporarily.
-      // The flush loop will create the conversation and re-map them.
-      this.pendingSessions.set(sessionId, meta);
-      conversationId = `pending:${sessionId}`;
-    }
+    const conversationId = this.db.getConversationId(sessionId);
 
     // Value-exact scrubbing of known vault secrets, applied to every role
     // (tool output is where `engram vault get` lands). This is the last
@@ -114,7 +114,16 @@ export class Syncer {
       }
     }
 
-    this.db.enqueue(conversationId, messages);
+    if (conversationId) {
+      this.db.enqueue(conversationId, messages);
+    } else {
+      // No conversation yet. Creating it is deferred to the flush loop so
+      // the parser never waits on the network; until then the messages wait
+      // under pending:<sessionId>, recorded together with the session in
+      // daemon.db (engram#370) so a restart or a failed create can't strand
+      // them.
+      this.db.enqueuePendingSession(sessionId, meta, messages);
+    }
   }
 
   /**
@@ -128,9 +137,9 @@ export class Syncer {
     const conversationId = this.db.getConversationId(sessionId);
 
     this.db.markSessionExcluded(sessionId, reason, conversationId ?? undefined);
-    this.pendingSessions.delete(sessionId);
+    this.createRetry.delete(sessionId);
     const dropped =
-      this.db.deleteAllForConversation(`pending:${sessionId}`) +
+      this.db.dropPendingSession(sessionId) +
       (conversationId ? this.db.deleteAllForConversation(conversationId) : 0);
 
     console.log(
@@ -195,7 +204,7 @@ export class Syncer {
       await this.retryRemoteDeletes();
 
       // Step 1: Create any pending conversations
-      await this.createPendingConversations();
+      const createsOk = await this.createPendingConversations();
 
       // Step 2: Flush messages for all conversations (with concurrency)
       const convIds = this.db.getPendingConversationIds().filter(
@@ -218,7 +227,9 @@ export class Syncer {
 
       // Report sync health
       const pending = this.db.getPendingCount();
-      if (!hadError && !this.authFailed) {
+      // A session still waiting on its create is not synced: no "healthy",
+      // and a billing backoff entered by the create must hold.
+      if (createsOk && !hadError && !this.authFailed) {
         this.resetBillingBackoff();
         recordSuccess(pending);
       }
@@ -231,62 +242,121 @@ export class Syncer {
     }
   }
 
-  /** Create conversations for sessions that were deferred during parsing. */
-  private async createPendingConversations(): Promise<void> {
-    if (this.pendingSessions.size === 0) return;
-
-    const entries = [...this.pendingSessions.entries()];
-    this.pendingSessions.clear();
-
-    // Create conversations in parallel batches
-    const batches = [];
-    for (let i = 0; i < entries.length; i += CONCURRENCY) {
-      batches.push(entries.slice(i, i + CONCURRENCY));
-    }
-
-    for (const batch of batches) {
-      const results = await Promise.allSettled(
-        batch.map(async ([sessionId, meta]) => {
-          // Double-check (another flush may have created it)
-          if (this.db.getConversationId(sessionId)) return;
-
-          const conversationId = await this.createConversation(sessionId, meta);
-
-          // Opt-out race (engram#462): the user may have said "don't save
-          // this" while the create was in flight — excludeSession saw no
-          // conversation id yet, so it couldn't schedule the remote delete.
-          // Schedule it now; the flush loop's retryRemoteDeletes handles it.
-          if (this.db.isSessionExcluded(sessionId)) {
-            this.db.markSessionExcluded(sessionId, "in-chat opt-out", conversationId);
-            this.db.deleteAllForConversation(`pending:${sessionId}`);
-            this.db.deleteAllForConversation(conversationId);
-            return;
-          }
-
-          // Migrate pending messages from pending:sessionId → real conversationId
-          this.db.remapPending(`pending:${sessionId}`, conversationId);
-        }),
-      );
-
-      for (const r of results) {
-        if (r.status === "rejected") {
-          const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
-          if (msg.includes("401") || msg.includes("403")) {
-            this.authFailed = true;
-            console.error(`[engram] auth error, stopping: ${msg}`);
-            recordFailure(msg, "auth", this.db.getPendingCount());
-            return;
-          }
-          const errType = classifyError(msg);
-          if (errType === "billing" || errType === "storage_full") {
-            this.enterBillingBackoff(msg);
-            return;
-          }
-          console.error(`[engram] create error (will retry): ${msg}`);
-          recordFailure(msg, errType, this.db.getPendingCount());
+  /**
+   * Create conversations for sessions that were deferred during parsing.
+   * Every session stays in daemon.db until its conversation exists and its
+   * messages have moved onto it — a failure here only means "try again".
+   * Returns false while any session is still waiting on a failed create.
+   */
+  private async createPendingConversations(): Promise<boolean> {
+    let ok = true;
+    if (!this.orphansAdopted) {
+      try {
+        const adopted = this.db.adoptOrphanedPendingRows();
+        this.orphansAdopted = true;
+        if (adopted.length > 0) {
+          console.log(
+            `[engram] recovered ${adopted.length} session(s) queued by an earlier daemon — creating their conversations`,
+          );
         }
+      } catch (err: unknown) {
+        // Not fatal: the orphans keep, and this runs again next flush.
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[engram] orphaned-queue check failed (will retry): ${msg}`);
+        ok = false;
       }
     }
+
+    const now = Date.now();
+    const pending = this.db.getPendingSessions();
+    const sessions = pending.filter(
+      (s) => (this.createRetry.get(s.sessionId)?.until ?? 0) <= now,
+    );
+    // A session sitting out a retry delay hasn't synced.
+    if (sessions.length < pending.length) ok = false;
+
+    // Create conversations in parallel batches
+    for (let i = 0; i < sessions.length; i += CONCURRENCY) {
+      const batch = sessions.slice(i, i + CONCURRENCY);
+      const results = await Promise.allSettled(
+        batch.map((s) => this.createPendingConversation(s.sessionId, s.meta)),
+      );
+
+      for (let j = 0; j < results.length; j++) {
+        const r = results[j];
+        const sessionId = batch[j].sessionId;
+        if (r.status === "fulfilled") {
+          this.createRetry.delete(sessionId);
+          continue;
+        }
+        ok = false;
+        const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
+        if (msg.includes("401") || msg.includes("403")) {
+          this.authFailed = true;
+          console.error(`[engram] auth error, stopping: ${msg}`);
+          recordFailure(msg, "auth", this.db.getPendingCount());
+          return false;
+        }
+        const errType = classifyError(msg);
+        if (errType === "billing" || errType === "storage_full") {
+          this.enterBillingBackoff(msg);
+          return false;
+        }
+        this.deferCreate(sessionId);
+        console.error(`[engram] create error (will retry): ${msg}`);
+        recordFailure(msg, errType, this.db.getPendingCount());
+      }
+    }
+    return ok;
+  }
+
+  private async createPendingConversation(
+    sessionId: string,
+    meta: SessionMeta,
+  ): Promise<void> {
+    // Opted out while it waited: nothing of this session may sync.
+    if (this.db.isSessionExcluded(sessionId)) {
+      this.db.dropPendingSession(sessionId);
+      return;
+    }
+
+    // Already mapped (rows an older daemon left under the temporary id after
+    // the conversation was created) — move them; never create a second
+    // conversation for the session.
+    const existing = this.db.getConversationId(sessionId);
+    if (existing) {
+      this.db.completePendingSession(sessionId, existing);
+      return;
+    }
+
+    const conversationId = await this.createConversation(sessionId, meta);
+
+    // Opt-out race (engram#462): the user may have said "don't save
+    // this" while the create was in flight — excludeSession saw no
+    // conversation id yet, so it couldn't schedule the remote delete.
+    // Schedule it now; the flush loop's retryRemoteDeletes handles it.
+    if (this.db.isSessionExcluded(sessionId)) {
+      this.db.markSessionExcluded(sessionId, "in-chat opt-out", conversationId);
+      this.db.dropPendingSession(sessionId);
+      this.db.deleteAllForConversation(conversationId);
+      return;
+    }
+
+    // Map the session and move its messages onto the conversation (one
+    // transaction — see DaemonDb.completePendingSession).
+    this.db.completePendingSession(sessionId, conversationId, {
+      projectDir: meta.projectDir,
+      cwd: meta.cwd,
+      gitBranch: meta.gitBranch,
+    });
+  }
+
+  /** Pace retries for a session whose create failed: 30s → 2m → 10m … */
+  private deferCreate(sessionId: string): void {
+    const prev = this.createRetry.get(sessionId);
+    const step = prev ? prev.step + 1 : 0;
+    const delay = CREATE_RETRY_MS[Math.min(step, CREATE_RETRY_MS.length - 1)];
+    this.createRetry.set(sessionId, { until: Date.now() + delay, step });
   }
 
   /** Per-conversation reduced batch size after a failed send (halves down to
@@ -423,13 +493,9 @@ export class Syncer {
         cwd: meta.cwd,
         gitBranch: meta.gitBranch,
         capturedBy: "engram-daemon",
+        // Metadata rebuilt after the session's own was lost (engram#370).
+        ...(meta.recovered ? { recovered: true } : {}),
       },
-    });
-
-    this.db.setSessionMap(sessionId, conversationId, {
-      projectDir: meta.projectDir,
-      cwd: meta.cwd,
-      gitBranch: meta.gitBranch,
     });
 
     return conversationId;

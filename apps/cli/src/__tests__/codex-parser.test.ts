@@ -10,7 +10,7 @@ function run(lines: object[], filePath = PATH) {
   const parser = new CodexParser((sessionId, meta, messages) =>
     out.push({ sessionId, meta, messages }),
   );
-  for (const l of lines) parser.processLine(JSON.stringify(l), filePath);
+  for (const l of lines) parser.processLine(JSON.stringify(l), filePath, 0);
   parser.flush();
   return out;
 }

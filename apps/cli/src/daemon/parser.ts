@@ -306,16 +306,23 @@ export class Parser implements LineParser {
   }
 
   private extractProjectDir(filePath: string): string {
-    // ~/.claude/projects/-Users-op-code-engram/session.jsonl
-    // We want "engram" from the project dir name
-    const parts = filePath.split("/");
-    const projectsIdx = parts.indexOf("projects");
-    if (projectsIdx >= 0 && projectsIdx + 1 < parts.length) {
-      const dirName = parts[projectsIdx + 1];
-      // Take the last segment of the hyphenated path
-      const segments = dirName.split("-").filter(Boolean);
-      return segments[segments.length - 1] ?? dirName;
-    }
-    return "unknown";
+    return claudeProjectDir(filePath);
   }
+}
+
+/**
+ * Project name from a Claude Code transcript path:
+ * ~/.claude/projects/-Users-op-code-engram/session.jsonl → "engram"
+ * (the last segment of the hyphen-encoded project directory).
+ */
+export function claudeProjectDir(filePath: string): string {
+  const parts = filePath.split("/");
+  const projectsIdx = parts.indexOf("projects");
+  if (projectsIdx >= 0 && projectsIdx + 1 < parts.length) {
+    const dirName = parts[projectsIdx + 1];
+    // Take the last segment of the hyphenated path
+    const segments = dirName.split("-").filter(Boolean);
+    return segments[segments.length - 1] ?? dirName;
+  }
+  return "unknown";
 }

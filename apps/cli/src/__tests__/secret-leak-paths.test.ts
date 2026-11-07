@@ -15,7 +15,7 @@ const PATH = "/Users/x/.claude/projects/-Users-x-p/s.jsonl";
 function run(lines: string[]): ParsedMessage[] {
   const out: ParsedMessage[] = [];
   const p = new Parser((_s, _m, ms) => out.push(...ms));
-  for (const l of lines) p.processLine(l, PATH);
+  for (const l of lines) p.processLine(l, PATH, 0);
   p.flush();
   return out;
 }

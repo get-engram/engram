@@ -27,7 +27,7 @@ const PATH = "/Users/x/.claude/projects/-Users-x-proj/sess.jsonl";
 function parse(line: string): ParsedMessage[] {
   const out: ParsedMessage[] = [];
   const p = new Parser((_s, _m, msgs) => out.push(...msgs));
-  p.processLine(line, PATH);
+  p.processLine(line, PATH, 0);
   p.flush();
   return out;
 }

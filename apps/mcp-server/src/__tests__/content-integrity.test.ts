@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import type { Mock } from "vitest";
 import { Hono } from "hono";
-import { insertConversation, getMessageById } from "@getengram/db";
+import { insertConversation, getMessageById, updateMessageContent } from "@getengram/db";
 import { chunkMessages, chunkId } from "@getengram/shared";
 import type { Message, MessageRole } from "@getengram/shared";
 import { createMockD1, createMockEnv } from "./helpers.js";
@@ -389,6 +389,168 @@ describe("scanContentIntegrity (engram#541)", () => {
     expect(second.missing.map((m) => m.id)).toEqual([msgId(conv, 41), msgId(conv, 42)]);
     expect(second.deferred).toBe(0);
     expect(second.done).toBe(true);
+  });
+
+  // engram#572: a repair only ever fills the gap. What got there first
+  // stays, and the row is never written.
+
+  /** Runs `step` just before the scan's first R2 put, then lets the put go through. */
+  function beforeFirstPut(env: MockEnv, step: () => Promise<void>) {
+    const put = env.CONTENT.put as unknown as Mock;
+    const real = put.getMockImplementation()!;
+    put.mockImplementationOnce(async (key: string, val: unknown, opts?: R2PutOptions) => {
+      expect(opts?.onlyIf).toEqual({ etagDoesNotMatch: "*" });
+      await step();
+      return real(key, val, opts);
+    });
+  }
+
+  it("leaves a body written while it rebuilt the message as it is, and its row as the edit left it", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const db = createMockD1();
+    const env = createMockEnv(db);
+    const conv = "conv_race";
+    await seedConversation(env, conv, SAMPLE);
+    const target = msgId(conv, 4); // gzip-stored; the edit's body is not
+    orphan(env, target);
+    let edited: { content: string; encoding: string | null } | undefined;
+    beforeFirstPut(env, async () => {
+      edited = await storeContent(asEnv(env), target, "Edited meanwhile.");
+      await updateMessageContent(db, target, ORG, edited.content, edited.encoding);
+    });
+
+    const result = await scanContentIntegrity(asEnv(env), { organizationId: ORG, repair: true });
+
+    expect(edited?.encoding).toBe("r2:raw");
+    expect(result.repaired).toEqual([]);
+    expect(result.unrecoverable).toEqual([
+      {
+        id: target,
+        conversation_id: conv,
+        sequence: 4,
+        reason: "a body was written to it while it was rebuilt; left as it is",
+      },
+    ]);
+    expect(await readBack(env, target)).toBe("Edited meanwhile.");
+    expect({ ...(await getMessageById(db, target, ORG)) }).toMatchObject({ content: "", content_encoding: "r2:raw" });
+    expect(await auditRows(env)).toEqual([]);
+  });
+
+  it("reports a body it could not write and leaves the row alone, so the next scan can still rebuild it", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const db = createMockD1();
+    const env = createMockEnv(db);
+    const conv = "conv_putfail";
+    await seedConversation(env, conv, SAMPLE);
+    const target = msgId(conv, 3);
+    const before = { ...(await getMessageById(db, target, ORG)) };
+    orphan(env, target);
+    (env.CONTENT.put as unknown as Mock).mockRejectedValueOnce(new Error("R2 unavailable (test)"));
+
+    const result = await scanContentIntegrity(asEnv(env), { organizationId: ORG, repair: true });
+
+    expect(result.repaired).toEqual([]);
+    expect(result.unrecoverable).toEqual([
+      {
+        id: target,
+        conversation_id: conv,
+        sequence: 3,
+        reason: "writing the rebuilt body failed: R2 unavailable (test)",
+      },
+    ]);
+    // No inline fallback: the row still points where it did.
+    expect({ ...(await getMessageById(db, target, ORG)) }).toEqual(before);
+    expect(env.__r2store.has(r2Key(target))).toBe(false);
+    expect(await auditRows(env)).toEqual([]);
+
+    const again = await scanContentIntegrity(asEnv(env), { organizationId: ORG, repair: true });
+    expect(again.repaired.map((r) => r.id)).toEqual([target]);
+    expect(await readBack(env, target)).toBe(SAMPLE[2][1]);
+  });
+
+  it("takes back a body it wrote for a message deleted while it was rebuilt", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const db = createMockD1();
+    const env = createMockEnv(db);
+    const conv = "conv_gone";
+    await seedConversation(env, conv, SAMPLE);
+    const target = msgId(conv, 3);
+    orphan(env, target);
+    // The delete removes the object (already gone) and then the row, both
+    // before the rebuilt body's put lands.
+    beforeFirstPut(env, async () => {
+      await db.prepare("DELETE FROM messages WHERE id = ?").bind(target).run();
+    });
+
+    const result = await scanContentIntegrity(asEnv(env), { organizationId: ORG, repair: true });
+
+    expect(result.repaired).toEqual([]);
+    expect(result.unrecoverable).toEqual([
+      {
+        id: target,
+        conversation_id: conv,
+        sequence: 3,
+        reason: "the message was deleted while its body was rebuilt",
+      },
+    ]);
+    expect(env.__r2store.has(r2Key(target))).toBe(false);
+    expect(await auditRows(env)).toEqual([]);
+  });
+
+  it("keeps the body it wrote for a message an org merge moved meanwhile", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const db = createMockD1();
+    const env = createMockEnv(db);
+    const conv = "conv_moved";
+    await seedConversation(env, conv, SAMPLE);
+    const target = msgId(conv, 3);
+    orphan(env, target);
+    // A merge keeps message ids and rewrites organization_id: the message
+    // still exists, so its body must stay.
+    beforeFirstPut(env, async () => {
+      await db.prepare("UPDATE messages SET organization_id = ? WHERE id = ?").bind("org_merged_into", target).run();
+    });
+
+    const result = await scanContentIntegrity(asEnv(env), { organizationId: ORG, repair: true });
+
+    expect(result.unrecoverable).toEqual([]);
+    expect(result.repaired.map((r) => r.id)).toEqual([target]);
+    const moved = (await getMessageById(db, target, "org_merged_into")) as {
+      id: string;
+      content: string;
+      content_encoding: string | null;
+    } | null;
+    expect(moved).not.toBeNull();
+    expect(await loadContent(asEnv(env), moved!)).toBe(SAMPLE[2][1]);
+  });
+
+  it("lets an edit that lands just after the write-back win, body and row", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const db = createMockD1();
+    const env = createMockEnv(db);
+    const conv = "conv_after";
+    await seedConversation(env, conv, SAMPLE);
+    const target = msgId(conv, 4); // gzip-stored; the edit's body is not
+    orphan(env, target);
+    const put = env.CONTENT.put as unknown as Mock;
+    const real = put.getMockImplementation()!;
+    let edited: { content: string; encoding: string | null } | undefined;
+    put.mockImplementationOnce(async (key: string, val: unknown, opts?: R2PutOptions) => {
+      const out = await real(key, val, opts);
+      edited = await storeContent(asEnv(env), target, "Edited meanwhile.");
+      await updateMessageContent(db, target, ORG, edited.content, edited.encoding);
+      return out;
+    });
+
+    const result = await scanContentIntegrity(asEnv(env), { organizationId: ORG, repair: true });
+
+    expect(result.repaired.map((r) => r.id)).toEqual([target]);
+    expect(edited?.encoding).toBe("r2:raw");
+    // Nothing written after the put may point the row back at the rebuilt
+    // body's encoding.
+    expect({ ...(await getMessageById(db, target, ORG)) }).toMatchObject({ content: "", content_encoding: "r2:raw" });
+    expect(await readBack(env, target)).toBe("Edited meanwhile.");
   });
 });
 

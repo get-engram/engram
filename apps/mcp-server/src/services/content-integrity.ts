@@ -2,9 +2,10 @@ import {
   getR2PointerPage,
   getChunkTextsCoveringSequence,
   getMessagesBySequenceRange,
-  updateMessageContent,
+  messageExists,
 } from "@getengram/db";
-import { loadContentOrNull, storeContent } from "./content-store.js";
+import { deleteContent, loadContentOrNull } from "./content-store.js";
+import { encodeContent } from "../utils/compress.js";
 import { loadChunkTexts } from "./chunk-store.js";
 import { audit } from "./audit.js";
 import { mapConcurrent } from "../utils/map-concurrent.js";
@@ -31,6 +32,10 @@ import type { Env } from "../types.js";
  * line up is skipped, and a message no chunk can reproduce is reported,
  * never invented. The bodies are the redacted text the service stored and
  * indexed, so what comes back is exactly what a read returned before.
+ *
+ * A rebuilt body only ever fills the gap: it is written create-only to the
+ * key the row already names, and the row itself is never written
+ * (writeBackBody). Anything that wrote a body there first wins.
  */
 
 export const SCAN_BATCH_MAX = 500;
@@ -79,7 +84,7 @@ export interface IntegrityScanResult {
   done: boolean;
 }
 
-interface PointerRow {
+export interface PointerRow {
   id: string;
   conversation_id: string;
   sequence: number;
@@ -154,35 +159,128 @@ export async function scanContentIntegrity(
       result.unrecoverable.push({ ...ref, reason: rebuilt.reason });
       continue;
     }
-    await restoreBody(env, opts.organizationId, row, rebuilt.content, rebuilt.sourceChunk);
+    const back = await writeBackBody(env, opts.organizationId, row, rebuilt.content, rebuilt.sourceChunk, "scan");
+    if (!back.written) {
+      result.unrecoverable.push({ ...ref, reason: back.reason });
+      continue;
+    }
     result.repaired.push({ ...ref, source_chunk: rebuilt.sourceChunk, chars: rebuilt.content.length });
   }
 
   return result;
 }
 
-/** Write a rebuilt body back exactly the way an append stores one. */
-async function restoreBody(
+/**
+ * Rebuild one message's missing body from the chunks covering it and write
+ * it back: the scan's repair, for one message (engram#572). A reindex runs
+ * it before it re-chunks a window, because the window's old chunks may be
+ * the last place a missing body's words are, and the reindex replaces them.
+ * The same byte-for-byte checks apply: a body that cannot be rebuilt exactly
+ * is reported, never invented.
+ *
+ * Sound only while the window's messages are the ones its chunks were cut
+ * from. Once a message in it is deleted, its part of the chunk text is no
+ * longer stripped as a neighbour's and would be taken for the missing body,
+ * so a delete runs this before it removes anything.
+ *
+ * `written` says whether the body is back in storage. The words come back
+ * either way, for the caller to keep in the new chunks: a failed write
+ * leaves the body as missing as it was, and a body something else wrote in
+ * the meantime is left as it is.
+ */
+export async function restoreMissingBody(
+  env: Env,
+  organizationId: string,
+  row: PointerRow,
+): Promise<{ content: string; written: boolean } | { reason: string }> {
+  const rebuilt = await reconstructFromChunks(env, organizationId, row);
+  if ("reason" in rebuilt) return rebuilt;
+  const back = await writeBackBody(env, organizationId, row, rebuilt.content, rebuilt.sourceChunk, "reindex");
+  return { content: rebuilt.content, written: back.written };
+}
+
+type WriteBack = { written: true } | { written: false; reason: string };
+
+/**
+ * Put a rebuilt body back at the key its row names, only if nothing is
+ * there. The scan is an operator action, audited as the admin; a reindex's
+ * restore is the service's own, audited with no key.
+ *
+ * Only ever fills the gap (engram#572). A rebuild takes a while, and the
+ * message can change under it: an edit writes its new body to this same
+ * key, and an unconditional put would replace the new words with the old
+ * ones. So the put is create-only, an `If-None-Match: *` precondition R2
+ * checks atomically: if a body got there first, nothing is written and the
+ * rebuilt one is dropped. And the row is never written: it already names
+ * the object and the encoding it is in, so the body is encoded to match. A
+ * row update could land after an edit's and point the row at an encoding
+ * its new body is not in.
+ *
+ * Never throws. A failed write leaves the body missing, as it was.
+ */
+async function writeBackBody(
   env: Env,
   organizationId: string,
   row: PointerRow,
   text: string,
   sourceChunk: string,
-): Promise<void> {
-  // storeContent falls back to inline D1 storage if the R2 put fails, and
-  // the row is rewritten to match either way — so after this the pointer
-  // cannot dangle.
-  const { content, encoding } = await storeContent(env, row.id, text);
-  await updateMessageContent(env.DB, row.id, organizationId, content, encoding);
-  await audit(env.DB, organizationId, "admin", "admin.message.restore", "message", row.id, {
-    conversation_id: row.conversation_id,
-    sequence: row.sequence,
-    source_chunk: sourceChunk,
-    chars: text.length,
-  });
-  console.log(
-    `[content-integrity] restored message ${row.id} (${text.length} chars) from chunk ${sourceChunk}`,
+  via: "scan" | "reindex",
+): Promise<WriteBack> {
+  const key = r2Key(row.id);
+  const enc = row.content_encoding ?? "";
+  let stored: boolean;
+  try {
+    if (!enc.startsWith("r2:")) throw new Error(`not an R2 pointer (${enc || "inline"})`);
+    const body = await encodeContent(text, enc.slice(3));
+    stored = (await env.CONTENT.put(key, body, { onlyIf: { etagDoesNotMatch: "*" } })) !== null;
+  } catch (err) {
+    const reason = `writing the rebuilt body failed: ${err instanceof Error ? err.message : String(err)}`;
+    console.error(`[content-integrity] message ${row.id}: ${reason}`);
+    return { written: false, reason };
+  }
+  if (!stored) {
+    const reason = "a body was written to it while it was rebuilt; left as it is";
+    console.warn(`[content-integrity] message ${row.id}: ${reason}`);
+    return { written: false, reason };
+  }
+
+  // A delete of the message meanwhile can have removed its object before
+  // the put above created it again. With the row gone for good nothing
+  // would ever read or delete that object, so remove it now.
+  try {
+    if (!(await messageExists(env.DB, row.id))) {
+      await deleteContent(env, [row.id]);
+      console.warn(`[content-integrity] message ${row.id} was deleted while its body was rebuilt; removed the body again`);
+      return { written: false, reason: "the message was deleted while its body was rebuilt" };
+    }
+  } catch (err) {
+    console.error(
+      `[content-integrity] message ${row.id}: checking the row after the write-back failed; the body stays: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+
+  await audit(
+    env.DB,
+    organizationId,
+    via === "scan" ? "admin" : null,
+    via === "scan" ? "admin.message.restore" : "message.restore",
+    "message",
+    row.id,
+    {
+      conversation_id: row.conversation_id,
+      sequence: row.sequence,
+      source_chunk: sourceChunk,
+      chars: text.length,
+    },
   );
+  console.log(
+    `[content-integrity] restored message ${row.id} (${text.length} chars) from chunk ${sourceChunk}${
+      via === "reindex" ? " before a reindex" : ""
+    }`,
+  );
+  return { written: true };
 }
 
 /** Trailing `_<n>` of a chunk id: the piece index of a hard-split message. */
@@ -306,5 +404,26 @@ async function extractFromWindow(
   if (!part.startsWith(marker)) {
     return { reason: "the remaining text does not start with this message's role marker" };
   }
-  return part.slice(marker.length);
+  const body = part.slice(marker.length);
+
+  // A message deleted from this window after the chunk was cut (its reindex
+  // failed, or was held back to keep a missing body's words, engram#572)
+  // still has its part in the text and no row to strip it as. Next to the
+  // target, that part is left over with the target's own, and would be
+  // written back as part of the target's body. Such a leftover always shows
+  // twice: a sequence missing beside the target (sequences are handed out
+  // one by one, so a gap is a deletion), and a line in the rebuilt body that
+  // starts like a message's part. Both together refuse the rebuild. A body
+  // that merely quotes a transcript is refused too when a neighbour was
+  // deleted; that keeps it missing, and its chunks, rather than guess.
+  const at = neighbours.findIndex((m) => m.id === row.id);
+  const prev = at > 0 ? (neighbours[at - 1].sequence as number) : w.start - 1;
+  const next = at < neighbours.length - 1 ? (neighbours[at + 1].sequence as number) : w.end + 1;
+  if ((row.sequence - prev > 1 || next - row.sequence > 1) && /\n\[[^\]\n]*\]: /.test(body)) {
+    return {
+      reason:
+        "a neighbour was deleted and the rebuilt text has a line that starts like a message, so it may hold the deleted message's text",
+    };
+  }
+  return body;
 }

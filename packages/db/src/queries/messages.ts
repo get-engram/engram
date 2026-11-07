@@ -221,60 +221,65 @@ export function getR2MessageIdsByConversation(
 }
 
 /**
- * One keyset page of an organization's R2-backed message pointers (id,
- * conversation, sequence, role, encoding — no content), for the
- * content-integrity scan (engram#541). Ordered by id so a scan can resume
- * from the last id it checked; optionally limited to one conversation.
+ * One rowid keyset page of an organization's message pointers (rowid, id,
+ * conversation, sequence, role, encoding; never content) for the
+ * content-integrity scan (engram#541), optionally limited to one
+ * conversation. Pass the last row's `rid` as `afterRowid` for the next page.
+ *
+ * Every message in the range comes back, inline or R2-backed, and the scan
+ * keeps the `r2:*` ones. Filtering on content_encoding here would let a page
+ * read past any number of inline rows to fill itself, so its cost would
+ * depend on the data instead of on `limit`.
+ *
+ * Organization-wide, the page seeks idx_messages_org, whose entries run in
+ * (organization_id, rowid) order: it reads `limit` rows from the cursor and
+ * stops, with no sort. The page used to be keyed on message id, an order no
+ * org-scoped index gives, so every page read and sorted all of the
+ * organization's pointers: seconds on the largest accounts, while D1 (one
+ * statement at a time) answered nothing else (engram#561). The INDEXED BY
+ * keeps the plan from depending on the statistics production's planner has
+ * (engram#559).
+ *
+ * Rowid order is safe to resume from: nothing in the service changes a
+ * message's rowid, and a row added during a scan gets a rowid above the
+ * cursor, so the scan still reaches it.
  */
-export function getR2PointerPage(
+export function getMessagePointerPage(
   db: D1Database,
   organizationId: string,
-  afterId: string | null,
+  afterRowid: number | null,
   limit: number,
   conversationId?: string
 ) {
+  const where: string[] = [];
   const params: unknown[] = [];
-  let where = "";
   if (conversationId) {
-    where += "conversation_id = ? AND ";
+    where.push("conversation_id = ?");
     params.push(conversationId);
   }
-  where += "organization_id = ? AND content_encoding LIKE 'r2:%'";
+  where.push("organization_id = ?");
   params.push(organizationId);
-  if (afterId !== null) {
-    where += " AND id > ?";
-    params.push(afterId);
+  if (afterRowid !== null) {
+    where.push("rowid > ?");
+    params.push(afterRowid);
   }
-  // Limited to one conversation, force the conversation index for the reason
-  // getR2MessageIdsByConversation does (engram#559). The org-wide form has no
-  // index that yields id order within an org and sorts the org's pointers on
-  // every page; it wants a rowid keyset (see #559).
-  const from = conversationId ? "messages INDEXED BY idx_messages_conv_seq" : "messages";
+  // Limited to one conversation, seek the conversation index for the reason
+  // getR2MessageIdsByConversation does (engram#559). That page sorts the
+  // conversation's rows by rowid, a sort one conversation bounds.
+  const index = conversationId ? "idx_messages_conv_seq" : "idx_messages_org";
   return db
     .prepare(
-      `SELECT id, conversation_id, sequence, role, content_encoding FROM ${from} WHERE ${where} ORDER BY id ASC LIMIT ?`
+      `SELECT rowid AS rid, id, conversation_id, sequence, role, content_encoding FROM messages INDEXED BY ${index} WHERE ${where.join(" AND ")} ORDER BY rowid LIMIT ?`
     )
     .bind(...params, limit)
     .all<{
+      rid: number;
       id: string;
       conversation_id: string;
       sequence: number;
       role: string;
       content_encoding: string | null;
     }>();
-}
-
-/** Same, for every message in an organization (hard-purge after account deletion). */
-export function getR2MessageIdsByOrganization(
-  db: D1Database,
-  organizationId: string
-) {
-  return db
-    .prepare(
-      "SELECT id FROM messages WHERE organization_id = ? AND content_encoding LIKE 'r2:%'"
-    )
-    .bind(organizationId)
-    .all<{ id: string }>();
 }
 
 /** One rowid-cursored page of an org's R2-backed message ids. Lets the GDPR

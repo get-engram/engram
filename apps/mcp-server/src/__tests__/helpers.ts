@@ -17,10 +17,29 @@ const COUNTER_DEFAULTS: Record<string, Record<string, number>> = {
 // Create a mock D1 database that stores data in memory
 export function createMockD1(): D1Database {
   const tables: Record<string, Record<string, unknown>[]> = {};
+  // SQLite's implicit rowid, per table: assigned on insert (a REPLACE deletes
+  // the old row and inserts a new one, so it gets a new rowid) and kept off
+  // the row object, so `SELECT *` results do not grow a column. Read through
+  // `rowid > ?`, `ORDER BY rowid` and `rowid AS rid` in all() — the rowid
+  // keyset pages (engram#561).
+  const rowids = new WeakMap<object, number>();
+  const lastRowid: Record<string, number> = {};
 
   function getTable(name: string) {
     if (!tables[name]) tables[name] = [];
     return tables[name];
+  }
+
+  function addRow(name: string, row: Record<string, unknown>) {
+    lastRowid[name] = (lastRowid[name] ?? 0) + 1;
+    rowids.set(row, lastRowid[name]);
+    getTable(name).push(row);
+  }
+
+  function rowidOf(row: Record<string, unknown>): number {
+    const rowid = rowids.get(row);
+    if (rowid === undefined) throw new Error("mock D1: a row was stored without a rowid");
+    return rowid;
   }
 
   const mockStatement = (sql: string, bindings: unknown[] = []) => {
@@ -49,7 +68,7 @@ export function createMockD1(): D1Database {
               const keys = target[1].split(",").map((k) => k.trim());
               const clash = table.some((r) => keys.every((k) => r[k] === row[k]));
               if (clash) return { results: [], success: true, meta: { changes: 0 } };
-              table.push(row);
+              addRow(insertMatch[2], row);
               return { results: [], success: true, meta: { changes: 1 } };
             }
             // INSERT OR REPLACE (chunk rows on re-index): the row with the
@@ -59,7 +78,7 @@ export function createMockD1(): D1Database {
               const dup = table.findIndex((r) => r.id === row.id);
               if (dup !== -1) table.splice(dup, 1);
             }
-            table.push(row);
+            addRow(insertMatch[2], row);
           }
           return { results: [], success: true, meta: {} };
         }
@@ -131,7 +150,7 @@ export function createMockD1(): D1Database {
           let row = table.find((r) => keys.every((k) => r[k] === input[k]));
           if (!row) {
             row = { ...(COUNTER_DEFAULTS[upsert[1]] ?? {}), ...input };
-            table.push(row);
+            addRow(upsert[1], row);
           }
           return { ...(COUNTER_DEFAULTS[upsert[1]] ?? {}), ...row };
         }
@@ -289,6 +308,23 @@ export function createMockD1(): D1Database {
           results = [...results].sort((a, b) => String(a.id).localeCompare(String(b.id)));
         }
 
+        // Keyset paging on rowid (`AND rowid > ?`), by placeholder ordinal
+        // like the id keyset above: the content-integrity scan, the purge and
+        // the chunk mover page this way (engram#561). A NULL bound matches
+        // nothing, as in SQLite.
+        const rowidKeyset = sql.match(/\browid > \?/);
+        if (rowidKeyset) {
+          const before = sql.slice(0, rowidKeyset.index);
+          const ordinal = (before.match(/\?/g) ?? []).length;
+          const bound = bindings[ordinal] == null ? NaN : Number(bindings[ordinal]);
+          results = results.filter((r) => rowidOf(r) > bound);
+        }
+        const rowidOrder = sql.match(/ORDER BY rowid\b(\s+DESC\b)?/i);
+        if (rowidOrder) {
+          const sign = rowidOrder[1] ? -1 : 1;
+          results = [...results].sort((a, b) => sign * (rowidOf(a) - rowidOf(b)));
+        }
+
         // LIMIT ? OFFSET ? — bound as the last two parameters by every
         // paging query (list conversations, messages, audit log). Honouring
         // them lets tests tell a page apart from the whole table (engram#540).
@@ -301,6 +337,11 @@ export function createMockD1(): D1Database {
         } else if (/LIMIT \?\s*$/i.test(sql) && bindings.length >= 1) {
           const limit = Number(bindings[bindings.length - 1]);
           if (Number.isFinite(limit)) results = results.slice(0, limit);
+        }
+
+        // `SELECT rowid AS rid`: the cursor every rowid keyset page reads.
+        if (/\browid AS rid\b/i.test(sql)) {
+          results = results.map((r) => ({ ...r, rid: rowidOf(r) }));
         }
 
         return { results, success: true, meta: {} };
@@ -318,7 +359,6 @@ export function createMockD1(): D1Database {
           /INSERT\s+(?:OR\s+IGNORE\s+)?INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)/i
         );
         if (insertMatch) {
-          const table = getTable(insertMatch[1]);
           const cols = insertMatch[2].split(",").map((c) => c.trim());
           const vals = insertMatch[3].split(",").map((v) => {
             const trimmed = v.trim().replace(/^'|'$/g, "");
@@ -330,7 +370,7 @@ export function createMockD1(): D1Database {
           });
           const row: Record<string, unknown> = {};
           cols.forEach((col, i) => (row[col] = vals[i]));
-          table.push(row);
+          addRow(insertMatch[1], row);
         }
         // Handle CREATE TABLE — just ignore
       }

@@ -7,6 +7,7 @@ import {
   refillChunkText,
   replaceChunks,
   searchChunksFts,
+  updateMessageContent,
 } from "@getengram/db";
 import { chunkId } from "@getengram/shared";
 import {
@@ -17,6 +18,8 @@ import {
 } from "../services/conversation.js";
 import { runChunkMoverBatch, emptyCounts, type ChunkMoverCounts } from "../services/chunk-mover.js";
 import { rebuildLostChunk } from "../services/chunk-rebuild.js";
+import { scanContentIntegrity } from "../services/content-integrity.js";
+import { loadContentOrNull, storeContent } from "../services/content-store.js";
 import { searchConversations } from "../services/search.js";
 import { moveConversation } from "../routes/merge-orgs.js";
 import { applyAllMigrations } from "./miniflare.js";
@@ -116,12 +119,12 @@ describe("reindex and rebuild never lose chunk text (engram#567), against real S
   }
 
   function makeEnv(
-    over: { CHUNKS?: Bucket; DB?: D1Database; aiDown?: boolean; vectorDeleteFails?: boolean } = {},
+    over: { CHUNKS?: Bucket; CONTENT?: Bucket; DB?: D1Database; aiDown?: boolean; vectorDeleteFails?: boolean } = {},
   ): Env {
     return {
       DB: over.DB ?? db,
       CHUNKS: over.CHUNKS ?? bucketWith(),
-      CONTENT: content,
+      CONTENT: over.CONTENT ?? content,
       AI: {
         async run(_model: string, input: { text: string[] }) {
           if (over.aiDown) throw new Error("ai down (test)");
@@ -773,5 +776,406 @@ describe("reindex and rebuild never lose chunk text (engram#567), against real S
     expect(await objectText(`conv_legacy/${windowed.id}`)).toBe(windowed.chunk_text);
     expect(await objectText(`conv_legacysplit/${middle.id}`)).toBe(middle.chunk_text);
     expect(await objectText(`conv_legacyodd/${misnamed.id}`)).toBeNull();
+  });
+
+  // ── A missing message body (engram#572) ─────────────────────────────────
+  //
+  // When a message's body object is gone, the chunks covering it may be the
+  // last place its words are, and the content-integrity repair (engram#541)
+  // rebuilds the body from exactly that text. An edit or delete re-chunks
+  // the window and replaces those chunks, so it must rebuild a missing body
+  // first, and when it cannot, keep the chunks.
+
+  const PLACEHOLDER = "[Message content unavailable";
+  const said = (word: string, n: number) => `${word} message number ${n} about the harbour lighthouse`;
+
+  /** Like seed, with each message's role chosen. */
+  async function seedRoles(org: string, conv: string, roles: Array<"user" | "assistant">, word: string) {
+    await addOrg(org);
+    await addConversation(org, conv);
+    return appendMessages(
+      makeEnv(),
+      org,
+      conv,
+      roles.map((role, i) => ({ role, content: said(word, i + 1) })),
+    );
+  }
+
+  /** A message's stored body: null when its object is missing, undefined when its row is gone. */
+  async function storedBody(id: string): Promise<string | null | undefined> {
+    const row = await db
+      .prepare("SELECT id, content, content_encoding FROM messages WHERE id = ?")
+      .bind(id)
+      .first<{ id: string; content: string; content_encoding: string | null }>();
+    if (!row) return undefined;
+    return loadContentOrNull(makeEnv(), row);
+  }
+
+  /** Every chunk's text, from its column or, once cleared, its object. */
+  async function chunkTexts(conv: string): Promise<string[]> {
+    const out: string[] = [];
+    for (const r of await chunkRows(conv)) {
+      out.push(r.chunk_text !== "" ? r.chunk_text : ((await objectText(`${conv}/${r.id}`)) ?? "<no copy>"));
+    }
+    return out;
+  }
+
+  async function audited(org: string, action: string) {
+    const res = await db
+      .prepare("SELECT api_key_id, resource_id, metadata FROM audit_log WHERE organization_id = ? AND action = ?")
+      .bind(org, action)
+      .all<{ api_key_id: string | null; resource_id: string; metadata: string }>();
+    return (res.results ?? []).map((r) => ({ ...r, metadata: JSON.parse(r.metadata) as Record<string, unknown> }));
+  }
+
+  /**
+   * CONTENT whose first put of `key` runs `first` instead: throw to fail it,
+   * as when R2 is briefly down, or step in ahead of it and return nothing to
+   * let it go through.
+   */
+  function contentAroundFirstPut(key: string, first: (o?: R2PutOptions) => Promise<void>): Bucket {
+    let done = false;
+    return {
+      put: async (k: string, v: string, o?: R2PutOptions) => {
+        if (k === key && !done) {
+          done = true;
+          await first(o);
+        }
+        return content.put(k, v, o);
+      },
+      get: (k: string) => content.get(k),
+      head: (k: string) => content.head(k),
+      delete: (k: string | string[]) => content.delete(k),
+      list: (o?: R2ListOptions) => content.list(o),
+    } as unknown as Bucket;
+  }
+
+  /** Runs `fn` with the console quiet, handing back what was logged at each level. */
+  async function quietly(fn: () => Promise<unknown>) {
+    const spies = {
+      log: vi.spyOn(console, "log").mockImplementation(() => {}),
+      warn: vi.spyOn(console, "warn").mockImplementation(() => {}),
+      error: vi.spyOn(console, "error").mockImplementation(() => {}),
+    };
+    try {
+      await fn();
+      return { log: logged(spies.log), warn: logged(spies.warn), error: logged(spies.error) };
+    } finally {
+      for (const spy of Object.values(spies)) spy.mockRestore();
+    }
+  }
+
+  it.each([false, true])(
+    "an edit rebuilds a neighbour's missing body from the old chunks before it replaces them (cleared: %s)",
+    async (cleared) => {
+      const org = `org_mb_edit_${cleared}`;
+      const conv = `conv_mb_edit_${cleared}`;
+      const saved = await seed(org, conv, 8, "plover");
+      if (cleared) await clearAll(conv);
+      await content.delete(`content/${saved[5].id}`); // message 6, in [4..8] only
+
+      // Message 5 sits in [1..5] and [4..8]: the edit re-chunks all eight.
+      await quietly(() => updateMessage(makeEnv(), org, conv, saved[4].id, "rewritten with kestrel"));
+
+      expect(await storedBody(saved[5].id)).toBe(said("plover", 6));
+      const texts = await chunkTexts(conv);
+      expect(texts.filter((t) => t.includes(PLACEHOLDER))).toEqual([]);
+      expect(texts.filter((t) => t.includes(`[assistant]: ${said("plover", 6)}`))).toHaveLength(1);
+      expect(texts.some((t) => t.includes("rewritten with kestrel"))).toBe(true);
+      expect(await audited(org, "message.restore")).toEqual([
+        {
+          api_key_id: null,
+          resource_id: saved[5].id,
+          metadata: {
+            conversation_id: conv,
+            sequence: 6,
+            source_chunk: chunkId(conv, 4, 8, 0),
+            chars: said("plover", 6).length,
+          },
+        },
+      ]);
+      expect(await audited(org, "index.reindex_kept")).toEqual([]);
+      await expectNothingLost(org);
+    },
+  );
+
+  it.each([false, true])(
+    "a delete rebuilds a neighbour's missing body before it removes anything, and none of the deleted text goes into it (cleared: %s)",
+    async (cleared) => {
+      const org = `org_mb_del_${cleared}`;
+      const conv = `conv_mb_del_${cleared}`;
+      // Messages 5 and 6 are both the user's. Once 5's row is gone, its part
+      // of [4..8] could pass for the start of 6's.
+      const saved = await seedRoles(
+        org,
+        conv,
+        ["user", "assistant", "user", "assistant", "user", "user", "assistant", "user"],
+        "redshank",
+      );
+      if (cleared) await clearAll(conv);
+      await content.delete(`content/${saved[5].id}`); // message 6
+
+      let deleted: boolean | undefined;
+      await quietly(async () => {
+        deleted = await deleteMessage(makeEnv(), org, conv, saved[4].id);
+      });
+      expect(deleted).toBe(true);
+
+      expect(await storedBody(saved[5].id)).toBe(said("redshank", 6));
+      expect(await storedBody(saved[4].id)).toBeUndefined();
+      const texts = await chunkTexts(conv);
+      expect(texts.filter((t) => t.includes(PLACEHOLDER))).toEqual([]);
+      expect(texts.filter((t) => t.includes("number 5 about"))).toEqual([]);
+      expect(texts.some((t) => t.includes(`[user]: ${said("redshank", 6)}`))).toBe(true);
+      expect((await audited(org, "message.restore")).map((a) => a.resource_id)).toEqual([saved[5].id]);
+      expect(await audited(org, "index.reindex_kept")).toEqual([]);
+      await expectNothingLost(org);
+    },
+  );
+
+  it("bodies that can only be rebuilt one after another all are: the narrow window first", async () => {
+    const saved = await seed("org_mb_chain", "conv_mb_chain", 8, "sanderling");
+    await clearAll("conv_mb_chain");
+    // 6 is only in [4..8], which needs 7's body; 7 is also in [7..8], which
+    // needs only 8's.
+    await content.delete(`content/${saved[5].id}`);
+    await content.delete(`content/${saved[6].id}`);
+
+    await quietly(() => updateMessage(makeEnv(), "org_mb_chain", "conv_mb_chain", saved[7].id, "rewritten with kestrel"));
+
+    expect(await storedBody(saved[5].id)).toBe(said("sanderling", 6));
+    expect(await storedBody(saved[6].id)).toBe(said("sanderling", 7));
+    expect((await chunkTexts("conv_mb_chain")).filter((t) => t.includes(PLACEHOLDER))).toEqual([]);
+    expect(await audited("org_mb_chain", "index.reindex_kept")).toEqual([]);
+  });
+
+  it.each(["edit", "delete"] as const)(
+    "a %s keeps the window's chunks, untouched, when a body in it cannot be rebuilt, and records which",
+    async (trigger) => {
+      const org = `org_mb_keep_${trigger}`;
+      const conv = `conv_mb_keep_${trigger}`;
+      const saved = await seed(org, conv, 8, "whimbrel");
+      await clearAll(conv);
+      // 4 and 5 are in [1..5] and [4..8] together, and each rebuild needs the
+      // other's body: neither can be rebuilt.
+      await content.delete(`content/${saved[3].id}`);
+      await content.delete(`content/${saved[4].id}`);
+      const before = await snapshot(conv);
+
+      // Message 2 is in [1..5] only.
+      const logs = await quietly(() =>
+        trigger === "edit"
+          ? updateMessage(makeEnv(), org, conv, saved[1].id, "rewritten with kestrel")
+          : deleteMessage(makeEnv(), org, conv, saved[1].id),
+      );
+      expect(
+        logs.error.some((m) => m.includes(`kept 1 chunk(s) of ${conv} after the ${trigger} of ${saved[1].id}`)),
+      ).toBe(true);
+
+      expect(await snapshot(conv)).toEqual(before);
+      expect(await storedBody(saved[1].id)).toBe(trigger === "edit" ? "rewritten with kestrel" : undefined);
+      expect(await storedBody(saved[3].id)).toBeNull();
+      expect(await storedBody(saved[4].id)).toBeNull();
+      expect(await audited(org, "index.reindex_kept")).toEqual([
+        {
+          api_key_id: null,
+          resource_id: conv,
+          metadata: {
+            trigger,
+            message_id: saved[1].id,
+            unreadable: [saved[3].id, saved[4].id],
+            kept_chunks: [chunkId(conv, 1, 5, 0)],
+          },
+        },
+      ]);
+      expect(await audited(org, "message.restore")).toEqual([]);
+      await expectNothingLost(org);
+    },
+  );
+
+  it.each([false, true])(
+    "an edit of a message whose own body is missing archives its real previous wording (writing the rebuilt body fails: %s)",
+    async (putFails) => {
+      const org = `org_mb_self_${putFails}`;
+      const conv = `conv_mb_self_${putFails}`;
+      const saved = await seed(org, conv, 8, "greenshank");
+      await clearAll(conv);
+      await content.delete(`content/${saved[1].id}`); // message 2
+      // The rebuilt wording is what the edit archives, whether or not R2
+      // takes it back in the meantime.
+      const env = makeEnv(
+        putFails
+          ? {
+              CONTENT: contentAroundFirstPut(`content/${saved[1].id}`, () =>
+                Promise.reject(new Error("R2 unavailable (test)")),
+              ),
+            }
+          : {},
+      );
+
+      await quietly(() => updateMessage(env, org, conv, saved[1].id, "rewritten with kestrel"));
+      expect((await audited(org, "message.restore")).map((a) => a.resource_id)).toEqual(
+        putFails ? [] : [saved[1].id],
+      );
+
+      const revs = await db
+        .prepare("SELECT id, content, content_encoding FROM message_revisions WHERE message_id = ?")
+        .bind(saved[1].id)
+        .all<{ id: string; content: string; content_encoding: string | null }>();
+      expect(revs.results).toHaveLength(1);
+      expect(await loadContentOrNull(makeEnv(), revs.results[0])).toBe(said("greenshank", 2));
+      expect(await storedBody(saved[1].id)).toBe("rewritten with kestrel");
+      const texts = await chunkTexts(conv);
+      expect(texts.filter((t) => t.includes(PLACEHOLDER))).toEqual([]);
+      expect(texts.filter((t) => t.includes("number 2 about"))).toEqual([]);
+      expect(texts.some((t) => t.includes("rewritten with kestrel"))).toBe(true);
+    },
+  );
+
+  it("a body an edit writes while a reindex rebuilds it is never replaced, and its row stays the edit's", async () => {
+    const org = "org_mb_race";
+    const conv = "conv_mb_race";
+    const saved = await seed(org, conv, 8, "avocet");
+    await clearAll(conv);
+    await content.delete(`content/${saved[5].id}`); // message 6, in [4..8] only
+    // Long enough to be stored gzipped, where the old wording was not.
+    const editedText = "edited meanwhile with stilt and turnstone. ".repeat(8);
+    let edited: { content: string; encoding: string | null } | undefined;
+    // An edit of message 6 stores its new body just before the rebuilt one
+    // is written back, the way updateMessage does.
+    const racing = contentAroundFirstPut(`content/${saved[5].id}`, async (o) => {
+      expect(o?.onlyIf).toBeDefined();
+      edited = await storeContent(makeEnv(), saved[5].id, editedText);
+      await updateMessageContent(db, saved[5].id, org, edited.content, edited.encoding);
+    });
+
+    // Message 5 sits in [1..5] and [4..8]: the edit re-chunks all eight.
+    const logs = await quietly(() =>
+      updateMessage(makeEnv({ CONTENT: racing }), org, conv, saved[4].id, "rewritten with kestrel"),
+    );
+
+    expect(edited?.encoding).toBe("r2:gzip+base64");
+    expect(await storedBody(saved[5].id)).toBe(editedText);
+    expect(
+      await db.prepare("SELECT content, content_encoding FROM messages WHERE id = ?").bind(saved[5].id).first(),
+    ).toEqual({ content: edited!.content, content_encoding: edited!.encoding });
+    expect(await storedBody(saved[4].id)).toBe("rewritten with kestrel");
+    expect(await audited(org, "message.restore")).toEqual([]);
+    expect(logs.warn.some((m) => m.includes(saved[5].id) && m.includes("written to it while it was rebuilt"))).toBe(
+      true,
+    );
+    await expectNothingLost(org);
+  });
+
+  it("a delete rebuilds its own missing body when a neighbour's rebuild needs it, then removes it", async () => {
+    const saved = await seed("org_mb_step", "conv_mb_step", 8, "godwit");
+    await clearAll("conv_mb_step");
+    // 6 is only in [4..8], whose rebuild needs 4's body; 4's can be rebuilt
+    // from [1..5].
+    await content.delete(`content/${saved[3].id}`);
+    await content.delete(`content/${saved[5].id}`);
+
+    let deleted: boolean | undefined;
+    await quietly(async () => {
+      deleted = await deleteMessage(makeEnv(), "org_mb_step", "conv_mb_step", saved[3].id);
+    });
+    expect(deleted).toBe(true);
+
+    expect(await storedBody(saved[5].id)).toBe(said("godwit", 6));
+    expect(await storedBody(saved[3].id)).toBeUndefined();
+    expect(await content.head(`content/${saved[3].id}`)).toBeNull();
+    const texts = await chunkTexts("conv_mb_step");
+    expect(texts.filter((t) => t.includes(PLACEHOLDER))).toEqual([]);
+    expect(texts.filter((t) => t.includes("number 4 about"))).toEqual([]);
+    expect(texts.some((t) => t.includes(said("godwit", 6)))).toBe(true);
+    expect((await audited("org_mb_step", "message.restore")).map((a) => a.resource_id).sort()).toEqual(
+      [saved[3].id, saved[5].id].sort(),
+    );
+    expect(await audited("org_mb_step", "index.reindex_kept")).toEqual([]);
+  });
+
+  it("a delete leaves its own missing body alone when no other rebuild needs it", async () => {
+    const saved = await seed("org_mb_noneed", "conv_mb_noneed", 8, "dunlin");
+    await clearAll("conv_mb_noneed");
+    // 7 comes back from [7..8] alone, so 4's body is never needed.
+    await content.delete(`content/${saved[3].id}`);
+    await content.delete(`content/${saved[6].id}`);
+
+    await quietly(() => deleteMessage(makeEnv(), "org_mb_noneed", "conv_mb_noneed", saved[3].id));
+
+    expect(await storedBody(saved[6].id)).toBe(said("dunlin", 7));
+    expect(await storedBody(saved[3].id)).toBeUndefined();
+    expect(await content.head(`content/${saved[3].id}`)).toBeNull();
+    const texts = await chunkTexts("conv_mb_noneed");
+    expect(texts.filter((t) => t.includes(PLACEHOLDER))).toEqual([]);
+    expect(texts.filter((t) => t.includes("number 4 about"))).toEqual([]);
+    expect((await audited("org_mb_noneed", "message.restore")).map((a) => a.resource_id)).toEqual([saved[6].id]);
+    expect(await audited("org_mb_noneed", "index.reindex_kept")).toEqual([]);
+  });
+
+  it("a deleted neighbour's text left in a stale chunk is never rebuilt into a message's body", async () => {
+    const saved = await seedRoles(
+      "org_mb_stale",
+      "conv_mb_stale",
+      ["user", "assistant", "user", "assistant", "user", "user", "assistant", "user"],
+      "stint",
+    );
+    // A delete whose reindex fails leaves [4..8] holding message 5's text,
+    // with no row for 5. Message 6 is next to it, and the user's too.
+    const del = await quietly(() =>
+      deleteMessage(makeEnv({ vectorDeleteFails: true }), "org_mb_stale", "conv_mb_stale", saved[4].id),
+    );
+    expect(del.error.some((m) => m.includes(`Failed to reindex after delete of ${saved[4].id}`))).toBe(true);
+    await content.delete(`content/${saved[5].id}`);
+
+    let scan: Awaited<ReturnType<typeof scanContentIntegrity>> | undefined;
+    await quietly(async () => {
+      scan = await scanContentIntegrity(makeEnv(), { organizationId: "org_mb_stale", repair: true });
+    });
+    expect(scan?.repaired).toEqual([]);
+    expect(scan?.unrecoverable).toEqual([
+      expect.objectContaining({
+        id: saved[5].id,
+        reason: expect.stringContaining("may hold the deleted message's text"),
+      }),
+    ]);
+
+    // An edit in the same window keeps its chunks rather than chunk a guess.
+    const before = await snapshot("conv_mb_stale");
+    await quietly(() => updateMessage(makeEnv(), "org_mb_stale", "conv_mb_stale", saved[7].id, "rewritten with kestrel"));
+    expect(await snapshot("conv_mb_stale")).toEqual(before);
+    expect(await storedBody(saved[5].id)).toBeNull();
+    expect(await audited("org_mb_stale", "message.restore")).toEqual([]);
+    expect(await audited("org_mb_stale", "admin.message.restore")).toEqual([]);
+    expect((await audited("org_mb_stale", "index.reindex_kept")).map((a) => a.metadata.unreadable)).toEqual([
+      [saved[5].id],
+    ]);
+  });
+
+  it("the guard refuses only both marks together: a gap alone, or a quoted transcript alone, still rebuilds", async () => {
+    const saved = await seedRoles(
+      "org_mb_bound",
+      "conv_mb_bound",
+      ["user", "assistant", "user", "assistant", "user", "user", "assistant", "user"],
+      "turnstone",
+    );
+    // A pasted transcript, but with no neighbour deleted next to it.
+    const quoted = "as pasted:\n[user]: is the lighthouse open\n[assistant]: on weekends";
+    await quietly(() => updateMessage(makeEnv(), "org_mb_bound", "conv_mb_bound", saved[1].id, quoted));
+    await content.delete(`content/${saved[1].id}`);
+    await quietly(() => updateMessage(makeEnv(), "org_mb_bound", "conv_mb_bound", saved[2].id, "rewritten with kestrel"));
+    expect(await storedBody(saved[1].id)).toBe(quoted);
+
+    // A neighbour deleted and its window re-chunked as it should be: 6 is
+    // next to the gap, and its plain body comes back.
+    await quietly(() => deleteMessage(makeEnv(), "org_mb_bound", "conv_mb_bound", saved[4].id));
+    await content.delete(`content/${saved[5].id}`);
+    await quietly(() => updateMessage(makeEnv(), "org_mb_bound", "conv_mb_bound", saved[7].id, "rewritten with merlin"));
+    expect(await storedBody(saved[5].id)).toBe(said("turnstone", 6));
+    expect(await audited("org_mb_bound", "index.reindex_kept")).toEqual([]);
+    expect((await audited("org_mb_bound", "message.restore")).map((a) => a.resource_id)).toEqual([
+      saved[1].id,
+      saved[5].id,
+    ]);
   });
 });

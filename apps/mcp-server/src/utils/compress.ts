@@ -31,6 +31,27 @@ function base64ToUint8(base64: string): Uint8Array {
   return bytes;
 }
 
+async function gzipBase64(raw: Uint8Array): Promise<string> {
+  const cs = new CompressionStream("gzip");
+  const writer = cs.writable.getWriter();
+  writer.write(raw);
+  writer.close();
+  return uint8ToBase64(new Uint8Array(await new Response(cs.readable).arrayBuffer()));
+}
+
+/**
+ * `text` in exactly the named encoding, whatever its size. compressContent
+ * chooses the encoding itself; this is for writing an object behind a row
+ * that already names one (engram#572).
+ */
+export async function encodeContent(text: string, encoding: string | null): Promise<string> {
+  if (!encoding || encoding === "raw") return text;
+  if (encoding !== ENCODING_GZIP) {
+    throw new Error(`Unknown content encoding: ${encoding}`);
+  }
+  return gzipBase64(new TextEncoder().encode(text));
+}
+
 /**
  * Compress a string with gzip and return base64-encoded result.
  * Returns null if the input is too short to benefit from compression.
@@ -44,13 +65,7 @@ export async function compressContent(
     return { content: text, encoding: null };
   }
 
-  const cs = new CompressionStream("gzip");
-  const writer = cs.writable.getWriter();
-  writer.write(raw);
-  writer.close();
-
-  const compressed = await new Response(cs.readable).arrayBuffer();
-  const encoded = uint8ToBase64(new Uint8Array(compressed));
+  const encoded = await gzipBase64(raw);
 
   // Only use compression if it actually saves space
   if (encoded.length >= text.length) {

@@ -63,7 +63,17 @@ export type AuditAction =
   // A message body rebuilt from the search index after its R2 object went
   // missing (engram#541). Metadata records the source chunk id and the
   // character count — never the text.
-  | "admin.message.restore";
+  | "admin.message.restore"
+  // The same rebuild, run by the service itself just before a reindex
+  // replaces the chunks it is rebuilt from (engram#572). No key: the user's
+  // edit or delete triggered it, but did not ask for it.
+  | "message.restore"
+  // A reindex after an edit or delete that was not applied because a body
+  // in the window could not be read or rebuilt (engram#572): the window's
+  // old chunks are the last copy of that message's words, so they were
+  // kept. Metadata names the messages and chunks — never the text. Each one
+  // is a window whose search is stale until the body is restored.
+  | "index.reindex_kept";
 
 /**
  * Audit log entry. Never throws — audit logging should not break the

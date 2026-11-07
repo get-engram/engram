@@ -365,7 +365,18 @@ export function createMockEnv(db: D1Database) {
     SUPABASE_ANON_KEY: "test-anon-key",
     DB: db,
     CONTENT: {
-      put: vi.fn(async (key: string, val: unknown) => {
+      // Honours the one precondition the code uses: `etagDoesNotMatch: "*"`,
+      // create-only (engram#572). R2 refuses such a put when the key exists
+      // and the binding resolves to null. Any other condition throws, so a
+      // test can never pass on a precondition the mock ignored.
+      put: vi.fn(async (key: string, val: unknown, opts?: R2PutOptions) => {
+        if (opts?.onlyIf !== undefined) {
+          const cond = opts.onlyIf as R2Conditional;
+          if (cond instanceof Headers || Object.keys(cond).join() !== "etagDoesNotMatch" || cond.etagDoesNotMatch !== "*") {
+            throw new Error(`mock R2 put: unmodelled onlyIf ${JSON.stringify(cond)}`);
+          }
+          if (r2store.has(key)) return null;
+        }
         r2store.set(key, typeof val === "string" ? val : String(val));
         return {};
       }),

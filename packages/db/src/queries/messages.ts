@@ -137,6 +137,23 @@ export function getMessageById(
 }
 
 /**
+ * Whether any message row has this id. Deliberately not org-scoped: an org
+ * merge moves rows by rewriting organization_id, ids unchanged, so a row
+ * missing from one org may be alive in another. Ids are never reused, so no
+ * row anywhere means the message is gone for good.
+ */
+export async function messageExists(
+  db: D1Database,
+  messageId: string
+): Promise<boolean> {
+  const row = await db
+    .prepare("SELECT 1 AS present FROM messages WHERE id = ?")
+    .bind(messageId)
+    .first();
+  return row !== null;
+}
+
+/**
  * Delete one message AND decrement the conversation's message_count in one
  * atomic batch (mirror of insertMessagesWithCount — split writes are how the
  * counter drifted historically). Org- and conversation-scoped.

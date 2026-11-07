@@ -46,7 +46,9 @@ import {
   IndexingQuotaError,
   type TierCheckResult,
 } from "./tier.js";
-import { storeContent, deleteContent, loadContent } from "./content-store.js";
+import { storeContent, deleteContent, loadContent, loadContentOrNull } from "./content-store.js";
+import { restoreMissingBody } from "./content-integrity.js";
+import { audit } from "./audit.js";
 import {
   copyChunkTextsToR2,
   chunkObjectKey,
@@ -512,8 +514,8 @@ export async function updateMessage(
   // history and the index untouched — the caller gets a 429 instead of an
   // edit that is stored but silently unsearchable.
   const plan = await planReindex(env, conversationId, organizationId, existing.sequence, {
-    id: messageId,
-    content: updated.content,
+    repair: true,
+    override: { id: messageId, content: updated.content },
   });
   const indexCheck = await meterReindex(env, organizationId, viewer, plan);
   if (!indexCheck.allowed) throw new IndexingQuotaError(indexCheck);
@@ -529,11 +531,20 @@ export async function updateMessage(
   // Done BEFORE the overwrite and allowed to throw: losing history silently
   // is the bug being fixed, so a failure must abort the edit rather than
   // proceed and destroy it.
-  const previousText = await loadContent(env, {
-    id: messageId,
-    content: (existing.content as string) ?? "",
-    content_encoding: (existing.content_encoding as string | null) ?? null,
-  });
+  //
+  // The plan read the stored body already, and rebuilt it from the old
+  // chunks if its object was missing (engram#572); the row read above
+  // predates that rebuild, so it is used only when the plan has no body. A
+  // body that could not be rebuilt is archived as the placeholder, and the
+  // plan keeps the old chunks that may still hold its words.
+  const previousText =
+    typeof plan.previous === "string"
+      ? plan.previous
+      : await loadContent(env, {
+          id: messageId,
+          content: (existing.content as string) ?? "",
+          content_encoding: (existing.content_encoding as string | null) ?? null,
+        });
   const revisionId = generateId("rev");
   const revisionNo = await nextRevisionNumber(env.DB, messageId);
   const archived = await storeContent(env, revisionId, previousText);
@@ -560,6 +571,7 @@ export async function updateMessage(
   // Rebuild the affected slice of the search index — planned above, before
   // the write, so the budget could refuse first.
   try {
+    if (plan.kept) await noteKept(env, organizationId, conversationId, "edit", messageId, plan.kept);
     await applyReindex(env, conversationId, organizationId, plan);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -577,23 +589,67 @@ export async function updateMessage(
  * away) and what the window's CURRENT message rows re-chunk to. Chunk
  * boundaries are per-append-batch, so re-chunking only the spanned window
  * can't shift neighbouring chunks. Shared by message edit and delete.
+ *
+ * `kept` is set when the window cannot be re-chunked without losing words
+ * (engram#572). `old` and `chunks` are then both empty, so applying the plan
+ * changes nothing and the old chunks stay where they are.
  */
 interface ReindexPlan {
   old: Array<{ id: string; vectorize_id: string }>;
   chunks: ChunkResult[];
+  kept?: KeptWindow;
+  /**
+   * The edited message's stored body before the edit: rebuilt if its object
+   * was missing, null if it could not be. Unset without an edit, or if the
+   * message was not in the window.
+   */
+  previous?: string | null;
+}
+
+interface KeptWindow {
+  /** The chunks left in place. */
+  chunks: string[];
+  /** Messages whose stored body could not be read or rebuilt. */
+  unreadable: string[];
+}
+
+interface PlanOptions {
+  /**
+   * Rebuild a missing body from the window's old chunks before planning
+   * (engram#572). Sound only while the window's messages are the ones the
+   * chunks were cut from: before an edit or a delete writes anything.
+   */
+  repair: boolean;
+  /**
+   * Stands in for a message whose new body is not written yet: the edit path
+   * plans before it writes, so the indexing budget (engram#445) can refuse
+   * first.
+   */
+  override?: { id: string; content: string };
+  /** Leaves out the message a delete is about to remove. */
+  skip?: string;
 }
 
 /**
- * Work out the plan without touching anything. `override` stands in for a
- * message whose new body is not written yet — the edit path plans before
- * it writes, so the indexing budget (engram#445) can refuse first.
+ * Work out the plan without changing the index.
+ *
+ * Every body in the window is read with loadContentOrNull, never through the
+ * placeholder loadContent serves for a missing object (engram#572). Chunked,
+ * the placeholder would replace the window's old chunks, and those may be
+ * the last place that message's words are: the content-integrity repair
+ * (engram#541) rebuilds a missing body from exactly that text. So with
+ * `repair` on a missing body is rebuilt from the old chunks first and written
+ * back, and if any body in the window still cannot be read, the plan keeps
+ * the old chunks. The edited message's own stored body counts too: it is the
+ * previous wording the edit archives as a revision, and the old chunks may
+ * be its last copy as well.
  */
 async function planReindex(
   env: Env,
   conversationId: string,
   organizationId: string,
   sequence: number,
-  override?: { id: string; content: string }
+  opts: PlanOptions
 ): Promise<ReindexPlan> {
   const overlapping = await getChunksOverlappingSequence(
     env.DB,
@@ -616,24 +672,165 @@ async function planReindex(
     startSeq,
     endSeq
   );
-  const windowMessages = (await Promise.all(
-    (windowResult.results as Array<Record<string, unknown>>).map(
-      async (m) => ({
-        ...m,
-        content:
-          override && m.id === override.id
-            ? override.content
-            : await loadContent(env, {
-                id: m.id as string,
-                content: m.content as string,
-                content_encoding: m.content_encoding as string | null,
-              }),
-        metadata: JSON.parse((m.metadata as string) || "{}"),
-      })
-    )
-  )) as Message[];
+  const all = windowResult.results as Array<Record<string, unknown>>;
+  const rows = all.filter((m) => m.id !== opts.skip);
+  const bodies = await Promise.all(rows.map((m) => loadContentOrNull(env, bodyRef(m))));
 
-  return { old, chunks: chunkMessages(windowMessages) };
+  if (opts.repair && old.length > 0 && bodies.includes(null)) {
+    await repairWindow(
+      env,
+      organizationId,
+      conversationId,
+      rows,
+      bodies,
+      all.find((m) => m.id === opts.skip)
+    );
+  }
+
+  const editedAt = opts.override ? rows.findIndex((m) => m.id === opts.override!.id) : -1;
+  const previous = editedAt === -1 ? undefined : bodies[editedAt];
+  const unreadable = rows.filter((_, i) => bodies[i] === null).map((m) => m.id as string);
+  // Without old chunks there is nothing to keep, and the window is the
+  // edited message alone (a delete leaves its own out), whose new body is
+  // known.
+  const chunkable = rows.every((m, i) => bodies[i] !== null || i === editedAt);
+  if (unreadable.length > 0 && (old.length > 0 || !chunkable)) {
+    return {
+      old: [],
+      chunks: [],
+      kept: { chunks: old.map((c) => c.id), unreadable },
+      previous,
+    };
+  }
+
+  const windowMessages = rows.map((m, i) => ({
+    ...m,
+    content: i === editedAt ? opts.override!.content : (bodies[i] as string),
+    metadata: JSON.parse((m.metadata as string) || "{}"),
+  })) as unknown as Message[];
+
+  return { old, chunks: chunkMessages(windowMessages), previous };
+}
+
+function bodyRef(m: Record<string, unknown>): {
+  id: string;
+  content: string;
+  content_encoding: string | null;
+} {
+  return {
+    id: m.id as string,
+    content: m.content as string,
+    content_encoding: (m.content_encoding as string | null) ?? null,
+  };
+}
+
+/**
+ * Rebuild a window's missing bodies from its old chunks and write them back
+ * (engram#572), filling `bodies` in as they come back.
+ *
+ * Each rebuild strips its neighbours' bodies off a chunk's text, so one
+ * written back can let another line up: one at a time, and again while that
+ * helps. The message a delete is about to remove is out of the plan but
+ * still in the chunks, so its body is one the others' rebuilds need. When it
+ * is missing as well it is rebuilt too, last, and only while another body
+ * is still missing; the delete then removes it again.
+ *
+ * A rebuilt body the write-back could not store (restoreMissingBody) still
+ * fills the plan, so its words are in the new chunks, but it cannot help a
+ * neighbour: their rebuilds read bodies from storage.
+ */
+async function repairWindow(
+  env: Env,
+  organizationId: string,
+  conversationId: string,
+  rows: Array<Record<string, unknown>>,
+  bodies: Array<string | null>,
+  skipped: Record<string, unknown> | undefined
+): Promise<void> {
+  const tries = rows.map((row, i) => ({
+    row,
+    done: () => bodies[i] !== null,
+    fill: (text: string) => {
+      bodies[i] = text;
+    },
+  }));
+  if (skipped && (await loadContentOrNull(env, bodyRef(skipped))) === null) {
+    let filled = false;
+    tries.push({
+      row: skipped,
+      done: () => filled,
+      fill: () => {
+        filled = true;
+      },
+    });
+  }
+  const needed = () => bodies.includes(null);
+
+  let progress = true;
+  while (progress && needed()) {
+    progress = false;
+    for (const t of tries) {
+      if (!needed()) break;
+      if (t.done()) continue;
+      const restored = await restoreOne(env, organizationId, conversationId, t.row);
+      if (restored === null) continue;
+      t.fill(restored.content);
+      if (restored.written) progress = true;
+    }
+  }
+}
+
+async function restoreOne(
+  env: Env,
+  organizationId: string,
+  conversationId: string,
+  m: Record<string, unknown>
+): Promise<{ content: string; written: boolean } | null> {
+  try {
+    const restored = await restoreMissingBody(env, organizationId, {
+      id: m.id as string,
+      conversation_id: conversationId,
+      sequence: m.sequence as number,
+      role: m.role as string,
+      content_encoding: (m.content_encoding as string | null) ?? null,
+    });
+    if ("content" in restored) return restored;
+    console.warn(
+      `[reindex] could not rebuild the missing body of ${String(m.id)} in ${conversationId}: ${restored.reason}`
+    );
+  } catch (err) {
+    console.error(
+      `[reindex] rebuilding the missing body of ${String(m.id)} in ${conversationId} failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+  }
+  return null;
+}
+
+/**
+ * A window's reindex was not applied because a body in it could not be read
+ * or rebuilt (engram#572). Logged, and recorded in the audit log, which
+ * outlives Workers logs: each one is a window whose search is stale, and the
+ * messages it names need their bodies restored.
+ */
+async function noteKept(
+  env: Env,
+  organizationId: string,
+  conversationId: string,
+  trigger: "edit" | "delete",
+  messageId: string,
+  kept: KeptWindow
+): Promise<void> {
+  console.error(
+    `[reindex] kept ${kept.chunks.length} chunk(s) of ${conversationId} after the ${trigger} of ${messageId}: no readable body for ${kept.unreadable.join(", ")}, and those chunks may be the last copy of its words`
+  );
+  await audit(env.DB, organizationId, null, "index.reindex_kept", "conversation", conversationId, {
+    trigger,
+    message_id: messageId,
+    unreadable: kept.unreadable,
+    kept_chunks: kept.chunks,
+  });
 }
 
 /**
@@ -826,6 +1023,26 @@ export async function deleteMessage(
     | null;
   if (!existing || existing.conversation_id !== conversationId) return false;
 
+  // Plan the reindex before deleting anything (engram#572). A body missing
+  // from this message's window is rebuilt from the window's chunks while
+  // they still line up with its messages; once this row is gone they don't
+  // (its part of the chunk text would be taken for the missing body), and
+  // the reindex below replaces those chunks. The plan leaves this message
+  // out, so it is what a plan made after the delete would be.
+  let plan: ReindexPlan | null = null;
+  try {
+    plan = await planReindex(env, conversationId, organizationId, existing.sequence, {
+      repair: true,
+      skip: messageId,
+    });
+  } catch (err) {
+    console.warn(
+      `[index] planning the reindex before the delete of ${messageId} failed; planning again after it, without rebuilding: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+  }
+
   // R2 before D1, same as conversation delete: the row is the only pointer
   // to the object — delete the row first and the body is orphaned forever.
   // deleteContent is idempotent for inline/missing objects.
@@ -859,7 +1076,15 @@ export async function deleteMessage(
   // Reindex is best-effort like edit — but a failure here means the deleted
   // text may still be recalled from a stale chunk, so log it loudly.
   try {
-    let plan = await planReindex(env, conversationId, organizationId, existing.sequence);
+    plan ??= await planReindex(env, conversationId, organizationId, existing.sequence, {
+      repair: false,
+    });
+    // A kept plan drops nothing, even past the budget below: the deleted
+    // text stays recallable until the missing body is restored, because
+    // the chunks that hold it are the last copy of another message's words
+    // (engram#572). Losing that message is the worse failure; this one is
+    // in the audit log and can be fixed.
+    if (plan.kept) await noteKept(env, organizationId, conversationId, "delete", messageId, plan.kept);
     const indexCheck = await meterReindex(env, organizationId, viewer, plan);
     if (!indexCheck.allowed) {
       // Deletes are never refused. Past the budget the stale chunks still

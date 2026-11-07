@@ -1,5 +1,32 @@
 import { ftsRowid, orgFtsToken, ftsMatch } from "./fts-keys.js";
 
+// Bound parameters per statement: D1 refuses a statement with more than 100.
+// Every IN (...) list of ids is cut to this many, leaving room for the
+// statement's other parameters.
+const ID_IN_CHUNK = 90;
+
+/**
+ * Statements deleting these chunks' FTS entries, at most ID_IN_CHUNK rowids
+ * each. Contentless FTS deletes by rowid alone (contentless_delete=1), so the
+ * old text is not needed to clear a stale entry, which is what keeps this
+ * working once chunk text lives in R2. `guard` is a condition every delete
+ * must also meet, with its own parameters.
+ */
+function ftsDeleteStatements(
+  db: D1Database,
+  chunkIds: string[],
+  guard?: { sql: string; params: unknown[] },
+): D1PreparedStatement[] {
+  const rowids = [...new Set(chunkIds.map(ftsRowid))];
+  const out: D1PreparedStatement[] = [];
+  for (let i = 0; i < rowids.length; i += ID_IN_CHUNK) {
+    const slice = rowids.slice(i, i + ID_IN_CHUNK);
+    const where = `rowid IN (${slice.map(() => "?").join(",")})${guard ? ` AND ${guard.sql}` : ""}`;
+    out.push(db.prepare(`DELETE FROM chunks_fts_v2 WHERE ${where}`).bind(...slice, ...(guard?.params ?? [])));
+  }
+  return out;
+}
+
 export function insertChunks(
   db: D1Database,
   chunks: Array<{
@@ -20,15 +47,12 @@ export function insertChunks(
   // whole FTS on every append), so we clear all prior FTS rows for this batch's
   // ids in ONE delete up front, then INSERT OR REPLACE each chunk row and write
   // its fresh FTS row. All in one D1 batch/transaction.
-  const ids = chunks.map((c) => c.id);
-  const ph = ids.map(() => "?").join(",");
-  const rowids = chunks.map((c) => ftsRowid(c.id));
-  const rph = rowids.map(() => "?").join(",");
+  //
+  // The delete is cut into statements of at most ID_IN_CHUNK rowids: one
+  // statement naming every id refused any append of more than 100 chunks
+  // (D1's bound-parameter limit), and the whole batch with it.
   const stmts = [
-    // Contentless FTS deletes by rowid alone (contentless_delete=1), so the
-    // old text is not needed to clear a stale entry — which is what keeps
-    // this working once chunk text moves to R2.
-    db.prepare(`DELETE FROM chunks_fts_v2 WHERE rowid IN (${rph})`).bind(...rowids),
+    ...ftsDeleteStatements(db, chunks.map((c) => c.id)),
     ...chunks.flatMap((c) => [
       db
         .prepare(
@@ -55,6 +79,99 @@ export function insertChunks(
     ]),
   ];
   return db.batch(stmts);
+}
+
+/** A chunk replaceChunks writes; its conversation and organization come from the call. */
+export interface ReplacementChunk {
+  id: string;
+  chunkText: string;
+  chunkSummary: string;
+  startSequence: number;
+  endSequence: number;
+  vectorizeId: string;
+}
+
+/**
+ * Swap chunks of one conversation for new ones in a single transaction
+ * (engram#567): the `oldIds` rows and their FTS entries go, and `chunks` go
+ * in with theirs. A reindex used to delete the old rows in one request and
+ * insert the new ones in the next, so a failure in between left the window
+ * with no chunks at all; once a row's text lives only in R2, with its object
+ * already deleted, that failure lost text that existed nowhere else. Now
+ * the table holds either the old rows or the new ones.
+ *
+ * Every statement is guarded on the conversation still belonging to
+ * `organizationId` when the transaction runs. A conversation deleted since
+ * the caller planned the swap, or moved to another organization by a merge,
+ * is left exactly as it is: nothing deleted, nothing written, and its FTS
+ * entries, which are keyed by chunk id alone, untouched. `owned` says which
+ * happened.
+ *
+ * Idempotent: a second run with the same arguments leaves the same rows,
+ * so a caller whose reply was lost can run it again.
+ *
+ * INDEXED BY on the row delete is load-bearing (engram#469, #559): given
+ * `id IN (...)` with the conversation and organization, the planner can
+ * seek idx_chunks_org and walk every chunk the organization owns.
+ */
+export async function replaceChunks(
+  db: D1Database,
+  conversationId: string,
+  organizationId: string,
+  oldIds: string[],
+  chunks: ReplacementChunk[],
+): Promise<{ owned: boolean }> {
+  const owned = {
+    sql: "EXISTS (SELECT 1 FROM conversations WHERE id = ? AND organization_id = ?)",
+    params: [conversationId, organizationId],
+  };
+  const stmts: D1PreparedStatement[] = [
+    db.prepare(`SELECT ${owned.sql} AS owned`).bind(...owned.params),
+    // The new ids too: one can match a row outside oldIds, which INSERT OR
+    // REPLACE overwrites, and its FTS entry must not be left behind.
+    ...ftsDeleteStatements(db, [...oldIds, ...chunks.map((c) => c.id)], owned),
+  ];
+  const old = [...new Set(oldIds)];
+  for (let i = 0; i < old.length; i += ID_IN_CHUNK) {
+    const slice = old.slice(i, i + ID_IN_CHUNK);
+    stmts.push(
+      db
+        .prepare(
+          `DELETE FROM conversation_chunks INDEXED BY sqlite_autoindex_conversation_chunks_1
+            WHERE id IN (${slice.map(() => "?").join(",")})
+              AND conversation_id = ? AND organization_id = ? AND ${owned.sql}`
+        )
+        .bind(...slice, conversationId, organizationId, ...owned.params)
+    );
+  }
+  for (const c of chunks) {
+    stmts.push(
+      db
+        .prepare(
+          `INSERT OR REPLACE INTO conversation_chunks
+             (id, conversation_id, organization_id, chunk_text, chunk_summary, start_sequence, end_sequence, vectorize_id, fts_rowid)
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${owned.sql}`
+        )
+        .bind(
+          c.id,
+          conversationId,
+          organizationId,
+          c.chunkText,
+          c.chunkSummary,
+          c.startSequence,
+          c.endSequence,
+          c.vectorizeId,
+          ftsRowid(c.id),
+          ...owned.params
+        ),
+      db
+        .prepare(`INSERT INTO chunks_fts_v2(rowid, chunk_text, org) SELECT ?, ?, ? WHERE ${owned.sql}`)
+        .bind(ftsRowid(c.id), c.chunkText, orgFtsToken(organizationId), ...owned.params)
+    );
+  }
+  const results = await db.batch(stmts);
+  const first = results[0]?.results?.[0] as { owned?: number } | undefined;
+  return { owned: first?.owned === 1 };
 }
 
 export function getChunksByVectorizeIds(
@@ -445,8 +562,77 @@ export async function restoreChunkTexts(
   return results.map((res) => (res.meta?.changes ?? 0) === 1);
 }
 
-// Bound parameters per IN(...) statement — D1 refuses more than 100.
-const ID_IN_CHUNK = 90;
+/** A chunk row as the lost-chunk rebuild reads it (engram#567). */
+export interface ChunkForRebuild {
+  id: string;
+  conversation_id: string;
+  organization_id: string;
+  chunk_text: string;
+  chunk_encoding: string | null;
+  chunk_summary: string | null;
+  start_sequence: number;
+  end_sequence: number;
+}
+
+/** One chunk row by id, or null when there is none. A primary-key lookup. */
+export function getChunkForRebuild(db: D1Database, id: string): Promise<ChunkForRebuild | null> {
+  return db
+    .prepare(
+      `SELECT id, conversation_id, organization_id, chunk_text, chunk_encoding, chunk_summary,
+              start_sequence, end_sequence
+         FROM conversation_chunks WHERE id = ?`
+    )
+    .bind(id)
+    .first<ChunkForRebuild>();
+}
+
+/**
+ * Put a rebuilt text into a cleared row whose R2 object is gone (engram#567),
+ * and index it for keyword search. Compare-and-set: only a row that is still
+ * this conversation's, still this organization's, and still cleared to
+ * `encoding` is written, so a row deleted, rewritten or restored since the
+ * caller read it is left as it is. created_at is reset, as by every rewrite
+ * of a row: the clear's settle window counts from it.
+ *
+ * The FTS entry is replaced only when the row is still this organization's
+ * and now holds exactly this text, so the index never gets terms the row
+ * does not have, or an organization it is not in. One transaction.
+ * Returns whether the row was refilled.
+ */
+export async function refillChunkText(
+  db: D1Database,
+  row: { id: string; conversationId: string; organizationId: string; text: string; summary: string },
+  encoding: string,
+): Promise<boolean> {
+  if (!encoding.startsWith("r2:")) {
+    throw new Error(`[chunks] refusing to refill chunks cleared to encoding ${JSON.stringify(encoding)}`);
+  }
+  const rowid = ftsRowid(row.id);
+  // The index entry carries the organization, so the row must still be this
+  // organization's: a merge that moved it meanwhile left it an entry of its own.
+  const holdsText = {
+    sql: `EXISTS (SELECT 1 FROM conversation_chunks INDEXED BY sqlite_autoindex_conversation_chunks_1
+                   WHERE id = ? AND organization_id = ? AND chunk_text = ?
+                     AND chunk_encoding IS NULL AND fts_rowid = ?)`,
+    params: [row.id, row.organizationId, row.text, rowid],
+  };
+  const results = await db.batch([
+    db
+      .prepare(
+        `UPDATE conversation_chunks INDEXED BY sqlite_autoindex_conversation_chunks_1
+            SET chunk_text = ?, chunk_encoding = NULL, chunk_summary = ?, fts_rowid = ?,
+                created_at = datetime('now')
+          WHERE id = ? AND conversation_id = ? AND organization_id = ?
+            AND chunk_text = '' AND chunk_encoding = ?`
+      )
+      .bind(row.text, row.summary, rowid, row.id, row.conversationId, row.organizationId, encoding),
+    ...ftsDeleteStatements(db, [row.id], holdsText),
+    db
+      .prepare(`INSERT INTO chunks_fts_v2(rowid, chunk_text, org) SELECT ?, ?, ? WHERE ${holdsText.sql}`)
+      .bind(rowid, row.text, orgFtsToken(row.organizationId), ...holdsText.params),
+  ]);
+  return (results[0]?.meta?.changes ?? 0) === 1;
+}
 
 /** A chunk as it is now, for checking a copy against the row. */
 export interface ChunkTextNow {
@@ -515,25 +701,4 @@ export async function getChunkOwnersByIds(
     out.push(...res.results);
   }
   return out;
-}
-
-export function deleteChunksByIds(
-  db: D1Database,
-  ids: string[],
-  organizationId: string
-) {
-  if (ids.length === 0) return Promise.resolve();
-  const ph = ids.map(() => "?").join(",");
-  return db.batch([
-    db
-      .prepare(
-        `DELETE FROM chunks_fts_v2 WHERE rowid IN (${ids.map(() => "?").join(",")})`
-      )
-      .bind(...ids.map(ftsRowid)),
-    db
-      .prepare(
-        `DELETE FROM conversation_chunks WHERE id IN (${ph}) AND organization_id = ?`
-      )
-      .bind(...ids, organizationId),
-  ]);
 }

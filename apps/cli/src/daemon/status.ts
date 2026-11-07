@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { writeFileSync, readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -223,9 +224,9 @@ function notifyDesktop(
       ? `${n(storage.used)}/${n(storage.limit)} messages used. New captures are paused.`
       : syncErrorSummary(errorType, storage).slice(0, 180);
   try {
-    // Lazy require: keeps the module import-light for the daemon bootstrap,
-    // which deliberately avoids pulling in anything heavy at startup.
-    const { execFile } = require("node:child_process") as typeof import("node:child_process");
+    // A static import (engram#581): this used to be a lazy `require`, which
+    // does not exist in this ES-module build. It threw, the catch below
+    // swallowed it, and no notification was ever shown.
     const done = () => {};
     if (process.platform === "darwin") {
       const esc = (s: string) => s.replace(/["\\]/g, "\\$&");

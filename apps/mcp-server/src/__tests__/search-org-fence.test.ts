@@ -81,6 +81,8 @@ describe("search result fence", () => {
           bind: (...b: unknown[]) => {
             prepared.push({ sql, bindings: b });
             return {
+              // The probe (engram#564): three matches, under the cap.
+              first: async () => ({ n: 3 }),
               all: async () => ({
                 results: [
                   { chunk_id: "chk_theirs", rank: -3 },

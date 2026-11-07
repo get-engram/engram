@@ -228,7 +228,36 @@ export function getChunksByIds(
 }
 
 /**
+ * Most matches a keyword query may have before it is ranked (engram#564).
+ *
+ * Ranking reads every match: bm25 scores each matching chunk before the sort,
+ * so a query's cost grows with how many of the organization's chunks it
+ * matches, and D1 runs one statement at a time for every tenant. Past this
+ * many, keyword ranking adds little that semantic search does not already
+ * find, so the query is declined rather than ranked.
+ */
+export const FTS_MAX_RANKED_MATCHES = 2000;
+
+export interface ChunkKeywordHit {
+  chunk_id: string;
+  rank: number;
+}
+
+export interface ChunkKeywordSearch {
+  results: ChunkKeywordHit[];
+  /** Set when no ranked query ran: the query had no searchable term, or it
+   *  matches more of the organization's chunks than ranking may cost. */
+  skipped?: "no_terms" | "too_broad";
+}
+
+/**
  * Keyword search over the contentless FTS5 index.
+ *
+ * The query is rebuilt from its tokens by ftsMatch, so it cannot be a syntax
+ * error, and a query with nothing to search for never reaches D1. A query
+ * matching more than FTS_MAX_RANKED_MATCHES of the organization's chunks is
+ * declined with `skipped: "too_broad"` instead of ranked. D1 errors propagate;
+ * the caller decides how to degrade.
  *
  * Ranking uses bm25(chunks_fts_v2, 1.0, 0.0) rather than the bare `rank`
  * shorthand. `rank` scores ALL indexed columns, and `org` is a real indexed
@@ -242,39 +271,63 @@ export function getChunksByIds(
  * near-zero overlap in the top 20. Zeroing the org column's weight restored
  * 20/20, 19/20, 19/20 agreement on the same queries.
  */
-export function searchChunksFts(
+export async function searchChunksFts(
   db: D1Database,
   query: string,
   organizationId: string,
   limit: number,
   conversationId?: string,
-) {
-  // FTS5 MATCH with org scoping. rank is negative BM25 (lower = better).
-  if (conversationId) {
-    return db
-      .prepare(
-        `SELECT c.id AS chunk_id, bm25(chunks_fts_v2, 1.0, 0.0) AS rank
-           FROM chunks_fts_v2 f
-           JOIN conversation_chunks c ON c.fts_rowid = f.rowid
-          WHERE chunks_fts_v2 MATCH ?
-            AND c.organization_id = ?
-            AND c.conversation_id = ?
-          ORDER BY bm25(chunks_fts_v2, 1.0, 0.0) LIMIT ?`
-      )
-      .bind(ftsMatch(query, organizationId), organizationId, conversationId, limit)
-      .all<{ chunk_id: string; rank: number }>();
-  }
-  return db
+  opts: { maxMatches?: number } = {},
+): Promise<ChunkKeywordSearch> {
+  const match = ftsMatch(query, organizationId);
+  if (match === null) return { results: [], skipped: "no_terms" };
+
+  // Tests lower the cap; nothing raises it.
+  const cap =
+    Number.isSafeInteger(opts.maxMatches) && (opts.maxMatches as number) > 0
+      ? Math.min(opts.maxMatches as number, FTS_MAX_RANKED_MATCHES)
+      : FTS_MAX_RANKED_MATCHES;
+
+  // Count the matches first, stopping at cap + 1. With no ORDER BY there is no
+  // bm25, so FTS5 hands back rowids in order and stops at the LIMIT: this
+  // costs at most cap + 1 matches however broad the query is. The count is
+  // per org token, before the organization_id join: a token shared by two
+  // org ids can only make it larger, which declines sooner, never later.
+  const probe = await db
     .prepare(
-      `SELECT c.id AS chunk_id, bm25(chunks_fts_v2, 1.0, 0.0) AS rank
-         FROM chunks_fts_v2 f
-         JOIN conversation_chunks c ON c.fts_rowid = f.rowid
-        WHERE chunks_fts_v2 MATCH ?
-          AND c.organization_id = ?
-        ORDER BY bm25(chunks_fts_v2, 1.0, 0.0) LIMIT ?`
+      "SELECT count(*) AS n FROM (SELECT rowid FROM chunks_fts_v2 WHERE chunks_fts_v2 MATCH ? LIMIT ?)",
     )
-    .bind(ftsMatch(query, organizationId), organizationId, limit)
-    .all<{ chunk_id: string; rank: number }>();
+    .bind(match, cap + 1)
+    .first<{ n: number }>();
+  if (!probe) throw new Error("keyword probe returned no row");
+  if (probe.n === 0) return { results: [] };
+  if (probe.n > cap) return { results: [], skipped: "too_broad" };
+
+  // FTS5 MATCH with org scoping. rank is negative BM25 (lower = better).
+  const ranked = conversationId
+    ? db
+        .prepare(
+          `SELECT c.id AS chunk_id, bm25(chunks_fts_v2, 1.0, 0.0) AS rank
+             FROM chunks_fts_v2 f
+             JOIN conversation_chunks c ON c.fts_rowid = f.rowid
+            WHERE chunks_fts_v2 MATCH ?
+              AND c.organization_id = ?
+              AND c.conversation_id = ?
+            ORDER BY bm25(chunks_fts_v2, 1.0, 0.0) LIMIT ?`,
+        )
+        .bind(match, organizationId, conversationId, limit)
+    : db
+        .prepare(
+          `SELECT c.id AS chunk_id, bm25(chunks_fts_v2, 1.0, 0.0) AS rank
+             FROM chunks_fts_v2 f
+             JOIN conversation_chunks c ON c.fts_rowid = f.rowid
+            WHERE chunks_fts_v2 MATCH ?
+              AND c.organization_id = ?
+            ORDER BY bm25(chunks_fts_v2, 1.0, 0.0) LIMIT ?`,
+        )
+        .bind(match, organizationId, limit);
+  const res = await ranked.all<ChunkKeywordHit>();
+  return { results: res.results ?? [] };
 }
 
 export function deleteChunksFts(

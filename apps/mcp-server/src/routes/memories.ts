@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { z } from "zod";
+import { MAX_SEARCH_QUERY_CHARS } from "@getengram/shared";
 import {
   appendMessages,
   getOrCreateDefaultConversation,
@@ -121,6 +122,14 @@ memories.get("/search", async (c) => {
   const query = c.req.query("q")?.trim();
   if (!query) {
     return c.json({ error: "missing_query" }, 400);
+  }
+  // The same bound as the REST and MCP search (engram#564): the dashboard
+  // path was the one that took a query of any length.
+  if (query.length > MAX_SEARCH_QUERY_CHARS) {
+    return c.json(
+      { error: "query_too_long", message: `Search query exceeds ${MAX_SEARCH_QUERY_CHARS} characters.` },
+      400,
+    );
   }
   const limit = Math.min(Math.max(Number(c.req.query("limit") ?? "5") || 5, 1), 20);
 

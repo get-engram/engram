@@ -101,6 +101,11 @@ interface PendingAssistant {
   messageId: string;
   textParts: string[];
   toolUses: { name: string; input: unknown }[];
+  /** Session and metadata of the lines the message came from. */
+  sessionId: string;
+  meta: SessionMeta;
+  /** Byte offset of the message's first line in its file. */
+  from: number;
 }
 
 /**
@@ -110,31 +115,48 @@ interface PendingAssistant {
  * response may span multiple lines sharing the same `message.id`. We
  * accumulate blocks and flush when the message is complete (stop_reason
  * is set) or a new message begins.
+ *
+ * One parser reads every transcript of the host, interleaved: a session's
+ * subagents and workflows write files of their own next to it. So the
+ * accumulator is kept per file, and a message is emitted under the session
+ * of its own lines (engram#579). It used to be a single accumulator emitted
+ * under whichever session the parser had seen last, from any file — a
+ * reply could be filed under another session, or dropped along with it when
+ * that session was opted out.
  */
 export class Parser implements LineParser {
-  private pending: PendingAssistant | null = null;
+  /**
+   * Every line names its session, so resuming a file needs no context but
+   * the recent tool calls: a `vault get` whose output is still to come.
+   * Wide enough to reach back past parallel tool calls with large outputs;
+   * past it, the value-exact scrubber (scrubber.ts) still applies.
+   */
+  readonly resumeContext = { headBytes: 0, tailBytes: 2 * 1024 * 1024 };
+
+  /** The buffered assistant message of each file that has one. */
+  private pending = new Map<string, PendingAssistant>();
 
   /**
    * tool_use ids whose result must not be captured. Bounded: an id is
    * removed the moment its result is seen, and a session produces a few
-   * hundred tool calls at most.
+   * hundred tool calls at most. Tool ids are unique, so one set serves
+   * every file.
    */
   private secretToolIds = new Set<string>();
-  private lastSessionId: string | null = null;
-  private lastMeta: SessionMeta | null = null;
   private onMessages: OnMessages;
 
   constructor(onMessages: OnMessages) {
     this.onMessages = onMessages;
   }
 
-  processLine(line: string, filePath: string): void {
+  processLine(line: string, filePath: string, offset: number): void {
     let data: JsonlLine;
     try {
       data = JSON.parse(line);
     } catch {
       return; // malformed line, skip
     }
+    if (!data || typeof data !== "object") return; // valid JSON, not a record
 
     // Skip noise
     if (SKIP_TYPES.has(data.type)) return;
@@ -153,23 +175,55 @@ export class Parser implements LineParser {
       version: data.version,
       host: "claude-code",
     };
-    this.lastSessionId = sessionId;
-    this.lastMeta = meta;
-
     if (!data.message) return;
 
     if (data.type === "user") {
-      // Flush any pending assistant message first
-      this.flushPending();
+      // A user turn ends this file's buffered assistant message
+      this.flushPending(filePath);
       this.processUserLine(sessionId, meta, data);
     } else if (data.type === "assistant") {
-      this.processAssistantLine(sessionId, meta, data);
+      this.processAssistantLine(sessionId, meta, data, filePath, offset);
     }
   }
 
-  /** Flush any remaining accumulated assistant message. */
-  flush(): void {
-    this.flushPending();
+  /**
+   * Replays a line an earlier daemon process already handled — the watcher
+   * does this for the lines just before where it resumes a file. Only one
+   * thing spans lines across a restart: which tool calls print a secret.
+   * Without it, a `vault get` whose output was written after the daemon
+   * restarted had that output captured. Never emits.
+   */
+  restoreLine(line: string, _filePath: string): void {
+    // Cheap pre-check: only tool_use and tool_result lines matter here.
+    if (!line.includes("tool_")) return;
+    let data: JsonlLine;
+    try {
+      data = JSON.parse(line);
+    } catch {
+      return;
+    }
+    const content = data?.message?.content;
+    if (!Array.isArray(content)) return;
+    for (const block of content) {
+      if (data.type === "assistant" && block.type === "tool_use") {
+        this.trackSecretTool(block);
+      } else if (data.type === "user" && block.type === "tool_result" && block.tool_use_id) {
+        this.secretToolIds.delete(block.tool_use_id);
+      }
+    }
+  }
+
+  bufferedFrom(filePath: string): number | null {
+    return this.pending.get(filePath)?.from ?? null;
+  }
+
+  /** Emit buffered assistant messages: one file's, or every file's. */
+  flush(filePath?: string): void {
+    if (filePath !== undefined) {
+      this.flushPending(filePath);
+      return;
+    }
+    for (const path of [...this.pending.keys()]) this.flushPending(path);
   }
 
   private processUserLine(
@@ -238,38 +292,45 @@ export class Parser implements LineParser {
     sessionId: string,
     meta: SessionMeta,
     data: JsonlLine,
+    filePath: string,
+    offset: number,
   ): void {
     const msg = data.message!;
     const messageId = msg.id ?? "";
     const content = msg.content;
 
-    // If this is a new message ID, flush the previous one
-    if (this.pending && this.pending.messageId !== messageId) {
-      this.flushPending();
+    // A new message ID in this file ends the previous one
+    let pending = this.pending.get(filePath);
+    if (pending && pending.messageId !== messageId) {
+      this.flushPending(filePath);
+      pending = undefined;
     }
 
     // Initialize accumulator if needed
-    if (!this.pending) {
-      this.pending = { messageId, textParts: [], toolUses: [] };
+    if (!pending) {
+      pending = { messageId, textParts: [], toolUses: [], sessionId, meta, from: offset };
+      this.pending.set(filePath, pending);
     }
+    pending.sessionId = sessionId;
+    pending.meta = meta;
 
     // Accumulate content blocks
     if (typeof content === "string") {
       if (content.trim()) {
-        this.pending.textParts.push(content);
+        pending.textParts.push(content);
       }
     } else if (Array.isArray(content)) {
       for (const block of content) {
         if (block.type === "text" && block.text?.trim()) {
-          this.pending.textParts.push(block.text);
-        } else if (block.type === "tool_use" && block.name) {
-          this.pending.toolUses.push({
-            name: block.name,
-            input: block.input,
-          });
-          if (block.id && REVEALS_SECRET.test(commandOf(block.input))) {
-            this.secretToolIds.add(block.id);
+          pending.textParts.push(block.text);
+        } else if (block.type === "tool_use") {
+          if (block.name) {
+            pending.toolUses.push({
+              name: block.name,
+              input: block.input,
+            });
           }
+          this.trackSecretTool(block);
         }
         // Skip thinking blocks — internal reasoning, not conversation
       }
@@ -277,14 +338,22 @@ export class Parser implements LineParser {
 
     // If stop_reason is set, message is complete
     if (msg.stop_reason) {
-      this.flushPending();
+      this.flushPending(filePath);
     }
   }
 
-  private flushPending(): void {
-    if (!this.pending || !this.lastSessionId || !this.lastMeta) return;
+  private trackSecretTool(block: ContentBlock): void {
+    if (block.id && REVEALS_SECRET.test(commandOf(block.input))) {
+      this.secretToolIds.add(block.id);
+    }
+  }
 
-    const { textParts, toolUses } = this.pending;
+  private flushPending(filePath: string): void {
+    const pending = this.pending.get(filePath);
+    if (!pending) return;
+    this.pending.delete(filePath);
+
+    const { textParts, toolUses, sessionId, meta } = pending;
     const messages: ParsedMessage[] = [];
 
     // Emit text content as assistant message
@@ -299,10 +368,8 @@ export class Parser implements LineParser {
     }
 
     if (messages.length > 0) {
-      this.onMessages(this.lastSessionId, this.lastMeta, messages);
+      this.onMessages(sessionId, meta, messages);
     }
-
-    this.pending = null;
   }
 
   private extractProjectDir(filePath: string): string {

@@ -33,13 +33,41 @@ export type OnMessages = (
 
 /**
  * A per-line transcript parser for one host format (engram#261). The
- * watcher feeds it complete lines from a session file; it emits messages
- * via the OnMessages callback it was constructed with.
+ * watcher feeds it complete lines from a host's session files; it emits
+ * messages via the OnMessages callback it was constructed with.
+ *
+ * One parser serves every file of its host, and the files are read
+ * interleaved, so any state a parser keeps between lines is kept per file
+ * (engram#579).
  */
 export interface LineParser {
-  processLine(line: string, filePath: string): void;
-  /** Flush any buffered partial message (e.g. a multi-block assistant turn). */
-  flush(): void;
+  /**
+   * Feed one complete line. `offset` is the byte position where the line
+   * starts in its file: a parser that buffers the line's content reports it
+   * from bufferedFrom() until the content is emitted.
+   */
+  processLine(line: string, filePath: string, offset: number): void;
+  /**
+   * Byte offset of the first line of `filePath` whose content is buffered
+   * and not yet emitted, or null when nothing of that file is buffered. The
+   * watcher never saves a resume offset past it, so a crash re-reads the
+   * line instead of losing what it held.
+   */
+  bufferedFrom(filePath: string): number | null;
+  /** Emit buffered partial messages (e.g. a multi-block assistant turn):
+   *  one file's, or every file's when no path is given. */
+  flush(filePath?: string): void;
+  /**
+   * How much of a file to replay through restoreLine() when a new process
+   * starts reading it part-way: bytes from the start of the file, and bytes
+   * just before the resume point.
+   */
+  readonly resumeContext: { headBytes: number; tailBytes: number };
+  /**
+   * Rebuild per-file state from a line an earlier process already handled
+   * (e.g. which session a file belongs to). Never emits.
+   */
+  restoreLine(line: string, filePath: string): void;
 }
 
 /**

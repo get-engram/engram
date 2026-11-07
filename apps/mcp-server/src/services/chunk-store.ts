@@ -48,8 +48,15 @@ import type { Env } from "../types.js";
  * Readers: a row's text is in R2 only when chunk_text = '' AND
  * chunk_encoding starts with 'r2:'. Anything else reads the column.
  *
- * Deletes go to R2 first and throw, like message content: a delete that
- * fails must abort while the rows still record which keys exist.
+ * Deletes. A conversation delete sweeps its prefix before its rows, and
+ * throws, like message content: a failure aborts while the conversation is
+ * still there to retry. A reindex (an edited or deleted message) goes the
+ * other way, because a cleared row's object is its only copy (engram#567):
+ * it swaps the old rows for the new ones in one transaction, then deletes
+ * the old objects, best-effort. A copy a failed delete leaves behind has no
+ * row, and the orphan sweep (engram#557) removes it. A lost row, cleared
+ * but with no object, is rebuilt from its messages by the mover's verify +
+ * repair (chunk-rebuild.ts).
  */
 
 export const CHUNK_R2_ENCODING = "r2:raw";
@@ -228,9 +235,10 @@ export async function loadChunkTexts(
 }
 
 /**
- * Delete these chunk objects. Throws, deliberately, for the reason
- * deleteContent does: the caller must be able to abort before the D1 rows
- * that name these keys are gone.
+ * Delete these chunk objects. Throws, and the caller decides what a failure
+ * means. Delete an object only once no row needs it: a cleared row's object
+ * is its only copy, so the reindex deletes the old objects after the rows
+ * that pointed at them are gone (engram#567).
  */
 export async function deleteChunkObjects(env: Env, keys: string[]): Promise<number> {
   let deleted = 0;

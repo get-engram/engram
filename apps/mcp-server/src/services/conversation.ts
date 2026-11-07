@@ -30,7 +30,7 @@ import {
   updateMessageContent,
   getMessagesBySequenceRange,
   getChunksOverlappingSequence,
-  deleteChunksByIds,
+  replaceChunks,
   getR2MessageIdsByConversation,
 
   insertMessageRevision,
@@ -653,8 +653,26 @@ async function meterReindex(
 }
 
 /**
- * Apply a plan: embed the new chunks, drop the stale ones (D1 + FTS +
- * Vectorize), insert the new ones. A plan with no chunks is a pure drop.
+ * Apply a plan: embed the new chunks, drop the stale vectors, swap the stale
+ * rows for the new ones, then drop the stale R2 copies and put the new ones.
+ * A plan with no chunks is a pure drop.
+ *
+ * The order keeps every chunk's text somewhere at every step (engram#567).
+ * Once the clear has moved a row's text to R2, its object is the only copy,
+ * so no object goes before the rows that point at it, and old and new rows
+ * change in one transaction. Whatever fails, D1 holds either the old rows,
+ * with their objects, or the new rows, with their text in the column:
+ *   - the vector delete fails: nothing else has changed;
+ *   - the swap fails (twice): the old rows and objects are as they were,
+ *     some without their vectors, so the window is found by keyword alone
+ *     until it is next reindexed;
+ *   - anything after the swap fails: the new rows hold their text inline.
+ *     A stale copy that could not be deleted is an orphan, which the sweep
+ *     (engram#557) removes, or sits under a reused key, which the put below
+ *     or the mover's verify rewrites; a new copy that did not land is
+ *     rewritten by the verify.
+ * It used to delete the objects first, so a failure between that and the
+ * insert left cleared rows pointing at objects that were gone.
  */
 async function applyReindex(
   env: Env,
@@ -663,6 +681,7 @@ async function applyReindex(
   plan: ReindexPlan
 ): Promise<void> {
   const { old, chunks } = plan;
+  if (old.length === 0 && chunks.length === 0) return;
   const texts = chunks.map((c) => c.text);
   const embeddings = texts.length
     ? await generateEmbeddings(env.AI, texts)
@@ -676,8 +695,6 @@ async function applyReindex(
     );
     return {
       id: cid,
-      conversationId,
-      organizationId,
       chunkText: chunk.text,
       chunkSummary: summarizeChunk(chunk.text),
       startSequence: chunk.startSequence,
@@ -686,54 +703,67 @@ async function applyReindex(
       embedding: embeddings[i],
     };
   });
-  const oldKeys = old.map((c) => chunkObjectKey(conversationId, c.id));
 
+  // Vectors first, and a failure aborts with nothing else changed. A vector
+  // must not outlive its row: a conversation delete finds the vectors to
+  // remove through the rows, so one left behind would never be removed.
   if (old.length > 0) {
-    // The replaced chunks' R2 copies (engram#384) go first, and a failure
-    // aborts the rebuild. An edit is often a redaction: the old wording
-    // must not outlive it in the bucket, and once the rows below are gone
-    // nothing would point at those objects again. Aborting here leaves the
-    // index exactly as it was.
-    await deleteChunkObjects(env, oldKeys);
     await deleteVectorsByIds(env, old.map((c) => c.vectorize_id));
-    await deleteChunksByIds(
-      env.DB,
-      old.map((c) => c.id),
-      organizationId
-    );
   }
 
-  if (chunkRecords.length > 0) {
-    await insertChunks(
+  // Retried once, whatever the error. D1 can report a failure for a request
+  // that committed (which is why withD1Retry retries only rejections that
+  // never ran), but the swap is idempotent: a second run leaves the same rows.
+  const swap = () =>
+    replaceChunks(
       env.DB,
-      chunkRecords.map((c) => ({
-        id: c.id,
-        conversationId: c.conversationId,
-        organizationId: c.organizationId,
-        chunkText: c.chunkText,
-        chunkSummary: c.chunkSummary,
-        startSequence: c.startSequence,
-        endSequence: c.endSequence,
-        vectorizeId: c.vectorizeId,
-      }))
+      conversationId,
+      organizationId,
+      old.map((c) => c.id),
+      chunkRecords,
     );
+  let swapped: { owned: boolean };
+  try {
+    swapped = await swap();
+  } catch (err) {
+    console.warn(
+      `[reindex] chunk swap for ${conversationId} failed, retrying: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+    swapped = await swap();
+  }
+  if (!swapped.owned) {
+    // Deleted, or moved to another organization by a merge, since the plan
+    // was made. The swap wrote nothing. The objects are keyed by
+    // conversation, not organization, so they still belong to whoever has
+    // the rows now; deleting them, or upserting vectors labelled with this
+    // organization, would be wrong either way.
+    console.warn(
+      `[reindex] ${conversationId} no longer belongs to ${organizationId}; left its chunks as they are`
+    );
+    return;
   }
 
   if (old.length > 0) {
-    // Second pass, now that the rows hold the new text. A chunk-copy job
-    // page read before this edit can put the old wording back after the
-    // first pass; the job removes or rewrites a copy it put after the rows
-    // changed, and this removes one it put in between. It runs before the
-    // new copies below, so it never deletes one of them. Best-effort: the
-    // rebuild is not failed over an object that is almost never there.
+    // The stale copies, now that no row points at them. An edit is often a
+    // redaction, so the old wording should not stay in the bucket: retried
+    // once, then logged for the orphan sweep (engram#557). Every old key goes,
+    // reused ones too: the put below writes those again, and if it fails the
+    // row still holds its text, where a stale copy would be the wrong one.
+    const oldKeys = old.map((c) => chunkObjectKey(conversationId, c.id));
     try {
       await deleteChunkObjects(env, oldKeys);
-    } catch (err) {
-      console.error(
-        `[reindex] second chunk-copy delete failed for ${conversationId}: ${
-          err instanceof Error ? err.message : String(err)
-        }`
-      );
+    } catch {
+      try {
+        await deleteChunkObjects(env, oldKeys);
+      } catch (err) {
+        console.error(
+          `[reindex] ${oldKeys.length} stale chunk copies of ${conversationId} not deleted; the orphan sweep removes them: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
     }
   }
 

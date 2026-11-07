@@ -4,8 +4,8 @@ import {
   deleteConversationById,
   getChunkForRebuild,
   getMessagesBySequenceRange,
+  getMessagePointerPage,
   getR2MessageIdsByConversation,
-  getR2PointerPage,
   getR2RevisionIdsByConversation,
   refillChunkText,
   reindexConversationTagsRange,
@@ -133,8 +133,8 @@ describe("conversation-scoped statements seek the conversation (engram#559)", ()
 
   it("content-integrity page limited to one conversation", async () => {
     const rec = recording(db);
-    await getR2PointerPage(rec.db, "org_x", null, 10, "conv_x");
-    await getR2PointerPage(rec.db, "org_x", "msg_x", 10, "conv_x");
+    await getMessagePointerPage(rec.db, "org_x", null, 10, "conv_x");
+    await getMessagePointerPage(rec.db, "org_x", 5, 10, "conv_x");
     await expectConversationSeeks(rec.sql, {
       "FROM messages": /SEARCH messages USING (COVERING )?INDEX idx_messages_conv_seq \(conversation_id=\?\)/,
     });

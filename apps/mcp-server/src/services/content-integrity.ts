@@ -1,5 +1,5 @@
 import {
-  getR2PointerPage,
+  getMessagePointerPage,
   getChunkTextsCoveringSequence,
   getMessagesBySequenceRange,
   messageExists,
@@ -22,7 +22,8 @@ import type { Env } from "../types.js";
  * way for two months.
  *
  * The scan HEADs every pointer in an organization (or one conversation),
- * one page per call, and reports the rows whose object is missing. With
+ * one page of rows per call in rowid order, and reports the rows whose
+ * object is missing. With
  * repair on it rebuilds each missing body from the search index: a chunk
  * row keeps the verbatim window text, one `[role]: content` part per
  * message joined by newlines (packages/shared chunk.ts), and the
@@ -57,9 +58,15 @@ export interface IntegrityScanOptions {
   organizationId: string;
   /** Limit the scan to one conversation. */
   conversationId?: string;
-  /** Resume cursor: the last message id already checked. */
-  after?: string | null;
-  /** Pointers to check in this call, 1..SCAN_BATCH_MAX. */
+  /**
+   * Resume cursor: `next_after` from the previous call, a message rowid.
+   * Rows after it are checked; null starts from the beginning.
+   */
+  after?: number | null;
+  /**
+   * Message rows to read in this call, 1..SCAN_BATCH_MAX. Inline rows are
+   * read and passed over, so a call can check fewer pointers than this.
+   */
   batch?: number;
   /** Rebuild and write back missing bodies. Off = report only. */
   repair?: boolean;
@@ -72,7 +79,7 @@ export interface MessageRef {
 }
 
 export interface IntegrityScanResult {
-  /** Pointers checked in this call. */
+  /** R2 pointers checked in this call (an inline row has nothing to check). */
   scanned: number;
   /** Rows whose R2 object is missing (repaired or not). */
   missing: MessageRef[];
@@ -80,7 +87,8 @@ export interface IntegrityScanResult {
   unrecoverable: Array<MessageRef & { reason: string }>;
   /** Missing rows cut from this call by REPAIR_MAX_PER_CALL; the cursor covers them. */
   deferred: number;
-  next_after: string | null;
+  /** The rowid to pass as `after` next; null when nothing has been read yet. */
+  next_after: number | null;
   done: boolean;
 }
 
@@ -90,6 +98,11 @@ export interface PointerRow {
   sequence: number;
   role: string;
   content_encoding: string | null;
+}
+
+/** A pointer as the scan pages it: the row plus its rowid, the cursor. */
+interface PagedPointerRow extends PointerRow {
+  rid: number;
 }
 
 interface ChunkWindow {
@@ -109,15 +122,17 @@ export async function scanContentIntegrity(
   opts: IntegrityScanOptions,
 ): Promise<IntegrityScanResult> {
   const batch = Math.min(SCAN_BATCH_MAX, Math.max(1, Math.floor(opts.batch ?? SCAN_BATCH_DEFAULT)));
-  const page = await getR2PointerPage(
+  const page = await getMessagePointerPage(
     env.DB,
     opts.organizationId,
     opts.after ?? null,
     batch,
     opts.conversationId,
   );
-  const pageRows = (page.results ?? []) as PointerRow[];
-  // The query selects r2:* rows; the filter keeps the invariant local.
+  // The page holds every message in its rowid range, so its cost is the
+  // batch whatever the data (engram#561). Only an `r2:*` row promises an
+  // object; an inline row has nothing to check and is passed over.
+  const pageRows = (page.results ?? []) as PagedPointerRow[];
   const rows = pageRows.filter((r) => r.content_encoding?.startsWith("r2:"));
 
   const present = await mapConcurrent(rows, HEAD_CONCURRENCY, async (r) =>
@@ -130,7 +145,7 @@ export async function scanContentIntegrity(
     repaired: [],
     unrecoverable: [],
     deferred: 0,
-    next_after: pageRows.length ? pageRows[pageRows.length - 1].id : (opts.after ?? null),
+    next_after: pageRows.length ? pageRows[pageRows.length - 1].rid : (opts.after ?? null),
     done: pageRows.length < batch,
   };
 
@@ -145,7 +160,7 @@ export async function scanContentIntegrity(
       // re-checked (cheaply) by the next call, which repairs it.
       result.deferred = rows.slice(i).filter((_, j) => !present[i + j]).length;
       result.scanned = i;
-      result.next_after = i > 0 ? rows[i - 1].id : (opts.after ?? null);
+      result.next_after = row.rid - 1;
       result.done = false;
       break;
     }

@@ -24,7 +24,11 @@ const PLACEHOLDER = "[Message content unavailable";
 type MockEnv = ReturnType<typeof createMockEnv>;
 const asEnv = (env: MockEnv) => env as unknown as Env;
 
-/** Zero-padded so id order == sequence order — the order the keyset scan walks. */
+/**
+ * Zero-padded so ids sort by sequence and assertions read in order. The scan
+ * walks rowid order (engram#561); seeding inserts in sequence order, so in
+ * these tests that is sequence order too, as append leaves it in production.
+ */
 const msgId = (convId: string, seq: number) => `msg_${convId}_${String(seq).padStart(3, "0")}`;
 const r2Key = (id: string) => `content/${id}`;
 
@@ -243,7 +247,7 @@ describe("scanContentIntegrity (engram#541)", () => {
     expect(await readBack(env, target)).toBe(big);
   });
 
-  it("repairs in id order so a restored neighbour unlocks the next one", async () => {
+  it("repairs in rowid (append) order so a restored neighbour unlocks the next one", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const db = createMockD1();
     const env = createMockEnv(db);
@@ -324,9 +328,10 @@ describe("scanContentIntegrity (engram#541)", () => {
     expect(env.__r2store.has(r2Key(msgId(conv, 3)))).toBe(false);
   });
 
-  it("pages on message id and honours the conversation scope", async () => {
+  it("pages on message rowid and honours the conversation scope", async () => {
     const db = createMockD1();
     const env = createMockEnv(db);
+    // Message rowids: conv_a 1-7, conv_b 8-10, in the order they were stored.
     await seedConversation(env, "conv_a", SAMPLE);
     await seedConversation(env, "conv_b", SAMPLE.slice(0, 3));
     orphan(env, msgId("conv_a", 7));
@@ -334,22 +339,24 @@ describe("scanContentIntegrity (engram#541)", () => {
 
     const p1 = await scanContentIntegrity(asEnv(env), { organizationId: ORG, batch: 3 });
     expect(p1.scanned).toBe(3);
-    expect(p1.next_after).toBe(msgId("conv_a", 3));
+    expect(p1.next_after).toBe(3);
     expect(p1.done).toBe(false);
     expect(p1.missing).toEqual([]);
 
     const p2 = await scanContentIntegrity(asEnv(env), { organizationId: ORG, batch: 3, after: p1.next_after });
     expect(p2.scanned).toBe(3);
-    expect(p2.next_after).toBe(msgId("conv_a", 6));
+    expect(p2.next_after).toBe(6);
     expect(p2.done).toBe(false);
 
     const p3 = await scanContentIntegrity(asEnv(env), { organizationId: ORG, batch: 3, after: p2.next_after });
     expect(p3.scanned).toBe(3);
+    expect(p3.next_after).toBe(9);
     expect(p3.missing.map((m) => m.id)).toEqual([msgId("conv_a", 7), msgId("conv_b", 2)]);
     expect(p3.done).toBe(false);
 
     const p4 = await scanContentIntegrity(asEnv(env), { organizationId: ORG, batch: 3, after: p3.next_after });
     expect(p4.scanned).toBe(1);
+    expect(p4.next_after).toBe(10);
     expect(p4.missing).toEqual([]);
     expect(p4.done).toBe(true);
 
@@ -357,6 +364,43 @@ describe("scanContentIntegrity (engram#541)", () => {
     expect(scoped.scanned).toBe(3);
     expect(scoped.missing.map((m) => m.id)).toEqual([msgId("conv_b", 2)]);
     expect(scoped.done).toBe(true);
+  });
+
+  it("reads a page of rows whatever their encoding and checks only the R2 pointers", async () => {
+    const db = createMockD1();
+    const env = createMockEnv(db);
+    // Rowids 1-3: R2-backed. 4-8: inline bodies (stored before R2), nothing
+    // to check. 9-10: R2-backed again, and 9 lost its object.
+    await seedConversation(env, "conv_r2a", SAMPLE.slice(0, 3));
+    for (let seq = 1; seq <= 5; seq++) {
+      await env.DB.prepare(
+        "INSERT INTO messages (id, conversation_id, organization_id, role, content, content_encoding, sequence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+        .bind(msgId("conv_inline", seq), "conv_inline", ORG, "user", `inline body ${seq}`, null, seq)
+        .run();
+    }
+    await seedConversation(env, "conv_r2b", SAMPLE.slice(0, 2));
+    orphan(env, msgId("conv_r2b", 1));
+    const head = env.CONTENT.head as unknown as Mock;
+    head.mockClear();
+
+    const p1 = await scanContentIntegrity(asEnv(env), { organizationId: ORG, batch: 4 });
+    expect([p1.scanned, p1.next_after, p1.done]).toEqual([3, 4, false]);
+
+    // A page of nothing but inline rows checks nothing and still moves on.
+    const p2 = await scanContentIntegrity(asEnv(env), { organizationId: ORG, batch: 4, after: p1.next_after });
+    expect([p2.scanned, p2.next_after, p2.done]).toEqual([0, 8, false]);
+    expect(p2.missing).toEqual([]);
+
+    const p3 = await scanContentIntegrity(asEnv(env), { organizationId: ORG, batch: 4, after: p2.next_after });
+    expect([p3.scanned, p3.next_after, p3.done]).toEqual([2, 10, true]);
+    expect(p3.missing.map((m) => m.id)).toEqual([msgId("conv_r2b", 1)]);
+
+    // Only the five R2 pointers were looked up; no inline row ever was.
+    expect(head.mock.calls.map(([key]) => key)).toEqual([
+      ...[1, 2, 3].map((s) => r2Key(msgId("conv_r2a", s))),
+      ...[1, 2].map((s) => r2Key(msgId("conv_r2b", s))),
+    ]);
   });
 
   it("caps repairs per call and rewinds the cursor so nothing is skipped", async () => {
@@ -377,7 +421,8 @@ describe("scanContentIntegrity (engram#541)", () => {
     expect(first.missing).toHaveLength(40);
     expect(first.unrecoverable).toHaveLength(40);
     expect(first.deferred).toBe(2);
-    expect(first.next_after).toBe(msgId(conv, 40));
+    // Rewound to just before message 41 (rowid 41), the first one deferred.
+    expect(first.next_after).toBe(40);
     expect(first.done).toBe(false);
 
     const second = await scanContentIntegrity(asEnv(env), {
@@ -598,12 +643,18 @@ describe("POST /admin/content-integrity", () => {
       asEnv(env),
     );
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { done: boolean; next_after: string; hint: string };
+    const body = (await res.json()) as { done: boolean; next_after: number; hint: string };
     expect(body.done).toBe(false);
-    expect(body.next_after).toBe(msgId(conv, 3));
-    expect(body.hint).toBe(
-      `POST /admin/content-integrity?org=${ORG}&after=${msgId(conv, 3)}&batch=3`,
-    );
+    expect(body.next_after).toBe(3);
+    expect(body.hint).toBe(`POST /admin/content-integrity?org=${ORG}&after=3&batch=3`);
+
+    // Following the hint picks up at message 4 and carries on.
+    const next = await app.request(body.hint.slice("POST ".length), { method: "POST" }, asEnv(env));
+    expect(next.status).toBe(200);
+    const page2 = (await next.json()) as { scanned: number; next_after: number; hint: string };
+    expect(page2.scanned).toBe(3);
+    expect(page2.next_after).toBe(6);
+    expect(page2.hint).toBe(`POST /admin/content-integrity?org=${ORG}&after=6&batch=3`);
   });
 
   it("rejects a call without an org or with a bad batch size", async () => {
@@ -622,6 +673,29 @@ describe("POST /admin/content-integrity", () => {
       asEnv(env),
     );
     expect(huge.status).toBe(400);
+  });
+
+  it("rejects a cursor that is not a rowid from next_after, instead of starting over", async () => {
+    const { env, app } = setup();
+    await seedConversation(env, "conv_cursor", SAMPLE);
+    // A message id was the cursor before engram#561.
+    for (const after of [msgId("conv_cursor", 3), "-1", "1.5", "1e3", " 3", "0x10", "9999999999999999", "99999999999999999"]) {
+      const res = await app.request(
+        `/admin/content-integrity?org=${ORG}&after=${encodeURIComponent(after)}`,
+        { method: "POST" },
+        asEnv(env),
+      );
+      expect(res.status, after).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toContain("next_after");
+    }
+    // An empty cursor is no cursor: the scan starts from the beginning.
+    const empty = await app.request(`/admin/content-integrity?org=${ORG}&after=`, { method: "POST" }, asEnv(env));
+    expect(empty.status).toBe(200);
+    expect(((await empty.json()) as { scanned: number }).scanned).toBe(7);
+    // Zero is a valid cursor (before the first rowid).
+    const zero = await app.request(`/admin/content-integrity?org=${ORG}&after=0`, { method: "POST" }, asEnv(env));
+    expect(zero.status).toBe(200);
+    expect(((await zero.json()) as { scanned: number }).scanned).toBe(7);
   });
 });
 

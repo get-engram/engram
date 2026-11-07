@@ -162,18 +162,6 @@ export function updatePrivacySettings(
     .run();
 }
 
-export function getVectorizeIdsByOrganization(
-  db: D1Database,
-  organizationId: string,
-) {
-  return db
-    .prepare(
-      "SELECT vectorize_id FROM conversation_chunks WHERE organization_id = ?",
-    )
-    .bind(organizationId)
-    .all<{ vectorize_id: string }>();
-}
-
 /** One rowid-cursored page of an org's vector ids — same streaming purpose as
  *  getR2MessageIdsByOrganizationPage, for the GDPR purge's Vectorize deletes. */
 export function getVectorizeIdsByOrganizationPage(

@@ -1,5 +1,5 @@
 import { loadConfig, saveConfig } from "../config.js";
-import { normalizeExcludePath, IGNORE_MARKER } from "../daemon/exclusions.js";
+import { normalizeExcludePath, samePath, IGNORE_MARKER } from "../daemon/exclusions.js";
 import { bold, dim } from "../output.js";
 
 // `engram exclude` — keep whole repos/directories out of capture (engram#462).
@@ -9,13 +9,14 @@ import { bold, dim } from "../output.js";
 export async function excludeAdd(args: string[]): Promise<void> {
   const target = normalizeExcludePath(args[0] ?? process.cwd());
   const config = await loadConfig();
-  const paths = new Set(config.excludePaths ?? []);
-  if (paths.has(target)) {
-    console.log(`${bold("Already excluded:")} ${target}`);
+  const paths = config.excludePaths ?? [];
+  // On macOS and Windows, ~/Code/x and ~/code/x are one directory (engram#619).
+  const existing = paths.find((p) => samePath(p, target));
+  if (existing !== undefined) {
+    console.log(`${bold("Already excluded:")} ${existing}`);
     return;
   }
-  paths.add(target);
-  config.excludePaths = [...paths].sort();
+  config.excludePaths = [...paths, target].sort();
   await saveConfig(config);
   console.log(`${bold("Excluded from capture:")} ${target}`);
   console.log(dim("Sessions in this directory (and below) will not be saved to Engram."));
@@ -27,14 +28,15 @@ export async function excludeRemove(args: string[]): Promise<void> {
   const target = normalizeExcludePath(args[0] ?? process.cwd());
   const config = await loadConfig();
   const paths = config.excludePaths ?? [];
-  if (!paths.includes(target)) {
+  const removed = paths.filter((p) => samePath(p, target));
+  if (removed.length === 0) {
     console.error(`Not in the exclude list: ${target}`);
     console.error(dim("Run 'engram exclude list' to see current exclusions."));
     process.exit(1);
   }
-  config.excludePaths = paths.filter((p) => p !== target);
+  config.excludePaths = paths.filter((p) => !samePath(p, target));
   await saveConfig(config);
-  console.log(`${bold("Removed from exclusions:")} ${target}`);
+  console.log(`${bold("Removed from exclusions:")} ${removed.join(", ")}`);
   console.log(dim("New sessions in this directory will be captured again."));
 }
 

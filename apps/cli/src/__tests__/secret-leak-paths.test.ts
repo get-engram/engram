@@ -69,6 +69,41 @@ describe("layer 1 — the parser withholds output of commands that print secrets
     }
   });
 
+  // engram#619: the key file has more names than `.engram/vault-key`, and a
+  // shell command isn't the only way to read it.
+  it("matches the key file however the command names it", () => {
+    for (const cmd of [
+      "type %USERPROFILE%\\.engram\\vault-key",
+      "Get-Content $env:USERPROFILE\\.Engram\\Vault-Key",
+      "cd ~/.engram && cat vault-key",
+      "cat ~/.engram/vault-key.bak-2026-11-08",
+      "echo $ENGRAM_VAULT_KEY",
+      "echo %engram_vault_key%",
+    ]) {
+      const msgs = run([toolUse("tk", cmd), toolResult("tk", "dGhlLWtleQ==")]);
+      expect(msgs.find((m) => m.role === "tool")!.content, cmd).toBe(REDACTED_TOOL_OUTPUT);
+    }
+  });
+
+  it("withholds a file-reading tool's output when its path is the key file", () => {
+    const call = (id: string, name: string, input: unknown) =>
+      JSON.stringify({
+        type: "assistant",
+        sessionId: "s",
+        message: { id: "m1", role: "assistant", content: [{ type: "tool_use", id, name, input }] },
+      });
+    for (const [name, input] of [
+      ["Read", { file_path: "/Users/x/.engram/vault-key" }],
+      ["Read", { file_path: "C:\\Users\\x\\.engram\\vault-key" }],
+      ["mcp__files__read", { request: { paths: ["/home/x/.engram/vault-key"] } }],
+    ] as const) {
+      const msgs = run([call("tr", name, input), toolResult("tr", "dGhlLWtleQ==")]);
+      expect(msgs.find((m) => m.role === "tool")!.content, JSON.stringify(input)).toBe(REDACTED_TOOL_OUTPUT);
+    }
+    const other = run([call("tn", "Read", { file_path: "/Users/x/notes/vault.md" }), toolResult("tn", "notes")]);
+    expect(other.find((m) => m.role === "tool")!.content).toBe("notes");
+  });
+
   it("leaves every other command's output alone", () => {
     const msgs = run([toolUse("t4", "engram vault list"), toolResult("t4", "PROD_DB_PASSWORD\nSTRIPE_KEY")]);
     expect(msgs.find((m) => m.role === "tool")!.content).toContain("PROD_DB_PASSWORD");

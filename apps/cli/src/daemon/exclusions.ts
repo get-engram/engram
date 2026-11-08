@@ -1,4 +1,4 @@
-import { statSync, existsSync, readFileSync } from "node:fs";
+import { statSync, existsSync, readFileSync, realpathSync } from "node:fs";
 import { join, dirname, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 
@@ -33,6 +33,41 @@ export function normalizeExcludePath(p: string): string {
   return abs.endsWith(sep) ? abs.slice(0, -sep.length) : abs;
 }
 
+// One directory has many spellings, and an exclusion has to match them all
+// (engram#619). File systems on macOS and Windows ignore case by default, so
+// ~/Code/Client is ~/code/client and C:\work is c:\work; macOS also ignores
+// Unicode normalization (é typed as one code point or as e + accent).
+// Matching too much on a case-sensitive volume only keeps more out of
+// capture, which is the safe side of this check.
+
+/** The form a path is compared in on `platform`. */
+export function foldPath(p: string, platform: NodeJS.Platform = process.platform): string {
+  return platform === "darwin" || platform === "win32"
+    ? p.normalize("NFC").toLowerCase()
+    : p;
+}
+
+/** True when `a` and `b` spell the same path on `platform`. */
+export function samePath(a: string, b: string, platform: NodeJS.Platform = process.platform): boolean {
+  return foldPath(normalizeExcludePath(a), platform) === foldPath(normalizeExcludePath(b), platform);
+}
+
+/**
+ * `p` as given and, when it differs, with symlinks resolved. Agents record
+ * the resolved directory, while an exclusion is often typed through a link:
+ * a ~/code that points at another volume, or /tmp, which on macOS is
+ * /private/tmp. A path that doesn't exist (yet) has only the first form.
+ */
+function spellings(p: string): string[] {
+  try {
+    const real = normalizeExcludePath(realpathSync.native(p));
+    return real === p ? [p] : [p, real];
+  } catch {
+    return [p];
+  }
+}
+
+/** Every excluded path, each as configured and with symlinks resolved. */
 export function loadExcludePaths(configFile: string = CONFIG_FILE): string[] {
   try {
     const mtimeMs = statSync(configFile).mtimeMs;
@@ -40,7 +75,7 @@ export function loadExcludePaths(configFile: string = CONFIG_FILE): string[] {
       const raw = JSON.parse(readFileSync(configFile, "utf-8")) as {
         excludePaths?: string[];
       };
-      cachedPaths = (raw.excludePaths ?? []).map(normalizeExcludePath);
+      cachedPaths = (raw.excludePaths ?? []).flatMap((p) => spellings(normalizeExcludePath(p)));
       cachedMtimeMs = mtimeMs;
     }
   } catch {
@@ -51,10 +86,15 @@ export function loadExcludePaths(configFile: string = CONFIG_FILE): string[] {
 }
 
 /** True when `cwd` is at or under `excluded` (never a sibling-prefix match:
- *  /a/repo does NOT match /a/repo2). */
-export function isUnder(cwd: string, excluded: string): boolean {
-  const c = normalizeExcludePath(cwd);
-  return c === excluded || c.startsWith(excluded + sep);
+ *  /a/repo does NOT match /a/repo2), in `platform`'s idea of case. */
+export function isUnder(
+  cwd: string,
+  excluded: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const c = foldPath(normalizeExcludePath(cwd), platform);
+  const e = foldPath(excluded, platform);
+  return c === e || c.startsWith(e + sep);
 }
 
 // ── .engramignore marker files ──
@@ -103,7 +143,10 @@ export function isPathExcluded(
 ): boolean {
   if (!cwd) return false;
   const paths = loadExcludePaths(configFile);
-  if (paths.some((p) => isUnder(cwd, p))) return true;
+  if (paths.length > 0) {
+    const dirs = spellings(normalizeExcludePath(cwd));
+    if (paths.some((p) => dirs.some((d) => isUnder(d, p)))) return true;
+  }
   return hasIgnoreMarker(cwd);
 }
 

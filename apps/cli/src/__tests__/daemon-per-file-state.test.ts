@@ -20,6 +20,8 @@ vi.mock("../daemon/status.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/status.js")>()),
   recordSuccess: vi.fn(),
   recordFailure: vi.fn(),
+  recordCaptureStall: vi.fn(),
+  recordCaptureResumed: vi.fn(),
 }));
 vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/exclusions.js")>()),
@@ -483,6 +485,7 @@ describe("Watcher saves its resume offset only past emitted content", () => {
         restoreLine() {},
         bufferedFrom: () => null,
         flush() {},
+        discard() {},
       }),
     };
     const w = new Watcher(db, () => {}, adapter);
@@ -507,6 +510,7 @@ describe("Watcher bookkeeping", () => {
       },
       bufferedFrom: () => buffered,
       flush() {},
+      discard() {},
     };
     const adapter: HostAdapter = {
       id: "spy",

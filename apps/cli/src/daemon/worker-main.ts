@@ -99,7 +99,11 @@ async function main(): Promise<void> {
 
   const syncer = new Syncer(db, client, scrubber, keys);
 
-  // Wrap syncer.onMessages to handle the async call
+  // syncer.onMessages queues the messages before it returns, and throws
+  // when it can't. That reaches the watcher, which holds the file at the
+  // line and reads it again later (engram#584). The promise it returns
+  // covers only the server-side delete an in-chat opt-out starts, which
+  // retries on its own: a failure there is only logged.
   const onMessages: ConstructorParameters<typeof Watcher>[1] = (
     sessionId,
     meta,

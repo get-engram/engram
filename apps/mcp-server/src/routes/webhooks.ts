@@ -8,7 +8,7 @@ import {
 } from "@getengram/db";
 import { checkFeatureAccess } from "../services/tier.js";
 import { validateWebhookUrl, WEBHOOK_MAX_PER_ORG } from "../services/webhook-url.js";
-import { denyUnlessOwner } from "./guards.js";
+import { denyExternalOAuthClient, denyUnlessOwner, denyUnlessScope } from "./guards.js";
 import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
@@ -18,6 +18,10 @@ const webhooks = new Hono<HonoEnv>();
 // Gate: webhooks are Team+ only, and owner-only within the org (the #441
 // floor). A webhook is org-wide integration config: it is told about every
 // seat's activity, and its URL routinely carries the receiver's own secret.
+//
+// Never a connected app's (engram#603): an endpoint an app registered would
+// go on receiving the org's events after the user disconnected the app. And
+// a change needs `write`, as every other write does.
 webhooks.use("*", async (c, next) => {
   const auth = c.get("auth");
   if (!checkFeatureAccess(auth.tier, "webhooks")) {
@@ -27,7 +31,13 @@ webhooks.use("*", async (c, next) => {
       tier: auth.tier,
     }, 403);
   }
-  const denied = denyUnlessOwner(c, "Only the organization owner can manage webhooks.");
+  const denied =
+    denyUnlessOwner(c, "Only the organization owner can manage webhooks.") ??
+    denyExternalOAuthClient(
+      c,
+      "Webhooks are managed with an Engram API key, not from a connected app.",
+    ) ??
+    (c.req.method === "GET" || c.req.method === "HEAD" ? null : denyUnlessScope(c, "write"));
   if (denied) return denied;
   await next();
 });

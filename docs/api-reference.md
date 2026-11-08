@@ -445,7 +445,7 @@ All requests require the same `Authorization: Bearer engram_sk_live_...` header.
 | `PATCH /api/v1/conversations/:id/messages/:messageId` | — (REST only) | Update a message's content. Body: `{ content }` → `200 { updated, message }`. The edit runs the same redaction pipeline as append, and the affected slice of the search index is rebuilt so recall matches the stored text. **The superseded body is kept** — see the revisions endpoint below. Requires the `write` scope. |
 | `GET /api/v1/conversations/:id/messages/:messageId/revisions` | — (REST only) | Full edit history for one message → `200 { message_id, conversation_id, current, revisions[], total }`, oldest revision first. Every body a message has ever had is retained; nothing is pruned. Honours the org's "share full message bodies" privacy setting — with it off, revision metadata is returned without text. Requires the `read` scope. |
 | `GET /api/v1/search` | `search` | Hybrid search. Query: `q` (required), `limit`, `conversation_id`, `tags`, `project` |
-| `GET /api/v1/export` | — (REST only) | Everything the key can see as JSON, one page per request (GDPR Art. 20 portability). Query: `limit` (messages per page, 1–400, default 400), `cursor` (the previous page's `next_cursor`). Not metered as API usage. See [Export](#export) |
+| `GET /api/v1/export` | — (REST only) | Everything the key can see as JSON, one page per request (GDPR Art. 20 portability). Query: `limit` (messages per page, 1–400, default 400), `cursor` (the previous page's `next_cursor`). Not metered as API usage. Requires the `read` scope. See [Export](#export) |
 
 ### Example
 
@@ -465,7 +465,7 @@ REST error responses use conventional status codes: `400` invalid body/query, `4
 
 ### Export
 
-`GET /api/v1/export` returns everything the key can see — every conversation with its tags, metadata and verbatim messages — as JSON, one page per request. `GET /api/export` is the same endpoint at its original path. It is owner tooling: a connected OAuth app gets `403`, and a Team seat key exports only the conversations that seat can see.
+`GET /api/v1/export` returns everything the key can see — every conversation with its tags, metadata and verbatim messages — as JSON, one page per request. `GET /api/export` is the same endpoint at its original path. It is owner tooling: a connected OAuth app gets `403`, and a Team seat key exports only the conversations that seat can see. It requires the `read` scope, like `GET /api/v1/conversations/:id`; a key without it gets `403 insufficient_scope`.
 
 | Query | Meaning |
 |-------|---------|

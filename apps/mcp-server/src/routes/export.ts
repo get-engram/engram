@@ -8,6 +8,7 @@ import {
 import { loadContent } from "../services/content-store.js";
 import { audit } from "../services/audit.js";
 import { isExternalOAuthClient } from "../mcp/auth-kind.js";
+import { denyUnlessScope } from "./guards.js";
 import { mapConcurrent } from "../utils/map-concurrent.js";
 import type { Env, AuthContext } from "../types.js";
 
@@ -90,6 +91,11 @@ dataExport.get("/", async (c) => {
       403,
     );
   }
+
+  // Every conversation and every verbatim body: the `read` scope, as
+  // get_conversation and GET /api/v1/conversations/:id ask (engram#603).
+  const noScope = denyUnlessScope(c, "read");
+  if (noScope) return noScope;
 
   const cursor = decodeCursor(c.req.query("cursor"));
   if (!cursor) {

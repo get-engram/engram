@@ -7,6 +7,7 @@ import {
   emailDomain,
 } from "@getengram/shared";
 import { audit } from "../services/audit.js";
+import { denyExternalOAuthClient, denyUnlessFirstPartyWrite, denyUnlessOwner } from "./guards.js";
 import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
@@ -34,6 +35,18 @@ const MAX_SENDS_PER_DAY = 5;
  */
 export const student = new Hono<HonoEnv>();
 
+const CONNECTOR_REFUSAL =
+  "Student verification is done from the Engram dashboard, not from a connected app.";
+
+// The org's billing status is account administration, not memory: a
+// connected app neither reads nor changes it (engram#603). The public
+// redemption router below is a separate Hono and is not behind this.
+student.use("*", async (c, next) => {
+  const denied = denyExternalOAuthClient(c, CONNECTOR_REFUSAL);
+  if (denied) return denied;
+  await next();
+});
+
 /**
  * Redemption is PUBLIC and lives on its own router.
  *
@@ -53,6 +66,12 @@ export const student = new Hono<HonoEnv>();
 export const studentPublic = new Hono<HonoEnv>();
 
 student.post("/verify", async (c) => {
+  // Verifying makes the whole org student-eligible: a billing change, so the
+  // owner's, with a key that can write (the #441 floor, engram#603).
+  const denied =
+    denyUnlessOwner(c, "Only the organization owner can verify student status.") ??
+    denyUnlessFirstPartyWrite(c, CONNECTOR_REFUSAL);
+  if (denied) return denied;
   const auth = c.get("auth");
   const body = await c.req
     .json<{ email?: string }>()

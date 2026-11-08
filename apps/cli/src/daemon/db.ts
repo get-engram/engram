@@ -338,6 +338,15 @@ export class DaemonDb {
       .all(conversationId, limit) as PendingRow[];
   }
 
+  /** Replace queued messages' content with its scrubbed text (engram#588). */
+  updateContents(rows: Array<{ id: number; content: string }>): void {
+    if (rows.length === 0) return;
+    const stmt = this.db.prepare("UPDATE pending_messages SET content = ? WHERE id = ?");
+    this.db.transaction((rs: Array<{ id: number; content: string }>) => {
+      for (const r of rs) stmt.run(r.content, r.id);
+    })(rows);
+  }
+
   markSent(ids: number[]): void {
     if (ids.length === 0) return;
     const placeholders = ids.map(() => "?").join(",");

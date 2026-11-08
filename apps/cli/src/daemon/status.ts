@@ -249,6 +249,23 @@ export function classifyError(err: unknown): SyncErrorType {
   return "network";
 }
 
+/**
+ * A refusal the server would repeat however long the client waited
+ * (engram#588): its own error code for a request it won't serve —
+ * insufficient_scope (a key without the read scope can never read the
+ * vault), a plan limit, a full memory. Not a rejected key: a new key fixes
+ * that, and the daemon picks one up without a restart (engram#587). Not a
+ * rate limit, a pause, a 5xx, or a code this doesn't know: those can pass.
+ */
+export function isRefusal(err: unknown): boolean {
+  const { status, message } = errorParts(err);
+  if (status === 429 || (status !== undefined && status >= 500)) return false;
+  const code = bodyCode(message);
+  if (!code) return false;
+  const kind = classifyCode(code);
+  return kind === "auth" || kind === "billing" || kind === "storage_full";
+}
+
 const NOT_FOUND = /^\s*(?:conversation[ _])?not[ _]found\s*\.?\s*$/i;
 
 /**

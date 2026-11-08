@@ -108,6 +108,9 @@ export class Syncer {
   /** Rows orphaned by a pre-#370 daemon are adopted once per process. */
   private orphansAdopted = false;
 
+  /** Sends are waiting for the vault to be read (engram#588). */
+  private vaultHeld = false;
+
   constructor(
     db: DaemonDb,
     client: Engram,
@@ -152,9 +155,13 @@ export class Syncer {
     const conversationId = this.db.getConversationId(sessionId);
 
     // Value-exact scrubbing of known vault secrets, applied to every role
-    // (tool output is where `engram vault get` lands). This is the last
-    // point before content touches disk, so even the local queue never
-    // holds a plaintext vault value.
+    // (tool output is where `engram vault get` lands), before the messages
+    // are queued. A message queued before the vault has been read isn't
+    // covered (its text is in the source transcript on this same disk
+    // anyway), so each batch is scrubbed again just before it's sent, and
+    // nothing is sent until the vault has been read (engram#588). No await
+    // between here and the enqueue: the watcher's offsets rely on it
+    // (engram#370).
     if (this.scrubber?.active) {
       let hits = 0;
       for (const m of messages) {
@@ -276,13 +283,19 @@ export class Syncer {
       await this.retryRemoteDeletes();
       if (this.halted()) return; // the key was rejected there
 
-      // Step 1: Create any pending conversations
+      // Step 1: Create any pending conversations. A create carries no
+      // message content, so it doesn't wait for the vault.
       const createsOk = await this.createPendingConversations();
+      if (this.halted()) return; // the key was rejected, or a limit hit, there
 
       // Step 2: Flush messages for all conversations (with concurrency)
       const convIds = this.db.getPendingConversationIds().filter(
         (id) => !id.startsWith("pending:"),
       );
+
+      // Nothing is sent before the vault has been read: a message queued
+      // before then wasn't scrubbed against it (engram#588).
+      if (convIds.length > 0 && !(await this.vaultReady())) return;
 
       // Process conversations in parallel, up to CONCURRENCY at a time
       const chunks = [];
@@ -458,6 +471,10 @@ export class Syncer {
       let rows = this.db.dequeue(conversationId, limit);
       if (rows.length === 0) return "sent";
 
+      // Scrubbed again against the set held now (engram#588): a row queued
+      // before the vault was read wasn't scrubbed against it.
+      rows = this.rescrub(rows);
+
       // Byte budget: transcript messages vary wildly in size — trim the batch
       // so its total content stays inside the budget. Always send at least
       // one row, however large (the server accepts it; it just needs time).
@@ -515,6 +532,86 @@ export class Syncer {
         return "retry";
       }
     }
+  }
+
+  /**
+   * Whether queued messages may be sent: the vault has been read through the
+   * current key, so the scrub before each send covers it (engram#588). Until
+   * then nothing is sent — captures keep queueing in daemon.db — and the
+   * status says why.
+   */
+  private async vaultReady(): Promise<boolean> {
+    if (!this.scrubber) return true;
+    if (await this.scrubber.ready()) {
+      if (this.vaultHeld) {
+        this.vaultHeld = false;
+        console.log("[engram] vault read — sending the messages held for it");
+      }
+      return true;
+    }
+    this.holdForVault(this.scrubber.failure);
+    return false;
+  }
+
+  private holdForVault(err: unknown): void {
+    const reason =
+      err === undefined
+        ? "the vault hasn't been read yet"
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    const errType = err === undefined ? "network" : classifyError(err);
+
+    // The key was rejected: the pause a rejected send enters, which picks up
+    // a new key without a restart (engram#587). The vault is read through
+    // the new key, and sends wait for that read.
+    if (errType === "auth") {
+      this.enterAuthHold(reason);
+      return;
+    }
+
+    if (!this.vaultHeld) {
+      this.vaultHeld = true;
+      console.error(
+        `[engram] holding queued messages until the vault is read, so a secret in them ` +
+          `can't be sent unredacted: ${reason}`,
+      );
+    }
+    // A plan or storage refusal of the read doesn't hold sends (the
+    // scrubber treats it as final), so what holds is the server or the
+    // network.
+    const kind = errType === "billing" || errType === "storage_full" ? "server" : errType;
+    recordFailure(`holding messages until the vault is read: ${reason}`, kind, this.db.getPendingCount());
+  }
+
+  /**
+   * Scrub queued rows against the set held now, and write the scrubbed text
+   * back so the queue stops holding the value too. A failed write-back
+   * doesn't stop the send: what's sent is scrubbed either way.
+   */
+  private rescrub(rows: PendingRow[]): PendingRow[] {
+    const scrubber = this.scrubber;
+    if (!scrubber?.active) return rows;
+
+    let hits = 0;
+    const changed: Array<{ id: number; content: string }> = [];
+    const out = rows.map((row) => {
+      const r = scrubber.scrub(row.content);
+      if (r.replaced.length === 0) return row;
+      hits += r.replaced.reduce((n, x) => n + x.count, 0);
+      changed.push({ id: row.id, content: r.text });
+      return { ...row, content: r.text };
+    });
+    if (changed.length === 0) return rows;
+
+    try {
+      this.db.updateContents(changed);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[engram] rewriting scrubbed queued messages failed (sending them scrubbed): ${msg}`);
+    }
+    console.error(`[engram] scrubbed ${hits} vault value occurrence(s) from queued messages before sending`);
+    return out;
   }
 
   /**

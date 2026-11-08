@@ -111,7 +111,7 @@ export function registerAppendMessages(
     "append_messages",
     {
       description:
-        "Saves messages to the user's long-term memory, making them available in future sessions in this app and any other AI the user connects. Applicable when the user asks to remember or save a specific thing (a preference, a fact, a decision, a goal, project context). Takes only the message(s) the user pointed at, not the conversation as a whole. Stores them verbatim, auto-chunked + embedded for search. conversation_id is optional: omit it to append to the user's default memory, or set it to group messages under a specific conversation. The response returns the conversation_id used. Stores only the messages passed in — it cannot fetch past or external chat history (bulk import is separate, via the Engram CLI). Not suitable for secrets (passwords, API keys, tokens, government IDs): stored text is searchable and resurfaces in future context; Engram's separate zero-knowledge encrypted vault is the store for credentials." +
+        "Saves messages to the user's long-term memory, making them available in future sessions in this app and any other AI the user connects. Applicable when the user asks to remember or save a specific thing (a preference, a fact, a decision, a goal, project context). Takes only the message(s) the user pointed at, not the conversation as a whole. The text is sent to and stored on Engram's servers, verbatim, auto-chunked + embedded for search. The user can view saved messages with get_conversation and delete them with delete_conversation, which deletes the conversation they were saved in along with its other messages. On multi-seat team accounts, saved messages are visible to the whole team by default; saving into a conversation created with visibility 'private' keeps them visible only to the seat that created it. conversation_id is optional: omit it to append to the user's default memory, or set it to group messages under a specific conversation. The response returns the conversation_id used. Stores only the messages passed in — it cannot fetch past or external chat history. Not suitable for secrets (passwords, API keys, tokens, government IDs): stored text is searchable and resurfaces in future context; Engram's separate zero-knowledge encrypted vault is the store for credentials." +
         (connector
           ? ""
           : " Optionally accepts client-encrypted vault entries."),
@@ -135,7 +135,7 @@ export function registerAppendMessages(
           .optional()
           .describe("Lifetime memory storage for the org (capped tiers only) — memory never expires; it fills up"),
         notice: z.string().optional().describe("Heads-up shown when approaching the plan limit"),
-        milestone: z.string().optional().describe("One-time notice when lifetime storage crosses a threshold — worth relaying to the user"),
+        milestone: z.string().optional().describe("One-time notice when lifetime storage crosses a threshold"),
         storage_notice: z.string().optional().describe("Heads-up shown when memory storage is nearly full"),
       },
       annotations: {

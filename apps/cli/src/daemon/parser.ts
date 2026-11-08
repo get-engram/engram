@@ -151,7 +151,7 @@ export class Parser implements LineParser {
 
   /**
    * tool_use ids whose result must not be captured. Bounded: an id is
-   * removed the moment its result is seen, and a session produces a few
+   * removed once its result is queued, and a session produces a few
    * hundred tool calls at most. Tool ids are unique, so one set serves
    * every file.
    */
@@ -230,6 +230,10 @@ export class Parser implements LineParser {
     return this.pending.get(filePath)?.from ?? null;
   }
 
+  discard(filePath: string): void {
+    this.pending.delete(filePath);
+  }
+
   /** Emit buffered assistant messages: one file's, or every file's. */
   flush(filePath?: string): void {
     if (filePath !== undefined) {
@@ -267,14 +271,21 @@ export class Parser implements LineParser {
 
     const messages: ParsedMessage[] = [];
     const parts: string[] = [];
+    // Forgotten only once the withheld output is queued: when queuing
+    // fails, the watcher reads this line again, and the output must be
+    // withheld again (engram#584).
+    const withheldIds: string[] = [];
     for (const block of content) {
       if (block.type === "text" && block.text?.trim()) {
         parts.push(block.text);
       } else if (block.type === "image") {
         parts.push(describeImage(block));
       } else if (block.type === "tool_result") {
-        const withheld =
-          !!block.tool_use_id && this.secretToolIds.delete(block.tool_use_id);
+        let withheld = false;
+        if (block.tool_use_id && this.secretToolIds.has(block.tool_use_id)) {
+          withheld = true;
+          withheldIds.push(block.tool_use_id);
+        }
         const text = withheld
           ? REDACTED_TOOL_OUTPUT
           : typeof block.content === "string"
@@ -299,6 +310,7 @@ export class Parser implements LineParser {
     if (messages.length > 0) {
       this.onMessages(sessionId, meta, messages);
     }
+    for (const id of withheldIds) this.secretToolIds.delete(id);
   }
 
   private processAssistantLine(

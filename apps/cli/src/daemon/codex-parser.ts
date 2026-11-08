@@ -105,6 +105,11 @@ export class CodexParser implements LineParser {
     // No buffering — each line emits immediately.
   }
 
+  discard(_filePath: string): void {
+    // Nothing buffered. The session id and cwd kept per file aren't
+    // buffered content: they are already true of the lines read again.
+  }
+
   private stateOf(filePath: string): RolloutState {
     let state = this.files.get(filePath);
     if (!state) {

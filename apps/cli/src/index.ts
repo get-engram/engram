@@ -23,7 +23,7 @@ import { status as showStatus } from "./commands/status.js";
 import { vaultKeygen, vaultStatus, loadVaultKey, vaultSet, vaultGet, vaultList, vaultDelete } from "./commands/vault.js";
 import { excludeAdd, excludeRemove, excludeList } from "./commands/exclude.js";
 import { bold, dim, red } from "./output.js";
-import { readStatus, syncErrorSummary } from "./daemon/status.js";
+import { readStatus, syncErrorSummary, captureErrorSummary } from "./daemon/status.js";
 
 // Read from package.json rather than duplicated here. The previous hardcoded
 // constant had drifted to 0.3.4 while the package shipped 0.5.1, so
@@ -212,13 +212,19 @@ ${dim(`v${VERSION} — https://getengram.app`)}
  * the user has to resolve. Goes to stderr, never stdout, so `--json` output
  * stays machine-parseable.
  *
- * Only the two states a human must act on are surfaced. Transient trouble
- * (network, rate limits, 5xx) resolves itself and would just be noise on
- * every command.
+ * Only the states a human must act on are surfaced: transcripts that can't
+ * be queued on this machine (a full disk, engram#584), a rejected key, a
+ * full memory. Transient trouble (network, rate limits, 5xx) resolves
+ * itself and would just be noise on every command.
  */
 function printSyncBanner(): void {
   try {
     const s = readStatus();
+    if (s.capture_error) {
+      console.error(red(bold("engram:")) + ` ${captureErrorSummary(s.capture_error)}`);
+      console.error(dim("  (run 'engram status' for details)"));
+      console.error("");
+    }
     if (s.error_type !== "storage_full" && s.error_type !== "auth") return;
     const queued =
       s.pending_messages > 0

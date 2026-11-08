@@ -24,7 +24,11 @@ export interface SessionMeta {
   recovered?: boolean;
 }
 
-/** Emits fully-parsed messages for a session as they complete. */
+/**
+ * Emits fully-parsed messages for a session as they complete. Returns once
+ * they are queued; throws a QueueWriteError when they couldn't be
+ * (engram#584), and the parser lets it propagate to the watcher.
+ */
 export type OnMessages = (
   sessionId: string,
   meta: SessionMeta,
@@ -57,6 +61,13 @@ export interface LineParser {
   /** Emit buffered partial messages (e.g. a multi-block assistant turn):
    *  one file's, or every file's when no path is given. */
   flush(filePath?: string): void;
+  /**
+   * Drop what `filePath` has buffered, without emitting it. The watcher
+   * calls this when the file's messages couldn't be queued (engram#584):
+   * it reads the file again from before the buffered lines, so they are
+   * parsed again then.
+   */
+  discard(filePath: string): void;
   /**
    * How much of a file to replay through restoreLine() when a new process
    * starts reading it part-way: bytes from the start of the file, and bytes

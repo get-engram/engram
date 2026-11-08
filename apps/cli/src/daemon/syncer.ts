@@ -3,6 +3,7 @@ import { DaemonDb } from "./db.js";
 import { recordSuccess, recordFailure, classifyError, isNotFound } from "./status.js";
 import { parseStorageFullError } from "../storage-error.js";
 import { isPathExcluded, detectOptOut } from "./exclusions.js";
+import { queueing } from "./queue-error.js";
 import type { SecretScrubber } from "./scrubber.js";
 import type { ParsedMessage, SessionMeta, PendingRow } from "./types.js";
 
@@ -46,6 +47,9 @@ const AUTH_RETRY_MS = [10 * 60_000, 30 * 60_000, 60 * 60_000];
 
 /** How often a paused daemon reads the configured key. */
 const KEY_CHECK_MS = 10_000;
+
+/** A settled promise, for the paths of onMessages that have nothing left to do. */
+const DONE: Promise<void> = Promise.resolve();
 
 /**
  * Where the daemon's API key comes from, so a rejected key can be replaced
@@ -124,10 +128,16 @@ export class Syncer {
 
   /**
    * Called by the parser when new messages are ready for a session.
-   * Queues messages locally; conversation creation is deferred to flush time
-   * to avoid blocking the parser on network calls.
+   * Queues them in daemon.db before it returns; creating the conversation
+   * is deferred to flush time, so the parser never waits on the network.
+   *
+   * A failure to queue throws a QueueWriteError, synchronously (engram#584):
+   * the watcher stops at the line and reads it again later, instead of
+   * saving its resume offset past a message that was never queued. The
+   * returned promise covers only the server-side delete an in-chat opt-out
+   * starts, which retries on its own.
    */
-  async onMessages(
+  onMessages(
     sessionId: string,
     meta: SessionMeta,
     messages: ParsedMessage[],
@@ -136,32 +146,29 @@ export class Syncer {
     // an excluded session never touches the queue or the network.
 
     // A session the user already opted out of stays out.
-    if (this.db.isSessionExcluded(sessionId)) return;
+    if (queueing(() => this.db.isSessionExcluded(sessionId))) return DONE;
 
     // Repo/directory exclusions: `engram exclude add <path>` or a
     // .engramignore marker at the repo root. Checked per batch (cheap,
     // cached) so a freshly added exclusion applies without a restart.
-    if (isPathExcluded(meta.cwd)) return;
+    if (isPathExcluded(meta.cwd)) return DONE;
 
     // In-chat opt-out: a USER message saying "don't save this to engram"
     // (or `engram:ignore`) excludes the whole session — including what was
     // already captured.
     if (messages.some((m) => m.role === "user" && detectOptOut(m.content))) {
-      await this.excludeSession(sessionId, "in-chat opt-out");
-      return;
+      return this.excludeSession(sessionId, "in-chat opt-out");
     }
 
     // Check if we already have a mapping
-    const conversationId = this.db.getConversationId(sessionId);
+    const conversationId = queueing(() => this.db.getConversationId(sessionId));
 
     // Value-exact scrubbing of known vault secrets, applied to every role
     // (tool output is where `engram vault get` lands), before the messages
     // are queued. A message queued before the vault has been read isn't
     // covered (its text is in the source transcript on this same disk
     // anyway), so each batch is scrubbed again just before it's sent, and
-    // nothing is sent until the vault has been read (engram#588). No await
-    // between here and the enqueue: the watcher's offsets rely on it
-    // (engram#370).
+    // nothing is sent until the vault has been read (engram#588).
     if (this.scrubber?.active) {
       let hits = 0;
       for (const m of messages) {
@@ -178,15 +185,16 @@ export class Syncer {
     }
 
     if (conversationId) {
-      this.db.enqueue(conversationId, messages);
+      queueing(() => this.db.enqueue(conversationId, messages));
     } else {
       // No conversation yet. Creating it is deferred to the flush loop so
       // the parser never waits on the network; until then the messages wait
       // under pending:<sessionId>, recorded together with the session in
       // daemon.db (engram#370) so a restart or a failed create can't strand
       // them.
-      this.db.enqueuePendingSession(sessionId, meta, messages);
+      queueing(() => this.db.enqueuePendingSession(sessionId, meta, messages));
     }
+    return DONE;
   }
 
   /**
@@ -195,15 +203,16 @@ export class Syncer {
    * whatever already reached the server. The remote delete is persisted in
    * excluded_sessions.delete_pending and retried from the flush loop until
    * it succeeds — offline opt-out must still stick.
+   *
+   * The local part happens before this returns, in one transaction; if it
+   * fails, the QueueWriteError stops the watcher at the opt-out line, so
+   * nothing after it is read until the opt-out has taken (engram#584).
    */
-  private async excludeSession(sessionId: string, reason: string): Promise<void> {
-    const conversationId = this.db.getConversationId(sessionId);
-
-    this.db.markSessionExcluded(sessionId, reason, conversationId ?? undefined);
+  private excludeSession(sessionId: string, reason: string): Promise<void> {
+    const { conversationId, dropped } = queueing(() =>
+      this.db.excludeSession(sessionId, reason),
+    );
     this.createRetry.delete(sessionId);
-    const dropped =
-      this.db.dropPendingSession(sessionId) +
-      (conversationId ? this.db.deleteAllForConversation(conversationId) : 0);
 
     console.log(
       `[engram] session ${sessionId} excluded (${reason}) — ` +
@@ -211,9 +220,7 @@ export class Syncer {
         (conversationId ? ", deleting synced copy" : ""),
     );
 
-    if (conversationId) {
-      await this.retryRemoteDeletes();
-    }
+    return conversationId ? this.retryRemoteDeletes() : DONE;
   }
 
   /** Delete server-side conversations for opted-out sessions; keeps

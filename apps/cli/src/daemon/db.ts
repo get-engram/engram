@@ -175,6 +175,30 @@ export class DaemonDb {
       .run(conversationId).changes;
   }
 
+  /**
+   * Opt a session out on this machine, in ONE transaction (engram#584):
+   * mark it excluded, with its conversation's server-side delete pending,
+   * and drop everything queued for it. Returns the conversation and the
+   * number of messages dropped.
+   *
+   * As separate steps, a failure part-way could mark the session excluded
+   * and leave its queue in place, still due to be sent. Nothing would ever
+   * drop it: an excluded session returns before the drop is reached.
+   */
+  excludeSession(
+    sessionId: string,
+    reason: string,
+  ): { conversationId: string | null; dropped: number } {
+    return this.db.transaction(() => {
+      const conversationId = this.getConversationId(sessionId);
+      this.markSessionExcluded(sessionId, reason, conversationId ?? undefined);
+      const dropped =
+        this.dropPendingSession(sessionId) +
+        (conversationId ? this.deleteAllForConversation(conversationId) : 0);
+      return { conversationId, dropped };
+    })();
+  }
+
   // ── Pending sessions (engram#370) ──
 
   /** Queue messages for a session that has no conversation yet, recording

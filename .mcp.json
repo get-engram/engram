@@ -2,10 +2,7 @@
   "mcpServers": {
     "engram": {
       "type": "http",
-      "url": "https://mcp.getengram.app/mcp",
-      "headers": {
-        "Authorization": "Bearer YOUR_ENGRAM_API_KEY"
-      }
+      "url": "https://mcp.getengram.app/mcp"
     }
   }
 }

@@ -1,17 +1,25 @@
-export function insertVaultEntries(
+export interface VaultEntryRow {
+  id: string;
+  organizationId: string;
+  conversationId: string;
+  messageId: string | null;
+  secretType: string;
+  encryptedValue: string;
+  iv: string;
+  expiresAt: string | null;
+}
+
+/**
+ * The INSERT statements for `entries`, unexecuted, so a caller can commit
+ * them in the same batch as the messages that reference them: an append
+ * whose vault entries failed after its messages committed kept messages
+ * pointing at secrets that were never stored (engram#591).
+ */
+export function insertVaultEntryStatements(
   db: D1Database,
-  entries: Array<{
-    id: string;
-    organizationId: string;
-    conversationId: string;
-    messageId: string | null;
-    secretType: string;
-    encryptedValue: string;
-    iv: string;
-    expiresAt: string | null;
-  }>
-) {
-  const stmts = entries.map((e) =>
+  entries: VaultEntryRow[],
+): D1PreparedStatement[] {
+  return entries.map((e) =>
     db
       .prepare(
         "INSERT INTO secrets_vault (id, organization_id, conversation_id, message_id, secret_type, encrypted_value, iv, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -27,7 +35,10 @@ export function insertVaultEntries(
         e.expiresAt
       )
   );
-  return db.batch(stmts);
+}
+
+export function insertVaultEntries(db: D1Database, entries: VaultEntryRow[]) {
+  return db.batch(insertVaultEntryStatements(db, entries));
 }
 
 export function getVaultEntriesByIds(

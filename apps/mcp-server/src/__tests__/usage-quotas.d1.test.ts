@@ -8,6 +8,8 @@ import {
   atomicIncrementSearches,
   atomicIncrementMessages,
   incrementChunksIndexed,
+  releaseMessagesStored,
+  releaseChunksIndexed,
 } from "@getengram/db";
 
 /**
@@ -131,6 +133,54 @@ describe("usage cost counters against real SQLite", () => {
     expect(await atomicIncrementMessages(db, o, 1, 1)).toEqual({ messages_stored: 1 });
     expect(await atomicIncrementMessages(db, o, 1, 1)).toBeNull();
     expect(((await getUsage(db, o)) as UsageRow).messages_stored).toBe(1);
+  });
+
+  it("a release gives back exactly its own counter, clamped at zero (engram#591)", async () => {
+    const o = await org();
+    const period = "2030-05";
+    await getOrCreateUsage(db, "usg_rel", o, period);
+    await atomicIncrementMessages(db, o, 5, 100, period);
+    await atomicIncrementChunksIndexed(db, o, 7, 100, period);
+
+    await releaseMessagesStored(db, o, 2, period);
+    await releaseChunksIndexed(db, o, 3, period);
+    let row = (await db
+      .prepare("SELECT * FROM usage WHERE organization_id = ? AND period = ?")
+      .bind(o, period)
+      .first()) as UsageRow;
+    expect(row.messages_stored).toBe(3);
+    expect(row.chunks_indexed).toBe(4);
+    expect(row.searches_run).toBe(0);
+
+    // Never below zero, whatever is released.
+    await releaseMessagesStored(db, o, 50, period);
+    await releaseChunksIndexed(db, o, 50, period);
+    row = (await db
+      .prepare("SELECT * FROM usage WHERE organization_id = ? AND period = ?")
+      .bind(o, period)
+      .first()) as UsageRow;
+    expect(row.messages_stored).toBe(0);
+    expect(row.chunks_indexed).toBe(0);
+  });
+
+  it("a charge and its release name one period, never the current one by default", async () => {
+    const o = await org();
+    await getOrCreateUsage(db, "usg_now", o);
+    await atomicIncrementMessages(db, o, 4, 100);
+    await getOrCreateUsage(db, "usg_old", o, "2020-01");
+    expect(await atomicIncrementMessages(db, o, 6, 100, "2020-01")).toEqual({ messages_stored: 6 });
+    expect(await atomicIncrementChunksIndexed(db, o, 2, 100, "2020-01")).toEqual({ chunks_indexed: 2 });
+
+    await releaseMessagesStored(db, o, 6, "2020-01");
+    await releaseChunksIndexed(db, o, 2, "2020-01");
+    const old = (await db
+      .prepare("SELECT * FROM usage WHERE organization_id = ? AND period = '2020-01'")
+      .bind(o)
+      .first()) as UsageRow;
+    expect(old.messages_stored).toBe(0);
+    expect(old.chunks_indexed).toBe(0);
+    // The current period's row is untouched by either.
+    expect(((await getUsage(db, o)) as UsageRow).messages_stored).toBe(4);
   });
 
   it("each counter moves independently of the others", async () => {

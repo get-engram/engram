@@ -14,8 +14,13 @@ import { isTransientD1Error } from "../services/resilient-d1.js";
  * This installs the REST layer's policy at the tool layer:
  *
  * - HTTPException: a deliberate, user-facing failure (the 404 for a missing
- *   conversation, the 503 of the maintenance freeze). Its message is written
- *   for the caller and passes through unchanged.
+ *   conversation, the 503 of the maintenance freeze), written for the
+ *   caller. A JSON body with a string `error` code passes through verbatim,
+ *   the same body app.onError answers REST with, so a client branches on
+ *   one code whichever surface it used (engram#592: the CLI daemon reads
+ *   `conversation_not_found` and `writes_paused` from it). Otherwise the
+ *   exception's message, and never an empty string: an empty failure reads
+ *   as "unknown error", which a client can only retry.
  * - McpError: protocol semantics belong to the SDK (a URL elicitation must
  *   propagate as a JSON-RPC error, anything else keeps its code prefix), so
  *   it is rethrown untouched.
@@ -45,19 +50,55 @@ function failure(text: string): CallToolResult {
   return { content: [{ type: "text", text }], isError: true };
 }
 
+/** Longest HTTPException body passed through; anything longer is not a code-bearing error body. */
+const MAX_PASSTHROUGH_BODY_CHARS = 2000;
+
+/**
+ * The exception's response body, when it is the JSON error shape the REST
+ * layer answers with (`{"error": "<code>", ...}`); otherwise null. Reads a
+ * clone, so the response itself stays readable, and treats a body that can't
+ * be read or parsed as absent rather than failing the failure path.
+ */
+async function errorBody(err: HTTPException): Promise<string | null> {
+  if (!err.res) return null;
+  try {
+    const text = await err.res.clone().text();
+    if (text.length === 0 || text.length > MAX_PASSTHROUGH_BODY_CHARS) return null;
+    const parsed: unknown = JSON.parse(text);
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      typeof (parsed as { error?: unknown }).error === "string"
+    ) {
+      return text;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function httpFailureText(name: string, err: HTTPException): Promise<string> {
+  const body = await errorBody(err);
+  if (body !== null) return body;
+  if (err.message) return err.message;
+  return `The ${name} tool was refused (HTTP ${err.status}) and did not complete.`;
+}
+
 /**
  * Map a value a tool threw to the result the caller may see, logging what
  * they may not. Rethrows an McpError (the SDK owns that path). Exported so
  * the policy can be tested without a server; createMcpServer wires it in
  * through guardToolErrors.
  */
-export function toolFailureResult(
+export async function toolFailureResult(
   name: string,
   err: unknown,
   log: ToolLog = console,
-): CallToolResult {
+): Promise<CallToolResult> {
   if (err instanceof McpError) throw err;
-  if (err instanceof HTTPException) return failure(err.message);
+  if (err instanceof HTTPException) return failure(await httpFailureText(name, err));
 
   const ref = shortRef();
   const detail = err instanceof Error ? (err.stack ?? err.message) : String(err);
@@ -80,7 +121,7 @@ function guarded(name: string, cb: AnyToolCallback, log: ToolLog): AnyToolCallba
     try {
       return await cb(...args);
     } catch (err) {
-      return toolFailureResult(name, err, log);
+      return await toolFailureResult(name, err, log);
     }
   };
 }

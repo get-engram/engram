@@ -43,6 +43,19 @@ export async function usage(
     headers: { Authorization: `Bearer ${apiKey}` },
   });
 
+  // Every rejected-key notice the daemon gives says to run `engram status`
+  // (this command), so a bare "Failed to fetch usage (401)" here was a dead
+  // end at exactly the moment someone followed it (engram#587).
+  if (res.status === 401 || res.status === 403) {
+    console.error(red("Your API key was rejected — run 'engram auth login'."));
+    if (process.env.ENGRAM_API_KEY) {
+      console.error(
+        dim("  ENGRAM_API_KEY is set in this shell, and it is used in place of the key 'engram auth login' saves."),
+      );
+    }
+    process.exit(1);
+  }
+
   if (!res.ok) {
     console.error(red(`Failed to fetch usage (${res.status}).`));
     process.exit(1);

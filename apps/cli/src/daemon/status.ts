@@ -138,29 +138,136 @@ export function updatePending(count: number): void {
   writeStatus();
 }
 
-function classifyError(message: string): SyncStatus["error_type"] {
-  if (message.includes("401") || message.includes("403") || message.includes("Authentication")) {
+/**
+ * What an error says about itself. The SDK throws typed errors: an
+ * AuthenticationError for an HTTP 401/403, an EngramError carrying the HTTP
+ * status for an error response, and, for a tool's own refusal, an
+ * EngramError whose message IS the server's JSON body
+ * (`{"error":"storage_full",…}`).
+ */
+interface ErrorParts {
+  name: string;
+  code: string;
+  status: number | undefined;
+  message: string;
+}
+
+function errorParts(err: unknown): ErrorParts {
+  if (err !== null && typeof err === "object") {
+    const e = err as Record<string, unknown>;
+    return {
+      name: typeof e.name === "string" ? e.name : "",
+      code: typeof e.code === "string" ? e.code : "",
+      status: typeof e.status === "number" ? e.status : undefined,
+      message: typeof e.message === "string" ? e.message : "",
+    };
+  }
+  return { name: "", code: "", status: undefined, message: String(err ?? "") };
+}
+
+/**
+ * The server's error code when the message carries its JSON body: "" for a
+ * body without one, null when there is no JSON body at all.
+ */
+function bodyCode(message: string): string | null {
+  const start = message.indexOf("{");
+  if (start === -1) return null;
+  try {
+    const body: unknown = JSON.parse(message.slice(start));
+    if (!body || typeof body !== "object") return null;
+    const code = (body as { error?: unknown }).error;
+    return typeof code === "string" ? code : "";
+  } catch {
+    return null;
+  }
+}
+
+function classifyCode(code: string): SyncErrorType | null {
+  switch (code) {
+    case "storage_full":
+      return "storage_full";
+    // The key works but may not write: only a different key can fix it.
+    case "insufficient_scope":
+      return "auth";
+    case "rate_limit_exceeded":
+      return "rate_limit";
+    case "writes_paused":
+      return "server";
+  }
+  // message_limit_exceeded, indexing_quota_exceeded,
+  // conversation_limit_exceeded, …: a plan limit.
+  if (code.endsWith("limit_exceeded") || code.endsWith("quota_exceeded")) return "billing";
+  return null;
+}
+
+const AUTH_PHRASE =
+  /\bunauthori[sz]ed\b|\bforbidden\b|\bauthentication (?:failed|error|required)\b|\binvalid (?:or missing )?api key\b/i;
+
+/**
+ * Which kind of failure an error is, and so how the daemon treats it.
+ *
+ * Read from the error's structure first (engram#587): the SDK's error type
+ * and code, then the server's JSON error code, then the HTTP status. The
+ * message text comes last. It used to be all there was, searched for "401",
+ * "403", "429", "rate" … and every one of those went wrong somewhere:
+ *  - the SDK's AuthenticationError reads "Invalid or missing API key", so a
+ *    rejected key passed as a network error and was retried every 2 s;
+ *  - a 429 arrives with an empty message, so it passed as a network error;
+ *  - indexing_quota_exceeded and insufficient_scope matched nothing;
+ *  - a usage count in a refusal body containing 401 or 403 read as a
+ *    rejected key, which stopped syncing until the daemon restarted;
+ *  - "rate" matched "generate" and "separate".
+ *
+ * Plain strings are still accepted (tests, and any error that isn't the
+ * SDK's). A status number in the text counts only outside a JSON body:
+ * inside one it is data.
+ */
+export function classifyError(err: unknown): SyncErrorType {
+  const { name, code, status, message } = errorParts(err);
+
+  if (name === "AuthenticationError" || code === "auth_error" || status === 401 || status === 403) {
     return "auth";
   }
+
+  const body = bodyCode(message);
+  const byCode = body ? classifyCode(body) : null;
+  if (byCode) return byCode;
+
+  if (status === 429) return "rate_limit";
+  if (status === 402) return "billing";
+  if (status !== undefined && status >= 500) return "server";
+
+  const head = body === null ? message : message.slice(0, message.indexOf("{"));
   // Must precede the generic billing check: a storage_full body also carries
   // a 402, but it is a different situation — backing off and retrying can
   // never clear it, so it gets its own state and its own copy.
-  if (message.includes("storage_full")) {
-    return "storage_full";
-  }
-  if (message.includes("402") || message.includes("limit_exceeded") || message.includes("billing")) {
-    return "billing";
-  }
-  if (message.includes("429") || message.includes("rate")) {
-    return "rate_limit";
-  }
-  if (message.includes("5") && /\b5\d{2}\b/.test(message)) {
-    return "server";
-  }
+  if (message.includes("storage_full")) return "storage_full";
+  if (/\b429\b/.test(head) || /rate[ _-]?limit|too many requests/i.test(message)) return "rate_limit";
+  if (/\b402\b/.test(head) || /(?:limit|quota)_exceeded|\bbilling\b/i.test(message)) return "billing";
+  if (/\b40[13]\b/.test(head) || AUTH_PHRASE.test(message)) return "auth";
+  if (/\b5\d\d\b/.test(head)) return "server";
   return "network";
 }
 
-export { classifyError };
+const NOT_FOUND = /^\s*(?:conversation[ _])?not[ _]found\s*\.?\s*$/i;
+
+/**
+ * True only when Engram itself answered that the conversation isn't there:
+ * the delete tool's `{"error":"Conversation not found"}`, which the SDK
+ * passes on as the message of an error with no HTTP status.
+ *
+ * Deliberately narrow (engram#587). The opt-out delete treats "not found"
+ * as done, so a false match keeps a conversation the user said not to save,
+ * and nothing retries it. "getaddrinfo ENOTFOUND" is a DNS failure. An
+ * error that carries a status (an SDK NotFoundError included) came from
+ * whatever answered at that URL, which need not be Engram: a proxy or the
+ * wrong host saying 404 says nothing about the conversation.
+ */
+export function isNotFound(err: unknown): boolean {
+  const { status, message } = errorParts(err);
+  if (status !== undefined) return false;
+  return NOT_FOUND.test(bodyCode(message) ?? message);
+}
 
 const n = (x: number) => x.toLocaleString("en-US");
 
@@ -175,7 +282,10 @@ export function syncErrorSummary(
 ): string {
   switch (errorType) {
     case "auth":
-      return "Authentication failed — run 'engram auth login'.";
+      return (
+        "Your API key was rejected — run 'engram auth login'. New captures are " +
+        "queued locally and sync as soon as a working key is saved."
+      );
     case "storage_full": {
       const size = storage ? `${n(storage.used)}/${n(storage.limit)} messages` : "its limit";
       return (

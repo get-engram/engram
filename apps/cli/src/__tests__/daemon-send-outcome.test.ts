@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Engram } from "@getengram/sdk";
+import { AuthenticationError, EngramError, NotFoundError, type Engram } from "@getengram/sdk";
 
 // status.ts writes the REAL ~/.engram/status.json (the watchdog reads it);
 // exclusions.ts reads the real ~/.engram/config.json. Keep both off the
@@ -44,7 +44,21 @@ const MONTHLY_LIMIT = JSON.stringify({
   tier: "pro",
 });
 
+/**
+ * What the SDK throws (packages/sdk/src/transport.ts) for a tool's refusal:
+ * the tool's JSON body as the message, with no code and no status.
+ */
+const refusal = (body: object) => new EngramError(JSON.stringify(body));
+
+/**
+ * What the SDK throws for an HTTP error whose JSON body has a string
+ * `error`, like the rate limiter's 429: the message is empty, the code is
+ * the string "undefined", and only the status says what happened.
+ */
+const httpError = (status: number) => new EngramError("", "undefined", status);
+
 type StoreParams = { conversationId: string; messages: Array<{ content: string }> };
+type Op = "create" | "store" | "delete";
 
 class FakeServer {
   /** Every send attempt, failed or not. */
@@ -57,29 +71,50 @@ class FakeServer {
   failWhen: ((p: StoreParams) => Error | null) | null = null;
   /** Per-send latency in real milliseconds (only Date is faked). */
   delayWhen: ((p: StoreParams) => number) | null = null;
+  /** Error for every delete while set. */
+  deleteError: Error | null = null;
+  /** Conversations deleted. */
+  deleted: string[] = [];
+  /**
+   * The keys the server accepts; null accepts any. Any other key gets what
+   * the SDK throws for an HTTP 401 or 403: AuthenticationError.
+   */
+  acceptedKeys: Set<string> | null = null;
+  /** Every request, with the key it carried. */
+  requests: Array<{ op: Op; key: string }> = [];
   private seq = 0;
 
-  async createConversation() {
-    this.creates++;
-    return { conversationId: `conv_${++this.seq}` };
-  }
-
-  async store(p: StoreParams) {
-    this.sends.push(p);
-    const delay = this.delayWhen?.(p) ?? 0;
-    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
-    const err = this.failWhen?.(p) ?? this.sendError;
-    if (err) throw err;
-    const list = this.stored.get(p.conversationId) ?? [];
-    list.push(...p.messages.map((m) => m.content));
-    this.stored.set(p.conversationId, list);
-    return { stored: p.messages.length };
-  }
-
-  async deleteConversation() {}
-
-  client(): Engram {
-    return this as unknown as Engram;
+  /** A client for one key, as `new Engram({ apiKey })` makes. */
+  client(key = "key-1"): Engram {
+    const admit = (op: Op) => {
+      this.requests.push({ op, key });
+      if (this.acceptedKeys && !this.acceptedKeys.has(key)) throw new AuthenticationError();
+    };
+    return {
+      createConversation: async () => {
+        admit("create");
+        this.creates++;
+        return { conversationId: `conv_${++this.seq}` };
+      },
+      store: async (p: StoreParams) => {
+        this.sends.push(p);
+        admit("store");
+        const delay = this.delayWhen?.(p) ?? 0;
+        if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+        const err = this.failWhen?.(p) ?? this.sendError;
+        if (err) throw err;
+        const list = this.stored.get(p.conversationId) ?? [];
+        list.push(...p.messages.map((m) => m.content));
+        this.stored.set(p.conversationId, list);
+        return { stored: p.messages.length };
+      },
+      deleteConversation: async (id: string) => {
+        admit("delete");
+        if (this.deleteError) throw this.deleteError;
+        this.deleted.push(id);
+        this.stored.delete(id);
+      },
+    } as unknown as Engram;
   }
 
   /** Messages the server holds for a session, via daemon.db's mapping. */
@@ -258,7 +293,7 @@ describe("a failed send is not a successful sync (engram#580)", () => {
     expect(recordSuccess).toHaveBeenCalledTimes(1);
   });
 
-  it("a rejected key stops syncing, and status never reads healthy", async () => {
+  it("a rejected key pauses syncing, and status never reads healthy", async () => {
     await syncer.onMessages("s1", meta("s1"), msgs("m1"));
     await syncer.onMessages("s2", meta("s2"), msgs("m2"));
     server.sendError = new Error("401 Unauthorized");
@@ -267,14 +302,19 @@ describe("a failed send is not a successful sync (engram#580)", () => {
     expect(recordSuccess).not.toHaveBeenCalled();
     expect(new Set(failureTypes())).toEqual(new Set(["auth"]));
 
-    // Nothing is sent or created again until the daemon restarts with a
-    // working key; a session that starts meanwhile waits in daemon.db.
+    // Nothing is sent or created for ten minutes; a session that starts
+    // meanwhile waits in daemon.db.
     await syncer.onMessages("s3", meta("s3"), msgs("m3"));
-    expect(await flushAfter(60 * 60_000)).toBe(2);
+    expect(await flushAfter(10 * 60_000 - 1_000)).toBe(2);
     expect(server.creates).toBe(2);
     expect(recordSuccess).not.toHaveBeenCalled();
     expect(db.getPendingCount()).toBe(3);
     expect(db.getPendingSessions().map((s) => s.sessionId)).toEqual(["s3"]);
+
+    // Two sends rejected together were one pause: the key is tried again
+    // after ten minutes, not thirty.
+    expect(await flushAfter(2_000)).toBe(5);
+    expect(recordSuccess).not.toHaveBeenCalled();
   });
 
   it("a send that throws before reaching the server isn't a sync either", async () => {
@@ -289,6 +329,404 @@ describe("a failed send is not a successful sync (engram#580)", () => {
 
     await flushAfter(2_000);
     expect(server.copyOf(db, "s1")).toEqual(["m1"]);
+    expect(recordSuccess).toHaveBeenCalledTimes(1);
+  });
+});
+
+/** The daemon's key source (worker-main.ts): the key `engram auth login`
+ *  last saved to config.json, and a client for each key. */
+function keySource(initial: string) {
+  const keys = {
+    current: initial,
+    configured: initial as string | undefined,
+    readError: null as Error | null,
+    reads: 0,
+    connected: [] as string[],
+    async read(): Promise<string | undefined> {
+      keys.reads++;
+      if (keys.readError) throw keys.readError;
+      return keys.configured;
+    },
+    connect(key: string): Engram {
+      keys.connected.push(key);
+      return server.client(key);
+    },
+  };
+  return keys;
+}
+
+describe("a rejected key pauses, and recovers without a restart (engram#587)", () => {
+  let keys: ReturnType<typeof keySource>;
+  const requests = () => server.requests.length;
+
+  beforeEach(() => {
+    keys = keySource("key-old");
+    server.acceptedKeys = new Set(["key-new"]);
+    syncer = new Syncer(db, server.client("key-old"), null, keys);
+  });
+
+  it("the SDK's rejected-key error pauses syncing instead of retrying every 2 s", async () => {
+    // AuthenticationError's message is "Invalid or missing API key": no
+    // "401", so it used to read as a network error and was retried forever.
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    await syncer.flush();
+    expect(server.requests).toEqual([{ op: "create", key: "key-old" }]);
+    expect(failureTypes()).toEqual(["auth"]);
+
+    for (let i = 0; i < 30; i++) await flushAfter(2_000);
+    expect(requests()).toBe(1);
+    expect(recordSuccess).not.toHaveBeenCalled();
+    expect(db.getPendingCount()).toBe(1);
+  });
+
+  it("retries the same key after 10 minutes, then 30, then every hour", async () => {
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    const attempts = async (ms: number) => {
+      await flushAfter(ms);
+      return requests();
+    };
+
+    expect(await attempts(0)).toBe(1);
+    expect(await attempts(10 * 60_000 - 2_000)).toBe(1);
+    expect(await attempts(3_000)).toBe(2); // 10 min
+    expect(await attempts(30 * 60_000 - 2_000)).toBe(2);
+    expect(await attempts(3_000)).toBe(3); // 30 min
+    expect(await attempts(60 * 60_000 - 2_000)).toBe(3);
+    expect(await attempts(3_000)).toBe(4); // 1 h
+    expect(await attempts(60 * 60_000 - 2_000)).toBe(4);
+    expect(await attempts(3_000)).toBe(5); // still 1 h
+    expect(recordSuccess).not.toHaveBeenCalled();
+    expect(new Set(failureTypes())).toEqual(new Set(["auth"]));
+
+    // The same key is accepted again (a revocation undone): the next retry
+    // sends everything.
+    server.acceptedKeys = null;
+    expect(await attempts(60 * 60_000)).toBe(5 + 2); // create + store
+    expect(server.copyOf(db, "s1")).toEqual(["m1"]);
+    expect(recordSuccess).toHaveBeenCalledTimes(1);
+
+    // And the schedule starts over: a new rejection pauses ten minutes.
+    server.acceptedKeys = new Set();
+    await syncer.onMessages("s1", meta("s1"), msgs("m2"));
+    expect(await attempts(2_000)).toBe(8);
+    expect(await attempts(10 * 60_000 - 1_000)).toBe(8);
+    expect(await attempts(2_000)).toBe(9);
+  });
+
+  it("switches to a key saved by 'engram auth login' within 10 s, without a restart", async () => {
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    await syncer.flush();
+    expect(failureTypes()).toEqual(["auth"]);
+
+    // The first flush of the pause reads config.json: still the old key.
+    await flushAfter(2_000);
+    expect(keys.reads).toBe(1);
+
+    // The user runs `engram auth login`. It saves the key and leaves the
+    // daemon running.
+    keys.configured = "key-new";
+    for (let i = 0; i < 4; i++) await flushAfter(2_000); // 8 s since the read
+    expect(keys.reads).toBe(1);
+    expect(keys.connected).toEqual([]);
+
+    await flushAfter(2_000); // 10 s
+    expect(keys.connected).toEqual(["key-new"]);
+    expect(server.requests.slice(1)).toEqual([
+      { op: "create", key: "key-new" },
+      { op: "store", key: "key-new" },
+    ]);
+    expect(server.copyOf(db, "s1")).toEqual(["m1"]);
+    expect(db.getPendingCount()).toBe(0);
+    expect(recordSuccess).toHaveBeenCalledTimes(1);
+
+    // The key isn't read again while it works.
+    await syncer.onMessages("s1", meta("s1"), msgs("m2"));
+    await flushAfter(60_000);
+    expect(keys.reads).toBe(2);
+    expect(server.copyOf(db, "s1")).toEqual(["m1", "m2"]);
+  });
+
+  it("ignores a removed key, an empty one, and a config.json it can't read", async () => {
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    await syncer.flush();
+
+    keys.configured = undefined; // `engram auth logout`, or a file mid-write
+    await flushAfter(10_000);
+    keys.configured = "";
+    await flushAfter(10_000);
+    keys.readError = new Error("EACCES: permission denied");
+    await flushAfter(10_000);
+    expect(keys.reads).toBe(3);
+    expect(keys.connected).toEqual([]);
+    expect(requests()).toBe(1);
+
+    // The next read finds a key, and that one is used.
+    keys.readError = null;
+    keys.configured = "key-new";
+    await flushAfter(10_000);
+    expect(keys.connected).toEqual(["key-new"]);
+    expect(server.copyOf(db, "s1")).toEqual(["m1"]);
+  });
+
+  it("a flush with nothing to send doesn't clear a rejected key's status", async () => {
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    await syncer.flush();
+    expect(failureTypes()).toEqual(["auth"]);
+
+    // The user opts the session out before it ever synced: nothing is left
+    // to send, and nothing reached the server to delete.
+    await syncer.onMessages("s1", meta("s1"), msgs("engram: ignore"));
+    expect(db.getPendingCount()).toBe(0);
+    expect(db.getPendingRemoteDeletes()).toEqual([]);
+
+    // The pause ends with nothing to try the key on. Nothing proved the key
+    // works, so status keeps asking for a login.
+    await flushAfter(10 * 60_000);
+    expect(requests()).toBe(1);
+    expect(recordSuccess).not.toHaveBeenCalled();
+  });
+
+  it("a new key also lifts a plan-limit backoff, so a different account syncs at once", async () => {
+    // s1 synced; then the memory filled up.
+    server.acceptedKeys = new Set(["key-old", "key-new"]);
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    await syncer.flush();
+    await syncer.onMessages("s2", meta("s2"), msgs("m2"));
+    server.sendError = new Error(STORAGE_FULL);
+    await flushAfter(2_000);
+    expect(failureTypes()).toEqual(["storage_full"]);
+
+    // The old key is revoked, and an opt-out's delete finds out.
+    server.acceptedKeys = new Set(["key-new"]);
+    await syncer.onMessages("s1", meta("s1"), msgs("engram: ignore"));
+    expect(failureTypes()).toEqual(["storage_full", "auth"]);
+
+    // The user logs in to an account with room.
+    server.sendError = null;
+    keys.configured = "key-new";
+    await flushAfter(2_000);
+    expect(server.deleted).toEqual(["conv_1"]);
+    expect(server.copyOf(db, "s2")).toEqual(["m2"]);
+  });
+
+  it("after the pause, a send that goes through clears the status", async () => {
+    // s1 is already synced, so the retry is a send and nothing else.
+    server.acceptedKeys = new Set(["key-old"]);
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    await syncer.flush();
+    vi.mocked(recordSuccess).mockClear();
+
+    server.acceptedKeys = new Set(); // revoked
+    await syncer.onMessages("s1", meta("s1"), msgs("m2"));
+    await flushAfter(2_000);
+    expect(failureTypes()).toEqual(["auth"]);
+
+    server.acceptedKeys = new Set(["key-old"]); // the revocation is undone
+    await flushAfter(10 * 60_000 + 1_000);
+    expect(server.requests.slice(-1)).toEqual([{ op: "store", key: "key-old" }]);
+    expect(server.copyOf(db, "s1")).toEqual(["m1", "m2"]);
+    expect(recordSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  it("a create that goes through starts the schedule over, even when its send fails", async () => {
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    await syncer.flush(); // the create is rejected: ten minutes
+
+    // Accepted after the pause: the create goes through, the send doesn't.
+    server.acceptedKeys = new Set(["key-old"]);
+    server.sendError = new EngramError("Network error: fetch failed");
+    await flushAfter(10 * 60_000 + 1_000);
+    expect(server.creates).toBe(1);
+
+    // Rejected again: ten minutes, as after any key that worked, not thirty.
+    server.sendError = null;
+    server.acceptedKeys = new Set();
+    await flushAfter(2_000);
+    const n = requests();
+    await flushAfter(10 * 60_000 - 1_000);
+    expect(requests()).toBe(n);
+    await flushAfter(2_000);
+    expect(requests()).toBe(n + 1);
+  });
+
+  it("a new key that's rejected too starts the schedule over, and isn't tried again meanwhile", async () => {
+    server.acceptedKeys = new Set(); // no key works
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    await syncer.flush(); // ten minutes
+    await flushAfter(10 * 60_000 + 1_000); // thirty
+    expect(requests()).toBe(2);
+
+    keys.configured = "key-typo"; // a login with a mistyped key
+    await flushAfter(10_000);
+    expect(keys.connected).toEqual(["key-typo"]);
+    expect(server.requests.slice(-1)).toEqual([{ op: "create", key: "key-typo" }]);
+    const n = requests();
+
+    // A fresh key gets the first pause, ten minutes. Reading the same key
+    // again during it changes nothing.
+    for (let t = 10_000; t < 10 * 60_000; t += 10_000) await flushAfter(10_000);
+    expect(requests()).toBe(n);
+    expect(keys.connected).toEqual(["key-typo"]);
+    await flushAfter(20_000);
+    expect(requests()).toBe(n + 1);
+  });
+});
+
+describe("refusals are read from the error, not from digits in its text (engram#587)", () => {
+  it.each([
+    ["indexing_quota_exceeded", 403],
+    ["message_limit_exceeded", 401],
+  ])("a %s refusal with a usage count of %i is a plan limit, not a rejected key", async (error, used) => {
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    server.sendError = refusal({ error, message: "Limit reached.", limit: 1000, used, tier: "free" });
+
+    expect(await flushAfter(0)).toBe(1);
+    expect(failureTypes()).toEqual(["billing"]);
+    // Retried on the plan-limit schedule. It used to stop syncing until the
+    // daemon restarted.
+    expect(await flushAfter(5 * 60_000 - 2_000)).toBe(1);
+    expect(await flushAfter(3_000)).toBe(2);
+  });
+
+  it("a key without the write scope pauses like a rejected key", async () => {
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    server.sendError = refusal({
+      error: "insufficient_scope",
+      required: "write",
+      message: "This API key lacks the 'write' scope.",
+    });
+
+    expect(await flushAfter(0)).toBe(1);
+    expect(failureTypes()).toEqual(["auth"]);
+    expect(await flushAfter(10 * 60_000 - 1_000)).toBe(1);
+  });
+
+  it("a rate limit is retried with the same batch, not split into more requests", async () => {
+    const many = Array.from({ length: 30 }, (_, i) => `m-${i}`);
+    await syncer.onMessages("s1", meta("s1"), msgs(...many));
+    server.failWhen = () => (server.sends.length === 1 ? httpError(429) : null);
+
+    await syncer.flush();
+    expect(failureTypes()).toEqual(["rate_limit"]);
+    await flushAfter(2_000);
+    expect(server.sends.map((p) => p.messages.length)).toEqual([25, 25, 5]);
+    expect(server.copyOf(db, "s1")).toEqual(many);
+  });
+});
+
+describe("an opt-out's server delete is dropped only when Engram says it's gone (engram#587)", () => {
+  /** s1 synced, then the user opted out of it. */
+  async function optOutAfterSync(deleteError: Error | null): Promise<void> {
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    await syncer.flush();
+    expect(server.copyOf(db, "s1")).toEqual(["m1"]);
+    server.deleteError = deleteError;
+    await syncer.onMessages("s1", meta("s1"), msgs("engram: ignore"));
+  }
+
+  it.each([
+    ["a DNS failure", new EngramError("Network error: getaddrinfo ENOTFOUND mcp.getengram.app")],
+    [
+      "a 404 page from another host",
+      new EngramError("Unexpected response format: <html><title>404 Not Found</title></html>"),
+    ],
+    ["a JSON-RPC not_found from another host", new EngramError("Not Found", "not_found", 404)],
+    ["the SDK's NotFoundError", new NotFoundError()],
+  ])("keeps the delete after %s, and retries until it lands", async (_, err) => {
+    await optOutAfterSync(err);
+    expect(db.getPendingRemoteDeletes()).toHaveLength(1);
+
+    await flushAfter(2_000);
+    expect(db.getPendingRemoteDeletes()).toHaveLength(1);
+
+    server.deleteError = null;
+    await flushAfter(2_000);
+    expect(server.deleted).toEqual(["conv_1"]);
+    expect(db.getPendingRemoteDeletes()).toEqual([]);
+  });
+
+  it("drops the delete when Engram says the conversation is already gone", async () => {
+    await optOutAfterSync(refusal({ error: "Conversation not found" }));
+    expect(db.getPendingRemoteDeletes()).toEqual([]);
+  });
+
+  it("a key without the delete scope keeps the delete, and doesn't pause syncing", async () => {
+    await optOutAfterSync(
+      refusal({ error: "insufficient_scope", required: "delete", message: "No 'delete' scope." }),
+    );
+    expect(db.getPendingRemoteDeletes()).toHaveLength(1);
+
+    await syncer.onMessages("s2", meta("s2"), msgs("m2"));
+    await flushAfter(2_000);
+    expect(server.copyOf(db, "s2")).toEqual(["m2"]);
+    expect(db.getPendingRemoteDeletes()).toHaveLength(1);
+  });
+
+  it("a rejected key pauses the deletes with everything else", async () => {
+    await optOutAfterSync(new AuthenticationError());
+    expect(failureTypes()).toEqual(["auth"]);
+    expect(db.getPendingRemoteDeletes()).toHaveLength(1);
+
+    await syncer.onMessages("s2", meta("s2"), msgs("m2"));
+    const before = server.requests.length;
+    await flushAfter(2_000);
+    expect(server.requests).toHaveLength(before);
+
+    // Accepted again after the pause: the delete lands, then s2 syncs.
+    server.deleteError = null;
+    await flushAfter(10 * 60_000);
+    expect(server.deleted).toEqual(["conv_1"]);
+    expect(server.copyOf(db, "s2")).toEqual(["m2"]);
+    expect(db.getPendingRemoteDeletes()).toEqual([]);
+  });
+  it("an opt-out during the pause waits for it: the delete isn't sent with the rejected key", async () => {
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    await syncer.flush();
+    server.acceptedKeys = new Set(); // revoked
+    await syncer.onMessages("s1", meta("s1"), msgs("m2"));
+    await flushAfter(2_000);
+    expect(failureTypes()).toEqual(["auth"]);
+    const before = server.requests.length;
+
+    await syncer.onMessages("s1", meta("s1"), msgs("engram: ignore"));
+    expect(server.requests).toHaveLength(before);
+    expect(db.getPendingRemoteDeletes()).toHaveLength(1);
+
+    // Accepted after the pause: the delete is the first thing sent.
+    server.acceptedKeys = null;
+    await flushAfter(10 * 60_000 + 1_000);
+    expect(server.requests.slice(before)).toEqual([{ op: "delete", key: "key-1" }]);
+    expect(server.deleted).toEqual(["conv_1"]);
+    expect(db.getPendingRemoteDeletes()).toEqual([]);
+  });
+
+  it("a delete rejected in a flush ends that flush: nothing else is sent with the key", async () => {
+    await optOutAfterSync(new EngramError("Network error: fetch failed"));
+    expect(db.getPendingRemoteDeletes()).toHaveLength(1);
+    await syncer.onMessages("s2", meta("s2"), msgs("m2"));
+
+    // The key is revoked; the flush's first request, the delete, finds out.
+    server.deleteError = null;
+    server.acceptedKeys = new Set();
+    const before = server.requests.length;
+    await flushAfter(2_000);
+    expect(server.requests.slice(before)).toEqual([{ op: "delete", key: "key-1" }]);
+    expect(failureTypes().at(-1)).toBe("auth");
+    expect(db.getPendingSessions().map((s) => s.sessionId)).toEqual(["s2"]);
+  });
+
+  it.each([
+    ["lands", null],
+    ["finds the conversation already gone", refusal({ error: "Conversation not found" })],
+  ])("after the pause, a delete that %s proves the key works", async (_, answer) => {
+    await optOutAfterSync(new AuthenticationError());
+    expect(failureTypes()).toEqual(["auth"]);
+    vi.mocked(recordSuccess).mockClear();
+
+    // Nothing else is waiting: the delete is the only proof there can be.
+    server.deleteError = answer;
+    await flushAfter(10 * 60_000 + 1_000);
+    expect(db.getPendingRemoteDeletes()).toEqual([]);
     expect(recordSuccess).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,6 +1,6 @@
 import type { Engram } from "@getengram/sdk";
 import { DaemonDb } from "./db.js";
-import { recordSuccess, recordFailure, classifyError } from "./status.js";
+import { recordSuccess, recordFailure, classifyError, isNotFound } from "./status.js";
 import { parseStorageFullError } from "../storage-error.js";
 import { isPathExcluded, detectOptOut } from "./exclusions.js";
 import type { SecretScrubber } from "./scrubber.js";
@@ -34,6 +34,33 @@ const BILLING_BACKOFF_MS = [
 const STORAGE_FULL_BACKOFF_MS = [60_000, 2 * 60_000, 5 * 60_000];
 
 /**
+ * Pause schedule while the API key is rejected: 10min → 30min → 1hr → 1hr …
+ * (engram#587). A rejected key used to stop syncing until the daemon
+ * restarted, and nothing restarts it: `engram auth login` saves the new key
+ * and leaves this process running with the old one. Now a paused daemon
+ * looks for a new key every KEY_CHECK_MS and switches to it at once; this
+ * schedule only paces retries of the same key, for a key that was refused
+ * for a while and accepted again.
+ */
+const AUTH_RETRY_MS = [10 * 60_000, 30 * 60_000, 60 * 60_000];
+
+/** How often a paused daemon reads the configured key. */
+const KEY_CHECK_MS = 10_000;
+
+/**
+ * Where the daemon's API key comes from, so a rejected key can be replaced
+ * without a restart.
+ */
+export interface KeySource {
+  /** The key the client was built with. */
+  current: string;
+  /** The key configured now: ENGRAM_API_KEY, else ~/.engram/config.json. */
+  read(): Promise<string | undefined>;
+  /** A client for a new key. */
+  connect(key: string): Engram;
+}
+
+/**
  * How one conversation's turn in a flush ended (engram#580). Only "sent"
  * means its queue is empty, and only a flush in which every conversation
  * sent is a successful sync.
@@ -42,7 +69,7 @@ type SendOutcome =
   | "sent" // everything queued for it went out
   | "retry" // a send failed; its rows stay queued for a later flush
   | "backoff" // the account hit a billing or storage limit
-  | "auth"; // the API key was rejected; syncing has stopped
+  | "auth"; // the API key was rejected; sending pauses (AUTH_RETRY_MS)
 
 /** Retry schedule for one session whose conversation create failed with an
  *  ordinary error (network, 5xx, rejected input). Its messages stay queued
@@ -59,7 +86,15 @@ export class Syncer {
   private client: Engram;
   private timer: ReturnType<typeof setInterval> | null = null;
   private flushing = false;
-  private authFailed = false;
+
+  /** Paused because the API key was rejected: until when, and how many
+   *  pauses in a row without a request going through. */
+  private authHeldUntil = 0;
+  private authHoldStep = 0;
+  /** The key the client was built with, and when the configured key was
+   *  last read for a new one. */
+  private currentKey: string | undefined;
+  private lastKeyCheck = 0;
 
   /** Billing backoff state */
   private billingBackoffUntil: number = 0;
@@ -77,9 +112,11 @@ export class Syncer {
     db: DaemonDb,
     client: Engram,
     private readonly scrubber: SecretScrubber | null = null,
+    private readonly keys: KeySource | null = null,
   ) {
     this.db = db;
     this.client = client;
+    this.currentKey = keys?.current;
   }
 
   /**
@@ -175,24 +212,37 @@ export class Syncer {
   /** Delete server-side conversations for opted-out sessions; keeps
    *  delete_pending until the server confirms. */
   private async retryRemoteDeletes(): Promise<void> {
+    // A rejected key can't delete either; the deletes keep until it's fixed.
+    if (this.authHeld()) return;
     for (const row of this.db.getPendingRemoteDeletes()) {
       try {
         await this.client.deleteConversation(row.delete_pending);
+        this.keyAccepted();
         this.db.clearPendingRemoteDelete(row.session_id);
         console.log(
           `[engram] deleted synced conversation ${row.delete_pending} for opted-out session`,
         );
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
-        // "Not found" means it's already gone (or was never fully created) —
-        // the promise is kept either way.
-        if (msg.includes("404") || /not.?found/i.test(msg)) {
+        // Engram saying "not found" means it's already gone (or was never
+        // fully created) — the promise is kept either way. Only Engram's
+        // own answer counts (engram#587): this used to accept any text
+        // matching /not.?found/ or "404", and a DNS failure (ENOTFOUND)
+        // matches that. The delete was dropped while the copy stayed.
+        if (isNotFound(err)) {
+          this.keyAccepted();
           this.db.clearPendingRemoteDelete(row.session_id);
           continue;
         }
         console.error(
           `[engram] opt-out delete failed for ${row.delete_pending} (will retry): ${msg}`,
         );
+        // Only a key refused outright pauses everything. A key that works
+        // but lacks the delete scope (insufficient_scope) can still save.
+        if (classifyError(err) === "auth" && !isScopeRefusal(msg)) {
+          this.enterAuthHold(msg);
+          return;
+        }
       }
     }
   }
@@ -210,15 +260,21 @@ export class Syncer {
 
   /** Flush all pending messages to the API. */
   async flush(): Promise<void> {
-    // Nothing can send while the key is rejected or a billing backoff holds.
-    if (this.flushing || this.halted()) return;
+    if (this.flushing) return;
 
     this.flushing = true;
 
     try {
+      // A rejected key: `engram auth login` may have saved a new one.
+      if (this.authHeld()) await this.pickUpNewKey();
+
+      // Nothing can send while the key is rejected or a billing backoff holds.
+      if (this.halted()) return;
+
       // Step 0: Honor opt-outs whose server-side delete hasn't landed yet
       // (e.g. the machine was offline when the user said "don't save this").
       await this.retryRemoteDeletes();
+      if (this.halted()) return; // the key was rejected there
 
       // Step 1: Create any pending conversations
       const createsOk = await this.createPendingConversations();
@@ -251,15 +307,19 @@ export class Syncer {
       // "healthy" while nothing synced, and the billing backoff a full
       // memory had just entered was cleared again, so the account was
       // retried every 2 s instead of backing off.
+      //
+      // After a pause for a rejected key, a flush with nothing to send
+      // proves nothing about the key: status keeps saying it was rejected
+      // until a request goes through (keyAccepted) or a new key is saved.
       const pending = this.db.getPendingCount();
-      if (createsOk && allSent) {
+      if (createsOk && allSent && this.authHoldStep === 0) {
         this.resetBillingBackoff();
         recordSuccess(pending);
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[engram] flush error: ${msg}`);
-      recordFailure(msg, classifyError(msg), this.db.getPendingCount());
+      recordFailure(msg, classifyError(err), this.db.getPendingCount());
     } finally {
       this.flushing = false;
     }
@@ -314,13 +374,11 @@ export class Syncer {
         }
         ok = false;
         const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
-        if (msg.includes("401") || msg.includes("403")) {
-          this.authFailed = true;
-          console.error(`[engram] auth error, stopping: ${msg}`);
-          recordFailure(msg, "auth", this.db.getPendingCount());
+        const errType = classifyError(r.reason);
+        if (errType === "auth") {
+          this.enterAuthHold(msg);
           return false;
         }
-        const errType = classifyError(msg);
         if (errType === "billing" || errType === "storage_full") {
           this.enterBillingBackoff(msg);
           return false;
@@ -353,6 +411,7 @@ export class Syncer {
     }
 
     const conversationId = await this.createConversation(sessionId, meta);
+    this.keyAccepted();
 
     // Opt-out race (engram#462): the user may have said "don't save
     // this" while the create was in flight — excludeSession saw no
@@ -392,7 +451,7 @@ export class Syncer {
       // An auth failure or a billing limit applies to the whole account.
       // Once any conversation in this flush has hit one, no new batch is
       // started: it could only fail the same way.
-      if (this.authFailed) return "auth";
+      if (this.authHeld()) return "auth";
       if (Date.now() < this.billingBackoffUntil) return "backoff";
 
       const limit = this.batchOverride.get(conversationId) ?? BATCH_SIZE;
@@ -418,30 +477,32 @@ export class Syncer {
 
       try {
         await this.client.store({ conversationId, messages });
+        this.keyAccepted();
         this.db.markSent(rows.map((r) => r.id));
         this.batchOverride.delete(conversationId);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
+        const errType = classifyError(err);
 
-        if (msg.includes("401") || msg.includes("403") || msg.includes("Authentication")) {
-          this.authFailed = true;
-          console.error(`[engram] auth error, stopping flush: ${msg}`);
-          recordFailure(msg, "auth", this.db.getPendingCount());
-          this.stopFlushLoop();
+        // The key was rejected: pause, and recover without a restart. This
+        // used to stop the flush loop for good (engram#587).
+        if (errType === "auth") {
+          this.enterAuthHold(msg);
           return "auth";
         }
 
         // Billing / limit errors — exponential backoff
-        const errType = classifyError(msg);
         if (errType === "billing" || errType === "storage_full") {
           this.enterBillingBackoff(msg);
           return "backoff";
         }
 
-        // Rate limit or network/timeout — leave in queue for next cycle, but
-        // halve this conversation's batch so an oversized batch self-resolves
-        // instead of retrying the identical payload forever.
-        if (rows.length > 1) {
+        // Network/timeout/server — leave in queue for next cycle, but halve
+        // this conversation's batch so an oversized batch self-resolves
+        // instead of retrying the identical payload forever. A rate limit
+        // refuses the request, not its size: halving it would only multiply
+        // the requests.
+        if (rows.length > 1 && errType !== "rate_limit") {
           const next = Math.max(1, Math.floor(rows.length / 2));
           this.batchOverride.set(conversationId, next);
           console.error(
@@ -500,10 +561,71 @@ export class Syncer {
     }
   }
 
+  /**
+   * The API key was rejected: pause sending on AUTH_RETRY_MS. Escalates once
+   * per pause, like the billing backoff: sends rejected together are one
+   * rejection. Captures keep queueing in daemon.db meanwhile.
+   */
+  private enterAuthHold(msg: string): void {
+    if (!this.authHeld()) {
+      const delay = AUTH_RETRY_MS[Math.min(this.authHoldStep, AUTH_RETRY_MS.length - 1)];
+      this.authHeldUntil = Date.now() + delay;
+      this.authHoldStep++;
+      console.error(
+        `[engram] API key rejected — sync paused. Retrying in ${Math.round(delay / 60_000)}m, ` +
+          `or as soon as a new key is saved ('engram auth login'): ${msg}`,
+      );
+    }
+    recordFailure(msg, "auth", this.db.getPendingCount());
+  }
+
+  private authHeld(): boolean {
+    return Date.now() < this.authHeldUntil;
+  }
+
+  /** A request went through: the key works. */
+  private keyAccepted(): void {
+    this.authHoldStep = 0;
+  }
+
+  /**
+   * While the key is rejected, switch to a new one as soon as it's saved
+   * (`engram auth login` writes config.json and leaves the daemon running).
+   * Throttled to KEY_CHECK_MS. Never throws: a config.json read mid-write
+   * has no key, and is read again on the next check.
+   */
+  private async pickUpNewKey(): Promise<void> {
+    if (!this.keys) return;
+    const now = Date.now();
+    if (now - this.lastKeyCheck < KEY_CHECK_MS) return;
+    this.lastKeyCheck = now;
+
+    let client: Engram;
+    let key: string | undefined;
+    try {
+      key = await this.keys.read();
+      if (!key || key === this.currentKey) return;
+      client = this.keys.connect(key);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[engram] reading the API key failed (will retry): ${msg}`);
+      return;
+    }
+
+    this.client = client;
+    this.currentKey = key;
+    this.authHeldUntil = 0;
+    this.authHoldStep = 0;
+    // The new key may belong to an account with room, and a held billing
+    // backoff would only delay finding out.
+    this.resetBillingBackoff();
+    console.log("[engram] new API key found — resuming sync");
+  }
+
   /** True while sending can only fail: the API key was rejected, or the
    *  account is inside a billing backoff. */
   private halted(): boolean {
-    return this.authFailed || Date.now() < this.billingBackoffUntil;
+    return this.authHeld() || Date.now() < this.billingBackoffUntil;
   }
 
   /** Reset billing backoff after a successful sync. */
@@ -542,6 +664,11 @@ export class Syncer {
 
     return conversationId;
   }
+}
+
+/** The server's refusal of a key that works but lacks a scope. */
+function isScopeRefusal(msg: string): boolean {
+  return msg.includes('"insufficient_scope"');
 }
 
 function rowToMessage(row: PendingRow) {

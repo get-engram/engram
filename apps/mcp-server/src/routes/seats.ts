@@ -1,39 +1,79 @@
 import { Hono } from "hono";
 import { generateId, hashApiKey } from "@getengram/shared";
-import { insertSeat, getSeatsByOrg, getSeatCount, getSeatByEmail, deleteSeat, acceptSeat, getOrganizationById, revokeApiKeysBySeat } from "@getengram/db";
+import { insertSeat, getSeatsByOrg, getSeatCount, getSeatByEmail, deleteSeat, getOrganizationById, revokeApiKeysBySeat } from "@getengram/db";
+import {
+  denyExternalOAuthClient,
+  denyUnlessFirstPartyWrite,
+  denyUnlessFullAuthority,
+  denyUnlessOwner,
+  type GuardContext,
+} from "./guards.js";
 import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
 
 const seats = new Hono<HonoEnv>();
 
-// Owner-only guard for seat administration. A seat-bound (Team member) key has
-// a non-null seatId; the owner key has null (engram#264). Members must not be
-// able to invite, remove, re-invite, or re-role other members — only accept
-// their own invite (below) and list. Returns a 403 Response to short-circuit,
-// or null to proceed. The `seats.role` column will refine this to owner+admin
-// once it's plumbed into AuthContext; owner-only is the safe floor until then.
-function ownerOnly(auth: AuthContext): Response | null {
-  if (auth.seatId) {
-    return Response.json(
-      { error: "forbidden", message: "Only the organization owner can manage seats." },
-      { status: 403 },
-    );
-  }
-  return null;
+const MEMBER_REFUSAL = "Only the organization owner can manage seats.";
+const CONNECTOR_REFUSAL =
+  "Team members are managed from the Engram dashboard, not from a connected app.";
+
+// Who belongs to the org is account administration, not memory: a connected
+// OAuth app never reads or changes it (engram#603).
+seats.use("*", async (c, next) => {
+  const denied = denyExternalOAuthClient(c, CONNECTOR_REFUSAL);
+  if (denied) return denied;
+  await next();
+});
+
+// Owner-only floor for seat administration. A seat-bound (Team member) key
+// has a non-null seatId; the owner key has null (engram#264). Members can list
+// but not invite, remove, re-invite, or re-role. The `seats.role` column will
+// refine this to owner+admin once it's plumbed into AuthContext; owner-only is
+// the safe floor until then.
+//
+// Changing or removing a member also needs `write` (engram#603).
+function denySeatChange(c: GuardContext): Response | null {
+  return denyUnlessOwner(c, MEMBER_REFUSAL) ?? denyUnlessFirstPartyWrite(c, CONNECTOR_REFUSAL);
 }
 
-// List seats
+// Issuing an invitation issues a credential: once accepted it mints a seat
+// key with every scope (invites.ts). So the caller must hold every scope
+// itself, as mintableScopes requires of POST /api/keys (engram#475, #603).
+function denyInvite(c: GuardContext): Response | null {
+  return denyUnlessFullAuthority(c, { connector: CONNECTOR_REFUSAL, member: MEMBER_REFUSAL });
+}
+
+interface SeatRow {
+  id: string;
+  email: string;
+  role: string;
+  invited_at: string;
+  accepted_at: string | null;
+}
+
+// List seats: the fields the dashboard shows, nothing else. The row also
+// holds the hash of a pending invite's token, which no caller needs
+// (engram#603).
 seats.get("/", async (c) => {
   const auth = c.get("auth");
   const result = await getSeatsByOrg(c.env.DB, auth.organizationId);
-  return c.json({ seats: result.results });
+  const rows = (result.results ?? []) as unknown as SeatRow[];
+  return c.json({
+    seats: rows.map(({ id, email, role, invited_at, accepted_at }) => ({
+      id,
+      email,
+      role,
+      invited_at,
+      accepted_at,
+    })),
+  });
 });
 
 // Invite a seat
 seats.post("/", async (c) => {
   const auth = c.get("auth");
-  const denied = ownerOnly(auth);
+  const denied = denyInvite(c);
   if (denied) return denied;
   const body = await c.req.json<{ email: string; role?: string }>().catch(() => ({}) as { email?: string; role?: string });
 
@@ -84,33 +124,18 @@ seats.post("/", async (c) => {
   );
 });
 
-// Accept a seat invitation
-seats.post("/:id/accept", async (c) => {
-  const auth = c.get("auth");
-  const seatId = c.req.param("id");
-
-  // Look up the seat and verify it belongs to this org
-  const seat = await c.env.DB
-    .prepare("SELECT * FROM seats WHERE id = ? AND organization_id = ?")
-    .bind(seatId, auth.organizationId)
-    .first<{ id: string; email: string; accepted_at: string | null }>();
-
-  if (!seat) {
-    return c.json({ error: "seat_not_found" }, 404);
-  }
-  if (seat.accepted_at) {
-    return c.json({ error: "already_accepted" }, 409);
-  }
-
-  await acceptSeat(c.env.DB, seatId);
-  return c.json({ id: seatId, status: "accepted" });
-});
+// There is no accept route here. An invitation is accepted on the public
+// POST /invites/accept, by the invitee proving the invited address
+// (engram#263). The older POST /:id/accept let any credential in the org mark
+// a pending seat accepted without the invitee, which then blocked the real
+// acceptance as "already accepted"; nothing called it, so it is gone
+// (engram#603).
 
 // Update a seat's role (engram-web#92). Owner isn't assignable — it
 // belongs to the org account itself, not a seat.
 seats.patch("/:id", async (c) => {
   const auth = c.get("auth");
-  const denied = ownerOnly(auth);
+  const denied = denySeatChange(c);
   if (denied) return denied;
   const seatId = c.req.param("id");
   const body = await c.req.json<{ role?: string }>().catch(() => ({}) as { role?: string });
@@ -130,7 +155,7 @@ seats.patch("/:id", async (c) => {
 // still-pending seat. The caller (engram-web) emails the new link.
 seats.post("/:id/resend", async (c) => {
   const auth = c.get("auth");
-  const denied = ownerOnly(auth);
+  const denied = denyInvite(c);
   if (denied) return denied;
   const seatId = c.req.param("id");
   const seat = await c.env.DB.prepare(
@@ -157,7 +182,7 @@ seats.post("/:id/resend", async (c) => {
 // Remove a seat (and revoke its API keys)
 seats.delete("/:id", async (c) => {
   const auth = c.get("auth");
-  const denied = ownerOnly(auth);
+  const denied = denySeatChange(c);
   if (denied) return denied;
   const seatId = c.req.param("id");
   // Verify the seat belongs to the caller's org BEFORE deleting. Seat ids are

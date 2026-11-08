@@ -13,7 +13,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join, win32 } from "node:path";
 import { bold, dim, red } from "../output.js";
 import { loadConfig, saveConfig } from "../config.js";
-import { readStatus, syncErrorSummary, type SyncStatus } from "./status.js";
+import { readStatus, syncErrorSummary, captureErrorSummary, type SyncStatus } from "./status.js";
 import { ALL_ADAPTERS } from "./adapters.js";
 import {
   ENGRAM_DIR,
@@ -272,6 +272,15 @@ function printAutoStart(): void {
 }
 
 function printSyncWarnings(status: SyncStatus): void {
+  // Capture comes before sending: what can't be queued here can't be sent
+  // either, however healthy syncing is (engram#584).
+  if (status.capture_error) {
+    console.log("");
+    console.log(red(`  WARNING: ${captureErrorSummary(status.capture_error)}`));
+    console.log(dim(`  Since: ${status.capture_error.since}`));
+    console.log("");
+  }
+
   if (status.health === "healthy") {
     if (status.last_sync_at) {
       console.log(`${dim("Last sync:")}        ${status.last_sync_at}`);

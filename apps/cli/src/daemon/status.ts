@@ -17,6 +17,21 @@ export type SyncErrorType =
   | "network"
   | "server";
 
+/**
+ * Transcripts that can't be queued in daemon.db (engram#584): a full disk,
+ * a daemon.db that is locked, read-only or damaged. Each such file is held
+ * at the line that failed and retried with backoff, so its lines are read
+ * again rather than skipped, but nothing new is captured from it meanwhile.
+ */
+export interface CaptureError {
+  /** What daemon.db said, e.g. "database or disk is full". */
+  message: string;
+  /** When capture first stalled. Kept until every file is queued again. */
+  since: string;
+  /** How many transcripts are waiting. */
+  files: number;
+}
+
 export interface SyncStatus {
   health: SyncHealth;
   last_sync_at: string | null;
@@ -28,6 +43,12 @@ export interface SyncStatus {
   /** Populated on a storage_full error so the numbers can be shown without
    *  a network round trip (the CLI may be offline when it surfaces them). */
   storage: { used: number; limit: number } | null;
+  /**
+   * Set while transcripts can't be queued locally. Separate from `health`,
+   * which is about sending what was queued: a successful send says nothing
+   * about whether new lines can be queued.
+   */
+  capture_error: CaptureError | null;
   updated_at: string;
 }
 
@@ -40,11 +61,19 @@ const DEFAULT_STATUS: SyncStatus = {
   pending_messages: 0,
   consecutive_failures: 0,
   storage: null,
+  capture_error: null,
   updated_at: new Date().toISOString(),
 };
 
 let currentStatus: SyncStatus = { ...DEFAULT_STATUS };
 let lastNotifiedError: string | null = null;
+
+/** Transcripts this process can't queue right now (engram#584). */
+const stalledFiles = new Set<string>();
+/** At most one capture notification per hour: a daemon.db that is locked
+ *  now and then would otherwise raise one per episode. */
+const CAPTURE_NOTIFY_INTERVAL_MS = 60 * 60_000;
+let lastCaptureNotifyAt = -Infinity;
 
 export function readStatus(): SyncStatus {
   try {
@@ -127,9 +156,62 @@ export function recordFailure(
     lastNotifiedError = errorType;
     logWarning(errorType, currentStatus.storage);
     if (errorType === "auth" || errorType === "storage_full") {
-      notifyDesktop(errorType, currentStatus.storage);
+      const storage = currentStatus.storage;
+      notifyDesktop(
+        errorType === "storage_full" ? "Engram memory is full" : "Engram needs attention",
+        errorType === "storage_full" && storage
+          ? `${n(storage.used)}/${n(storage.limit)} messages used. New captures are paused.`
+          : syncErrorSummary(errorType, storage).slice(0, 180),
+      );
     }
   }
+}
+
+/**
+ * A transcript's new lines couldn't be queued in daemon.db; the watcher
+ * holds the file at the failing line and retries it (engram#584). The
+ * first stall of an episode is logged as a warning and raised as a desktop
+ * notification: when the disk is full, daemon.log and status.json may not
+ * be writable either, and the notification still gets through.
+ */
+export function recordCaptureStall(filePath: string, message: string): void {
+  const first = stalledFiles.size === 0;
+  stalledFiles.add(filePath);
+  currentStatus.capture_error = {
+    message,
+    since: currentStatus.capture_error?.since ?? new Date().toISOString(),
+    files: stalledFiles.size,
+  };
+  writeStatus();
+  if (!first) return;
+
+  const summary = captureErrorSummary(currentStatus.capture_error);
+  console.error(`[engram] WARNING: ${summary}`);
+  console.error(`[engram] Run 'engram status' for details.`);
+  if (Date.now() - lastCaptureNotifyAt >= CAPTURE_NOTIFY_INTERVAL_MS) {
+    lastCaptureNotifyAt = Date.now();
+    // The reason is cut short, not the advice after it. The advice covers
+    // a locked or read-only daemon.db as well as a full disk.
+    const reason = message.length > 60 ? `${message.slice(0, 59)}…` : message;
+    notifyDesktop(
+      "Engram can't capture",
+      `New messages can't be queued (${reason}). Free up disk space, or check ` +
+        `~/.engram/daemon.db. Capture resumes where it stopped.`,
+    );
+  }
+}
+
+/** A stalled transcript was queued again, or there is nothing left to
+ *  retry (the file is gone). The error clears once no file is waiting. */
+export function recordCaptureResumed(filePath: string): void {
+  if (!stalledFiles.delete(filePath)) return;
+  if (stalledFiles.size > 0 && currentStatus.capture_error) {
+    currentStatus.capture_error = { ...currentStatus.capture_error, files: stalledFiles.size };
+  } else {
+    currentStatus.capture_error = null;
+    console.error("[engram] capture resumed: new messages are being queued again");
+  }
+  writeStatus();
 }
 
 /** Update pending count without changing health. */
@@ -323,6 +405,19 @@ export function syncErrorSummary(
   }
 }
 
+/**
+ * One-line summary of a capture error, in the second person: the daemon
+ * log, the desktop notification, `engram status` and the CLI banner.
+ */
+export function captureErrorSummary(c: CaptureError): string {
+  const files = c.files === 1 ? "1 transcript is" : `${n(c.files)} transcripts are`;
+  return (
+    `Engram can't queue new messages on this machine (${c.message}), so ${files} ` +
+    `waiting. Free up disk space, or check that ~/.engram/daemon.db can be ` +
+    `written. Capture picks up where it stopped, so nothing is skipped.`
+  );
+}
+
 /** Log a warning to stderr (goes to daemon.log). One line per error type. */
 function logWarning(
   errorType: SyncStatus["error_type"],
@@ -341,15 +436,7 @@ function logWarning(
  * absent on plenty of systems (headless Linux, minimal containers) and a
  * failure to notify must never disturb syncing.
  */
-function notifyDesktop(
-  errorType: SyncStatus["error_type"],
-  storage?: { used: number; limit: number } | null,
-): void {
-  const title = errorType === "storage_full" ? "Engram memory is full" : "Engram needs attention";
-  const body =
-    errorType === "storage_full" && storage
-      ? `${n(storage.used)}/${n(storage.limit)} messages used. New captures are paused.`
-      : syncErrorSummary(errorType, storage).slice(0, 180);
+function notifyDesktop(title: string, body: string): void {
   try {
     // A static import (engram#581): this used to be a lazy `require`, which
     // does not exist in this ES-module build. It threw, the catch below

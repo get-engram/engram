@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-// `engram status` runs the usage command, and it is where every rejected-key
-// notice from the daemon points (engram#587).
-describe("engram status with a rejected key (engram#587)", () => {
+// `engram usage` says when the key was rejected. So does `engram status`,
+// which shows usage below the daemon and is where every rejected-key notice
+// from the daemon points (engram#587, engram#609).
+describe("engram usage with a rejected key (engram#587)", () => {
   const savedKey = process.env.ENGRAM_API_KEY;
 
   afterEach(() => {

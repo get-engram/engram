@@ -11,7 +11,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { bold, dim, red } from "../output.js";
 import { loadConfig, saveConfig } from "../config.js";
-import { readStatus, type SyncStatus } from "./status.js";
+import { readStatus, syncErrorSummary, type SyncStatus } from "./status.js";
 import { ALL_ADAPTERS } from "./adapters.js";
 
 /** Render the per-host capture status (engram#261). */
@@ -238,15 +238,10 @@ function printSyncWarnings(status: SyncStatus): void {
     return;
   }
 
-  const warnings: Record<string, string> = {
-    auth: "Authentication failed — run 'engram auth login'",
-    billing: "Plan limit reached — upgrade at getengram.app/pricing\n           Messages are queued locally and will retry with backoff.",
-    rate_limit: "Rate limited — messages queued, will retry",
-    network: "Can't reach servers — messages queued locally",
-    server: "Server error — messages queued, will retry",
-  };
-
-  const msg = warnings[status.error_type ?? "network"] ?? status.last_error ?? "Unknown error";
+  // The same words as the daemon's log line and desktop notification. This
+  // kept a copy of its own, which had no storage_full entry: a full account
+  // showed the raw server error instead of what to do about it.
+  const msg = syncErrorSummary(status.error_type, status.storage);
 
   console.log("");
   console.log(red(`  WARNING: ${msg}`));

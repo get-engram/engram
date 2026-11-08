@@ -48,7 +48,7 @@ export class SecretScrubber {
   private timer: NodeJS.Timeout | null = null;
 
   constructor(
-    private readonly vault: VaultLike | null,
+    private vault: VaultLike | null,
     private readonly vaultKey: string | undefined,
     private readonly log: (msg: string) => void = () => {},
   ) {}
@@ -69,6 +69,9 @@ export class SecretScrubber {
    * off silently in the middle of a session.
    */
   async refresh(): Promise<void> {
+    // The client this read goes through. reconnect() may replace it while
+    // the read is in flight; see below.
+    const vault = this.vault;
     const next = new Map<string, string>();
 
     // The key itself is the most damaging thing to leak, and `engram vault
@@ -77,12 +80,12 @@ export class SecretScrubber {
       next.set("vault-key", this.vaultKey);
     }
 
-    if (this.vault) {
+    if (vault) {
       try {
-        const entries = await this.vault.list();
+        const entries = await vault.list();
         for (const { name } of entries) {
           try {
-            const value = await this.vault.get(name);
+            const value = await vault.get(name);
             if (value && value.length >= MIN_SCRUB_LENGTH) next.set(name, value);
           } catch {
             // One unreadable secret must not block the rest.
@@ -95,11 +98,27 @@ export class SecretScrubber {
       }
     }
 
+    // The client was replaced mid-read (the API key changed): this set is
+    // the old client's, and the read through the new one decides. Applying
+    // it could put an account's secrets in place of the current one's after
+    // the current one had loaded.
+    if (vault !== this.vault) return;
+
     const before = this.values.size;
     this.values = next;
     if (next.size !== before) {
       this.log(`vault scrubber: protecting ${next.size} secret(s)`);
     }
+  }
+
+  /**
+   * Read the vault through a new client: the daemon's API key was replaced
+   * (engram#587). Refreshes at once. Until that finishes, the current set
+   * stays in force, and a refresh that fails keeps it too.
+   */
+  reconnect(vault: VaultLike | null): Promise<void> {
+    this.vault = vault;
+    return this.refresh();
   }
 
   /** Refresh now and on an interval. */

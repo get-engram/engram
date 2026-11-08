@@ -24,7 +24,7 @@ import {
   getMaxSequence,
   insertChunks,
   getVectorizeIdsByConversation,
-  insertVaultEntries,
+  insertVaultEntryStatements,
   getMessageById,
   deleteMessageWithCount,
   updateMessageContent,
@@ -167,10 +167,12 @@ export function assertWritesEnabled(env: Env): void {
       "Nothing already saved is affected, and nothing is lost — retry shortly, " +
       "or let your client retry automatically.";
     // An HTTPException, like the 404 in appendMessages, so both layers answer
-    // with this text instead of masking it: a bare Error reached app.onError
+    // with this body instead of masking it: a bare Error reached app.onError
     // as a generic 500 on the REST path, and the tool guard (engram#513) would
-    // now hide it as an internal failure on the MCP path. 503 + Retry-After
-    // is what the CLI daemon already backs off on.
+    // hide it as an internal failure on the MCP path, which now passes the
+    // JSON body through (engram#592). The CLI daemon reads `writes_paused` as
+    // a server-side pause: the rows stay queued and are resent on a later
+    // flush. It does not read Retry-After yet (engram#596).
     throw new HTTPException(503, {
       message,
       res: new Response(JSON.stringify({ error: "writes_paused", message }), {
@@ -198,37 +200,63 @@ export function boundMessageContent(messageInputs: MessageInput[]): MessageInput
   );
 }
 
+const CONVERSATION_NOT_FOUND = "No conversation with that id exists in this account.";
+
+/**
+ * The answer for a conversation the caller can't write to: absent, another
+ * tenant's, or another seat's private one, indistinguishably. An
+ * HTTPException rather than a bare Error, which reached app.onError as a 500:
+ * a mistyped conversation_id got "internal_error" and landed in the logs as a
+ * server fault. Both layers pass it on: app.onError as this 404, the MCP tool
+ * guard as this JSON body. The message is set as well as the body, so no
+ * reader of it is ever handed an empty string (engram#592).
+ */
+function conversationNotFound(): HTTPException {
+  return new HTTPException(404, {
+    message: CONVERSATION_NOT_FOUND,
+    res: Response.json(
+      { error: "conversation_not_found", message: CONVERSATION_NOT_FOUND },
+      { status: 404 },
+    ),
+  });
+}
+
+/**
+ * Store `messageInputs` (and their vault entries) in a conversation.
+ *
+ * Throws only BEFORE the append commits: the messages, the conversation's
+ * message_count and the vault entries commit in one batch, and everything
+ * after that batch is best-effort and never throws. Callers rely on it: a
+ * throw means no message was stored, so they refund the append's charges
+ * (engram#591), and the client's resend is not a duplicate. (A throw can
+ * leave R2 bodies written for message ids that never got a row; nothing
+ * references them — engram#574 sweeps that prefix.)
+ *
+ * `viewer` is the caller's identity for the private-space rule (engram#264):
+ * another seat's private conversation is answered exactly like a missing
+ * one. Every append surface passes it.
+ */
 export async function appendMessages(
   env: Env,
   organizationId: string,
   conversationId: string,
   messageInputs: MessageInput[],
-  vaultEntries?: VaultEntryInput[]
+  vaultEntries?: VaultEntryInput[],
+  viewer?: AuthContext,
 ): Promise<Message[]> {
   assertWritesEnabled(env);
 
   messageInputs = boundMessageContent(messageInputs);
 
-  // Verify conversation exists and belongs to org. The lookup is org-scoped,
-  // so another tenant's id is indistinguishable from a nonexistent one —
-  // which is the correct answer to give either way.
-  //
-  // Thrown as a 404 HTTPException rather than a bare Error because the bare
-  // Error reached app.onError and became a 500: a client that mistyped a
-  // conversation_id got "internal_error", and every such mistake landed in
-  // the logs as a server fault. The MCP tool pre-checks and returns its own
-  // "Conversation not found", so this is the REST surface's equivalent.
+  // The lookup is org-scoped, so another tenant's id is indistinguishable
+  // from a nonexistent one — the correct answer either way.
   const conv = await getConversationById(env.DB, conversationId, organizationId);
-  if (!conv) {
-    throw new HTTPException(404, {
-      res: Response.json(
-        {
-          error: "conversation_not_found",
-          message: "No conversation with that id exists in this account.",
-        },
-        { status: 404 },
-      ),
-    });
+  if (
+    !conv ||
+    (viewer &&
+      !canAccessConversation(viewer, conv as { visibility?: string | null; seat_id?: string | null }))
+  ) {
+    throw conversationNotFound();
   }
 
   // Get current max sequence
@@ -264,9 +292,29 @@ export async function appendMessages(
     redacted.map((m) => storeContent(env, m.id, m.content))
   );
 
-  // Insert message rows (content lives in R2; D1 row carries the pointer) AND
-  // bump the conversation's message_count in the SAME atomic batch, so the
-  // count can never drift from the actual rows.
+  // Client-encrypted vault entries (zero-knowledge — the server never
+  // decrypts) commit in the same batch as the messages that reference them.
+  const vaultStatements =
+    vaultEntries && vaultEntries.length > 0
+      ? insertVaultEntryStatements(
+          env.DB,
+          vaultEntries.map((e) => ({
+            id: e.id,
+            organizationId,
+            conversationId,
+            messageId: null,
+            secretType: e.secret_type,
+            encryptedValue: e.encrypted_value,
+            iv: e.iv,
+            expiresAt: null,
+          })),
+        )
+      : [];
+
+  // Insert message rows (content lives in R2; D1 row carries the pointer),
+  // bump the conversation's message_count, and store the vault entries in
+  // the SAME atomic batch: the count can never drift from the actual rows,
+  // and no message can be kept while the secrets it points at are lost.
   await insertMessagesWithCount(
     env.DB,
     redacted.map((m, i) => ({
@@ -282,39 +330,23 @@ export async function appendMessages(
       metadata: m.metadata,
     })),
     conversationId,
+    vaultStatements,
   );
-
-  // Store client-encrypted vault entries (zero-knowledge — server never decrypts)
-  if (vaultEntries && vaultEntries.length > 0) {
-    await insertVaultEntries(
-      env.DB,
-      vaultEntries.map((e) => ({
-        id: e.id,
-        organizationId,
-        conversationId,
-        messageId: null,
-        secretType: e.secret_type,
-        encryptedValue: e.encrypted_value,
-        iv: e.iv,
-        expiresAt: null,
-      }))
-    );
+  if (vaultStatements.length > 0) {
     console.log(
-      `[vault] Stored ${vaultEntries.length} encrypted vault entry(ies) for ${conversationId}`
+      `[vault] Stored ${vaultStatements.length} encrypted vault entry(ies) for ${conversationId}`
     );
   }
 
-  // (message_count was bumped atomically with the inserts above.)
-
-  // Chunk the redacted messages for embedding.
-  // Indexing (embeddings + vectorize) is best-effort — if it fails, messages
-  // are still stored. They just won't be searchable until the next successful
-  // index run. This prevents AI model or Vectorize rate limits from crashing
-  // the entire append_messages request.
-  const chunks = chunkMessages(redacted);
-
-  if (chunks.length > 0) {
-    try {
+  // Committed. Nothing below may throw (see the doc comment): indexing
+  // (chunking, embeddings, Vectorize) is best-effort — if it fails, the
+  // messages are still stored and become searchable on the next successful
+  // index run, and an AI-model or Vectorize rate limit can't fail the append.
+  let chunkCount = 0;
+  try {
+    const chunks = chunkMessages(redacted);
+    chunkCount = chunks.length;
+    if (chunks.length > 0) {
       // Generate embeddings for all chunks
       const texts = chunks.map((c) => c.text);
       const embeddings = await generateEmbeddings(env.AI, texts);
@@ -384,13 +416,13 @@ export async function appendMessages(
       } finally {
         await copied;
       }
-    } catch (err) {
-      // Log but don't fail — messages are already stored above.
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(
-        `[index] Failed to index ${chunks.length} chunk(s) for ${conversationId}: ${msg}`,
-      );
     }
+  } catch (err) {
+    // Log but don't fail — messages are already stored above.
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[index] Failed to index ${chunkCount} chunk(s) for ${conversationId}: ${msg}`,
+    );
   }
 
   return messages;

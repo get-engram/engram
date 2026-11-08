@@ -20,12 +20,9 @@ import {
 } from "../services/conversation.js";
 import {
   checkConversationLimit,
-  checkAndTrackMessages,
-  checkAndTrackStorage,
-  checkAndTrackIndexing,
   checkAndTrackSearch,
-  estimateIndexingUnits,
-  releaseStorage,
+  reserveAppend,
+  releaseAppendCharges,
   IndexingQuotaError,
 } from "../services/tier.js";
 import { searchConversations } from "../services/search.js";
@@ -298,69 +295,39 @@ v1.post("/messages", async (c) => {
   if (!parsed.success) {
     return c.json({ error: "invalid_body", details: z.flattenError(parsed.error) }, 400);
   }
-  const count = parsed.data.messages.length;
 
-  // Primary gate: lifetime storage. Atomically reserves space; released
-  // below if a later step rejects or fails.
-  const storageCheck = await checkAndTrackStorage(c.env.DB, auth.organizationId, auth.tier, count);
-  if (!storageCheck.allowed) {
-    return c.json(
-      {
-        error: storageCheck.error,
-        limit: storageCheck.limit,
-        used: storageCheck.used,
-        tier: storageCheck.tier,
-        upgrade_url: "https://getengram.app/pricing",
-      },
-      402,
-    );
-  }
-
-  // Secondary gate: monthly velocity.
-  const tierCheck = await checkAndTrackMessages(c.env.DB, auth.organizationId, auth.tier, count);
-  if (!tierCheck.allowed) {
-    await releaseStorage(c.env.DB, auth.organizationId, count);
-    return c.json(
-      {
-        error: tierCheck.error,
-        limit: tierCheck.limit,
-        used: tierCheck.used,
-        tier: tierCheck.tier,
-        upgrade_url: "https://getengram.app/pricing",
-      },
-      429,
-    );
-  }
-
-  // Tertiary gate (engram#445/#450): the indexing budget, charged in the
-  // unit that costs money — chunks embedded — and never refunded by a
-  // delete, so a save/delete loop can't farm the embedding model.
-  const indexCheck = await checkAndTrackIndexing(
+  // Every gate, in order (engram#591): lifetime storage (402), the month's
+  // message budget, then the indexing budget (429). A refusal has already
+  // given back what the gates before it took.
+  const reserved = await reserveAppend(
     c.env.DB,
     auth.organizationId,
     auth.tier,
-    estimateIndexingUnits(parsed.data.messages),
+    parsed.data.messages,
   );
-  if (!indexCheck.allowed) {
-    await releaseStorage(c.env.DB, auth.organizationId, count);
+  if (!reserved.allowed) {
+    const check = reserved.check;
     return c.json(
       {
-        error: indexCheck.error,
-        limit: indexCheck.limit,
-        used: indexCheck.used,
-        tier: indexCheck.tier,
+        error: check.error,
+        limit: check.limit,
+        used: check.used,
+        tier: check.tier,
         upgrade_url: "https://getengram.app/pricing",
       },
-      429,
+      reserved.gate === "storage" ? 402 : 429,
     );
   }
+  const { storage: storageCheck, messages: tierCheck } = reserved;
 
-  const conversationId =
-    parsed.data.conversation_id ??
-    (await getOrCreateDefaultConversation(c.env.DB, auth.organizationId));
-
+  let conversationId: string;
   let messages;
   try {
+    conversationId =
+      parsed.data.conversation_id ??
+      (await getOrCreateDefaultConversation(c.env.DB, auth.organizationId));
+    // `auth` as the viewer: another seat's private conversation is refused
+    // as not-found here too, as on the MCP tool (engram#264).
     messages = await appendMessages(
       c.env,
       auth.organizationId,
@@ -369,9 +336,13 @@ v1.post("/messages", async (c) => {
         ...m,
         metadata: m.metadata as Record<string, unknown>,
       })),
+      undefined,
+      auth,
     );
   } catch (err) {
-    await releaseStorage(c.env.DB, auth.organizationId, count).catch(() => {});
+    // Nothing was stored (appendMessages throws only before it commits):
+    // give back every charge (engram#591).
+    await releaseAppendCharges(c.env.DB, auth.organizationId, reserved.charges);
     throw err;
   }
 

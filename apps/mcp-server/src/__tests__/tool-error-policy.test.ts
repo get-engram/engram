@@ -150,6 +150,73 @@ describe("tool failure policy (engram#513)", () => {
     expect(log.warn).not.toHaveBeenCalled();
   });
 
+  it("a JSON error body passes through verbatim, so a tool caller reads the code REST callers get (engram#592)", async () => {
+    // The shape that answered with an empty string before: a body, no message.
+    const { server, log } = guardedServer();
+    const body = { error: "conversation_not_found", message: "No such conversation." };
+    server.registerTool("gone", { description: "404", inputSchema: {} }, async () => {
+      throw new HTTPException(404, { res: Response.json(body, { status: 404 }) });
+    });
+    const client = await connect(server);
+    const res = (await client.callTool({ name: "gone", arguments: {} })) as CallToolResult;
+    expect(res.isError).toBe(true);
+    expect(JSON.parse(text(res))).toEqual(body);
+    expect(log.error).not.toHaveBeenCalled();
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it("the code-bearing body wins over the message, and the response stays readable", async () => {
+    const message = "Paused for maintenance.";
+    const err = new HTTPException(503, {
+      message,
+      res: new Response(JSON.stringify({ error: "writes_paused", message }), {
+        status: 503,
+        headers: { "Content-Type": "application/json", "Retry-After": "60" },
+      }),
+    });
+    const res = await toolFailureResult("append_messages", err, silentLog());
+    expect(res.isError).toBe(true);
+    expect(JSON.parse(text(res))).toEqual({ error: "writes_paused", message });
+    // Read through a clone: app.onError could still answer with the original.
+    expect(JSON.parse(await err.getResponse().text()).error).toBe("writes_paused");
+  });
+
+  it("a body that is not a JSON error object falls back to the message", async () => {
+    const cases: Array<[string, Response]> = [
+      ["plain text", new Response("Not here", { status: 404 })],
+      ["no error code", Response.json({ ok: false }, { status: 404 })],
+      ["non-string code", Response.json({ error: 404 }, { status: 404 })],
+      ["array", Response.json([{ error: "x" }], { status: 404 })],
+      ["oversized", Response.json({ error: "x", pad: "y".repeat(5000) }, { status: 404 })],
+      ["empty", new Response("", { status: 404 })],
+    ];
+    for (const [label, body] of cases) {
+      const res = await toolFailureResult(
+        "t",
+        new HTTPException(404, { message: "Conversation not found", res: body }),
+        silentLog(),
+      );
+      expect(text(res), label).toBe("Conversation not found");
+    }
+  });
+
+  it("never answers with an empty string: no message and no code-bearing body names the tool and the status", async () => {
+    for (const err of [
+      new HTTPException(404),
+      new HTTPException(409, { res: new Response("", { status: 409 }) }),
+      new HTTPException(400, { res: Response.json({ ok: false }, { status: 400 }) }),
+    ]) {
+      const log = silentLog();
+      const res = await toolFailureResult("append_messages", err, log);
+      const t = text(res);
+      expect(res.isError).toBe(true);
+      expect(t.trim().length, `HTTP ${err.status}`).toBeGreaterThan(0);
+      expect(t).toContain("append_messages");
+      expect(t).toContain(String(err.status));
+      expect(log.error).not.toHaveBeenCalled();
+    }
+  });
+
   it("an McpError keeps the SDK's own handling", async () => {
     const { server, log } = guardedServer();
     server.registerTool("protocol", { description: "mcp", inputSchema: {} }, async () => {
@@ -187,9 +254,9 @@ describe("tool failure policy (engram#513)", () => {
     expect(log.error).not.toHaveBeenCalled();
   });
 
-  it("a non-Error throw is handled like any other internal failure", () => {
+  it("a non-Error throw is handled like any other internal failure", async () => {
     const log = silentLog();
-    const res = toolFailureResult("odd", "a bare string", log);
+    const res = await toolFailureResult("odd", "a bare string", log);
     expect(res.isError).toBe(true);
     expectGeneric(text(res), "odd");
     expect(String(log.error.mock.calls[0][0])).toContain("a bare string");

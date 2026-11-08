@@ -7,13 +7,16 @@ import {
   type Message,
 } from "@getengram/shared";
 import {
+  getCurrentPeriod,
   getOrCreateUsage,
   atomicIncrementMessages,
   incrementMessagesStored,
+  releaseMessagesStored,
   incrementSearchesRun,
   atomicIncrementSearches,
   incrementChunksIndexed,
   atomicIncrementChunksIndexed,
+  releaseChunksIndexed,
   incrementApiRequests,
   atomicIncrementStorage,
   incrementStorage,
@@ -31,12 +34,12 @@ export interface TierCheckResult {
 }
 
 /**
- * Ensure a usage row exists for the current period and return it.
+ * Ensure a usage row exists for `period` (default: now) and return it.
  * Single D1 round trip via INSERT ... ON CONFLICT ... RETURNING.
  */
-async function ensureUsage(db: D1Database, organizationId: string) {
+async function ensureUsage(db: D1Database, organizationId: string, period?: string) {
   const id = generateId("usg");
-  return getOrCreateUsage(db, id, organizationId);
+  return getOrCreateUsage(db, id, organizationId, period);
 }
 
 /**
@@ -45,21 +48,23 @@ async function ensureUsage(db: D1Database, organizationId: string) {
  * pass the check but together exceed the limit.
  *
  * For unlimited tiers, skips the atomic check and just increments.
+ * `period` pins every statement to one month (see reserveAppend).
  */
 export async function checkAndTrackMessages(
   db: D1Database,
   organizationId: string,
   tier: Tier,
   messageCount: number,
+  period: string = getCurrentPeriod(),
 ): Promise<TierCheckResult> {
   const limits = TIER_LIMITS[tier];
 
   // Ensure usage row exists
-  await ensureUsage(db, organizationId);
+  await ensureUsage(db, organizationId, period);
 
   // Unlimited tier — just increment, no limit check
   if (limits.messages_per_month === -1) {
-    await incrementMessagesStored(db, organizationId, messageCount);
+    await incrementMessagesStored(db, organizationId, messageCount, period);
     return { allowed: true };
   }
 
@@ -69,11 +74,12 @@ export async function checkAndTrackMessages(
     organizationId,
     messageCount,
     limits.messages_per_month,
+    period,
   );
 
   if (!result) {
     // Limit would be exceeded — fetch current usage for error message
-    const usage = await ensureUsage(db, organizationId);
+    const usage = await ensureUsage(db, organizationId, period);
     const used = (usage as { messages_stored: number }).messages_stored;
     return {
       allowed: false,
@@ -226,28 +232,30 @@ export class IndexingQuotaError extends Error {
 /**
  * Reserve `units` chunks of the period's indexing budget (engram#445,
  * #450) — the number of embeddings about to be generated, on append or on
- * an edit/delete re-index. The counter is monotonic: deleting frees
- * storage but never refunds indexing, so a save/delete loop cannot re-run
- * the embedding model past the budget. Tiers without a budget just count.
+ * an edit/delete re-index. Deleting frees storage but never refunds
+ * indexing, so a save/delete loop cannot re-run the embedding model past
+ * the budget; the only refund is an append that stored nothing
+ * (releaseAppendCharges). Tiers without a budget just count.
  */
 export async function checkAndTrackIndexing(
   db: D1Database,
   organizationId: string,
   tier: Tier,
   units: number,
+  period: string = getCurrentPeriod(),
 ): Promise<TierCheckResult> {
   const limit = TIER_LIMITS[tier].chunks_indexed_per_month;
   if (units <= 0) return { allowed: true, limit, tier };
-  await ensureUsage(db, organizationId);
+  await ensureUsage(db, organizationId, period);
 
   if (limit === -1) {
-    await incrementChunksIndexed(db, organizationId, units);
+    await incrementChunksIndexed(db, organizationId, units, period);
     return { allowed: true, tier };
   }
 
-  const result = await atomicIncrementChunksIndexed(db, organizationId, units, limit);
+  const result = await atomicIncrementChunksIndexed(db, organizationId, units, limit, period);
   if (!result) {
-    const usage = (await ensureUsage(db, organizationId)) as { chunks_indexed?: number } | null;
+    const usage = (await ensureUsage(db, organizationId, period)) as { chunks_indexed?: number } | null;
     return {
       allowed: false,
       error: "indexing_quota_exceeded",
@@ -280,8 +288,9 @@ export function storageLimitFor(tier: Tier, seatLimit?: number | null): number {
 
 /**
  * Atomically check the lifetime storage cap AND increment the counter.
- * Same race-safe reserve-then-write pattern as checkAndTrackMessages;
- * callers must releaseStorage() if the write that follows fails.
+ * Same race-safe reserve-then-write pattern as checkAndTrackMessages.
+ * Appends reach it through reserveAppend, which gives the reservation
+ * back (releaseAppendCharges) if a later gate refuses or the write fails.
  */
 export async function checkAndTrackStorage(
   db: D1Database,
@@ -318,10 +327,9 @@ export async function checkAndTrackStorage(
 }
 
 /**
- * Give reserved storage back — when the monthly gate rejects after the
- * storage reservation, when the write itself fails, or when a
- * conversation is deleted (freeing space is a feature: memory is never
- * expired, but the user can always make room).
+ * Give storage back when messages are deleted (freeing space is a feature:
+ * memory is never expired, but the user can always make room). A refused
+ * or failed append refunds through releaseAppendCharges instead.
  */
 export async function releaseStorage(
   db: D1Database,
@@ -330,6 +338,133 @@ export async function releaseStorage(
 ) {
   if (messageCount <= 0) return;
   await decrementStorage(db, organizationId, messageCount);
+}
+
+/**
+ * Everything one append has been charged (engram#591): what a refusal or
+ * a failed write must give back. Every append surface charges through
+ * reserveAppend and refunds through releaseAppendCharges, so the order of
+ * the gates and what each one refunds live in one place.
+ */
+export interface AppendCharges {
+  /** The month the per-period counters were charged in. */
+  readonly period: string;
+  /** Messages reserved against the lifetime storage cap. */
+  storage: number;
+  /** Messages counted against the month's message budget. */
+  messages: number;
+  /** Chunks counted against the month's indexing budget. */
+  chunks: number;
+}
+
+/** The gate that refused an append; nothing it charged is still held. */
+export type AppendGate = "storage" | "messages" | "indexing";
+
+export type AppendReservation =
+  | {
+      allowed: true;
+      charges: AppendCharges;
+      storage: TierCheckResult;
+      messages: TierCheckResult;
+      indexing: TierCheckResult;
+    }
+  | { allowed: false; gate: AppendGate; check: TierCheckResult };
+
+type ReleaseLog = Pick<Console, "error">;
+
+/**
+ * Give back everything `charges` holds, then zero it so a second call
+ * refunds nothing. Only for an append that stored nothing — refused by a
+ * later gate or check, or its write threw (appendMessages throws only
+ * before it commits) — so nothing was embedded either, and refunding the
+ * indexing charge is not the save/delete loophole the monotonic counter
+ * closes: a delete still never refunds it.
+ *
+ * Never throws. Each counter is released on its own; one that fails is
+ * logged and left charged, so an org can end up over-charged by a failed
+ * refund but never under-charged, and the caller's own answer (a refusal,
+ * or the original error) is never replaced by a refund error.
+ */
+export async function releaseAppendCharges(
+  db: D1Database,
+  organizationId: string,
+  charges: AppendCharges,
+  log: ReleaseLog = console,
+): Promise<void> {
+  const { storage, messages, chunks, period } = charges;
+  charges.storage = 0;
+  charges.messages = 0;
+  charges.chunks = 0;
+  const steps: Array<[string, number, () => Promise<unknown>]> = [
+    ["storage", storage, () => decrementStorage(db, organizationId, storage)],
+    ["messages", messages, () => releaseMessagesStored(db, organizationId, messages, period)],
+    ["indexing", chunks, () => releaseChunksIndexed(db, organizationId, chunks, period)],
+  ];
+  for (const [name, amount, release] of steps) {
+    if (amount <= 0) continue;
+    try {
+      await release();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.error(`[append] could not refund ${amount} ${name} for ${organizationId}: ${msg}`);
+    }
+  }
+}
+
+/**
+ * Charge one append against every gate, in order (engram#275, #445/#450):
+ * lifetime storage (atomically reserved), the month's message budget (a
+ * velocity guard on paid tiers; free has none), then the month's indexing
+ * budget, in the unit that costs money — chunks embedded, computed with
+ * the real chunker. A refusal gives back what the gates before it took
+ * and names the gate; nothing stays charged for a refused append. On
+ * success the caller owns `charges` and must hand them to
+ * releaseAppendCharges if anything before the commit refuses or throws.
+ *
+ * All per-period statements use one captured period, so an append that
+ * straddles midnight UTC on the 1st charges, and refunds, one month.
+ */
+export async function reserveAppend(
+  db: D1Database,
+  organizationId: string,
+  tier: Tier,
+  messages: ReadonlyArray<{ role: string; content: string }>,
+): Promise<AppendReservation> {
+  const count = messages.length;
+  const charges: AppendCharges = {
+    period: getCurrentPeriod(),
+    storage: 0,
+    messages: 0,
+    chunks: 0,
+  };
+
+  const storage = await checkAndTrackStorage(db, organizationId, tier, count);
+  if (!storage.allowed) return { allowed: false, gate: "storage", check: storage };
+  charges.storage = count;
+
+  try {
+    const monthly = await checkAndTrackMessages(db, organizationId, tier, count, charges.period);
+    if (!monthly.allowed) {
+      await releaseAppendCharges(db, organizationId, charges);
+      return { allowed: false, gate: "messages", check: monthly };
+    }
+    charges.messages = count;
+
+    const units = estimateIndexingUnits(messages);
+    const indexing = await checkAndTrackIndexing(db, organizationId, tier, units, charges.period);
+    if (!indexing.allowed) {
+      await releaseAppendCharges(db, organizationId, charges);
+      return { allowed: false, gate: "indexing", check: indexing };
+    }
+    charges.chunks = Math.max(0, units);
+
+    return { allowed: true, charges, storage, messages: monthly, indexing };
+  } catch (err) {
+    // A gate threw (D1 trouble). Refund only what is known to be charged:
+    // a charge whose statement may or may not have landed stays charged.
+    await releaseAppendCharges(db, organizationId, charges);
+    throw err;
+  }
 }
 
 export function checkConversationLimit(

@@ -15,22 +15,14 @@ import {
   storageFullMessage,
   approachingStorageNotice,
 } from "../usage-messaging.js";
-import {
-  checkAndTrackMessages,
-  checkAndTrackStorage,
-  checkAndTrackIndexing,
-  estimateIndexingUnits,
-  releaseStorage,
-} from "../../services/tier.js";
+import { reserveAppend, releaseAppendCharges } from "../../services/tier.js";
 import { fireWebhooks } from "../../services/webhooks.js";
 import { checkMilestone } from "../../services/milestones.js";
-import { canAccessConversation } from "../../services/spaces.js";
 import {
   MAX_MESSAGES_PER_APPEND,
   MAX_MESSAGES_PER_APPEND_CONNECTOR,
   MAX_MESSAGE_METADATA_CHARS,
 } from "@getengram/shared";
-import { getConversationById } from "@getengram/db";
 import { audit } from "../../services/audit.js";
 import { hasScope, scopeError } from "../scopes.js";
 import type { Env, AuthContext } from "../../types.js";
@@ -163,29 +155,40 @@ export function registerAppendMessages(
       const vaultEntries = (params as { vault_entries?: VaultEntryInput[] })
         .vault_entries;
 
-      // Primary gate (engram#275): lifetime storage. Atomically reserves
-      // space; released below if a later step rejects or fails.
-      const storageCheck = await checkAndTrackStorage(
+      // Every gate, in order, in one place (engram#591): lifetime storage
+      // (engram#275), the month's message budget (a velocity guard on paid
+      // tiers; free has none), then the indexing budget in chunks embedded
+      // (engram#445/#450). A refusal has already given back what the gates
+      // before it took.
+      const reserved = await reserveAppend(
         env.DB,
         auth.organizationId,
         auth.tier,
-        count
+        params.messages,
       );
 
-      if (!storageCheck.allowed) {
+      if (!reserved.allowed) {
+        const check = reserved.check;
+        const message =
+          reserved.gate === "storage"
+            ? storageFullMessage({ limit: check.limit, isOAuth })
+            : limitMessage({
+                unit: reserved.gate,
+                tier: check.tier,
+                limit: check.limit,
+                used: check.used,
+                isOAuth,
+              });
         return {
           content: [
             {
               type: "text" as const,
               text: JSON.stringify({
-                error: storageCheck.error,
-                message: storageFullMessage({
-                  limit: storageCheck.limit,
-                  isOAuth,
-                }),
-                limit: storageCheck.limit,
-                used: storageCheck.used,
-                tier: storageCheck.tier,
+                error: check.error,
+                message,
+                limit: check.limit,
+                used: check.used,
+                tier: check.tier,
                 upgrade_url: isOAuth
                   ? "https://getengram.app/dashboard"
                   : "https://getengram.app/pricing",
@@ -195,105 +198,19 @@ export function registerAppendMessages(
           isError: true,
         };
       }
+      const { storage: storageCheck, messages: tierCheck } = reserved;
 
-      // Secondary gate: monthly velocity (abuse guard on paid tiers;
-      // unlimited on free — the storage cap is free's only gate).
-      const tierCheck = await checkAndTrackMessages(
-        env.DB,
-        auth.organizationId,
-        auth.tier,
-        count
-      );
-
-      if (!tierCheck.allowed) {
-        // Give the reserved storage back — nothing was written.
-        await releaseStorage(env.DB, auth.organizationId, count);
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({
-                error: tierCheck.error,
-                message: limitMessage({
-                  unit: "messages",
-                  tier: tierCheck.tier,
-                  limit: tierCheck.limit,
-                  used: tierCheck.used,
-                  isOAuth,
-                }),
-                limit: tierCheck.limit,
-                used: tierCheck.used,
-                tier: tierCheck.tier,
-                upgrade_url: isOAuth
-                  ? "https://getengram.app/dashboard"
-                  : "https://getengram.app/pricing",
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // Tertiary gate (engram#445/#450): the indexing budget, charged in
-      // the unit that costs money — chunks embedded — and never refunded
-      // by a delete, so a save/delete loop can't farm the embedding model.
-      const indexCheck = await checkAndTrackIndexing(
-        env.DB,
-        auth.organizationId,
-        auth.tier,
-        estimateIndexingUnits(params.messages)
-      );
-
-      if (!indexCheck.allowed) {
-        await releaseStorage(env.DB, auth.organizationId, count);
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({
-                error: indexCheck.error,
-                message: limitMessage({
-                  unit: "indexing",
-                  tier: indexCheck.tier,
-                  limit: indexCheck.limit,
-                  used: indexCheck.used,
-                  isOAuth,
-                }),
-                limit: indexCheck.limit,
-                used: indexCheck.used,
-                tier: indexCheck.tier,
-                upgrade_url: isOAuth
-                  ? "https://getengram.app/dashboard"
-                  : "https://getengram.app/pricing",
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // No conversation_id → append to the org's default memory (find-or-create).
-      const conversationId =
-        params.conversation_id ??
-        (await getOrCreateDefaultConversation(env.DB, auth.organizationId));
-
-      // Private-space enforcement (engram#264): appending into another
-      // seat's private conversation is refused as not-found.
-      if (params.conversation_id) {
-        const conv = await getConversationById(env.DB, params.conversation_id, auth.organizationId);
-        if (conv && !canAccessConversation(auth, conv as { visibility?: string | null; seat_id?: string | null })) {
-          await releaseStorage(env.DB, auth.organizationId, count);
-          return {
-            content: [
-              { type: "text" as const, text: JSON.stringify({ error: "Conversation not found" }) },
-            ],
-            isError: true,
-          };
-        }
-      }
-
+      let conversationId: string;
       let messages;
       try {
+        // No conversation_id → append to the org's default memory (find-or-create).
+        conversationId =
+          params.conversation_id ??
+          (await getOrCreateDefaultConversation(env.DB, auth.organizationId));
+
+        // appendMessages refuses a conversation this caller can't write to
+        // (absent, another tenant's, another seat's private one — engram#264)
+        // as not-found, before anything is stored.
         messages = await appendMessages(
           env,
           auth.organizationId,
@@ -304,12 +221,14 @@ export function registerAppendMessages(
             const meta = (m as { metadata?: Record<string, unknown> }).metadata;
             return { ...m, metadata: meta };
           }),
-          vaultEntries
+          vaultEntries,
+          auth,
         );
       } catch (err) {
-        // The write failed — free the reserved storage so the lifetime
-        // counter tracks what's actually stored.
-        await releaseStorage(env.DB, auth.organizationId, count).catch(() => {});
+        // Nothing was stored (appendMessages throws only before it commits),
+        // so every charge goes back: a refused or failed append costs nothing,
+        // and a client that retries one can't drain the budgets (engram#591).
+        await releaseAppendCharges(env.DB, auth.organizationId, reserved.charges);
         throw err;
       }
 

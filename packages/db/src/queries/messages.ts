@@ -61,6 +61,10 @@ function insertMessageStatements(
  * drifting below the real row count — the same "counter maintained by
  * convention" class that miscounted ~984 orgs' storage totals. One batch means
  * they can never diverge.
+ *
+ * `extra` statements commit in the same batch: rows that must exist exactly
+ * when these messages do (the append's vault entries, engram#591). Either
+ * everything is written or nothing is.
  */
 export function insertMessagesWithCount(
   db: D1Database,
@@ -77,6 +81,7 @@ export function insertMessagesWithCount(
     metadata: Record<string, unknown>;
   }>,
   conversationId: string,
+  extra: D1PreparedStatement[] = [],
 ) {
   return db.batch([
     ...insertMessageStatements(db, messages),
@@ -85,6 +90,7 @@ export function insertMessagesWithCount(
         "UPDATE conversations SET message_count = message_count + ?, updated_at = datetime('now') WHERE id = ?",
       )
       .bind(messages.length, conversationId),
+    ...extra,
   ]);
 }
 

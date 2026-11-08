@@ -109,8 +109,8 @@ function check(ok, what) {
 
 /**
  * Run the built CLI as a user would; colours stripped from the output.
- * `daemon status`, not `status`: a bare `engram status` runs `engram usage`,
- * which asks the server (engram#609).
+ * Most checks use `daemon status`, the daemon alone. `engram status` also
+ * asks the server for usage, which is unreachable here (engram#609).
  */
 function engram(...args) {
   const r = spawnSync(node, [CLI, ...args], {
@@ -193,6 +193,12 @@ try {
   check(!existsSync(join(home, "Library")), "nothing launchd-shaped is written");
   r = engram("daemon", "status");
   check(/Status: running/.test(r.out), "status says running");
+
+  // ── engram status: the daemon, then usage, with the API unreachable (engram#609) ──
+  r = engram("status");
+  check(r.status === 0, "engram status exits 0 offline");
+  check(/Status: running/.test(r.out), "engram status shows the daemon");
+  check(/Plan and usage: couldn't reach/.test(r.out), "engram status says usage is unreachable, in one line");
 
   if (WINDOWS) {
     // ── engram start --install, the command in the report ──

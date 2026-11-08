@@ -19,6 +19,7 @@ import { daemonStart, daemonStop, daemonStatus, daemonInstall, daemonUninstall }
 import { autoEnableCapture } from "./daemon/commands.js";
 import { upgrade } from "./commands/upgrade.js";
 import { usage as showUsage } from "./commands/usage.js";
+import { status as showStatus } from "./commands/status.js";
 import { vaultKeygen, vaultStatus, loadVaultKey, vaultSet, vaultGet, vaultList, vaultDelete } from "./commands/vault.js";
 import { excludeAdd, excludeRemove, excludeList } from "./commands/exclude.js";
 import { bold, dim, red } from "./output.js";
@@ -176,7 +177,7 @@ ${bold("COMMANDS")}
 
   ${bold("start")}                    Start background daemon (auto-capture)
   ${bold("stop")}                     Stop the daemon
-  ${bold("status")}                   Show daemon status and sync info
+  ${bold("status")}                   Show daemon status, sync info, and plan usage
   ${bold("install")}                  Start the daemon at login ${dim("(macOS, Windows)")}
   ${bold("uninstall")}                Turn off start at login
 
@@ -260,6 +261,8 @@ async function main(): Promise<void> {
   const CAPTURE_EXEMPT = new Set([
     "help", "version", "start", "stop", "restart", "install", "uninstall",
     "status", "log", "signup", "login", "link", "auth login", "auth logout",
+    // The `daemon` spellings of the same commands (engram#609).
+    "daemon start", "daemon stop", "daemon status", "daemon install", "daemon uninstall",
     // A user configuring exclusions is expressing a privacy preference —
     // that must never silently resurrect the capture daemon (engram#462).
     "exclude", "exclude add", "exclude remove", "exclude rm", "exclude list", "exclude ls",
@@ -269,8 +272,9 @@ async function main(): Promise<void> {
   // The daemon is headless, so a full memory would otherwise only ever be
   // visible in ~/.engram/daemon.log. Surface it on the next interactive
   // command instead — this is the moment the user is actually looking.
-  // `status` and `usage` print their own detail, so skip the banner there.
-  if (cmd !== "status" && cmd !== "usage") {
+  // The status commands and `usage` print their own detail, so skip the
+  // banner there.
+  if (cmd !== "status" && cmd !== "daemon status" && cmd !== "usage") {
     printSyncBanner();
   }
 
@@ -358,8 +362,13 @@ async function main(): Promise<void> {
         break;
 
       case "usage":
-      case "status":
         await showUsage(args, flags);
+        break;
+
+      // The daemon on this machine, then the account's plan and usage
+      // (engram#609). `engram daemon status` shows the daemon alone.
+      case "status":
+        await showStatus(args, flags);
         break;
 
       // Vault commands
@@ -417,7 +426,6 @@ async function main(): Promise<void> {
         await daemonStop();
         break;
 
-      case "status":
       case "daemon status":
         await daemonStatus();
         break;

@@ -4,6 +4,9 @@ import { readStatus } from "../daemon/status.js";
 
 const API_URL = process.env.ENGRAM_BASE_URL ?? getBaseUrl();
 
+/** How long to wait for the API before calling it unreachable. */
+const USAGE_TIMEOUT_MS = 15_000;
+
 /** Render a progress bar like "[████████████░░░░░░░░] 62%". Exported for tests. */
 export function renderBar(used: number, limit: number, width = 20): string {
   const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
@@ -16,12 +19,72 @@ export function renderBar(used: number, limit: number, width = 20): string {
 
 const fmt = (n: number) => n.toLocaleString("en-US");
 
-interface UsageResponse {
+export interface UsageResponse {
   tier: string;
   period: string | null;
   messages: { used: number; limit: number };
   storage?: { used: number; limit: number };
   searches: { used: number };
+}
+
+/** What asking the API for the account's plan and usage came to. */
+export type UsageResult =
+  | { kind: "ok"; data: UsageResponse }
+  | { kind: "signed-out" }
+  | { kind: "rejected" }
+  | { kind: "failed"; status: number }
+  | { kind: "unreachable"; url: string };
+
+/** Fetch the account's plan and usage. Never throws. */
+export async function fetchUsage(): Promise<UsageResult> {
+  const config = await loadConfig();
+  const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
+  if (!apiKey) return { kind: "signed-out" };
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/api/usage`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(USAGE_TIMEOUT_MS),
+    });
+  } catch {
+    // Offline, a DNS failure, a refused connection, or no answer in time.
+    return { kind: "unreachable", url: API_URL };
+  }
+  if (res.status === 401 || res.status === 403) return { kind: "rejected" };
+  if (!res.ok) return { kind: "failed", status: res.status };
+  try {
+    return { kind: "ok", data: (await res.json()) as UsageResponse };
+  } catch {
+    return { kind: "failed", status: res.status };
+  }
+}
+
+/** Say on stderr why the plan and usage couldn't be shown. */
+export function printUsageError(result: Exclude<UsageResult, { kind: "ok" }>): void {
+  switch (result.kind) {
+    case "signed-out":
+      console.error(red("Not authenticated. Run 'engram signup' first."));
+      break;
+    case "rejected":
+      // Every rejected-key notice the daemon gives says to run `engram
+      // status`, which shows this, so a bare "Failed to fetch usage (401)"
+      // was a dead end at exactly the moment someone followed it
+      // (engram#587).
+      console.error(red("Your API key was rejected — run 'engram auth login'."));
+      if (process.env.ENGRAM_API_KEY) {
+        console.error(
+          dim("  ENGRAM_API_KEY is set in this shell, and it is used in place of the key 'engram auth login' saves."),
+        );
+      }
+      break;
+    case "failed":
+      console.error(red(`Failed to fetch usage (${result.status}).`));
+      break;
+    case "unreachable":
+      console.error(red(`Couldn't reach Engram at ${result.url}.`));
+      break;
+  }
 }
 
 /**
@@ -31,43 +94,22 @@ export async function usage(
   _args: string[],
   flags: Record<string, string>,
 ): Promise<void> {
-  const config = await loadConfig();
-  const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
-
-  if (!apiKey) {
-    console.error(red("Not authenticated. Run 'engram signup' first."));
+  const result = await fetchUsage();
+  if (result.kind !== "ok") {
+    printUsageError(result);
     process.exit(1);
   }
-
-  const res = await fetch(`${API_URL}/api/usage`, {
-    headers: { Authorization: `Bearer ${apiKey}` },
-  });
-
-  // Every rejected-key notice the daemon gives says to run `engram status`
-  // (this command), so a bare "Failed to fetch usage (401)" here was a dead
-  // end at exactly the moment someone followed it (engram#587).
-  if (res.status === 401 || res.status === 403) {
-    console.error(red("Your API key was rejected — run 'engram auth login'."));
-    if (process.env.ENGRAM_API_KEY) {
-      console.error(
-        dim("  ENGRAM_API_KEY is set in this shell, and it is used in place of the key 'engram auth login' saves."),
-      );
-    }
-    process.exit(1);
-  }
-
-  if (!res.ok) {
-    console.error(red(`Failed to fetch usage (${res.status}).`));
-    process.exit(1);
-  }
-
-  const data = (await res.json()) as UsageResponse;
 
   if ("json" in flags) {
-    printJson(data);
+    printJson(result.data);
     return;
   }
 
+  printUsage(result.data);
+}
+
+/** The plan, the meters, and any memory-full warning. */
+export function printUsage(data: UsageResponse): void {
   console.log(`\n${bold("Plan:")} ${data.tier}\n`);
 
   if (data.storage) {

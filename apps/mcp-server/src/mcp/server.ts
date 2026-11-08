@@ -30,13 +30,13 @@ import type { Env, AuthContext } from "../types.js";
 export const SERVER_INSTRUCTIONS = `Engram provides persistent, user-controlled memory: conversation content the user chooses to save, stored verbatim and searchable by meaning across their connected apps.
 
 Tool applicability:
-- \`search\`: applicable when previously saved context is relevant to the user's request, or when the user asks what is remembered about a topic. Results include a chunk_summary for choosing among matches; chunk_text or \`get_conversation\` provide full context. Answers about stored memory should come from search results, which reflect what is actually stored.
-- \`append_messages\`: stores the specific content the user asks to remember ("remember this", "save my preference for X"), verbatim. It takes only the message or messages the user pointed at, not the conversation as a whole. conversation_id is optional; when omitted, content is stored in the user's default memory. A brief confirmation when saving keeps the user informed. Trivial chatter (greetings, acknowledgements) is not meaningful to store.
+- \`search\`: applicable when previously saved context is relevant to the user's request, or when the user asks what is remembered about a topic. Results include a chunk_summary for choosing among matches; chunk_text or \`get_conversation\` provide full context. Search results reflect what is actually stored.
+- \`append_messages\`: stores the specific content the user asks to remember ("remember this", "save my preference for X"), verbatim. It takes only the message or messages the user pointed at, not the conversation as a whole. conversation_id is optional; when omitted, content is stored in the user's default memory. Trivial chatter (greetings, acknowledgements) is not meaningful to store.
 - \`create_conversation\`: groups content for a distinct topic under its own conversation id, which can then be reused for related saves.
 - \`delete_conversation\`: permanently removes a stored conversation.
 - \`memory_status\`: reports storage usage and plan state, for questions like "how full is my memory?".
 - Engram stores text only; the content of an image can be stored as a written description.
-- Engram has no access to conversations outside the ones stored in it: past or external chat history cannot be retrieved or reconstructed. Users can bulk-import exported history from their account dashboard.`;
+- Engram has no access to conversations outside the ones stored in it: past or external chat history cannot be retrieved or reconstructed.`;
 
 // Secrets guidance differs by connection kind: OAuth connectors can't see
 // the vault tools (app marketplaces prohibit credential collection), which

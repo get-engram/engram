@@ -1,7 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
-import { SERVER_INSTRUCTIONS } from "../mcp/server.js";
+import {
+  SERVER_INSTRUCTIONS,
+  VAULT_INSTRUCTIONS_OAUTH,
+  VAULT_INSTRUCTIONS_FIRST_PARTY,
+} from "../mcp/server.js";
 
 /**
  * Anthropic's directory review rejected this listing on 2026-09-21 for text
@@ -88,5 +92,37 @@ describe("Claude directory policy", () => {
     const src = readFileSync(resolve(TOOLS_DIR, "create-conversation.ts"), "utf-8");
     expect(src).toMatch(/visible to the whole team by default/i);
     expect(src).toMatch(/'private'/);
+  });
+
+  it("append_messages says where saved text goes, how to remove it, and who can see it (review, 2026-11-07)", () => {
+    // The reviewer asked for this at save time, not only in create_conversation:
+    // the default memory conversation is shared org-wide too.
+    const src = readFileSync(resolve(TOOLS_DIR, "append-messages.ts"), "utf-8");
+    expect(src).toMatch(/sent to and stored on Engram's servers/);
+    expect(src).toMatch(/view saved messages with get_conversation/);
+    expect(src).toMatch(/delete them with delete_conversation/);
+    expect(src).toMatch(/visible to the whole team by default/i);
+    expect(src).toMatch(/'private'/);
+  });
+
+  it("describes schema fields without telling the model what to pass on (review, 2026-11-07)", () => {
+    for (const { file, text } of toolSources) {
+      const described = text.match(/\.describe\(\s*(["'`])(?:\\.|(?!\1)[^\\])*\1/g) ?? [];
+      for (const d of described) {
+        expect(d, file).not.toMatch(/relay|tell the user|worth (mentioning|sharing)/i);
+      }
+    }
+  });
+
+  it("keeps the dashboard and history import out of the instructions (review, 2026-11-07)", () => {
+    // "Move the import description to the docs": the dashboard pointer read
+    // as marketing, and import is not something any tool here does.
+    for (const text of [
+      SERVER_INSTRUCTIONS + VAULT_INSTRUCTIONS_OAUTH,
+      SERVER_INSTRUCTIONS + VAULT_INSTRUCTIONS_FIRST_PARTY,
+    ]) {
+      expect(text).not.toMatch(/dashboard/i);
+      expect(text).not.toMatch(/\bimport(s|ed|ing)?\b/i);
+    }
   });
 });

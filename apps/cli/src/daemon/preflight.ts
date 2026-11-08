@@ -71,6 +71,9 @@ export function ensureNativeSqlite(
         cwd: ownerDir,
         stdio: "pipe",
         timeout: 180_000,
+        // The daemon has no console; on Windows a rebuild would otherwise
+        // open one, and the compiler's, in front of the user (engram#602).
+        windowsHide: true,
       });
       // Re-probe, not re-require: the failed module stays in require's
       // cache, so only a fresh open proves the rebuild took.

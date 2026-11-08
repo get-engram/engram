@@ -41,4 +41,12 @@ describe("daemon ABI preflight", () => {
     // returns the broken one and reports a repair that did not happen.
     expect(SRC).toMatch(/delete req\.cache/);
   });
+
+  it("rebuilds without opening a console window on Windows", () => {
+    // The daemon is detached and has no console, so on Windows every child
+    // it starts gets a new, visible one unless it asks not to (engram#602).
+    expect(SRC).toMatch(
+      /execSync\("npm rebuild better-sqlite3",\s*\{[^}]*windowsHide:\s*true/,
+    );
+  });
 });

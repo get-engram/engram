@@ -380,10 +380,13 @@ export class Parser implements LineParser {
 /**
  * Project name from a Claude Code transcript path:
  * ~/.claude/projects/-Users-op-code-engram/session.jsonl → "engram"
- * (the last segment of the hyphen-encoded project directory).
+ * C:\Users\op\.claude\projects\C--Users-op-code-engram\session.jsonl → "engram"
+ * (the last segment of the hyphen-encoded project directory). Either
+ * separator: split on "/" alone, every Windows conversation was filed under
+ * "unknown" (engram#602).
  */
 export function claudeProjectDir(filePath: string): string {
-  const parts = filePath.split("/");
+  const parts = filePath.split(/[\\/]/);
   const projectsIdx = parts.indexOf("projects");
   if (projectsIdx >= 0 && projectsIdx + 1 < parts.length) {
     const dirName = parts[projectsIdx + 1];

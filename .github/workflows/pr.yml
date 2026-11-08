@@ -43,6 +43,11 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # Start and stop the real daemon from the build (engram#602).
+      - name: Daemon smoke test
+        working-directory: apps/cli
+        run: node scripts/smoke-daemon.mjs
+
       # `pnpm build` runs `wrangler deploy --dry-run`, which only bundles the
       # worker; nothing evaluates the result. Boot it in workerd so an error
       # thrown while the module graph loads blocks the merge instead of failing
@@ -50,3 +55,44 @@ jobs:
       - name: Boot worker bundle in workerd
         working-directory: apps/mcp-server
         run: pnpm smoke:bundle
+
+  # The daemon has Windows-only code paths (the worker's path, start at login
+  # through the Run key, reg.exe) that nothing else here runs (engram#602).
+  cli-windows:
+    name: CLI on Windows (daemon start, start at login)
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      # Windows runners check text files out with CRLF line endings, which
+      # the tests' expected output doesn't have.
+      - name: Keep line endings as committed
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the CLI
+        run: pnpm --filter '@getengram/cli...' build
+
+      - name: Test the CLI
+        working-directory: apps/cli
+        run: pnpm test
+
+      - name: Daemon smoke test
+        working-directory: apps/cli
+        run: node scripts/smoke-daemon.mjs

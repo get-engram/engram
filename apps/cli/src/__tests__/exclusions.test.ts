@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,6 +9,7 @@ import {
   hasIgnoreMarker,
   isPathExcluded,
   resetExclusionCaches,
+  samePath,
   IGNORE_MARKER,
 } from "../daemon/exclusions.js";
 import { DaemonDb } from "../daemon/db.js";
@@ -87,6 +88,34 @@ describe("path exclusion matching", () => {
   it("normalizes trailing separators", () => {
     expect(normalizeExcludePath("/a/b/")).toBe(normalizeExcludePath("/a/b"));
   });
+
+  // engram#619: an exclusion typed as ~/Code/Client let sessions recorded in
+  // ~/code/client through, though on macOS and Windows they're one directory.
+  it("ignores case and Unicode normalization on macOS and Windows, not on Linux", () => {
+    const excluded = normalizeExcludePath("/Users/x/Code/Client");
+    for (const platform of ["darwin", "win32"] as const) {
+      expect(isUnder("/Users/x/code/client/src", excluded, platform), platform).toBe(true);
+      expect(isUnder("/users/X/CODE/CLIENT", excluded, platform), platform).toBe(true);
+      expect(isUnder("/Users/x/code/client2", excluded, platform), platform).toBe(false);
+    }
+    expect(isUnder("/Users/x/code/client", excluded, "linux")).toBe(false);
+    expect(isUnder("/Users/x/Code/Client/src", excluded, "linux")).toBe(true);
+
+    // é as one code point, then as e + a combining accent.
+    const cafe = normalizeExcludePath("/Users/x/caf\u00e9");
+    expect(isUnder("/Users/x/cafe\u0301/notes", cafe, "darwin")).toBe(true);
+  });
+
+  it("samePath follows the platform's rules", () => {
+    expect(samePath("/a/Repo", "/a/repo", "darwin")).toBe(true);
+    expect(samePath("/a/Repo/", "/a/repo", "win32")).toBe(true);
+    expect(samePath("/a/Repo", "/a/repo", "linux")).toBe(false);
+    expect(samePath("/a/repo/", "/a/repo", "linux")).toBe(true);
+  });
+
+  it.runIf(process.platform === "win32")("treats C:\\ and c:\\ as one drive", () => {
+    expect(isUnder("C:\\work\\client\\src", normalizeExcludePath("c:\\Work\\Client"))).toBe(true);
+  });
 });
 
 describe(".engramignore markers + config integration", () => {
@@ -127,6 +156,28 @@ describe(".engramignore markers + config integration", () => {
     writeFileSync(cfg, JSON.stringify({ excludePaths: [repo] }));
     expect(isPathExcluded(repo, cfg)).toBe(true);
     expect(isPathExcluded(join(repo, "sub"), cfg)).toBe(true);
+    expect(isPathExcluded(join(dir, "other"), cfg)).toBe(false);
+  });
+
+  // engram#619: agents record the directory with symlinks resolved, and
+  // people often type the path through a link (or the other way round).
+  it("matches an exclusion typed through a symlink, and the reverse", () => {
+    const real = join(dir, "real");
+    mkdirSync(join(real, "sub"), { recursive: true });
+    const link = join(dir, "link");
+    symlinkSync(real, link, "junction"); // a junction needs no admin rights on Windows
+    const cfg = join(dir, "config.json");
+
+    writeFileSync(cfg, JSON.stringify({ excludePaths: [link] }));
+    resetExclusionCaches();
+    expect(isPathExcluded(join(realpathSync.native(real), "sub"), cfg)).toBe(true);
+
+    writeFileSync(cfg, JSON.stringify({ excludePaths: [real] }));
+    resetExclusionCaches();
+    expect(isPathExcluded(join(link, "sub"), cfg)).toBe(true);
+
+    // A sibling of the target stays captured.
+    mkdirSync(join(dir, "other"), { recursive: true });
     expect(isPathExcluded(join(dir, "other"), cfg)).toBe(false);
   });
 

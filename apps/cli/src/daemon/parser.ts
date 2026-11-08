@@ -70,12 +70,25 @@ function describeImage(block: ContentBlock): string {
 // get`, `npx engram vault get` and `./engram vault get` all print the same
 // value. Withholding the output of some other tool's `vault get` by mistake
 // is a harmless over-redaction; missing one of these is the leak.
-const REVEALS_SECRET = /\bvault\s+(get|keygen)\b|\.engram\/vault-key\b/;
+//
+// The key file is matched by its name alone, without regard to case
+// (engram#619): `type %USERPROFILE%\.Engram\vault-key`, `cd ~/.engram && cat
+// vault-key` and a Read of its path all print the key, and macOS and Windows
+// ignore case in file names. ENGRAM_VAULT_KEY is the same key, kept in the
+// environment.
+const REVEALS_SECRET = /\bvault\s+(?:get|keygen)\b|\bvault-key\b|\bENGRAM_VAULT_KEY\b/i;
 
-function commandOf(input: unknown): string {
-  if (!input || typeof input !== "object") return "";
-  const cmd = (input as { command?: unknown }).command;
-  return typeof cmd === "string" ? cmd : "";
+/**
+ * Every string in a tool call's input, nested ones included: a shell
+ * command, a file-reading tool's path, an MCP tool's arguments. Looking only
+ * at `command` let a Read of the key file through (engram#619).
+ */
+function stringsOf(value: unknown, out: string[] = [], depth = 0): string[] {
+  if (typeof value === "string") out.push(value);
+  else if (value && typeof value === "object" && depth < 8) {
+    for (const v of Object.values(value)) stringsOf(v, out, depth + 1);
+  }
+  return out;
 }
 
 export const REDACTED_TOOL_OUTPUT =
@@ -343,7 +356,7 @@ export class Parser implements LineParser {
   }
 
   private trackSecretTool(block: ContentBlock): void {
-    if (block.id && REVEALS_SECRET.test(commandOf(block.input))) {
+    if (block.id && stringsOf(block.input).some((s) => REVEALS_SECRET.test(s))) {
       this.secretToolIds.add(block.id);
     }
   }

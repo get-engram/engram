@@ -16,11 +16,20 @@ const src = readFileSync(
   join(__dirname, "..", "daemon", "commands.ts"),
   "utf-8",
 );
+// Where the worker's path is worked out, shared by `engram start`, launchd
+// and the Windows sign-in entry (engram#602).
+const launchSrc = readFileSync(
+  join(__dirname, "..", "daemon", "launch.ts"),
+  "utf-8",
+);
 
 describe("launchd plist generation", () => {
   it("launches the preflight bootstrap, not the raw worker", () => {
-    expect(src).toMatch(/resolve\(dir,\s*"worker\.js"\)/);
-    expect(src).not.toMatch(/resolve\(dir,\s*"worker-main\.js"\)/);
+    expect(launchSrc).toMatch(/new URL\("\.\/worker\.js",\s*moduleUrl\)/);
+    expect(src).toMatch(/<string>\$\{workerPath\(\)\}<\/string>/);
+    for (const file of [src, launchSrc]) {
+      expect(file).not.toMatch(/["'](?:\.\/)?worker-main\.js["']/);
+    }
   });
 
   it("gives the job a PATH that includes node's own bin dir", () => {

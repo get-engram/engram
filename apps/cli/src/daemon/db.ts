@@ -441,7 +441,10 @@ export function recoveredSessionMeta(
   sessionId: string,
   filePath: string | undefined,
 ): SessionMeta {
-  if (filePath?.includes("/.claude/projects/")) {
+  // One separator for the checks below: Windows paths use backslashes
+  // (engram#602).
+  const normalized = filePath?.replace(/\\/g, "/");
+  if (filePath && normalized?.includes("/.claude/projects/")) {
     return {
       sessionId,
       projectDir: claudeProjectDir(filePath),
@@ -449,7 +452,7 @@ export function recoveredSessionMeta(
       recovered: true,
     };
   }
-  if (filePath && /(^|\/)rollout-[^/]*\.jsonl$/.test(filePath)) {
+  if (normalized && /(^|\/)rollout-[^/]*\.jsonl$/.test(normalized)) {
     return { sessionId, projectDir: "", host: "codex", recovered: true };
   }
   return unknownSessionMeta(sessionId);

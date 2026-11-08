@@ -11,8 +11,8 @@ import { Engram } from "@getengram/sdk";
 import { loadConfig, getBaseUrl } from "../config.js";
 import { DaemonDb } from "./db.js";
 import { Watcher } from "./watcher.js";
-import { Syncer } from "./syncer.js";
-import { SecretScrubber } from "./scrubber.js";
+import { Syncer, type KeySource } from "./syncer.js";
+import { SecretScrubber, type VaultLike } from "./scrubber.js";
 import { loadVaultKey } from "../commands/vault.js";
 import { availableAdapters } from "./adapters.js";
 
@@ -42,15 +42,18 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const client = new Engram({
-    apiKey,
-    baseUrl: process.env.ENGRAM_BASE_URL ?? config.baseUrl ?? getBaseUrl(),
-    // Appends of large transcript batches do real work server-side (per-
-    // message R2 writes, chunking, embedding, indexing) — the SDK's default
-    // 30s timeout aborted them mid-flight and wedged the queue in a retry
-    // loop. The daemon is a background process; it can afford to wait.
-    timeout: 120_000,
-  });
+  const baseUrl = process.env.ENGRAM_BASE_URL ?? config.baseUrl ?? getBaseUrl();
+  const connect = (key: string): Engram =>
+    new Engram({
+      apiKey: key,
+      baseUrl,
+      // Appends of large transcript batches do real work server-side (per-
+      // message R2 writes, chunking, embedding, indexing) — the SDK's default
+      // 30s timeout aborted them mid-flight and wedged the queue in a retry
+      // loop. The daemon is a background process; it can afford to wait.
+      timeout: 120_000,
+    });
+  const client = connect(apiKey);
 
   const db = new DaemonDb(DB_FILE);
 
@@ -61,21 +64,40 @@ async function main(): Promise<void> {
   // vault so the scrubber can match exact values.
   const vaultKey = await loadVaultKey();
   let scrubber: SecretScrubber | null = null;
+  let vaultFor: ((key: string) => VaultLike | null) | null = null;
   if (vaultKey) {
-    const vaultClient = new Engram({
-      apiKey,
-      baseUrl: process.env.ENGRAM_BASE_URL ?? config.baseUrl ?? getBaseUrl(),
-      vault: { encryptionKey: vaultKey },
-      timeout: 30_000,
-    });
-    scrubber = new SecretScrubber(vaultClient.vault, vaultKey, log);
+    vaultFor = (key) =>
+      new Engram({
+        apiKey: key,
+        baseUrl,
+        vault: { encryptionKey: vaultKey },
+        timeout: 30_000,
+      }).vault;
+    scrubber = new SecretScrubber(vaultFor(apiKey), vaultKey, log);
     scrubber.start();
     log("vault scrubber: on (exact-match redaction of named secrets and the vault key)");
   } else {
     log("vault scrubber: off (no vault key configured — only pattern redaction applies)");
   }
 
-  const syncer = new Syncer(db, client, scrubber);
+  // A rejected key pauses syncing, and `engram auth login` saves the new
+  // key without restarting this process — so the syncer reads it from here
+  // (engram#587). An ENGRAM_API_KEY set for the daemon is fixed for its
+  // lifetime and is never replaced from config.json.
+  const keys: KeySource = {
+    current: apiKey,
+    read: async () => process.env.ENGRAM_API_KEY ?? (await loadConfig()).apiKey,
+    connect: (key) => {
+      if (scrubber && vaultFor) {
+        scrubber.reconnect(vaultFor(key)).catch((err: unknown) => {
+          log(`vault scrubber: reconnect failed (${err instanceof Error ? err.message : String(err)})`);
+        });
+      }
+      return connect(key);
+    },
+  };
+
+  const syncer = new Syncer(db, client, scrubber, keys);
 
   // Wrap syncer.onMessages to handle the async call
   const onMessages: ConstructorParameters<typeof Watcher>[1] = (

@@ -169,3 +169,79 @@ describe("layer 2 — exact-value scrubbing of known vault secrets", () => {
     expect(s.scrub("4821").text).toBe("4821");
   });
 });
+
+describe("layer 2 — the scrubber follows a replaced API key (engram#587)", () => {
+  const vaultOf = (values: Record<string, string>, rejected = false) => ({
+    async list() {
+      if (rejected) throw new Error("Invalid or missing API key");
+      return Object.keys(values).map((name) => ({ name }));
+    },
+    async get(name: string) {
+      return values[name] ?? null;
+    },
+  });
+
+  it("reads the vault through the new key once the old one was rejected", async () => {
+    // Started with a rejected key: only the vault key itself is protected.
+    const s = new SecretScrubber(vaultOf({}, true), "base64-vault-key-value", () => {});
+    await s.refresh();
+    expect(s.names).toEqual(["vault-key"]);
+
+    await s.reconnect(vaultOf({ DB_PASSWORD: "Tr0ub4dor&3-horse" }));
+    expect(s.scrub("pw Tr0ub4dor&3-horse").text).toBe("pw [VAULT:DB_PASSWORD]");
+
+    // And keeps reading through it.
+    await s.refresh();
+    expect(s.names.sort()).toEqual(["DB_PASSWORD", "vault-key"]);
+  });
+
+  it("keeps the current set while the new client's first read is in flight", async () => {
+    const s = new SecretScrubber(vaultOf({ PIN: "4821" }), undefined, () => {});
+    await s.refresh();
+
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const slow = {
+      async list() {
+        await gate;
+        return [{ name: "PIN" }];
+      },
+      async get() {
+        return "4821";
+      },
+    };
+    const reading = s.reconnect(slow);
+    expect(s.scrub("the PIN is 4821").text).toBe("the PIN is [VAULT:PIN]");
+    release();
+    await reading;
+    expect(s.scrub("the PIN is 4821").text).toBe("the PIN is [VAULT:PIN]");
+  });
+
+  it("a read through the replaced client that finishes late changes nothing", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const old = {
+      async list() {
+        await gate;
+        return [{ name: "OLD_PIN" }];
+      },
+      async get() {
+        return "7310-old";
+      },
+    };
+    const s = new SecretScrubber(old, undefined, () => {});
+    const reading = s.refresh(); // in flight when the key is replaced
+    await s.reconnect(vaultOf({ NEW_PIN: "5926-new" }));
+    release();
+    await reading;
+    expect(s.names).toEqual(["NEW_PIN"]);
+    expect(s.scrub("5926-new").text).toBe("[VAULT:NEW_PIN]");
+  });
+
+  it("keeps the current set when the new client can't read the vault", async () => {
+    const s = new SecretScrubber(vaultOf({ PIN: "4821" }), undefined, () => {});
+    await s.refresh();
+    await s.reconnect(vaultOf({}, true));
+    expect(s.scrub("4821").text).toBe("[VAULT:PIN]");
+  });
+});

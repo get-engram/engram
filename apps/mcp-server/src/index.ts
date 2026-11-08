@@ -87,8 +87,9 @@ app.onError((err, c) => {
   // Transient D1 pressure (the "D1 overloaded" 7429 class, busy/timeout/
   // dropped-connection) is not a bug — it's back-pressure. Returning a blanket
   // 500 turned one hot D1 period into a full API outage with nothing telling
-  // the client to slow down; a 503 + Retry-After lets callers (the CLI already
-  // backs off on it) retry instead of hammering a struggling database.
+  // the client to slow down; a 503 + Retry-After lets callers retry instead of
+  // hammering a struggling database. (The CLI daemon retries a 503 on its next
+  // flush; honoring Retry-After is engram#596.)
   const msg = err.message || "";
   // Shares the retry layer's predicate so the two can't drift. It is kept at
   // least as broad as the regex it replaced — reaching here means retries were

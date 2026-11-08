@@ -6,12 +6,9 @@ import {
   getOrCreateDefaultConversation,
 } from "../services/conversation.js";
 import {
-  checkAndTrackStorage,
-  checkAndTrackMessages,
-  checkAndTrackIndexing,
   checkAndTrackSearch,
-  estimateIndexingUnits,
-  releaseStorage,
+  reserveAppend,
+  releaseAppendCharges,
 } from "../services/tier.js";
 import { searchConversations } from "../services/search.js";
 import {
@@ -47,51 +44,49 @@ memories.post("/", async (c) => {
   }
   const { text, conversation_id } = parsed.data;
 
-  const storageCheck = await checkAndTrackStorage(c.env.DB, auth.organizationId, auth.tier, 1);
-  if (!storageCheck.allowed) {
+  // Every gate, in order, as on the other append paths (engram#591):
+  // storage, the month's message budget, the indexing budget. A refusal
+  // has already given back what the gates before it took.
+  const reserved = await reserveAppend(c.env.DB, auth.organizationId, auth.tier, [
+    { role: "user", content: text },
+  ]);
+  if (!reserved.allowed) {
+    const { gate, check } = reserved;
+    if (gate === "storage") {
+      return c.json({ error: "storage_full", limit: check.limit, used: check.used }, 402);
+    }
     return c.json(
-      { error: "storage_full", limit: storageCheck.limit, used: storageCheck.used },
-      402,
-    );
-  }
-
-  const tierCheck = await checkAndTrackMessages(c.env.DB, auth.organizationId, auth.tier, 1);
-  if (!tierCheck.allowed) {
-    await releaseStorage(c.env.DB, auth.organizationId, 1);
-    return c.json(
-      { error: tierCheck.error ?? "message_limit_exceeded", limit: tierCheck.limit, used: tierCheck.used },
+      {
+        error:
+          check.error ??
+          (gate === "messages" ? "message_limit_exceeded" : "indexing_quota_exceeded"),
+        limit: check.limit,
+        used: check.used,
+      },
       429,
     );
   }
+  const { storage: storageCheck } = reserved;
 
-  // Indexing budget (engram#445/#450), same as the other append paths.
-  const indexCheck = await checkAndTrackIndexing(
-    c.env.DB,
-    auth.organizationId,
-    auth.tier,
-    estimateIndexingUnits([{ role: "user", content: text }]),
-  );
-  if (!indexCheck.allowed) {
-    await releaseStorage(c.env.DB, auth.organizationId, 1);
-    return c.json(
-      { error: indexCheck.error ?? "indexing_quota_exceeded", limit: indexCheck.limit, used: indexCheck.used },
-      429,
-    );
-  }
-
-  const conversationId =
-    conversation_id ?? (await getOrCreateDefaultConversation(c.env.DB, auth.organizationId));
-
+  let conversationId: string;
   let messages;
   try {
+    conversationId =
+      conversation_id ?? (await getOrCreateDefaultConversation(c.env.DB, auth.organizationId));
+    // `auth` as the viewer: another seat's private conversation is refused
+    // as not-found (engram#264).
     messages = await appendMessages(
       c.env,
       auth.organizationId,
       conversationId,
       [{ role: "user", content: text }],
+      undefined,
+      auth,
     );
   } catch (err) {
-    await releaseStorage(c.env.DB, auth.organizationId, 1).catch(() => {});
+    // Nothing was stored (appendMessages throws only before it commits):
+    // give back every charge (engram#591).
+    await releaseAppendCharges(c.env.DB, auth.organizationId, reserved.charges);
     throw err;
   }
 

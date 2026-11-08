@@ -3,8 +3,12 @@ export function getCurrentPeriod(): string {
   return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
-export function getOrCreateUsage(db: D1Database, id: string, organizationId: string) {
-  const period = getCurrentPeriod();
+export function getOrCreateUsage(
+  db: D1Database,
+  id: string,
+  organizationId: string,
+  period: string = getCurrentPeriod(),
+) {
   return db
     .prepare(
       `INSERT INTO usage (id, organization_id, period)
@@ -24,8 +28,12 @@ export function getUsage(db: D1Database, organizationId: string) {
     .first();
 }
 
-export function incrementMessagesStored(db: D1Database, organizationId: string, count: number) {
-  const period = getCurrentPeriod();
+export function incrementMessagesStored(
+  db: D1Database,
+  organizationId: string,
+  count: number,
+  period: string = getCurrentPeriod(),
+) {
   return db
     .prepare(
       `UPDATE usage SET messages_stored = messages_stored + ?, updated_at = datetime('now')
@@ -46,6 +54,10 @@ type CappedCounter = "messages_stored" | "searches_run" | "chunks_indexed";
  * `limit`. Returns the updated value, or null if the limit would be
  * exceeded (the row is left untouched). One statement, so concurrent
  * requests cannot both pass the check and together exceed the limit.
+ *
+ * `period` defaults to now. A caller that may have to give the charge back
+ * passes the period it captured, so the charge, the row it ensured, and any
+ * release all name the same month even across a month boundary.
  */
 function atomicIncrementCounter(
   db: D1Database,
@@ -53,8 +65,8 @@ function atomicIncrementCounter(
   organizationId: string,
   count: number,
   limit: number,
+  period: string = getCurrentPeriod(),
 ) {
-  const period = getCurrentPeriod();
   return db
     .prepare(
       `UPDATE usage
@@ -73,8 +85,8 @@ function incrementCounter(
   column: CappedCounter,
   organizationId: string,
   count: number,
+  period: string = getCurrentPeriod(),
 ) {
-  const period = getCurrentPeriod();
   return db
     .prepare(
       `UPDATE usage SET ${column} = ${column} + ?, updated_at = datetime('now')
@@ -95,8 +107,9 @@ export function atomicIncrementMessages(
   organizationId: string,
   count: number,
   limit: number,
+  period?: string,
 ): Promise<{ messages_stored: number } | null> {
-  return atomicIncrementCounter(db, "messages_stored", organizationId, count, limit);
+  return atomicIncrementCounter(db, "messages_stored", organizationId, count, limit, period);
 }
 
 export function incrementSearchesRun(db: D1Database, organizationId: string) {
@@ -117,24 +130,76 @@ export function atomicIncrementSearches(
 }
 
 /** Unconditional indexing count — tiers with no indexing cap. */
-export function incrementChunksIndexed(db: D1Database, organizationId: string, count: number) {
-  return incrementCounter(db, "chunks_indexed", organizationId, count);
+export function incrementChunksIndexed(
+  db: D1Database,
+  organizationId: string,
+  count: number,
+  period?: string,
+) {
+  return incrementCounter(db, "chunks_indexed", organizationId, count, period);
 }
 
 /**
  * Reserve `count` chunks of this period's indexing budget (engram#445,
  * #450). Null = the budget would be exceeded; nothing was counted and the
- * caller must not embed. Never decremented: a delete frees storage, not
- * indexing, so a save/delete loop cannot re-run the embedding model for
- * free.
+ * caller must not embed. A delete never decrements it: a delete frees
+ * storage, not indexing, so a save/delete loop cannot re-run the embedding
+ * model for free. The one decrement is releaseChunksIndexed, for an append
+ * refused or failed before anything was stored or embedded (engram#591).
  */
 export function atomicIncrementChunksIndexed(
   db: D1Database,
   organizationId: string,
   count: number,
   limit: number,
+  period?: string,
 ): Promise<{ chunks_indexed: number } | null> {
-  return atomicIncrementCounter(db, "chunks_indexed", organizationId, count, limit);
+  return atomicIncrementCounter(db, "chunks_indexed", organizationId, count, limit, period);
+}
+
+/**
+ * Give back `count` of a period counter that an append charged and then
+ * did not use (engram#591): a later gate refused, or the write failed, so
+ * nothing was stored and nothing was embedded. Clamped at zero, like
+ * decrementStorage. Takes the period the charge was made in, never "now".
+ */
+function releaseCounter(
+  db: D1Database,
+  column: "messages_stored" | "chunks_indexed",
+  organizationId: string,
+  count: number,
+  period: string,
+) {
+  return db
+    .prepare(
+      `UPDATE usage SET ${column} = MAX(0, ${column} - ?), updated_at = datetime('now')
+       WHERE organization_id = ? AND period = ?`
+    )
+    .bind(count, organizationId, period)
+    .run();
+}
+
+/** Refund monthly messages an append charged but did not store (engram#591). */
+export function releaseMessagesStored(
+  db: D1Database,
+  organizationId: string,
+  count: number,
+  period: string,
+) {
+  return releaseCounter(db, "messages_stored", organizationId, count, period);
+}
+
+/**
+ * Refund indexing an append charged but never embedded (engram#591). Only
+ * for a write that stored nothing: never on delete, never after a save.
+ */
+export function releaseChunksIndexed(
+  db: D1Database,
+  organizationId: string,
+  count: number,
+  period: string,
+) {
+  return releaseCounter(db, "chunks_indexed", organizationId, count, period);
 }
 
 /**

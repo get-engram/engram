@@ -76,17 +76,25 @@ describe("GET /api/seats", () => {
 
     const app = createSeatsApp(env, auth);
 
-    // Invite a seat first
-    await app.request("/api/seats", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: "member@example.com" }),
-    }, env);
+    // A pending invite with every column the real row has, the stored
+    // invite-token hash included.
+    await db
+      .prepare(
+        "INSERT INTO seats (id, organization_id, email, role, invited_at, accepted_at, invite_token_hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .bind("seat_a", "org_1", "member@example.com", "member", "2026-11-01 00:00:00", null, "hash_of_invite_token")
+      .run();
 
     const res = await app.request("/api/seats", { method: "GET" }, env);
     expect(res.status).toBe(200);
-    const data = await res.json() as { seats: unknown[] };
+    const data = await res.json() as { seats: Record<string, unknown>[] };
     expect(data.seats.length).toBe(1);
+    // The fields the dashboard shows, and not the stored invite-token hash
+    // or anything else on the row (engram#603).
+    expect(Object.keys(data.seats[0]).sort()).toEqual(
+      ["accepted_at", "email", "id", "invited_at", "role"],
+    );
+    expect(data.seats[0]).toMatchObject({ email: "member@example.com", role: "member", accepted_at: null });
   });
 });
 
@@ -212,45 +220,24 @@ describe("POST /api/seats", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Tests: POST /api/seats/:id/accept — Accept a seat invitation
+// Tests: no POST /api/seats/:id/accept (engram#603)
 // ---------------------------------------------------------------------------
 
 describe("POST /api/seats/:id/accept", () => {
-  it("accepts an invited seat", async () => {
+  it("is gone: accepting is the invitee's act, on POST /invites/accept", async () => {
     const db = createMockD1();
     const env = createSeatsEnv(db);
     const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team", scopes: ["read", "write", "search", "delete"] };
     await insertOrgWithSeatLimit(db, "org_1", "Test Org", "test@example.com", "team", 5);
+    await db
+      .prepare("INSERT INTO seats (id, organization_id, email, role, accepted_at) VALUES (?, ?, ?, ?, ?)")
+      .bind("seat_pending", "org_1", "new@example.com", "member", null)
+      .run();
 
+    // Even the owner's full-scope key: a seat marked accepted here would
+    // block the invitee's real acceptance as "already accepted".
     const app = createSeatsApp(env, auth);
-
-    // Invite
-    const inviteRes = await app.request("/api/seats", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: "new@example.com" }),
-    }, env);
-    const { id } = await inviteRes.json() as { id: string };
-
-    // Accept
-    const res = await app.request(`/api/seats/${id}/accept`, {
-      method: "POST",
-    }, env);
-    expect(res.status).toBe(200);
-    const data = await res.json() as { id: string; status: string };
-    expect(data.status).toBe("accepted");
-  });
-
-  it("returns 404 for nonexistent seat", async () => {
-    const db = createMockD1();
-    const env = createSeatsEnv(db);
-    const auth: AuthContext = { organizationId: "org_1", apiKeyId: "key_1", tier: "team", scopes: ["read", "write", "search", "delete"] };
-    await insertOrgWithSeatLimit(db, "org_1", "Test Org", "test@example.com", "team", 5);
-
-    const app = createSeatsApp(env, auth);
-    const res = await app.request("/api/seats/seat_nonexistent/accept", {
-      method: "POST",
-    }, env);
+    const res = await app.request("/api/seats/seat_pending/accept", { method: "POST" }, env);
     expect(res.status).toBe(404);
   });
 });

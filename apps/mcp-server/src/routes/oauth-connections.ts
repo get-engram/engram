@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { getConnectedAppsByOrg, revokeOAuthConnection } from "@getengram/db";
 import { audit } from "../services/audit.js";
+import { denyExternalOAuthClient, denyUnlessFirstPartyWrite, denyUnlessOwner } from "./guards.js";
 import type { Env, AuthContext } from "../types.js";
 
 type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
@@ -8,6 +9,17 @@ type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
 // Dashboard-facing management of OAuth connections (e.g. ChatGPT). Mounted
 // under /api/* so it's gated by the standard API-key auth middleware.
 const oauthConnections = new Hono<HonoEnv>();
+
+const CONNECTOR_REFUSAL =
+  "Connected apps are managed from the Engram dashboard, not from a connected app.";
+
+// The org's connections are its credentials, not memory: a connected app
+// neither lists the others nor disconnects them (engram#603).
+oauthConnections.use("*", async (c, next) => {
+  const denied = denyExternalOAuthClient(c, CONNECTOR_REFUSAL);
+  if (denied) return denied;
+  await next();
+});
 
 interface ConnectionRow {
   client_id: string;
@@ -30,7 +42,15 @@ oauthConnections.get("/", async (c) => {
 
 // Revoke this org's connection to a client — deletes its access tokens and
 // revokes its refresh tokens. The app must re-authorize to reconnect.
+//
+// A connection is org-wide (tokens carry no seat), so disconnecting one cuts
+// it off for everyone: the owner's call, with a key that can write (the #441
+// floor, engram#603).
 oauthConnections.delete("/:clientId", async (c) => {
+  const denied =
+    denyUnlessOwner(c, "Only the organization owner can disconnect apps.") ??
+    denyUnlessFirstPartyWrite(c, CONNECTOR_REFUSAL);
+  if (denied) return denied;
   const auth = c.get("auth");
   const clientId = c.req.param("clientId");
 

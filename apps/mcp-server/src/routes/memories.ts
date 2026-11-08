@@ -17,6 +17,7 @@ import {
   PRIVACY_CROSS_CONVERSATION_NOTICE, stripBodyFields } from "../services/privacy.js";
 import { fireWebhooks } from "../services/webhooks.js";
 import { audit } from "../services/audit.js";
+import { denyUnlessScope } from "./guards.js";
 import { usageMeter, meterBar } from "../mcp/usage-messaging.js";
 import type { Env, AuthContext } from "../types.js";
 
@@ -38,6 +39,9 @@ const saveSchema = z.object({
 
 memories.post("/", async (c) => {
   const auth = c.get("auth");
+  // The scope every other append path checks (engram#603).
+  const denied = denyUnlessScope(c, "write");
+  if (denied) return denied;
   const parsed = saveSchema.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) {
     return c.json({ error: "invalid_body", details: z.flattenError(parsed.error) }, 400);
@@ -114,6 +118,9 @@ memories.post("/", async (c) => {
 
 memories.get("/search", async (c) => {
   const auth = c.get("auth");
+  // The scope every other search path checks (engram#603).
+  const denied = denyUnlessScope(c, "search");
+  if (denied) return denied;
   const query = c.req.query("q")?.trim();
   if (!query) {
     return c.json({ error: "missing_query" }, 400);

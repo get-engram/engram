@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { basename, dirname } from "node:path";
+import { createPrivateFileSync, PRIVATE_DIR_MODE, restrictSync } from "../private-files.js";
 import { claudeProjectDir } from "./parser.js";
 import type { ParsedMessage, PendingRow, SessionMeta } from "./types.js";
 
@@ -158,7 +159,15 @@ export class DaemonDb {
       this.keyed = hasColumn(this.db, "pending_messages", "key_fp");
       return;
     }
-    mkdirSync(dirname(dbPath), { recursive: true });
+    // The queue holds captured transcript text, so its files are the
+    // user's alone (engram#627). The database file is created 0600 before
+    // SQLite opens it, and SQLite gives the -wal and -shm files it creates
+    // the database file's mode. Files from before the fix are set to 0600
+    // first. By path on purpose: opening and closing the database file
+    // here would drop locks this process holds on it through SQLite.
+    mkdirSync(dirname(dbPath), { recursive: true, mode: PRIVATE_DIR_MODE });
+    createPrivateFileSync(dbPath);
+    for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) restrictSync(file);
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.exec(SCHEMA);

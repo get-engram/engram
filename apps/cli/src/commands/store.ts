@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { Engram, type MessageInput } from "@getengram/sdk";
-import { json, green } from "../output.js";
+import { json, green, plural } from "../output.js";
 
 export async function store(
   engram: Engram,
@@ -57,6 +57,6 @@ export async function store(
     return;
   }
 
-  console.log(green(`✓ Stored ${result.appended} message(s)`));
+  console.log(green(`✓ Stored ${plural(result.appended, "message")}`));
   console.log(`  IDs: ${result.messageIds.join(", ")}`);
 }

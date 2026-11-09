@@ -37,22 +37,51 @@ export function table(
   }
 }
 
+/**
+ * Whether what the CLI prints gets colors (engram#628): only when stdout
+ * and stderr are both terminals, since a colored string can go to either.
+ * Pipes, files and CI logs used to get the raw escape codes. NO_COLOR set
+ * to anything but "" turns colors off (https://no-color.org), and so does
+ * a terminal that can't show them (TERM=dumb).
+ */
+export function colorEnabled(): boolean {
+  if (process.env.NO_COLOR) return false;
+  if (process.env.TERM === "dumb") return false;
+  return Boolean(process.stdout.isTTY && process.stderr.isTTY);
+}
+
+function paint(code: string, text: string): string {
+  return colorEnabled() ? `\x1b[${code}m${text}\x1b[0m` : text;
+}
+
 export function dim(text: string): string {
-  return `\x1b[2m${text}\x1b[0m`;
+  return paint("2", text);
 }
 
 export function bold(text: string): string {
-  return `\x1b[1m${text}\x1b[0m`;
+  return paint("1", text);
 }
 
 export function green(text: string): string {
-  return `\x1b[32m${text}\x1b[0m`;
+  return paint("32", text);
 }
 
 export function red(text: string): string {
-  return `\x1b[31m${text}\x1b[0m`;
+  return paint("31", text);
 }
 
 export function cyan(text: string): string {
-  return `\x1b[36m${text}\x1b[0m`;
+  return paint("36", text);
+}
+
+/**
+ * A count and its noun, singular for exactly one (engram#628): "1 message",
+ * "0 messages", "1,234 messages". `many` is for a noun that doesn't just
+ * add an "s" ("copy", "copies").
+ */
+export function plural(count: number, one: string, many = `${one}s`): string {
+  // A count that isn't a number after all is printed as it is, as the
+  // template strings this replaced did, instead of throwing.
+  const shown = Number.isFinite(count) ? count.toLocaleString("en-US") : String(count);
+  return `${shown} ${count === 1 ? one : many}`;
 }

@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { generateVaultKey, type Engram } from "@getengram/sdk";
-import { bold, dim } from "../output.js";
+import { bold, dim, plural } from "../output.js";
 import { ensurePrivateDirSync, writePrivateFileSync } from "../private-files.js";
 
 const VAULT_KEY_FILE = join(homedir(), ".engram", "vault-key");
@@ -251,7 +251,7 @@ export async function vaultList(
   }
 
   console.log();
-  console.log(dim(`${secrets.length} secret(s)`));
+  console.log(dim(plural(secrets.length, "secret")));
 }
 
 /**

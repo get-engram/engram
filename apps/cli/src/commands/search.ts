@@ -1,5 +1,5 @@
 import { Engram } from "@getengram/sdk";
-import { json, dim, cyan, bold } from "../output.js";
+import { json, dim, cyan, bold, plural } from "../output.js";
 
 export async function search(
   engram: Engram,
@@ -39,7 +39,7 @@ export async function search(
     return;
   }
 
-  console.log(`${result.total} result(s)\n`);
+  console.log(`${plural(result.total, "result")}\n`);
 
   for (const r of result.results) {
     const score = (r.score * 100).toFixed(1);

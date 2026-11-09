@@ -44,6 +44,18 @@ import {
   removePidFileIf,
   type Probe,
 } from "./instance.js";
+import {
+  UNIT_VERSION,
+  generateUnit,
+  installUnit,
+  readUnit,
+  removeUnit,
+  rewriteUnit,
+  systemctlPath,
+  systemdReachable,
+  unitPath,
+  type UnitState,
+} from "./systemd.js";
 
 /** Render the per-host capture status (engram#261). `signedOut`: the
  *  daemon runs without a key, so nothing is captured (engram#594). */
@@ -268,9 +280,11 @@ export async function daemonStart(
   }
 
   // A stale plist survives every CLI upgrade, so check it here rather than
-  // only at install time (engram#469). The Windows entry likewise.
+  // only at install time (engram#469). The Windows entry and the systemd
+  // unit likewise.
   migrateLaunchdIfStale();
   repairRunEntryIfBroken();
+  repairSystemdUnitIfStale();
 
   if (!reportStart(await startInBackground())) {
     process.exit(1);
@@ -657,6 +671,8 @@ function printAutoStart(): boolean {
     on = true;
   }
 
+  if (process.platform === "linux") return printSystemdAutoStart(readUnit());
+
   const entry = readRunEntry();
   if (entry === null) return on;
   if (runEntryBroken(entry)) {
@@ -671,6 +687,26 @@ function printAutoStart(): boolean {
     on = true;
   }
   return on;
+}
+
+/** printAutoStart for the systemd unit: nothing when there is none of ours. */
+function printSystemdAutoStart(unit: UnitState): boolean {
+  if (unit.kind !== "ours") return false;
+  if (!unit.enabled) {
+    console.log(
+      `${dim("Auto-start:")} off — disabled with systemctl` + dim("  ('engram install' turns it back on)"),
+    );
+    return false;
+  }
+  if (unit.broken) {
+    console.log(`${dim("Auto-start:")} enabled (systemd)` + red("  — broken, run 'engram start' to repair"));
+    return false;
+  }
+  console.log(
+    `${dim("Auto-start:")} enabled (systemd)` +
+      (unit.version < UNIT_VERSION ? red("  — outdated config, run 'engram start' to update") : ""),
+  );
+  return true;
 }
 
 function printSyncWarnings(status: SyncStatus): void {
@@ -1092,6 +1128,122 @@ function removeStrayPlist(): void {
   }
 }
 
+// ── Linux: a systemd user unit (engram#615) ──
+//
+// ~/.config/systemd/user/engram.service, linked into default.target by
+// `systemctl --user enable`: the user's service manager starts the daemon at
+// login and again after a crash. See systemd.ts.
+
+/**
+ * The unit for this CLI: this Node, this build's worker, this home. Or why
+ * there can't be one: a path with a control character in it, which a unit
+ * can't hold. The reason has the path JSON-escaped, so it is safe to print.
+ */
+function unitForThisCli(): { text: string } | { error: string } {
+  const node = nodePathForEntry();
+  try {
+    return {
+      text: generateUnit({
+        node,
+        worker: workerPath(),
+        log: LOG_FILE,
+        engramDir: ENGRAM_DIR,
+        home: homedir(),
+        path: `${dirname(node)}:/usr/local/bin:/usr/bin:/bin`,
+      }),
+    };
+  } catch (err: unknown) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Rewrite an enabled unit of ours that names a Node or a CLI that has since
+ * moved, or that an older CLI wrote: the counterpart of migrateLaunchdIfStale
+ * and repairRunEntryIfBroken. One the user disabled is left as it is.
+ */
+export function repairSystemdUnitIfStale(unit: UnitState = readUnit()): boolean {
+  if (process.platform !== "linux") return false;
+  if (unit.kind !== "ours" || !unit.enabled) return false;
+  if (!unit.broken && unit.version >= UNIT_VERSION) return false;
+  // Only a source checkout run through tsx has no worker.js: the build ships it.
+  if (!existsSync(workerPath())) return false;
+  // Never fails the command it runs in: a unit that can't be made or written
+  // is left as it is, and `engram install` says why.
+  const made = unitForThisCli();
+  if ("error" in made || !rewriteUnit(made.text)) return false;
+  console.log(`${bold("Updated auto-start configuration")} ${dim(`(systemd unit v${UNIT_VERSION})`)}`);
+  return true;
+}
+
+async function enableSystemdStartAtLogin(running: boolean): Promise<void> {
+  removeStrayPlist();
+  if (readUnit().kind === "foreign") {
+    console.error(red(`Can't turn on start at login: ${unitPath()} is there already, and Engram didn't write it.`));
+    console.error(dim("  Rename or remove it, then run 'engram install' again."));
+    process.exitCode = 1;
+    return;
+  }
+  const systemctl = systemctlPath();
+  if (systemctl === null || !systemdReachable(systemctl)) {
+    console.log(bold("Start at login isn't available here: it needs a systemd user session ('systemctl --user')."));
+    console.log(dim(running ? RUNS_UNTIL_RESTART : START_AFTER_RESTART));
+    return;
+  }
+  if (!existsSync(workerPath())) {
+    // Only a source checkout run through tsx gets here: the build ships it.
+    console.error(red(`Can't turn on start at login: ${workerPath()} is missing.`));
+    process.exitCode = 1;
+    return;
+  }
+  const made = unitForThisCli();
+  if ("error" in made) {
+    console.error(red("Can't turn on start at login: a systemd unit can't hold one of the paths it needs."));
+    console.error(dim(`  ${made.error}`));
+    process.exitCode = 1;
+    return;
+  }
+  const failed = installUnit(systemctl, made.text);
+  if (failed !== null) {
+    console.error(red("Couldn't turn on start at login."));
+    console.error(dim(`  systemctl: ${failed}`));
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`${bold("Auto-start enabled")} — daemon will start when you log in (systemd)`);
+  console.log(`${dim("Unit:")} ${unitPath()}`);
+  // Enabled, not started: systemd starts it from the next login on. The
+  // daemon now is started as 'engram start' starts it, with this shell's
+  // environment, and never beside a running one.
+  if (!running && !reportStart(await startInBackground())) {
+    process.exitCode = 1;
+  }
+}
+
+/**
+ * Start at login when auto-capture turns capture on, as on macOS and
+ * Windows: add the unit when there is none, and repair one of ours that is
+ * broken or outdated. One the user disabled with systemctl stays disabled,
+ * and one Engram didn't write is never touched. Never fails the command it
+ * runs after.
+ *
+ * "changed": it added or repaired the unit, and said so. "failed": it
+ * couldn't add one. "unavailable": there is no systemd user session to add
+ * one to. autoEnableCapture says either along with the rest.
+ */
+function autoEnableSystemdStartAtLogin(): "changed" | "unchanged" | "failed" | "unavailable" {
+  const unit = readUnit();
+  if (unit.kind === "foreign") return "unchanged";
+  if (unit.kind === "ours") return repairSystemdUnitIfStale(unit) ? "changed" : "unchanged";
+  if (!existsSync(workerPath())) return "unchanged";
+  const systemctl = systemctlPath();
+  if (systemctl === null || !systemdReachable(systemctl)) return "unavailable";
+  const made = unitForThisCli();
+  if ("error" in made || installUnit(systemctl, made.text) !== null) return "failed";
+  console.log(`${bold("Auto-start enabled")} — daemon will start when you log in (systemd)`);
+  return "changed";
+}
+
 // ── Start at login, per platform ──
 
 /** "Windows", "Linux", … for the messages below. */
@@ -1108,11 +1260,16 @@ function platformLabel(platform: NodeJS.Platform = process.platform): string {
   }
 }
 
+const RUNS_UNTIL_RESTART =
+  "  The daemon keeps running until you sign out or restart. Run 'engram start' again after that.";
+const START_AFTER_RESTART = "  Run 'engram start' to capture now, and again after you sign out or restart.";
+
 /**
  * Start at login: a launchd agent on macOS, a Run entry on Windows
- * (engram#602). Off those, this used to write a macOS plist into
- * ~/Library/LaunchAgents and run a launchctl that isn't there; now it says
- * what actually happens. `running`: whether a daemon is up right now.
+ * (engram#602), a systemd user unit on Linux (engram#615). Elsewhere, this
+ * used to write a macOS plist into ~/Library/LaunchAgents and run a
+ * launchctl that isn't there; now it says what actually happens. `running`:
+ * whether a daemon is up right now.
  */
 async function enableStartAtLogin(running: boolean): Promise<void> {
   if (process.platform === "darwin") {
@@ -1123,14 +1280,12 @@ async function enableStartAtLogin(running: boolean): Promise<void> {
     await enableWindowsStartAtLogin(running);
     return;
   }
+  if (process.platform === "linux") {
+    await enableSystemdStartAtLogin(running);
+    return;
+  }
   console.log(bold(`Start at login isn't available on ${platformLabel()} yet.`));
-  console.log(
-    dim(
-      running
-        ? "  The daemon keeps running until you sign out or restart. Run 'engram start' again after that."
-        : "  Run 'engram start' to capture now, and again after you sign out or restart.",
-    ),
-  );
+  console.log(dim(running ? RUNS_UNTIL_RESTART : START_AFTER_RESTART));
 }
 
 async function enableWindowsStartAtLogin(running: boolean): Promise<void> {
@@ -1207,6 +1362,29 @@ async function disableStartAtLogin(): Promise<void> {
     }
     return;
   }
+  if (process.platform === "linux") {
+    const unit = readUnit();
+    if (unit.kind === "none") {
+      console.log("Auto-start isn't on.");
+    } else if (unit.kind === "foreign") {
+      console.log("Auto-start isn't on.");
+      console.log(dim(`  ${unitPath()} isn't one Engram wrote, so it was left as it is.`));
+    } else {
+      try {
+        removeUnit();
+      } catch {
+        console.error(red("Couldn't remove the systemd unit."));
+        console.error(dim(`  Remove ${unitPath()} to turn start at login off.`));
+        process.exitCode = 1;
+        return;
+      }
+      console.log(`${bold("Auto-start disabled")} — the systemd unit is removed`);
+    }
+    if ((await findDaemon()).state !== "stopped") {
+      console.log(dim("  The daemon keeps running until 'engram stop' or sign-out."));
+    }
+    return;
+  }
   console.log(`Start at login isn't set up on ${platformLabel()}, so there is nothing to remove.`);
 }
 
@@ -1252,13 +1430,15 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
       await sleep(500);
     }
     let startAtLoginFailed = false;
+    let startAtLoginUnavailable = false;
     if (platform === "darwin" && !isLaunchdInstalled()) {
       installLaunchd();
       changed = true;
-    } else if (platform === "win32") {
-      const startAtLogin = autoEnableWindowsStartAtLogin();
+    } else if (platform === "win32" || platform === "linux") {
+      const startAtLogin = platform === "win32" ? autoEnableWindowsStartAtLogin() : autoEnableSystemdStartAtLogin();
       if (startAtLogin === "changed") changed = true;
       startAtLoginFailed = startAtLogin === "failed";
+      startAtLoginUnavailable = startAtLogin === "unavailable";
     } else if (migrateLaunchdIfStale()) {
       changed = true;
     }
@@ -1272,9 +1452,9 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
     console.log(
       `${bold("Auto-capture is on")} — conversations from supported agents on this machine save to your Engram.`,
     );
-    if (platform === "linux") {
+    if (startAtLoginUnavailable) {
       console.log(
-        dim(`  Start at login isn't available on ${platformLabel()} yet: run 'engram start' after a restart.`),
+        dim("  Start at login isn't available here (no systemd user session): run 'engram start' after a restart."),
       );
     }
     console.log(dim("  Turn off anytime: engram stop && engram uninstall"));

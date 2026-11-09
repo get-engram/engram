@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { Engram, type MessageInput } from "@getengram/sdk";
-import { loadConfig, getBaseUrl } from "../config.js";
+import { loadConfig, resolveBaseUrl } from "../config.js";
 import { green, dim, bold } from "../output.js";
 
 import { parseStorageFullError } from "../storage-error.js";
@@ -343,7 +343,7 @@ async function fetchStorageUsage(): Promise<StorageUsage | null> {
     const config = await loadConfig();
     const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
     if (!apiKey) return null;
-    const baseUrl = process.env.ENGRAM_BASE_URL ?? config.baseUrl ?? getBaseUrl();
+    const baseUrl = resolveBaseUrl(config);
     const res = await fetch(`${baseUrl}/api/usage`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(10_000),

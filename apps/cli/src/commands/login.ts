@@ -1,10 +1,11 @@
 import { createInterface } from "node:readline";
-import { saveConfig, loadConfig, getBaseUrl } from "../config.js";
+import { saveConfig, loadConfig, resolveBaseUrl } from "../config.js";
 import { green, red, dim, bold } from "../output.js";
 import { Engram } from "@getengram/sdk";
 import { autoEnableCapture } from "../daemon/commands.js";
 
-const API_URL = process.env.ENGRAM_BASE_URL ?? getBaseUrl();
+/** The server these commands talk to: see resolveBaseUrl (engram#625). */
+const apiUrl = async (): Promise<string> => resolveBaseUrl(await loadConfig());
 
 /** Prompt for input (hides input for passwords). */
 function prompt(question: string, hidden = false): Promise<string> {
@@ -66,7 +67,7 @@ export async function signup(): Promise<void> {
 
   console.log("Creating account...");
 
-  const res = await fetch(`${API_URL}/signup/anonymous`, {
+  const res = await fetch(`${await apiUrl()}/signup/anonymous`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
   });
@@ -120,7 +121,7 @@ export async function link(args: string[] = [], flags: Record<string, string> = 
   // Link email to org via worker. Supabase user creation happens
   // lazily on first dashboard login — the CLI only needs the email
   // attached to the org for billing.
-  const linkRes = await fetch(`${API_URL}/signup/link`, {
+  const linkRes = await fetch(`${await apiUrl()}/signup/link`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -163,7 +164,7 @@ export async function link(args: string[] = [], flags: Record<string, string> = 
 
 /** POST /signup/set-password — create the Supabase login for this org. */
 async function setWebPassword(apiKey: string, password: string): Promise<void> {
-  const res = await fetch(`${API_URL}/signup/set-password`, {
+  const res = await fetch(`${await apiUrl()}/signup/set-password`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -202,7 +203,7 @@ export async function whoami(): Promise<void> {
     process.exit(1);
   }
 
-  const res = await fetch(`${API_URL}/api/account`, {
+  const res = await fetch(`${await apiUrl()}/api/account`, {
     headers: { Authorization: `Bearer ${apiKey}` },
   });
   if (!res.ok) {
@@ -241,7 +242,7 @@ async function confirmSavedKeyIsFor(
 ): Promise<void> {
   let res: Response;
   try {
-    res = await fetch(`${API_URL}/api/account`, {
+    res = await fetch(`${await apiUrl()}/api/account`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(30_000),
     });
@@ -300,7 +301,7 @@ export async function login(args: string[] = [], flags: Record<string, string> =
   console.log("Signing in...");
 
   // Authenticate via worker — keeps Supabase credentials server-side
-  const signupRes = await fetch(`${API_URL}/signup/login`, {
+  const signupRes = await fetch(`${await apiUrl()}/signup/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ email: email.trim(), password }),

@@ -8,7 +8,7 @@ import { writeFileSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Engram } from "@getengram/sdk";
-import { loadConfigStrict, getBaseUrl } from "../config.js";
+import { loadConfigStrict, resolveBaseUrl } from "../config.js";
 import { DaemonDb } from "./db.js";
 import { Watcher } from "./watcher.js";
 import { Syncer, type CaptureControl, type KeySource } from "./syncer.js";
@@ -114,7 +114,7 @@ async function main(): Promise<void> {
     log(`couldn't read ~/.engram/config.json (${errorText(err)}) — will keep trying`);
   }
 
-  const baseUrl = process.env.ENGRAM_BASE_URL ?? configBaseUrl ?? getBaseUrl();
+  const baseUrl = resolveBaseUrl({ baseUrl: configBaseUrl });
   const connect = (key: string): Engram =>
     new Engram({
       apiKey: key,

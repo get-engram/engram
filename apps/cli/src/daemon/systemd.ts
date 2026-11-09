@@ -1,20 +1,18 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
-  accessSync,
   chmodSync,
-  constants,
   existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
   renameSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, isAbsolute, join } from "node:path";
+import { isAbsolute, join } from "node:path";
+import { commandFailure, commandPath } from "./command-path.js";
 
 // Start at login on Linux (engram#615): a systemd user unit,
 // ~/.config/systemd/user/engram.service. `systemctl --user enable` links it
@@ -261,17 +259,7 @@ function writeUnitFile(text: string): void {
  * none.
  */
 export function systemctlPath(): string | null {
-  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
-    if (!isAbsolute(dir)) continue;
-    const file = join(dir, "systemctl");
-    try {
-      accessSync(file, constants.X_OK);
-      if (statSync(file).isFile()) return file;
-    } catch {
-      // not here
-    }
-  }
-  return null;
+  return commandPath("systemctl");
 }
 
 function systemctl(file: string, args: string[]): string {
@@ -292,14 +280,6 @@ export function systemdReachable(file: string): boolean {
   }
 }
 
-/** What went wrong, in a line: systemctl's own first line when it said anything. */
-function failure(err: unknown): string {
-  const stderr = (err as { stderr?: unknown }).stderr;
-  const said = typeof stderr === "string" ? stderr.split("\n").find((l) => l.trim() !== "") : undefined;
-  const line = (said ?? (err instanceof Error ? err.message : String(err))).trim();
-  return line.length > 200 ? `${line.slice(0, 199)}…` : line;
-}
-
 /**
  * Write the unit and enable it: the service manager starts the daemon from
  * the next login on. Null when it worked; else what went wrong, and a unit
@@ -318,7 +298,7 @@ export function installUnit(file: string, text: string): string | null {
       rmSync(unitPath(), { force: true });
       reload(file);
     }
-    return failure(err);
+    return commandFailure(err);
   }
 }
 

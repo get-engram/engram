@@ -12,6 +12,7 @@ import {
 import { parseStorageFullError } from "../storage-error.js";
 import { isPathExcluded, detectOptOut } from "./exclusions.js";
 import { queueing } from "./queue-error.js";
+import { plural } from "../output.js";
 import type { SecretScrubber } from "./scrubber.js";
 import type { ParsedMessage, SessionMeta, PendingRow } from "./types.js";
 
@@ -595,10 +596,10 @@ export class Syncer {
     const elsewhere = conversations.length - here;
     console.log(
       `[engram] session ${sessionId} excluded (${reason}) — ` +
-        `${dropped} queued message(s) dropped` +
+        `${plural(dropped, "queued message")} dropped` +
         (here > 0 ? ", deleting synced copy" : "") +
         (elsewhere > 0
-          ? `; ${elsewhere} cop${elsewhere === 1 ? "y" : "ies"} synced under another API key ` +
+          ? `; ${plural(elsewhere, "copy", "copies")} synced under another API key ` +
             `will be deleted when that key's account signs in again`
           : ""),
     );

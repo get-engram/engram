@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { Engram, type MessageInput } from "@getengram/sdk";
 import { loadConfig, resolveBaseUrl } from "../config.js";
-import { green, dim, bold } from "../output.js";
+import { green, dim, bold, plural } from "../output.js";
 
 import { parseStorageFullError } from "../storage-error.js";
 // Re-exported for backwards compatibility: this parser moved to a shared module
@@ -329,7 +329,7 @@ export function storageWarning(
 ): string {
   const n = (x: number) => x.toLocaleString("en-US");
   return (
-    `Your export contains ${n(messageCount)} messages, but your engram plan has ` +
+    `Your export contains ${plural(messageCount, "message")}, but your engram plan has ` +
     `${n(check.remaining)} of ${n(check.limit)} messages of memory remaining. ` +
     `Importing will stop when memory is full — everything imported stays saved forever. ` +
     `Upgrade for more space: https://getengram.app/pricing`
@@ -449,7 +449,7 @@ export async function importHistory(
   const source = format === "claude" ? "claude-import" : "chatgpt-import";
   const toImport = conversations.slice(0, limit);
   console.log(
-    `${bold(`${format} import`)} ${dim(`(${toImport.length} of ${conversations.length} conversations${dryRun ? ", dry run" : ""})`)}`,
+    `${bold(`${format} import`)} ${dim(`(${toImport.length} of ${plural(conversations.length, "conversation")}${dryRun ? ", dry run" : ""})`)}`,
   );
 
   // Pre-flight: warn if the export won't fit in remaining lifetime
@@ -533,7 +533,7 @@ export async function importHistory(
         console.error(`\n${storageFull.message}`);
         console.error(
           dim(
-            `\nStopped with ${imported} conversations (${messageTotal} messages) imported — everything imported stays saved forever.`,
+            `\nStopped with ${plural(imported, "conversation")} (${plural(messageTotal, "message")}) imported — everything imported stays saved forever.`,
           ),
         );
         process.exit(1);
@@ -553,7 +553,7 @@ export async function importHistory(
   }
 
   console.log(
-    `\n${bold("Done.")} ${imported} imported, ${messageTotal} messages` +
+    `\n${bold("Done.")} ${imported} imported, ${plural(messageTotal, "message")}` +
       `${skipped ? `, ${skipped} empty skipped` : ""}` +
       `${failed ? `, ${failed} failed` : ""}.`,
   );

@@ -284,12 +284,21 @@ export class DaemonDb {
       .run(conversationId);
   }
 
-  /** Drop every queued (sent or not) local row for a conversation — used when
-   *  the user opts a session out. */
+  /**
+   * Drop every local row for a conversation, sent or not — used when the
+   * user opts a session out. Returns how many of them had never been sent
+   * (engram#628): a sent row is only this machine's record of a message the
+   * server already has, and counting those told the user that messages
+   * were dropped before they could be sent when none were.
+   */
   deleteAllForConversation(conversationId: string): number {
-    return this.db
-      .prepare("DELETE FROM pending_messages WHERE conversation_id = ?")
-      .run(conversationId).changes;
+    return this.db.transaction(() => {
+      const { c: unsent } = this.db
+        .prepare("SELECT COUNT(*) AS c FROM pending_messages WHERE conversation_id = ? AND sent_at IS NULL")
+        .get(conversationId) as { c: number };
+      this.db.prepare("DELETE FROM pending_messages WHERE conversation_id = ?").run(conversationId);
+      return unsent;
+    })();
   }
 
   /**
@@ -297,7 +306,8 @@ export class DaemonDb {
    * mark it excluded, record a server-side delete for its conversation in
    * EVERY account that has one (each under that account's key), and drop
    * everything queued for it, whichever key it was queued under. Returns
-   * those conversations and the number of messages dropped.
+   * those conversations and how many of the messages dropped had never been
+   * sent.
    *
    * As separate steps, a failure part-way could mark the session excluded
    * and leave its queue in place, still due to be sent. Nothing would ever
@@ -425,7 +435,7 @@ export class DaemonDb {
   }
 
   /** Drop a pending session and everything queued under its temporary id
-   *  (opt-out). Returns the number of messages dropped. */
+   *  (opt-out). Returns how many of those messages had never been sent. */
   dropPendingSession(sessionId: string): number {
     return this.db.transaction(() => {
       const dropped = this.deleteAllForConversation(

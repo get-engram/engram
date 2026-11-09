@@ -1,5 +1,5 @@
 import { loadConfig, resolveBaseUrl } from "../config.js";
-import { bold, dim, red, json as printJson } from "../output.js";
+import { bold, dim, red, plural, json as printJson } from "../output.js";
 import { readStatus } from "../daemon/status.js";
 
 
@@ -114,7 +114,7 @@ export function printUsage(data: UsageResponse): void {
 
   if (data.storage) {
     if (data.storage.limit === -1) {
-      console.log(`  ${bold("Memory")}       unlimited ${dim(`· ${fmt(data.storage.used)} messages stored · never expires`)}`);
+      console.log(`  ${bold("Memory")}       unlimited ${dim(`· ${plural(data.storage.used, "message")} stored · never expires`)}`);
     } else {
       console.log(
         `  ${bold("Memory")}       ${renderBar(data.storage.used, data.storage.limit)}  ` +

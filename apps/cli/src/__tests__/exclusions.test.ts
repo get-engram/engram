@@ -12,6 +12,7 @@ import {
   samePath,
   IGNORE_MARKER,
 } from "../daemon/exclusions.js";
+import Database from "better-sqlite3";
 import { DaemonDb } from "../daemon/db.js";
 
 // Capture exclusions (engram#462). The opt-out phrase detector is the risky
@@ -199,6 +200,21 @@ describe("DaemonDb excluded_sessions", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  /** Rows daemon.db has for `conversationId`, sent or not (getPendingCount
+   *  counts only the unsent ones). */
+  function rowsFor(conversationId: string): number {
+    const raw = new Database(join(dir, "daemon.db"), { readonly: true });
+    try {
+      return (
+        raw
+          .prepare("SELECT COUNT(*) AS c FROM pending_messages WHERE conversation_id = ?")
+          .get(conversationId) as { c: number }
+      ).c;
+    } finally {
+      raw.close();
+    }
+  }
+
   it("marks and reports excluded sessions", () => {
     expect(db.isSessionExcluded("s1")).toBe(false);
     db.markSessionExcluded("s1", "in-chat opt-out");
@@ -227,13 +243,51 @@ describe("DaemonDb excluded_sessions", () => {
     expect(db.isSessionExcluded("s2")).toBe(true);
   });
 
-  it("deleteAllForConversation removes queued rows (sent and unsent)", () => {
+  it("deleteAllForConversation removes every row and counts only the unsent ones (engram#628)", () => {
     db.enqueue("conv_x", [
       { role: "user", content: "a" },
       { role: "assistant", content: "b" },
+      { role: "user", content: "c" },
     ], null);
-    expect(db.getPendingCount()).toBe(2);
-    expect(db.deleteAllForConversation("conv_x")).toBe(2);
+    // Two went out before the opt-out. Their rows are only this machine's
+    // record of messages the server already has, not messages dropped.
+    const sent = db.dequeue("conv_x", 2, null);
+    expect(sent).toHaveLength(2);
+    db.markSent(sent.map((r) => r.id));
+    expect(rowsFor("conv_x")).toBe(3);
+
+    expect(db.deleteAllForConversation("conv_x")).toBe(1);
+    expect(rowsFor("conv_x")).toBe(0);
     expect(db.getPendingCount()).toBe(0);
+
+    // Everything sent already: nothing was dropped, though rows were deleted.
+    db.enqueue("conv_y", [{ role: "user", content: "d" }], null);
+    db.markSent(db.dequeue("conv_y", 10, null).map((r) => r.id));
+    expect(db.deleteAllForConversation("conv_y")).toBe(0);
+    expect(rowsFor("conv_y")).toBe(0);
+  });
+
+  it("excludeSession counts only the dropped messages that were never sent (engram#628)", () => {
+    db.setSessionMap("s3", "conv_s3", { projectDir: "p" }, "fp-a");
+    db.enqueue("conv_s3", [
+      { role: "user", content: "a" },
+      { role: "assistant", content: "b" },
+    ], "fp-a");
+    db.markSent(db.dequeue("conv_s3", 10, "fp-a").map((r) => r.id));
+    db.enqueue("conv_s3", [{ role: "user", content: "c" }], "fp-a");
+    // Under another key, the session has no conversation yet.
+    db.enqueuePendingSession(
+      "s3",
+      { sessionId: "s3", projectDir: "p" },
+      [{ role: "user", content: "d" }],
+      "fp-b",
+    );
+
+    const { conversations, dropped } = db.excludeSession("s3", "in-chat opt-out");
+    expect(conversations).toEqual([{ conversationId: "conv_s3", keyFp: "fp-a" }]);
+    expect(dropped).toBe(2); // "c" and "d"; "a" and "b" had been sent
+    expect(rowsFor("conv_s3")).toBe(0);
+    expect(rowsFor("pending:s3")).toBe(0);
+    expect(db.isSessionExcluded("s3")).toBe(true);
   });
 });

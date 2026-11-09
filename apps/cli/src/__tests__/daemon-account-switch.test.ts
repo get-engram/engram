@@ -878,10 +878,12 @@ describe("an opt-out reaches the copy in every account (engram#594)", () => {
     expect(db.getPendingRemoteDeletes(fp("key-a1"))).toEqual([
       { conversation_id: "conv_1", session_id: "s1" },
     ]);
+    // Both messages had been sent, so none was dropped (engram#628: the
+    // count used to include sent rows and said 2).
     expect(linesWith("[engram] session s1 excluded (in-chat opt-out)")).toEqual([
-      expect.stringMatching(
-        /, deleting synced copy; 1 copy synced under another API key will be deleted when that key's account signs in again$/,
-      ),
+      "[engram] session s1 excluded (in-chat opt-out) — 0 queued messages dropped, " +
+        "deleting synced copy; 1 copy synced under another API key will be deleted " +
+        "when that key's account signs in again",
     ]);
 
     // Nothing more of the session is captured, under either key.

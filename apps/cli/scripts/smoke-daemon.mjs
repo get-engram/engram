@@ -4,7 +4,9 @@
  * start at login on and off (engram#602). The unit tests fake the registry
  * and the spawn; this runs the real thing, which is where #602's bugs were:
  * a worker path of "C:\C:\…" that failed every background start, and an
- * `install` that only knew launchd.
+ * `install` that only knew launchd. On macOS and Linux it also checks that
+ * ~/.engram and every file in it are the user's alone (engram#627), on a new
+ * install and on one an older version left readable by other users.
  *
  * Usage, after `pnpm build`:  node scripts/smoke-daemon.mjs
  *
@@ -18,13 +20,21 @@
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
@@ -97,8 +107,14 @@ const env = {
   ENGRAM_BASE_URL: "http://127.0.0.1:9",
   ENGRAM_NO_AUTOCAPTURE: "1",
 };
-const PID_FILE = join(home, ".engram", "daemon.pid");
-const LOG_FILE = join(home, ".engram", "daemon.log");
+const ENGRAM_DIR = join(home, ".engram");
+const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
+const LOG_FILE = join(ENGRAM_DIR, "daemon.log");
+
+// The usual umask, whatever this shell's is: under it, what the CLI and the
+// daemon create is readable by other users unless they say otherwise
+// (engram#627). They inherit it from this process.
+if (!WINDOWS) process.umask(0o022);
 
 let failures = 0;
 function check(ok, what) {
@@ -182,6 +198,49 @@ async function stopped(pid) {
   check(r.status === 0, "stop exits 0");
   if (pid) await waitFor("the worker exits", () => !alive(pid));
   check(daemonPid() === null, "stop removes the PID file");
+}
+
+/** Permission bits, in octal. */
+function modeOf(path) {
+  return (statSync(path).mode & 0o777).toString(8);
+}
+
+/**
+ * What the daemon keeps in ~/.engram while it runs: the CLI's config, the
+ * log, the PID file, status.json, and the queue of transcript text with
+ * SQLite's -wal and -shm files beside it.
+ */
+const DAEMON_FILES = ["config.json", "daemon.log", "daemon.pid", "status.json", "daemon.db", "daemon.db-wal", "daemon.db-shm"];
+
+async function daemonFiles() {
+  await waitFor("the daemon's files are all there", () =>
+    DAEMON_FILES.every((name) => existsSync(join(ENGRAM_DIR, name))),
+  );
+}
+
+/** ~/.engram is 0700 and every regular file in it 0600 (engram#627). Returns the files' names. */
+function checkPrivate(when) {
+  const dirMode = modeOf(ENGRAM_DIR);
+  check(dirMode === "700", `${when}: ~/.engram is 0700 (it is ${dirMode})`);
+  const files = [];
+  const open = [];
+  for (const name of readdirSync(ENGRAM_DIR).sort()) {
+    let st;
+    try {
+      st = lstatSync(join(ENGRAM_DIR, name));
+    } catch {
+      continue; // a temp file of status.json's, renamed since the listing
+    }
+    if (!st.isFile()) continue;
+    files.push(name);
+    const mode = (st.mode & 0o777).toString(8);
+    if (mode !== "600") open.push(`${name} is ${mode}`);
+  }
+  check(
+    open.length === 0,
+    `${when}: every file in ~/.engram is 0600 (${open.length > 0 ? open.join(", ") : files.join(", ")})`,
+  );
+  return files;
 }
 
 try {
@@ -271,10 +330,73 @@ try {
     check(!existsSync(join(home, "Library")), "install writes no plist");
   }
 
+  let freshTemp = null;
+  if (!WINDOWS) {
+    // ── ~/.engram is the user's alone (engram#627) ──
+    // A new install, made by the start above under the usual umask.
+    await daemonFiles();
+    checkPrivate("a new install");
+
+    // An install from before the fix: the folder 0755 and the files in it
+    // 0644. Beside them, what the start must clean up or leave alone: a temp
+    // file an interrupted write left an hour ago (removed), one a write in
+    // progress could have now (kept), a file that isn't the daemon's (made
+    // private too), and a symlink to a file outside ~/.engram and a folder
+    // inside it (neither changed).
+    await stopped(daemonPid());
+    const outside = join(root, "outside.txt");
+    writeFileSync(outside, "not Engram's\n");
+    writeFileSync(join(ENGRAM_DIR, "notes.txt"), "not the daemon's\n");
+    const staleTemp = join(ENGRAM_DIR, "status.json.99999.deadbeef.tmp");
+    freshTemp = join(ENGRAM_DIR, "config.json.99999.cafef00d.tmp");
+    writeFileSync(staleTemp, "{");
+    writeFileSync(freshTemp, "{");
+    const anHourAgo = Date.now() / 1000 - 3600;
+    utimesSync(staleTemp, anHourAgo, anHourAgo);
+    symlinkSync(outside, join(ENGRAM_DIR, "outside-link"));
+    mkdirSync(join(ENGRAM_DIR, "folder"));
+    writeFileSync(join(ENGRAM_DIR, "folder", "inside.txt"), "left as it is\n");
+    for (const name of readdirSync(ENGRAM_DIR)) {
+      const path = join(ENGRAM_DIR, name);
+      const st = lstatSync(path);
+      if (!st.isSymbolicLink()) chmodSync(path, st.isDirectory() ? 0o755 : 0o644);
+    }
+    chmodSync(join(ENGRAM_DIR, "folder", "inside.txt"), 0o644);
+    chmodSync(outside, 0o644);
+    chmodSync(ENGRAM_DIR, 0o755);
+
+    r = engram("start");
+    check(r.status === 0, "start exits 0 on an install from before the fix");
+    await started("the worker starts on it");
+    await daemonFiles();
+    checkPrivate("an install from before the fix");
+    check(!existsSync(staleTemp), "the start removes the temp file an interrupted write left");
+    check(existsSync(freshTemp), "and keeps the one a write in progress could have");
+    check(
+      readlinkSync(join(ENGRAM_DIR, "outside-link")) === outside && modeOf(outside) === "644",
+      "a file outside ~/.engram, linked from it, is left as it was",
+    );
+    check(
+      modeOf(join(ENGRAM_DIR, "folder")) === "755" && modeOf(join(ENGRAM_DIR, "folder", "inside.txt")) === "644",
+      "a folder in ~/.engram is left as it was",
+    );
+    const log = readFileSync(LOG_FILE, "utf-8");
+    check(/made ~\/\.engram private: set .*notes\.txt/.test(log), "the log says which files the start made private");
+    check(/removed 1 temp file/.test(log), "and that it removed the temp file");
+  }
+
   // ── engram stop ──
   await stopped(daemonPid());
   r = engram("daemon", "status");
   check(/Status: stopped/.test(r.out), "status says stopped");
+  if (!WINDOWS) {
+    const files = checkPrivate("after stop");
+    const temps = files.filter((name) => name.endsWith(".tmp"));
+    check(
+      temps.length === 1 && join(ENGRAM_DIR, temps[0]) === freshTemp,
+      `the CLI's and the daemon's writes leave no temp file behind (${temps.join(", ")})`,
+    );
+  }
 } catch (err) {
   check(false, `smoke test crashed: ${err instanceof Error ? err.stack : err}`);
 } finally {

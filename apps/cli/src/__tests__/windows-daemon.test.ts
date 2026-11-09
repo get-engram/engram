@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 /**
  * engram#602 — the daemon on Windows. `engram start` built the worker's path
@@ -608,13 +608,23 @@ describe("the Windows sign-in launcher (engram#602)", () => {
   });
 
   it("imports nothing but Node built-ins: it runs before the ABI preflight", () => {
-    for (const file of ["launch.ts", "login-start.ts"]) {
-      const src = readFileSync(join(__dirname, "..", "daemon", file), "utf-8");
+    // launch.ts, login-start.ts, and every module of ours they import, all
+    // the way down: launch.ts imports private-files.ts (engram#627).
+    const seen = new Set<string>();
+    const visit = (file: string): void => {
+      if (seen.has(file)) return;
+      seen.add(file);
+      const src = readFileSync(file, "utf-8");
       const specifiers = [...src.matchAll(/\b(?:from|import)\s*\(?\s*["']([^"']+)["']/g)].map((m) => m[1]);
       expect(specifiers.length).toBeGreaterThan(0);
       for (const s of specifiers) {
-        expect(s.startsWith("node:") || s === "./launch.js").toBe(true);
+        if (s.startsWith("node:")) continue;
+        expect(s.startsWith("./") || s.startsWith("../"), `${basename(file)} imports ${s}`).toBe(true);
+        visit(join(dirname(file), s.replace(/\.js$/, ".ts")));
       }
-    }
+    };
+    for (const file of ["launch.ts", "login-start.ts"]) visit(join(__dirname, "..", "daemon", file));
+    // A new import here is a new module to check for the same rule.
+    expect([...seen].map((f) => basename(f)).sort()).toEqual(["launch.ts", "login-start.ts", "private-files.ts"]);
   });
 });

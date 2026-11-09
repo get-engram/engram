@@ -1,6 +1,7 @@
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { ensurePrivateDirSync, writePrivateFileSync } from "./private-files.js";
 
 const CONFIG_DIR = join(homedir(), ".engram");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
@@ -49,9 +50,15 @@ export async function loadConfigStrict(): Promise<Config> {
   return parsed as Config;
 }
 
+/**
+ * config.json holds the API key, so it and ~/.engram are the user's alone
+ * (engram#627), and it is replaced in one step: the daemon reads it every
+ * few seconds, and a save cut short leaves the old file whole instead of a
+ * truncated one without the key.
+ */
 export async function saveConfig(config: Config): Promise<void> {
-  await mkdir(CONFIG_DIR, { recursive: true });
-  await writeFile(CONFIG_FILE, JSON.stringify(config, null, 2) + "\n");
+  ensurePrivateDirSync(CONFIG_DIR);
+  writePrivateFileSync(CONFIG_FILE, JSON.stringify(config, null, 2) + "\n");
 }
 
 export function getApiKey(): string {

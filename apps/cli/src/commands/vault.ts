@@ -1,8 +1,9 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { generateVaultKey, type Engram } from "@getengram/sdk";
 import { bold, dim } from "../output.js";
+import { ensurePrivateDirSync, writePrivateFileSync } from "../private-files.js";
 
 const VAULT_KEY_FILE = join(homedir(), ".engram", "vault-key");
 
@@ -13,9 +14,10 @@ export async function vaultKeygen(
   const key = await generateVaultKey();
 
   if (flags.save !== undefined) {
-    // ~/.engram may not exist yet on a fresh machine; without this, writeFile
-    // ENOENT-crashes on the very first `vault keygen --save`.
-    await mkdir(dirname(VAULT_KEY_FILE), { recursive: true });
+    // ~/.engram may not exist yet on a fresh machine; without this, the
+    // write ENOENT-crashes on the very first `vault keygen --save`. It is
+    // the user's alone (engram#627).
+    ensurePrivateDirSync(dirname(VAULT_KEY_FILE));
 
     // Overwriting the key file is irreversible destruction: every secret
     // encrypted under the old key becomes permanently undecryptable. Refuse
@@ -38,11 +40,13 @@ export async function vaultKeygen(
     if (existing) {
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
       const backup = `${VAULT_KEY_FILE}.bak-${stamp}`;
-      await writeFile(backup, existing + "\n", { mode: 0o600 });
+      writePrivateFileSync(backup, existing + "\n");
       console.log(dim(`Previous key backed up to ${backup}`));
     }
 
-    await writeFile(VAULT_KEY_FILE, key + "\n", { mode: 0o600 });
+    // 0600, and in one step: a write cut short leaves the old key whole.
+    // An overwrite in place also kept an old file's mode.
+    writePrivateFileSync(VAULT_KEY_FILE, key + "\n");
     console.log(`${bold("Vault key generated and saved to:")} ${VAULT_KEY_FILE}`);
     console.log(dim("Permissions set to owner-only (600)."));
   } else {

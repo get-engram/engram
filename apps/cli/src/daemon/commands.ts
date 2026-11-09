@@ -20,6 +20,7 @@ import {
   LOG_FILE,
   PID_FILE,
   loginStartPath,
+  prepareLogSync,
   readPidFile,
   spawnWorker,
   workerPath,
@@ -402,6 +403,19 @@ function installedPlistVersion(): number {
 }
 
 /**
+ * launchd opens the log for the job, and creates a missing one with the
+ * default 0644 (engram#627), so it is made first, 0600. Best effort: the
+ * worker sets every file in ~/.engram to 0600 when it starts anyway.
+ */
+function prepareLaunchdLog(): void {
+  try {
+    prepareLogSync();
+  } catch {
+    // the worker's start covers it
+  }
+}
+
+/**
  * Rewrite and reload a stale launchd plist (engram#469).
  *
  * Without this, a plist defect is permanent: `brew upgrade` / `npm i -g`
@@ -419,6 +433,7 @@ export function migrateLaunchdIfStale(): boolean {
   } catch {
     return false; // not fatal — the daemon can still run in this session
   }
+  prepareLaunchdLog();
 
   // bootout/bootstrap is the modern pair; fall back to unload/load on older
   // macOS. Either way a failure here is non-fatal: the new plist is on disk
@@ -458,6 +473,7 @@ function isLaunchdInstalled(): boolean {
 function installLaunchd(): void {
   mkdirSync(PLIST_DIR, { recursive: true });
   writeFileSync(PLIST_PATH, generatePlist());
+  prepareLaunchdLog();
 
   try {
     execSync(`launchctl load -w "${PLIST_PATH}"`, { stdio: "pipe" });

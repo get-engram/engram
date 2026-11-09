@@ -1,8 +1,9 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync } from "node:fs";
+import { closeSync, openSync, readFileSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createPrivateFileSync, ensurePrivateDirSync, PRIVATE_FILE_MODE, restrictSync } from "../private-files.js";
 
 // Starting the worker, shared by `engram start` (commands.ts) and the Windows
 // sign-in entry (login-start.ts).
@@ -45,13 +46,25 @@ export function loginStartPath(): string {
 }
 
 /**
+ * ~/.engram made private, and the log in it created 0600 or set to it
+ * (engram#627): the log repeats what the daemon does with the user's
+ * transcripts. Before the worker starts, and before launchd opens the log
+ * for it, which would create a missing one with the default 0644.
+ */
+export function prepareLogSync(): void {
+  ensurePrivateDirSync(ENGRAM_DIR);
+  createPrivateFileSync(LOG_FILE);
+  restrictSync(LOG_FILE);
+}
+
+/**
  * Start the worker detached, logging to LOG_FILE. windowsHide: on Windows a
  * detached child otherwise gets a console window of its own, and closing
  * that window ends the daemon.
  */
 export function spawnWorker(): ChildProcess {
-  mkdirSync(ENGRAM_DIR, { recursive: true });
-  const logFd = openSync(LOG_FILE, "a");
+  prepareLogSync();
+  const logFd = openSync(LOG_FILE, "a", PRIVATE_FILE_MODE);
   try {
     const child = spawn(process.execPath, [workerPath()], {
       detached: true,

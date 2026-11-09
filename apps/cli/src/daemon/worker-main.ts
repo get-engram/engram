@@ -16,6 +16,7 @@ import { SecretScrubber, type VaultLike } from "./scrubber.js";
 import { loadVaultKey } from "../commands/vault.js";
 import { availableAdapters } from "./adapters.js";
 import { configuredKey, ownedKeysAt } from "./key-source.js";
+import { makeDirPrivateSync, PRIVATE_FILE_MODE, type PrivateDirReport } from "../private-files.js";
 
 const ENGRAM_DIR = join(homedir(), ".engram");
 const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
@@ -51,12 +52,32 @@ function within(p: Promise<unknown>, ms: number): Promise<void> {
   });
 }
 
+/** What makeDirPrivateSync did at start, when it did anything. */
+function logPrivacy(made: PrivateDirReport): void {
+  const set: string[] = [];
+  if (made.dir === "changed") set.push("the folder to 0700");
+  if (made.changed.length > 0) set.push(`${made.changed.join(", ")} to 0600`);
+  if (set.length > 0) log(`made ~/.engram private: set ${set.join(", and ")}`);
+  if (made.dir === "not-ours") log("~/.engram belongs to another user: its permissions were left as they are");
+  if (made.skipped.length > 0) {
+    log(`left ${made.skipped.length} file(s) in ~/.engram readable by others (not yours, or the change failed): ${made.skipped.join(", ")}`);
+  }
+  if (made.removed.length > 0) log(`removed ${made.removed.length} temp file(s) left by an interrupted write`);
+}
+
 async function main(): Promise<void> {
-  // Write PID file
-  writeFileSync(PID_FILE, String(process.pid));
+  // Everything the daemon creates is the user's alone (engram#627): the
+  // queue of transcript text, the log, status.json and the PID file. Set
+  // here, after worker.ts's preflight, so an `npm rebuild` it runs keeps
+  // the usual umask. Then what an older version left in ~/.engram is set
+  // to 0600 as well.
+  if (process.platform !== "win32") process.umask(0o077);
+  const made = makeDirPrivateSync(ENGRAM_DIR);
+  writeFileSync(PID_FILE, String(process.pid), { mode: PRIVATE_FILE_MODE });
 
   log(`daemon started (pid ${process.pid})`);
   log(`database: ${DB_FILE}`);
+  logPrivacy(made);
 
   // A signal shuts down whatever has been set up by then, in order.
   let db: DaemonDb | null = null;

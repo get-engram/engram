@@ -555,6 +555,28 @@ describe("start at login on Windows (engram#602)", () => {
     expect(registry.value).toBe(ENTRY);
   });
 
+  it("engram start starts the supervisor, and reports the worker it starts (engram#613)", async () => {
+    onWindows();
+    spawn.mockImplementation(() => {
+      // The supervisor (pid 9999) starts the worker (pid 4242), which answers.
+      timers.push(setTimeout(() => daemonRunning(4242), 200));
+      return fakeChild(9999);
+    });
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const before = Date.now();
+    await daemonStart([], {});
+    const after = Date.now();
+    expect(exit).not.toHaveBeenCalled();
+    expect(output()).toContain("Engram daemon started (pid 4242)");
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const [file, args] = spawn.mock.calls[0];
+    expect(file).toBe(process.execPath);
+    expect(args[0]).toBe(supervisorPath());
+    const until = Number(/^--report-until=(\d+)$/.exec(args[1])?.[1]);
+    expect(until).toBeGreaterThanOrEqual(before + START_WAIT_MS - 2_000);
+    expect(until).toBeLessThanOrEqual(after + START_WAIT_MS - 2_000);
+  });
+
   it("engram start reports a worker that dies, and installs nothing", async () => {
     onWindows();
     spawn.mockImplementation(() => {
@@ -722,14 +744,47 @@ describe("waiting for the worker to start (engram#602, engram#612)", () => {
     timers.push(setTimeout(() => child.emit("error", new Error("spawn EAGAIN")), 50));
     expect(await waitForWorker(child as never, 5_000)).toEqual({ state: "failed" });
   });
+
+  describe("under the Windows supervisor (engram#613)", () => {
+    // The child is the supervisor (pid 9999). The worker it starts answers
+    // on the pipe with a PID of its own.
+    it("is running once a daemon answers ready, by that daemon's PID", async () => {
+      timers.push(setTimeout(() => (daemon.answering = { pid: 4242 }), 250));
+      expect(await waitForWorker(fakeChild(9999) as never, 5_000, { supervisor: true })).toEqual({
+        state: "running",
+        pid: 4242,
+      });
+    });
+
+    it("is still starting while the daemon answers as not ready, or as stopping, and names no PID", async () => {
+      // One that is stopping is on its way out: the supervisor's worker
+      // waits for it to go. The supervisor's own PID is no daemon's.
+      for (const answer of [{ pid: 4242, ready: false }, { pid: 4242, stopping: true }]) {
+        daemon.answering = answer;
+        expect(await waitForWorker(fakeChild(9999) as never, 300, { supervisor: true }), JSON.stringify(answer)).toEqual({
+          state: "starting",
+          pid: null,
+        });
+      }
+    });
+
+    it("has failed once the supervisor exits with an error: its first worker couldn't start", async () => {
+      const child = fakeChild(9999);
+      timers.push(setTimeout(() => child.emit("exit", 3, null), 50));
+      expect(await waitForWorker(child as never, 5_000, { supervisor: true })).toEqual({ state: "failed" });
+    });
+  });
 });
 
 describe("one daemon, found by its pipe, on Windows (engram#612)", () => {
   it("engram stop signals the daemon, waits for it to exit, and removes its PID file", async () => {
     // A daemon from before engram#613, which doesn't look for a request in
-    // the stop file: it is ended outright, as before.
+    // the stop file: it is ended outright, as before, with no request
+    // written and no wait for one. It answers with an id (engram#612), but
+    // not that it takes a request.
     onWindows();
     daemonRunning(4242);
+    daemon.answering = { pid: 4242, id: "b".repeat(32) };
     madeUp(4242, { onTermExitsIn: 300 });
     await daemonStop();
     expect(signalled).toEqual([[4242, "SIGTERM"]]);
@@ -920,6 +975,21 @@ describe("stopping the daemon on Windows through the stop file (engram#613)", ()
     expect(output()).toContain("Nothing queued is lost");
     expect(output()).toContain("Daemon stopped (pid 4242)");
     expect(stopRequest()).toEqual({ pid: 4242, id: ID });
+  });
+
+  it("ends nothing that took the request, however long its send takes to finish", async () => {
+    // It answers as stopping from the moment it takes the request. A send to
+    // a slow server can go on past STOP_PICKUP_MS.
+    onWindows();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    daemonWithStopFile(4242, { exitsIn: STOP_PICKUP_MS + 5_000 });
+    const stopping = daemonStop();
+    await vi.advanceTimersByTimeAsync(STOP_PICKUP_MS + 10_000);
+    await stopping;
+    expect(signalled).toEqual([]);
+    expect(output()).not.toContain("so it was ended");
+    expect(output()).toContain("Waiting for it to finish what it was sending...");
+    expect(output()).toContain("Daemon stopped (pid 4242)");
   });
 
   it("ends it, and says it may start again, when the request can't be written", async () => {

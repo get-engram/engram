@@ -202,6 +202,12 @@ describe.skipIf(!POSIX)("the daemon's hold on its socket", () => {
     checkStopRequest();
     expect(stopped).toHaveBeenCalledTimes(1);
     stopped.mockClear();
+    // And without being called: the daemon looks every second by itself.
+    // `engram stop` run again writes the request again.
+    writePrivateFileSync(STOP_FILE, JSON.stringify({ pid: process.pid, id }));
+    await vi.waitFor(() => expect(stopped).toHaveBeenCalledTimes(1), { timeout: 3_000, interval: 50 });
+    expect(logs.splice(0)).toEqual(["stop requested ('engram stop')"]);
+    stopped.mockClear();
   });
 
   it("removes the request it stopped for after a clean exit, and keeps it after an error, for the supervisor (engram#613)", () => {

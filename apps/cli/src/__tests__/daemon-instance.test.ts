@@ -415,6 +415,14 @@ describe("the stop file (engram#613)", () => {
     expect(Date.now() - before).toBeLessThan(500);
   });
 
+  it.skipIf(!POSIX)("is no request when a link in its place leads to a device", () => {
+    // /dev/null reads as empty: a regular file that did would be a request
+    // for no daemon.
+    const file = join(dir, "daemon.stop");
+    symlinkSync("/dev/null", file);
+    expect(readStopFile(file)).toBeNull();
+  });
+
   it("is removed only when it holds the request asked for", () => {
     const file = join(dir, "daemon.stop");
     writePrivateFileSync(file, JSON.stringify({ pid: 4242, id: ID }));

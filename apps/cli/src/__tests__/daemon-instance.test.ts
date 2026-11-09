@@ -60,8 +60,6 @@ const {
   daemonEndpoint,
   identifyProcess,
   lockEndpoint,
-  markReady,
-  markStopping,
   parseAnswer,
   pidInFile,
   probeDaemon,
@@ -959,15 +957,27 @@ describe.skipIf(!POSIX)("loading modules after the socket is looked at (engram#6
   });
 });
 
-// Last: what this process answers can't be put back once marked.
 describe("the daemon's answer as it starts and stops", () => {
   it("is ready once the worker says so, and stopping once it starts to shut down", async () => {
+    // Ready and stopping, once marked, are never put back. The marks go on a
+    // copy of the module of this test's own, so the copy every other test
+    // holds the lock with still answers as a daemon that is starting, in
+    // whatever order the tests run (engram#656).
+    vi.resetModules();
+    const fresh = await import("../daemon/instance.js");
     const endpoint = endpointIn(dir);
-    heldOf(await lock(endpoint));
+    const result = await fresh.lockEndpoint(endpoint, { settleMs: 20 });
+    if (result.state === "held") lockServers.push(result.held.server);
+    heldOf(result);
     expect(await probeDaemon({ endpoint })).toMatchObject({ info: { ready: false, stopping: false } });
-    markReady();
+    fresh.markReady();
     expect(await probeDaemon({ endpoint })).toMatchObject({ info: { ready: true, stopping: false } });
-    markStopping();
+    fresh.markStopping();
     expect(await probeDaemon({ endpoint })).toMatchObject({ info: { ready: true, stopping: true } });
+
+    // The copy the other tests use was never marked.
+    const other = endpointIn(mkdtempSync(join(dir, "o")));
+    heldOf(await lock(other));
+    expect(await probeDaemon({ endpoint: other })).toMatchObject({ info: { ready: false, stopping: false } });
   });
 });

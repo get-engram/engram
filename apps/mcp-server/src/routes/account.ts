@@ -6,6 +6,8 @@ import {
   softDeleteOrganization,
   restoreOrganization,
   setOrganizationEmail,
+  getOwnedKeyHashes,
+  MAX_OWNED_KEY_HASHES,
 } from "@getengram/db";
 import { audit } from "../services/audit.js";
 import { hasScope } from "../mcp/scopes.js";
@@ -93,6 +95,55 @@ account.get("/", async (c) => {
     deleted_at: org.deleted_at ?? null,
     purge_at: org.deleted_at ? purgeAt(org.deleted_at) : null,
   });
+});
+
+const KEY_HASH = /^[0-9a-f]{64}$/;
+
+// POST /api/account/owned-keys — which of these key hashes are the caller's
+// own keys (engram#594)? Body: {key_hashes: [...]}, 1–50 lowercase hex
+// SHA-256 hashes (what api_keys.key_hash stores; a raw key never leaves the
+// machine). Answers {owned: [...]}: the ones with the caller's organization
+// and seat, revoked and expired keys included. The CLI daemon sends a queued
+// capture only with a key of the account it was captured for; this is how a
+// new key claims what an earlier key of the same account captured. Another
+// account's key and an unknown hash are both simply left out.
+//
+// Read-only, so a read-only key may ask, as with GET. Not a connected app:
+// an OAuth connection carries no seat and so would read as the owner, and
+// only the CLI needs this.
+account.post("/owned-keys", async (c) => {
+  const auth = c.get("auth");
+  if (isExternalOAuthClient(auth)) {
+    return c.json(
+      { error: "forbidden", message: "This is for the Engram CLI, not a connected app." },
+      403,
+    );
+  }
+  const body = (await c.req.json<{ key_hashes?: unknown }>().catch(() => null)) as {
+    key_hashes?: unknown;
+  } | null;
+  const hashes = body?.key_hashes;
+  if (
+    !Array.isArray(hashes) ||
+    hashes.length === 0 ||
+    hashes.length > MAX_OWNED_KEY_HASHES ||
+    !hashes.every((h): h is string => typeof h === "string" && KEY_HASH.test(h))
+  ) {
+    return c.json(
+      {
+        error: "invalid_request",
+        message: `key_hashes must be 1 to ${MAX_OWNED_KEY_HASHES} lowercase hex SHA-256 hashes.`,
+      },
+      400,
+    );
+  }
+  const owned = await getOwnedKeyHashes(
+    c.env.DB,
+    auth.organizationId,
+    auth.seatId ?? null,
+    [...new Set(hashes)],
+  );
+  return c.json({ owned });
 });
 
 // PATCH /api/account — update organization settings (email)

@@ -147,3 +147,44 @@ export function revokeApiKeysByOrg(db: D1Database, organizationId: string) {
     .bind(organizationId)
     .run();
 }
+
+/** Most hashes one getOwnedKeyHashes call takes. D1 binds at most 100
+ *  parameters; this leaves room for the organization and seat. */
+export const MAX_OWNED_KEY_HASHES = 50;
+
+/**
+ * Which of `keyHashes` are this account's own keys: same organization and
+ * same seat (null for the owner), revoked and expired keys included
+ * (engram#594). The CLI daemon queues captures under the key that was signed
+ * in when they were made. When the signed-in key changes, it asks with the
+ * new key which of the earlier ones were this account's, so a rotated key's
+ * queue follows the account. The earlier key is often revoked by then, and a
+ * revoked key can't say whose it was, so the answer comes from here.
+ *
+ * Another account's key and a hash that matches no key get the same answer
+ * (left out), so this says nothing about anyone else. A removed Team
+ * member's keys lose their seat (seat_id ON DELETE SET NULL), so they read
+ * as the owner's: that member's captures were made for this organization.
+ */
+export async function getOwnedKeyHashes(
+  db: D1Database,
+  organizationId: string,
+  seatId: string | null,
+  keyHashes: string[],
+): Promise<string[]> {
+  if (keyHashes.length === 0) return [];
+  if (keyHashes.length > MAX_OWNED_KEY_HASHES) {
+    throw new Error(`getOwnedKeyHashes takes at most ${MAX_OWNED_KEY_HASHES} hashes`);
+  }
+  const placeholders = keyHashes.map(() => "?").join(", ");
+  const { results } = await db
+    .prepare(
+      `SELECT key_hash FROM api_keys
+       WHERE key_hash IN (${placeholders})
+         AND organization_id = ?
+         AND seat_id IS ?`
+    )
+    .bind(...keyHashes, organizationId, seatId)
+    .all<{ key_hash: string }>();
+  return results.map((r) => r.key_hash);
+}

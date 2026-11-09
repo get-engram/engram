@@ -921,7 +921,7 @@ describe("daemon.db schema version 1 (engram#594)", () => {
 
     new DaemonDb(path).close();
     const after = inspect();
-    expect(after.version).toBe(1);
+    expect(after.version).toBe(2); // version 1, then 2 (engram#598)
     expect(after.tables).toContain("remote_deletes");
     expect(after.queueColumns).toContain("key_fp");
     expect(after.sessionKey).toEqual(["conversation_id"]);

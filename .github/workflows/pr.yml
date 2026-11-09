@@ -14,7 +14,7 @@ jobs:
   check:
     name: Lint, typecheck, test, build
     runs-on: ubuntu-latest
-    # About 6 minutes with the daemon tests below; room for a slow runner.
+    # About 7 minutes with the daemon tests below; room for a slow runner.
     timeout-minutes: 15
 
     steps:
@@ -78,6 +78,21 @@ jobs:
       - name: Daemon single-instance test
         working-directory: apps/cli
         run: node scripts/e2e-daemon-lock.mjs
+
+      # Start at login under the real systemd (engram#615): the unit `engram
+      # install` writes, started when the user's service manager starts, as
+      # at login, started again after a crash and not after `engram stop`.
+      # Lingering gives the runner's user a service manager of its own.
+      - name: Daemon systemd test
+        working-directory: apps/cli
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          for _ in $(seq 1 30); do
+            [ -S "$XDG_RUNTIME_DIR/systemd/private" ] && break
+            sleep 1
+          done
+          ENGRAM_E2E_SYSTEMD=1 node scripts/e2e-systemd.mjs
 
       # `pnpm build` runs `wrangler deploy --dry-run`, which only bundles the
       # worker; nothing evaluates the result. Boot it in workerd so an error

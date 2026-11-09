@@ -97,7 +97,7 @@ const PLIST = join(home.dir, "Library", "LaunchAgents", "app.getengram.daemon.pl
 const LOGIN_START = join(home.dir, "login-start.js");
 writeFileSync(LOGIN_START, "");
 
-const { workerPathFor, loginStartPathFor, supervisorPathFor, supervisorPath, workerPath, START_WAIT_MS } = await import(
+const { workerPathFor, loginStartPathFor, supervisorPathFor, supervisorPath, START_WAIT_MS } = await import(
   "../daemon/launch.js"
 );
 const { IDENTIFY_STATEMENTS, VERSION } = await import("../daemon/instance.js");
@@ -1377,14 +1377,6 @@ describe("auto-capture after sign-in to Engram, on Windows (engram#614)", () => 
     expect(registry.value).toBeNull();
     expect(output()).toBe("");
   });
-
-  it("still says start at login isn't there yet on Linux", async () => {
-    onPlatform("linux");
-    daemonRunning();
-    await autoEnableCapture({ after: "login" });
-    expect(execFileSync).not.toHaveBeenCalled();
-    expect(output()).toContain("Start at login isn't available on Linux yet");
-  });
 });
 
 describe("auto-capture after any other command (engram#644)", () => {
@@ -1499,23 +1491,6 @@ describe("auto-capture after any other command (engram#644)", () => {
     expect(text).toContain("Auto-capture is on");
     expect(registry.value).toBeNull();
     expect(process.exitCode).toBeUndefined();
-  });
-
-  it("on Linux, says nothing while the daemon runs, and starts one that isn't", async () => {
-    onPlatform("linux");
-    daemonRunning();
-    await autoEnableCapture({ after: "command" });
-    expect(said()).toBe("");
-    expect(spawn).not.toHaveBeenCalled();
-
-    daemonGone();
-    await autoEnableCapture({ after: "command" });
-    expect(spawn).toHaveBeenCalledTimes(1);
-    expect(spawn.mock.calls[0][1]).toEqual([workerPath()]);
-    const text = said();
-    expect(text).toContain("Auto-capture is on");
-    expect(text).toContain("Start at login isn't available on Linux yet");
-    expect(execFileSync).not.toHaveBeenCalled();
   });
 
   it("on macOS, says so when it installs the launchd agent or updates an old one, then nothing", async () => {

@@ -83,17 +83,23 @@ const idsOf = (conversationId: string) =>
 
 /** Set when rows were sent (markSent always writes the current time). A
  *  string is written as it is. */
-function setSentAt(ids: number[], at: Date | string | null): void {
+function setSentTimes(times: Iterable<readonly [number, Date | string | null]>): void {
+  // One connection and one transaction for all of them: a commit per row is
+  // slow on slow disks (Windows runners).
   const raw = new Database(dbPath);
   try {
     raw.pragma("secure_delete = ON"); // leave no trace of its own
     const set = raw.prepare("UPDATE pending_messages SET sent_at = ? WHERE id = ?");
     raw.transaction(() => {
-      for (const id of ids) set.run(at instanceof Date ? sqliteTime(at) : at, id);
+      for (const [id, at] of times) set.run(at instanceof Date ? sqliteTime(at) : at, id);
     })();
   } finally {
     raw.close();
   }
+}
+
+function setSentAt(ids: number[], at: Date | string | null): void {
+  setSentTimes(ids.map((id) => [id, at] as const));
 }
 
 /** Whether `text` is in daemon.db's write-ahead log. */
@@ -223,8 +229,10 @@ describe("DaemonDb.pruneSent (engram#598)", () => {
         else recent.push(id);
       }
       db.markSent([...due, ...recent]);
-      for (const id of due) setSentAt([id], new Date(cutoff.getTime() - 1000 - Math.floor(random() * 400 * DAY)));
-      for (const id of recent) setSentAt([id], new Date(cutoff.getTime() + Math.floor(random() * 29 * DAY)));
+      const times: Array<[number, Date]> = [];
+      for (const id of due) times.push([id, new Date(cutoff.getTime() - 1000 - Math.floor(random() * 400 * DAY))]);
+      for (const id of recent) times.push([id, new Date(cutoff.getTime() + Math.floor(random() * 29 * DAY))]);
+      setSentTimes(times);
       // Queued years ago and never sent: still never deleted.
       const raw = new Database(dbPath);
       raw.prepare("UPDATE pending_messages SET created_at = '2020-01-01 00:00:00' WHERE sent_at IS NULL").run();
@@ -359,7 +367,9 @@ describe("daemon.db schema version 2 (engram#598)", () => {
 });
 
 describe("Pruner (engram#598)", () => {
-  it("removes what is due in batches, gives the space back, and says how many in words", async () => {
+  // Writes 9 MB several times over, so that giving the space back takes more
+  // than one step: slow disks (Windows runners) need more than the default 5 s.
+  it("removes what is due in batches, gives the space back, and says how many in words", { timeout: 30_000 }, async () => {
     const db = openDb();
     db.enqueue("conv_old", msgs(...Array.from({ length: 450 }, (_, i) => long(`OLD-${i}`))), null);
     db.enqueue("conv_new", msgs("NEW-1"), null);

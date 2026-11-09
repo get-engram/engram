@@ -342,10 +342,10 @@ describe("daemon.db schema version 2 (engram#598)", () => {
     expect(db.storage()).toMatchObject({ incremental: true, freePages: 0 });
     const raw = track(new Database(dbPath, { readonly: true }));
     expect(raw.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
-    expect(SCHEMA_VERSION).toBe(2);
+    expect(SCHEMA_VERSION).toBe(3); // 3: engram#593
   });
 
-  it("brings a version 1 daemon.db to version 2 once, keeping every row", () => {
+  it("brings a version 1 daemon.db up to date once, keeping every row", () => {
     const db = openDb();
     db.enqueue("conv_a", msgs("a", "b"), null);
     db.markSent(idsOf("conv_a").slice(0, 1));
@@ -359,7 +359,7 @@ describe("daemon.db schema version 2 (engram#598)", () => {
 
     openDb().close();
     const check = new Database(dbPath, { readonly: true });
-    expect(check.pragma("user_version", { simple: true })).toBe(2);
+    expect(check.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
     expect(
       check.prepare("SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'idx_pending_sent'").get(),
     ).toEqual({ name: "idx_pending_sent" });

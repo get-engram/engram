@@ -119,5 +119,7 @@ export interface DaemonStats {
   pendingMessages: number;
   /** Queued under another account's key (engram#594). */
   heldMessages: number;
+  /** Queued for a conversation Engram no longer has (engram#593). */
+  notSentMessages: number;
   sessionsMapped: number;
 }

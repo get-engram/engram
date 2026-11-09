@@ -54,6 +54,14 @@ jobs:
         working-directory: apps/cli
         run: node scripts/e2e-account-switch.mjs
 
+      # A conversation Engram no longer has, under the real daemon, against a
+      # fake server that answers as the real one does: its messages are kept
+      # and not sent, it isn't created again, and it is checked again later
+      # (engram#593).
+      - name: Daemon conversation-gone test
+        working-directory: apps/cli
+        run: node scripts/e2e-conversation-gone.mjs
+
       # `pnpm build` runs `wrangler deploy --dry-run`, which only bundles the
       # worker; nothing evaluates the result. Boot it in workerd so an error
       # thrown while the module graph loads blocks the merge instead of failing

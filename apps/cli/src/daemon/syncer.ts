@@ -8,6 +8,7 @@ import {
   recordSignedIn,
   recordSignedOut,
   classifyError,
+  isConversationGone,
   isNotFound,
 } from "./status.js";
 import { retryDelay, formatWait } from "./backoff.js";
@@ -177,7 +178,8 @@ type SendOutcome =
   | "retry" // a send failed, or the key changed; its rows stay queued for a later flush
   | "backoff" // the account hit a billing or storage limit
   | "auth" // the API key was rejected; sending pauses (AUTH_RETRY_MS)
-  | "wait"; // a rate limit or a maintenance pause holds the account (engram#596)
+  | "wait" // a rate limit or a maintenance pause holds the account (engram#596)
+  | "gone"; // Engram doesn't have the conversation; its rows stay here, not sent (engram#593)
 
 /** When one thing that failed is tried again, and how many times in a row
  *  it has failed. */
@@ -190,6 +192,35 @@ interface Wait {
  *  ordinary error (network, 5xx, rejected input). Its messages stay queued
  *  in daemon.db throughout — this only paces the retries. */
 const CREATE_RETRY_MS = [30_000, 2 * 60_000, 10 * 60_000];
+
+/**
+ * After Engram answers that it doesn't have a conversation (engram#593),
+ * when it is asked again: the n-th such answer in a row is followed by a
+ * check after the n-th wait here, and the answer after the last of them is
+ * final (about four days after the first). A check sends one message. If
+ * that goes through, Engram has the conversation after all (a restore, or
+ * an answer that was wrong) and the rest follows as usual.
+ *
+ * Until then the conversation's messages, and any captured for its session
+ * later, stay in daemon.db and aren't sent. The conversation is never
+ * created again: the user may have deleted it, and a deleted conversation
+ * must not come back. Kept in daemon.db, so a restart doesn't start the
+ * schedule over.
+ */
+export const GONE_RECHECK_MS = [
+  10 * 60_000,
+  60 * 60_000,
+  6 * 60 * 60_000,
+  24 * 60 * 60_000,
+  72 * 60 * 60_000,
+];
+
+/** When a conversation Engram said `checks` times it doesn't have, last at
+ *  `checkedAt`, is checked again; null: never. */
+function goneRecheckAt(checkedAt: number, checks: number): number | null {
+  const wait = GONE_RECHECK_MS[checks - 1];
+  return wait === undefined ? null : checkedAt + wait;
+}
 
 /**
  * Batches parsed messages and sends them to the Engram API.
@@ -774,10 +805,14 @@ export class Syncer {
     const createsOk = await this.createPendingConversations(run);
     if (this.halted(run)) return; // the key was rejected, or a limit hit, there
 
-    // Step 2: Flush messages for all conversations (with concurrency)
-    const convIds = this.db.getPendingConversationIds(run.fp).filter(
-      (id) => !id.startsWith("pending:"),
-    );
+    // Step 2: Flush messages for all conversations (with concurrency).
+    // Not those Engram said it doesn't have (engram#593), but for the ones
+    // due to be checked again.
+    const rechecks = this.dueRechecks(run);
+    const convIds = [
+      ...this.db.getPendingConversationIds(run.fp).filter((id) => !id.startsWith("pending:")),
+      ...rechecks,
+    ];
 
     // A conversation whose last send failed waits its turn (engram#596).
     // It used to be tried again at every flush, every 2 s, for as long as
@@ -796,13 +831,18 @@ export class Syncer {
       chunks.push(due.slice(i, i + CONCURRENCY));
     }
 
-    // A conversation waiting its turn hasn't synced.
+    // A conversation waiting its turn hasn't synced. One that Engram
+    // doesn't have is done: nothing more can be sent to it.
     let allSent = due.length === convIds.length;
     for (const chunk of chunks) {
       const results = await Promise.allSettled(
-        chunk.map((id) => this.flushConversation(run, id)),
+        chunk.map((id) => this.flushConversation(run, id, rechecks.has(id))),
       );
-      if (results.some((r) => r.status === "rejected" || r.value !== "sent")) {
+      if (
+        results.some(
+          (r) => r.status === "rejected" || (r.value !== "sent" && r.value !== "gone"),
+        )
+      ) {
         allSent = false;
       }
     }
@@ -1093,7 +1133,17 @@ export class Syncer {
     return delay;
   }
 
-  private async flushConversation(run: Run, conversationId: string): Promise<SendOutcome> {
+  /**
+   * Send what is queued for one conversation, batch by batch. `recheck`:
+   * Engram said it doesn't have the conversation (engram#593), and this
+   * checks again with one message before anything more is sent.
+   */
+  private async flushConversation(
+    run: Run,
+    conversationId: string,
+    recheck = false,
+  ): Promise<SendOutcome> {
+    let checking = recheck;
     while (true) {
       // The key changed or was removed (engram#594): no new batch goes out
       // with this one. What is left stays queued for its account.
@@ -1105,7 +1155,7 @@ export class Syncer {
       if (Date.now() < this.billingBackoffUntil) return "backoff";
       if (this.throttled()) return "wait";
 
-      const limit = this.batchOverride.get(conversationId) ?? BATCH_SIZE;
+      const limit = checking ? 1 : (this.batchOverride.get(conversationId) ?? BATCH_SIZE);
       let rows = this.db.dequeue(conversationId, limit, run.fp);
       if (rows.length === 0) return "sent";
 
@@ -1134,6 +1184,14 @@ export class Syncer {
         await run.client.store({ conversationId, messages });
         this.requestWentThrough(run, true);
         this.db.markSent(rows.map((r) => r.id));
+        if (checking) {
+          // Engram has the conversation after all: the rest follows.
+          this.db.clearGone(conversationId);
+          checking = false;
+          console.log(
+            `[engram] conversation ${conversationId} is on Engram again — sending its queued messages`,
+          );
+        }
         if (this.active === run) {
           this.batchOverride.delete(conversationId);
           this.sendRetry.delete(conversationId);
@@ -1142,6 +1200,19 @@ export class Syncer {
         // Failed under a key no longer in use: that says nothing about the
         // key in use now. The rows stay queued for their account.
         if (this.active !== run) return "retry";
+
+        // Engram doesn't have the conversation (engram#593): deleted there,
+        // or not this account's. Sending again can't change that, so its
+        // messages stay here instead of being retried forever, and the
+        // conversation isn't created again. Engram answered, after checking
+        // that writes aren't paused: the key works and the account can
+        // write, so this is no failure of the account's.
+        if (isConversationGone(err)) {
+          this.requestWentThrough(run, true);
+          this.setAside(conversationId);
+          return "gone";
+        }
+
         const msg = errorText(err);
         const errType = classifyError(err);
 
@@ -1187,6 +1258,37 @@ export class Syncer {
         return "retry";
       }
     }
+  }
+
+  /**
+   * Stop sending a conversation Engram said it doesn't have (engram#593).
+   * Its messages stay in daemon.db; the flush loop leaves it out until it
+   * is due to be checked again (GONE_RECHECK_MS).
+   */
+  private setAside(conversationId: string): void {
+    this.sendRetry.delete(conversationId);
+    this.batchOverride.delete(conversationId);
+    const now = Date.now();
+    const checks = this.db.markGone(conversationId, now);
+    const next = goneRecheckAt(now, checks);
+    const kept = plural(this.db.getUnsentCount(conversationId), "queued message");
+    console.log(
+      `[engram] conversation ${conversationId} ${checks === 1 ? "isn't" : "still isn't"} on Engram ` +
+        `(deleted there, or not this account's) — keeping its ${kept} on this machine, not sent; ` +
+        (next === null ? "not checking again" : `checking again in ${waitInWords(next - now)}`),
+    );
+  }
+
+  /** The conversations Engram said it doesn't have that are due to be
+   *  checked again, with messages queued under `run`'s key (engram#593). */
+  private dueRechecks(run: Run): Set<string> {
+    const now = Date.now();
+    const due = new Set<string>();
+    for (const g of this.db.getGoneConversations(run.fp)) {
+      const at = goneRecheckAt(g.checkedAt, g.checks);
+      if (at !== null && at <= now) due.add(g.conversationId);
+    }
+    return due;
   }
 
   /**
@@ -1474,6 +1576,16 @@ function errorText(err: unknown): string {
   // in a field it doesn't look at); the status at least names it.
   const status = (err as { status?: unknown } | null)?.status;
   return typeof status === "number" ? `HTTP ${status}` : "unknown error";
+}
+
+/** A wait of whole minutes, hours or days, in words: "10 minutes", "1 hour",
+ *  "3 days". */
+function waitInWords(ms: number): string {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return plural(minutes, "minute");
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return plural(hours, "hour");
+  return plural(Math.round(hours / 24), "day");
 }
 
 /** Wait before trying one thing again that failed again: the wait doubles

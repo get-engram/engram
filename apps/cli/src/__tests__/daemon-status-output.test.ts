@@ -201,3 +201,45 @@ describe("engram daemon status: when the daemon tries again (engram#596)", () =>
     expect(output().some((l) => l.includes("Next try"))).toBe(false);
   });
 });
+
+describe("engram daemon status: messages of a conversation Engram no longer has (engram#593)", () => {
+  /** `n` messages queued under `key` for a conversation Engram answered it
+   *  doesn't have. */
+  function setAside(n: number, key = KEY): void {
+    const db = new DaemonDb(join(ENGRAM_DIR, "daemon.db"));
+    try {
+      db.enqueue("conv_gone", msgs(n), keyFingerprint(key));
+      db.markGone("conv_gone", Date.UTC(2026, 10, 9));
+    } finally {
+      db.close();
+    }
+  }
+
+  const NOT_SENT_NOTE =
+    "(their conversation is no longer on Engram — kept on this machine; nothing to do if you deleted it)";
+
+  it("says how many aren't sent and why, and counts them in nothing else", async () => {
+    queue(2, 1);
+    setAside(3);
+    await daemonStatus();
+    const lines = output();
+    expect(lines).toContain("Pending sync:      2 messages");
+    expect(lines).toContain(`Held:              1 message ${HELD_NOTE}`);
+    expect(lines).toContain(`Not sent:          3 messages ${NOT_SENT_NOTE}`);
+    expect(lines.join("\n")).not.toContain(ESC);
+  });
+
+  it("says 1 message, whichever account queued it", async () => {
+    setAside(1, "engram-test-key-other");
+    await daemonStatus();
+    expect(output()).toContain(`Not sent:          1 message ${NOT_SENT_NOTE}`);
+    expect(output()).toContain("Pending sync:      0 messages");
+    expect(output().some((l) => l.startsWith("Held:"))).toBe(false);
+  });
+
+  it("has no such line when there are none", async () => {
+    queue(1, 0);
+    await daemonStatus();
+    expect(output().some((l) => l.startsWith("Not sent:"))).toBe(false);
+  });
+});

@@ -320,24 +320,85 @@ export function agentLoaded(): boolean {
   }
 }
 
+/**
+ * Whether `launchctl print-disabled` output has the job switched off: true
+ * for `"<label>" => disabled` (`=> true` on older macOS), false for enabled,
+ * or for a job it doesn't list, which launchd was never told to switch off.
+ * null when it can't tell: no "disabled services" list, or a value it
+ * doesn't know for the job. Only the label itself counts, never one that
+ * starts with it.
+ * Exported for tests.
+ */
+export function disabledIn(output: string, label = PLIST_LABEL): boolean | null {
+  let listed = false;
+  let inList = false;
+  for (const line of output.split("\n")) {
+    const text = line.trim();
+    if (text === "disabled services = {") {
+      listed = inList = true;
+      continue;
+    }
+    if (text === "}") {
+      inList = false;
+      continue;
+    }
+    if (!inList) continue;
+    const entry = /^"(.*)"\s*=>\s*(.*)$/.exec(text);
+    if (entry === null || entry[1] !== label) continue;
+    if (entry[2] === "disabled" || entry[2] === "true") return true;
+    if (entry[2] === "enabled" || entry[2] === "false") return false;
+    return null;
+  }
+  return listed ? false : null;
+}
+
+/**
+ * launchd has the job switched off: with `launchctl disable`, or `unload -w`.
+ * It then loads it at no login, and won't bootstrap it, until it is switched
+ * back on, and it remembers that after the plist is gone (engram#654). null
+ * when launchctl couldn't say.
+ */
+export function agentDisabled(): boolean | null {
+  try {
+    return disabledIn(launchctl(["print-disabled", guiDomain()]));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Switch the job back on in launchd, for `engram install` only: the user
+ * asking for start at login (engram#654). Whether launchd took it.
+ */
+export function enableAgent(): boolean {
+  try {
+    launchctl(["enable", `${guiDomain()}/${PLIST_LABEL}`]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 /**
  * Load the agent: launchd starts the daemon now and at every login. bootstrap
- * where macOS has it; `load -w` on older ones, and for a job turned off with
- * `launchctl unload -w`, which -w turns back on. The error when it couldn't.
+ * where macOS has it; `load` where that fails, as on older ones. Neither
+ * loads a job the user switched off. `turnOn`: `load -w`, which switches it
+ * back on too: for `engram install` only, never a repair or auto-capture
+ * (engram#654). The error when it couldn't.
  */
-export function loadAgent(): string | null {
+export function loadAgent({ turnOn = false }: { turnOn?: boolean } = {}): string | null {
   try {
     launchctl(["bootstrap", guiDomain(), plistPath()]);
     return null;
   } catch {
-    // older macOS, or switched off: load -w
+    // older macOS, or switched off
   }
   try {
-    launchctl(["load", "-w", plistPath()]);
+    launchctl(turnOn ? ["load", "-w", plistPath()] : ["load", plistPath()]);
     return null;
   } catch (err: unknown) {
     return commandFailure(err);
@@ -362,12 +423,12 @@ export function unloadAgent(): void {
 /**
  * Load the plist as it is now. launchd keeps the job it loaded, whatever the
  * file says since, until the job is unloaded; and it can still be letting go
- * of one when bootout returns, when a bootstrap straight after fails. The
- * error when it couldn't load it.
+ * of one when bootout returns, when a bootstrap straight after fails.
+ * `turnOn`: as for loadAgent. The error when it couldn't load it.
  */
-export function reloadAgent(): string | null {
+export function reloadAgent({ turnOn = false }: { turnOn?: boolean } = {}): string | null {
   unloadAgent();
   const deadline = Date.now() + UNLOAD_WAIT_MS;
   while (agentLoaded() && Date.now() < deadline) sleepSync(100);
-  return loadAgent();
+  return loadAgent({ turnOn });
 }

@@ -50,8 +50,10 @@ import {
 } from "./systemd.js";
 import {
   PLIST_VERSION,
+  agentDisabled,
   agentLoaded,
   agentPid,
+  enableAgent,
   generatePlist,
   loadAgent,
   plistPath,
@@ -673,6 +675,12 @@ function printAutoStart(): boolean {
 /** printAutoStart for the launchd agent: nothing when there is none. */
 function printLaunchdAutoStart(plist: PlistState): boolean {
   if (plist.kind === "none") return false;
+  // Said before broken or outdated: 'engram start' won't repair a job the
+  // user switched off (engram#654).
+  if (agentDisabled() === true) {
+    console.log(`${dim("Auto-start:")} off — disabled in launchd` + dim("  ('engram install' turns it back on)"));
+    return false;
+  }
   if (plist.broken) {
     console.log(`${dim("Auto-start:")} enabled (launchd)` + red("  — broken, run 'engram start' to repair"));
     return false;
@@ -831,6 +839,9 @@ function prepareLaunchdLog(): void {
  * replaces the code but leaves the plist, so the machine keeps launching the
  * old entry point forever. That is how a self-heal shipped in 0.4.2 was still
  * inert on a 0.6.0 install. Runs on any daemon start; silent when current.
+ *
+ * One the user switched off in launchd is left as it is, as on Linux: only
+ * `engram install` switches it back on (engram#654).
  */
 export function repairLaunchdIfStale(plist?: PlistState): boolean {
   if (process.platform !== "darwin") return false;
@@ -843,6 +854,10 @@ export function repairLaunchdIfStale(plist?: PlistState): boolean {
   // written is left as it is, and `engram install` says why.
   const made = plistForThisCli();
   if ("error" in made) return false;
+  // One the user switched off is left as it is too: reloading it would stop
+  // the daemon launchd still runs, if it runs one, and launchd wouldn't load
+  // it again.
+  if (agentDisabled() === true) return false;
   try {
     writePlistFile(made.text);
   } catch {
@@ -894,10 +909,14 @@ function enableLaunchdStartAtLogin(): void {
     }
   }
   prepareLaunchdLog();
+  // Install is the user asking for start at login, so it switches the job
+  // back on where they switched it off (engram#654). Where launchd won't take
+  // that, the load below does it, with load -w.
+  const switchedOn = agentDisabled() === false || enableAgent();
   // Loading the job starts the daemon (a second one finds the first and
   // exits, engram#612). One launchd has loaded already is loaded again only
   // when the plist changed: unloading it stops the daemon launchd runs.
-  const failed = unchanged && agentLoaded() ? null : reloadAgent();
+  const failed = unchanged && switchedOn && agentLoaded() ? null : reloadAgent({ turnOn: true });
   if (failed === null) {
     console.log(`${bold("Auto-start enabled")} — daemon will start on login`);
     console.log(`${dim("Plist:")} ${plistPath()}`);
@@ -910,8 +929,10 @@ function enableLaunchdStartAtLogin(): void {
 
 /**
  * Start at login when auto-capture turns capture on: add the agent when
- * there is none, and repair one of ours that is broken or outdated. Never
- * fails the command it runs after.
+ * there is none, and repair one of ours that is broken or outdated. Unlike
+ * `engram install`, it leaves a job the user switched off in launchd off
+ * (engram#654), as on Windows and Linux. Never fails the command it runs
+ * after.
  *
  * "changed": it added or repaired the agent, and said so. "failed": it
  * couldn't add one, which autoEnableCapture says along with the rest.
@@ -929,6 +950,13 @@ function autoEnableLaunchdStartAtLogin(): "changed" | "unchanged" | "failed" {
     return "failed";
   }
   prepareLaunchdLog();
+  // launchd remembers a job switched off after its plist is gone. Said once:
+  // from now on the plist is there, and current.
+  if (agentDisabled() === true) {
+    console.log(`${bold("Start at login is switched off")} in launchd`);
+    console.log(dim("  Run 'engram install' to start the daemon when you log in."));
+    return "changed";
+  }
   loadAgent(); // one launchd can't load now loads at the next login
   console.log(`${bold("Auto-start enabled")} — daemon will start on login`);
   return "changed";

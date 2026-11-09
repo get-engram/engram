@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { workerPath } from "../daemon/launch.js";
+import { PLIST_VERSION, generatePlist, pathsIn, type PlistPaths } from "../daemon/launchd.js";
 
 /**
  * engram#469 — a plist is written once and never revisited, so a defect that
@@ -11,46 +13,42 @@ import { join } from "node:path";
  *      worker-main.js directly — the latter skips the self-heal entirely.
  *   2. the job must carry a PATH that can reach npm, or the self-heal's
  *      `npm rebuild better-sqlite3` dies with command-not-found.
+ *
+ * What `engram install` writes for this CLI, and how `engram start` and
+ * auto-capture rewrite an older or broken plist, is in darwin-daemon.test.ts
+ * (engram#616).
  */
-const src = readFileSync(
-  join(__dirname, "..", "daemon", "commands.ts"),
-  "utf-8",
-);
-// Where the worker's path is worked out, shared by `engram start`, launchd
-// and the Windows sign-in entry (engram#602).
-const launchSrc = readFileSync(
-  join(__dirname, "..", "daemon", "launch.ts"),
-  "utf-8",
-);
+
+const paths: PlistPaths = {
+  node: "/opt/homebrew/Cellar/node/24.1.0/bin/node",
+  worker: "/opt/homebrew/lib/node_modules/@getengram/cli/dist/daemon/worker.js",
+  log: "/Users/op/.engram/daemon.log",
+  home: "/Users/op",
+  path: "/opt/homebrew/Cellar/node/24.1.0/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+};
 
 describe("launchd plist generation", () => {
   it("launches the preflight bootstrap, not the raw worker", () => {
-    expect(launchSrc).toMatch(/new URL\("\.\/worker\.js",\s*moduleUrl\)/);
-    expect(src).toMatch(/<string>\$\{workerPath\(\)\}<\/string>/);
-    for (const file of [src, launchSrc]) {
-      expect(file).not.toMatch(/["'](?:\.\/)?worker-main\.js["']/);
+    // The real one, beside launch.ts: worker.ts here, dist/daemon/worker.js in a build.
+    expect(workerPath()).toMatch(/[\\/]daemon[\\/]worker\.js$/);
+    expect(generatePlist(paths)).toContain(
+      `<key>ProgramArguments</key>\n  <array>\n    <string>${paths.node}</string>\n    <string>${paths.worker}</string>\n  </array>`,
+    );
+    for (const file of ["commands.ts", "launch.ts", "launchd.ts"]) {
+      const src = readFileSync(join(__dirname, "..", "daemon", file), "utf-8");
+      expect(src).not.toMatch(/["'](?:\.\/)?worker-main\.js["']/);
     }
   });
 
-  it("gives the job a PATH that includes node's own bin dir", () => {
-    expect(src).toMatch(/const nodeBinDir = dirname\(nodePath\)/);
-    expect(src).toMatch(/<key>PATH<\/key>/);
-    expect(src).toMatch(/\$\{jobPath\}/);
+  it("gives the job a PATH, Node's own directory first", () => {
+    expect(generatePlist(paths)).toContain(`<key>PATH</key>\n    <string>${paths.path}</string>`);
   });
 
   it("stamps a version so stale plists are detectable", () => {
-    expect(src).toMatch(/const PLIST_VERSION = \d+/);
-    expect(src).toMatch(/<key>ENGRAM_PLIST_VERSION<\/key>/);
-  });
-
-  it("exports a migration that reruns on start, not only at install", () => {
-    expect(src).toMatch(/export function migrateLaunchdIfStale/);
-    // called from the start path and the auto-enable path
-    const calls = src.match(/migrateLaunchdIfStale\(\)/g) ?? [];
-    expect(calls.length).toBeGreaterThanOrEqual(3);
-  });
-
-  it("treats an unstamped plist as v1 so pre-fix installs migrate", () => {
-    expect(src).toMatch(/return m \? parseInt\(m\[1\], 10\) : 1/);
+    expect(PLIST_VERSION).toBeGreaterThanOrEqual(2);
+    expect(generatePlist(paths)).toContain(
+      `<key>ENGRAM_PLIST_VERSION</key>\n    <string>${PLIST_VERSION}</string>`,
+    );
+    expect(pathsIn(generatePlist(paths))).toEqual(paths);
   });
 });

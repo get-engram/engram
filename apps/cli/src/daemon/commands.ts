@@ -1,14 +1,5 @@
-import { execSync, execFileSync, type ChildProcess } from "node:child_process";
-import {
-  readFileSync,
-  writeFileSync,
-  unlinkSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  realpathSync,
-  rmSync,
-} from "node:fs";
+import { execFileSync, type ChildProcess } from "node:child_process";
+import { readFileSync, existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, win32 } from "node:path";
 import { bold, dim, plural, red } from "../output.js";
@@ -56,6 +47,19 @@ import {
   unitPath,
   type UnitState,
 } from "./systemd.js";
+import {
+  PLIST_VERSION,
+  agentLoaded,
+  agentPid,
+  generatePlist,
+  loadAgent,
+  plistPath,
+  readPlist,
+  reloadAgent,
+  unloadAgent,
+  writePlistFile,
+  type PlistState,
+} from "./launchd.js";
 
 /** Render the per-host capture status (engram#261). `signedOut`: the
  *  daemon runs without a key, so nothing is captured (engram#594). */
@@ -70,20 +74,6 @@ function printHostStatus(signedOut = false): void {
 }
 
 const DB_FILE = join(ENGRAM_DIR, "daemon.db");
-const PLIST_NAME = "app.getengram.daemon";
-const PLIST_DIR = join(homedir(), "Library", "LaunchAgents");
-const PLIST_PATH = join(PLIST_DIR, `${PLIST_NAME}.plist`);
-
-// Bump when generatePlist() changes in a way existing installs must pick up.
-// A plist is written once at install time and never revisited, so upgrading
-// the CLI alone does NOT fix a defect that lives in the plist — the stale file
-// keeps launching the old thing. Every machine installed before v2 is still
-// pointing launchd at `worker-main.js`, the pre-0.4.2 entry point that has no
-// ABI preflight, which is why the self-heal shipped in 0.4.2 has never once
-// run on them (engram#469).
-//
-// v2: launch `worker.js` (preflight bootstrap) and give the job a PATH.
-const PLIST_VERSION = 2;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -225,27 +215,7 @@ async function exited(pid: number, slow?: () => void): Promise<boolean> {
 }
 
 function readLaunchdPid(): number | null {
-  if (!isLaunchdInstalled()) return null;
-  try {
-    const output = execSync(`launchctl list ${PLIST_NAME} 2>/dev/null`, {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    const match = output.match(/"PID"\s*=\s*(\d+)/);
-    if (match) return parseInt(match[1], 10);
-    // Also check the tabular format: PID\tStatus\tLabel
-    const lines = output.trim().split("\n");
-    for (const line of lines) {
-      const parts = line.split("\t");
-      if (parts.length >= 1) {
-        const pid = parseInt(parts[0], 10);
-        if (!isNaN(pid) && pid > 0) return pid;
-      }
-    }
-  } catch {
-    // not loaded
-  }
-  return null;
+  return isLaunchdInstalled() ? agentPid() : null;
 }
 
 export async function daemonStart(
@@ -280,9 +250,9 @@ export async function daemonStart(
   }
 
   // A stale plist survives every CLI upgrade, so check it here rather than
-  // only at install time (engram#469). The Windows entry and the systemd
-  // unit likewise.
-  migrateLaunchdIfStale();
+  // only at install time (engram#469), and a broken one too (engram#616).
+  // The Windows entry and the systemd unit likewise.
+  repairLaunchdIfStale();
   repairRunEntryIfBroken();
   repairSystemdUnitIfStale();
 
@@ -661,20 +631,11 @@ export async function daemonStatus(): Promise<void> {
 
 /** Print how the daemon starts at login; true when it is set to and should work. */
 function printAutoStart(): boolean {
-  let on = false;
-  if (isLaunchdInstalled()) {
-    const stale = installedPlistVersion() < PLIST_VERSION;
-    console.log(
-      `${dim("Auto-start:")} enabled (launchd)` +
-        (stale ? red("  — outdated config, run 'engram start' to update") : ""),
-    );
-    on = true;
-  }
-
+  if (process.platform === "darwin") return printLaunchdAutoStart(readPlist());
   if (process.platform === "linux") return printSystemdAutoStart(readUnit());
 
   const entry = readRunEntry();
-  if (entry === null) return on;
+  if (entry === null) return false;
   if (runEntryBroken(entry)) {
     console.log(`${dim("Auto-start:")} enabled (Windows sign-in)` + red("  — broken, run 'engram start' to repair"));
   } else if (switchedOffInStartupApps()) {
@@ -684,9 +645,24 @@ function printAutoStart(): boolean {
     );
   } else {
     console.log(`${dim("Auto-start:")} enabled (Windows sign-in)`);
-    on = true;
+    return true;
   }
-  return on;
+  return false;
+}
+
+/** printAutoStart for the launchd agent: nothing when there is none. */
+function printLaunchdAutoStart(plist: PlistState): boolean {
+  if (plist.kind === "none") return false;
+  if (plist.broken) {
+    console.log(`${dim("Auto-start:")} enabled (launchd)` + red("  — broken, run 'engram start' to repair"));
+    return false;
+  }
+  const stale = plist.version < PLIST_VERSION;
+  console.log(
+    `${dim("Auto-start:")} enabled (launchd)` +
+      (stale ? red("  — outdated config, run 'engram start' to update") : ""),
+  );
+  return true;
 }
 
 /** printAutoStart for the systemd unit: nothing when there is none of ours. */
@@ -771,65 +747,45 @@ function printSyncWarnings(status: SyncStatus): void {
   console.log("");
 }
 
-// ── Launchd integration ──
+// ── macOS: a launchd agent ──
+//
+// ~/Library/LaunchAgents/app.getengram.daemon.plist: launchd loads it when
+// the user logs in and starts the daemon, and starts it again after a crash.
+// See launchd.ts.
 
-function generatePlist(): string {
-  const nodePath = process.execPath;
-  // launchd hands a job a bare PATH (/usr/bin:/bin:/usr/sbin:/sbin) — npm is
-  // not on it. The ABI self-heal in preflight.ts shells out to `npm rebuild
-  // better-sqlite3`, so without this it fails with command-not-found at the
-  // exact moment it is needed. npm ships beside the node binary, so putting
-  // node's own directory first makes the heal reachable.
-  const nodeBinDir = dirname(nodePath);
-  const jobPath = `${nodeBinDir}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`;
-
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${PLIST_NAME}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${nodePath}</string>
-    <string>${workerPath()}</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key>
-    <false/>
-  </dict>
-  <key>StandardOutPath</key>
-  <string>${LOG_FILE}</string>
-  <key>StandardErrorPath</key>
-  <string>${LOG_FILE}</string>
-  <key>ThrottleInterval</key>
-  <integer>10</integer>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key>
-    <string>${homedir()}</string>
-    <key>PATH</key>
-    <string>${jobPath}</string>
-    <key>ENGRAM_PLIST_VERSION</key>
-    <string>${PLIST_VERSION}</string>
-  </dict>
-</dict>
-</plist>`;
+/**
+ * The plist for this CLI: this Node, this build's worker, this home. Or why
+ * there can't be one: a path with a control character in it, which a plist
+ * can't hold. The reason has the path JSON-escaped, so it is safe to print.
+ */
+function plistForThisCli(): { text: string } | { error: string } {
+  const node = nodePathForEntry();
+  try {
+    return {
+      text: generatePlist({
+        node,
+        worker: workerPath(),
+        log: LOG_FILE,
+        home: homedir(),
+        // launchd hands a job a bare PATH (/usr/bin:/bin:/usr/sbin:/sbin) —
+        // npm is not on it. The ABI self-heal in preflight.ts shells out to
+        // `npm rebuild better-sqlite3`, so without this it fails with
+        // command-not-found at the exact moment it is needed. npm ships
+        // beside the node binary, so node's own directory goes first.
+        path: `${dirname(node)}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
+      }),
+    };
+  } catch (err: unknown) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
-/** Version stamped into an installed plist; 1 for plists written before stamping. */
-function installedPlistVersion(): number {
+/** The plist's text as it is now; null when there is none to read. */
+function installedPlistText(): string | null {
   try {
-    const xml = readFileSync(PLIST_PATH, "utf-8");
-    const m = xml.match(
-      /<key>ENGRAM_PLIST_VERSION<\/key>\s*<string>(\d+)<\/string>/,
-    );
-    return m ? parseInt(m[1], 10) : 1;
+    return readFileSync(plistPath(), "utf-8");
   } catch {
-    return 1;
+    return null;
   }
 }
 
@@ -847,50 +803,36 @@ function prepareLaunchdLog(): void {
 }
 
 /**
- * Rewrite and reload a stale launchd plist (engram#469).
+ * Rewrite and reload a plist of ours that an older CLI wrote (engram#469),
+ * or that can't start the daemon (engram#616): one launchd can't read, or
+ * one naming a Node or a CLI that has since moved.
  *
  * Without this, a plist defect is permanent: `brew upgrade` / `npm i -g`
  * replaces the code but leaves the plist, so the machine keeps launching the
  * old entry point forever. That is how a self-heal shipped in 0.4.2 was still
  * inert on a 0.6.0 install. Runs on any daemon start; silent when current.
  */
-export function migrateLaunchdIfStale(): boolean {
+export function repairLaunchdIfStale(plist?: PlistState): boolean {
   if (process.platform !== "darwin") return false;
-  if (!isLaunchdInstalled()) return false;
-  if (installedPlistVersion() >= PLIST_VERSION) return false;
-
+  const state = plist ?? readPlist();
+  if (state.kind !== "ours") return false;
+  if (!state.broken && state.version >= PLIST_VERSION) return false;
+  // Only a source checkout run through tsx has no worker.js: the build ships it.
+  if (!existsSync(workerPath())) return false;
+  // Never fails the command it runs in: a plist that can't be made or
+  // written is left as it is, and `engram install` says why.
+  const made = plistForThisCli();
+  if ("error" in made) return false;
   try {
-    writeFileSync(PLIST_PATH, generatePlist());
+    writePlistFile(made.text);
   } catch {
-    return false; // not fatal — the daemon can still run in this session
+    return false;
   }
   prepareLaunchdLog();
-
-  // bootout/bootstrap is the modern pair; fall back to unload/load on older
-  // macOS. Either way a failure here is non-fatal: the new plist is on disk
-  // and takes effect at next login.
-  const uid = process.getuid?.() ?? 0;
-  try {
-    execSync(`launchctl bootout gui/${uid}/${PLIST_NAME}`, { stdio: "pipe" });
-  } catch {
-    try {
-      execSync(`launchctl unload "${PLIST_PATH}"`, { stdio: "pipe" });
-    } catch {
-      // already unloaded
-    }
-  }
-  try {
-    execSync(`launchctl bootstrap gui/${uid} "${PLIST_PATH}"`, { stdio: "pipe" });
-  } catch {
-    try {
-      execSync(`launchctl load -w "${PLIST_PATH}"`, { stdio: "pipe" });
-    } catch {
-      // takes effect at next login
-    }
-  }
-  console.log(
-    `${bold("Updated auto-start configuration")} ${dim(`(plist v${PLIST_VERSION})`)}`,
-  );
+  // launchd keeps running the job it loaded until it is unloaded. One it
+  // can't load now loads from the file at the next login.
+  reloadAgent();
+  console.log(`${bold("Updated auto-start configuration")} ${dim(`(plist v${PLIST_VERSION})`)}`);
   return true;
 }
 
@@ -898,22 +840,78 @@ function isLaunchdInstalled(): boolean {
   // Darwin only: CLIs before engram#602 wrote this plist on every platform,
   // and a stray copy must not read as "auto-start enabled" or send status
   // shelling out to launchctl on Windows.
-  return process.platform === "darwin" && existsSync(PLIST_PATH);
+  return process.platform === "darwin" && existsSync(plistPath());
 }
 
-function installLaunchd(): void {
-  mkdirSync(PLIST_DIR, { recursive: true });
-  writeFileSync(PLIST_PATH, generatePlist());
-  prepareLaunchdLog();
+/** A path as one word of a command line for the user to run. */
+function shellWord(path: string): string {
+  return /^[\w@%+=:,./-]+$/.test(path) ? path : `'${path.replace(/'/g, "'\\''")}'`;
+}
 
-  try {
-    execSync(`launchctl load -w "${PLIST_PATH}"`, { stdio: "pipe" });
-    console.log(`${bold("Auto-start enabled")} — daemon will start on login`);
-    console.log(`${dim("Plist:")} ${PLIST_PATH}`);
-  } catch {
-    console.log(`Plist written to ${PLIST_PATH}`);
-    console.log("Run manually: launchctl load -w " + PLIST_PATH);
+function enableLaunchdStartAtLogin(): void {
+  if (!existsSync(workerPath())) {
+    // Only a source checkout run through tsx gets here: the build ships it.
+    console.error(red(`Can't turn on start at login: ${workerPath()} is missing.`));
+    process.exitCode = 1;
+    return;
   }
+  const made = plistForThisCli();
+  if ("error" in made) {
+    console.error(red("Can't turn on start at login: a launchd job can't hold one of the paths it needs."));
+    console.error(dim(`  ${made.error}`));
+    process.exitCode = 1;
+    return;
+  }
+  const unchanged = installedPlistText() === made.text;
+  if (!unchanged) {
+    try {
+      writePlistFile(made.text);
+    } catch (err: unknown) {
+      console.error(red("Couldn't turn on start at login."));
+      console.error(dim(`  ${err instanceof Error ? err.message : String(err)}`));
+      process.exitCode = 1;
+      return;
+    }
+  }
+  prepareLaunchdLog();
+  // Loading the job starts the daemon (a second one finds the first and
+  // exits, engram#612). One launchd has loaded already is loaded again only
+  // when the plist changed: unloading it stops the daemon launchd runs.
+  const failed = unchanged && agentLoaded() ? null : reloadAgent();
+  if (failed === null) {
+    console.log(`${bold("Auto-start enabled")} — daemon will start on login`);
+    console.log(`${dim("Plist:")} ${plistPath()}`);
+  } else {
+    console.log(`Plist written to ${plistPath()}`);
+    console.log(dim(`  launchctl: ${failed}`));
+    console.log(`Run manually: launchctl load -w ${shellWord(plistPath())}`);
+  }
+}
+
+/**
+ * Start at login when auto-capture turns capture on: add the agent when
+ * there is none, and repair one of ours that is broken or outdated. Never
+ * fails the command it runs after.
+ *
+ * "changed": it added or repaired the agent, and said so. "failed": it
+ * couldn't add one, which autoEnableCapture says along with the rest.
+ */
+function autoEnableLaunchdStartAtLogin(): "changed" | "unchanged" | "failed" {
+  const plist = readPlist();
+  if (plist.kind === "ours") return repairLaunchdIfStale(plist) ? "changed" : "unchanged";
+  // Only a source checkout run through tsx has no worker.js: the build ships it.
+  if (!existsSync(workerPath())) return "unchanged";
+  const made = plistForThisCli();
+  if ("error" in made) return "failed";
+  try {
+    writePlistFile(made.text);
+  } catch {
+    return "failed";
+  }
+  prepareLaunchdLog();
+  loadAgent(); // one launchd can't load now loads at the next login
+  console.log(`${bold("Auto-start enabled")} — daemon will start on login`);
+  return "changed";
 }
 
 function uninstallLaunchd(): void {
@@ -921,19 +919,15 @@ function uninstallLaunchd(): void {
     console.log("Launchd agent not installed.");
     return;
   }
-
+  unloadAgent();
   try {
-    execSync(`launchctl unload "${PLIST_PATH}"`, { stdio: "pipe" });
+    rmSync(plistPath(), { force: true });
   } catch {
-    // may already be unloaded
+    console.error(red("Couldn't remove the launchd agent."));
+    console.error(dim(`  Remove ${plistPath()} to turn start at login off.`));
+    process.exitCode = 1;
+    return;
   }
-
-  try {
-    unlinkSync(PLIST_PATH);
-  } catch {
-    // ignore
-  }
-
   console.log(`${bold("Auto-start disabled")} — launchd agent removed`);
 }
 
@@ -1108,7 +1102,7 @@ function deleteRunEntry(): boolean {
 }
 
 /**
- * Point a broken entry at this CLI, the counterpart of migrateLaunchdIfStale:
+ * Point a broken entry at this CLI, the counterpart of repairLaunchdIfStale:
  * an entry naming a Node or a CLI that has since moved fails at every
  * sign-in without a word. A working entry is left as it is.
  */
@@ -1122,9 +1116,9 @@ export function repairRunEntryIfBroken(entry: string | null = readRunEntry()): b
 /** The plist CLIs before engram#602 wrote off macOS too. */
 function removeStrayPlist(): void {
   try {
-    unlinkSync(PLIST_PATH);
+    rmSync(plistPath(), { force: true });
   } catch {
-    // none written
+    // nothing reads it on this OS
   }
 }
 
@@ -1159,7 +1153,7 @@ function unitForThisCli(): { text: string } | { error: string } {
 
 /**
  * Rewrite an enabled unit of ours that names a Node or a CLI that has since
- * moved, or that an older CLI wrote: the counterpart of migrateLaunchdIfStale
+ * moved, or that an older CLI wrote: the counterpart of repairLaunchdIfStale
  * and repairRunEntryIfBroken. One the user disabled is left as it is.
  */
 export function repairSystemdUnitIfStale(unit: UnitState = readUnit()): boolean {
@@ -1273,7 +1267,7 @@ const START_AFTER_RESTART = "  Run 'engram start' to capture now, and again afte
  */
 async function enableStartAtLogin(running: boolean): Promise<void> {
   if (process.platform === "darwin") {
-    installLaunchd();
+    enableLaunchdStartAtLogin();
     return;
   }
   if (process.platform === "win32") {
@@ -1429,19 +1423,15 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
       changed = true;
       await sleep(500);
     }
-    let startAtLoginFailed = false;
-    let startAtLoginUnavailable = false;
-    if (platform === "darwin" && !isLaunchdInstalled()) {
-      installLaunchd();
-      changed = true;
-    } else if (platform === "win32" || platform === "linux") {
-      const startAtLogin = platform === "win32" ? autoEnableWindowsStartAtLogin() : autoEnableSystemdStartAtLogin();
-      if (startAtLogin === "changed") changed = true;
-      startAtLoginFailed = startAtLogin === "failed";
-      startAtLoginUnavailable = startAtLogin === "unavailable";
-    } else if (migrateLaunchdIfStale()) {
-      changed = true;
-    }
+    const startAtLogin =
+      platform === "darwin"
+        ? autoEnableLaunchdStartAtLogin()
+        : platform === "win32"
+          ? autoEnableWindowsStartAtLogin()
+          : autoEnableSystemdStartAtLogin();
+    if (startAtLogin === "changed") changed = true;
+    const startAtLoginFailed = startAtLogin === "failed";
+    const startAtLoginUnavailable = startAtLogin === "unavailable";
     if (after === "command" && !changed) return;
     // Said with the rest, not after every command while it keeps failing:
     // after a command, that is when the daemon had to be started, which is

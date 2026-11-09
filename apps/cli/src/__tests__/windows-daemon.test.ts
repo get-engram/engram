@@ -225,6 +225,12 @@ function fakeExec(file: string, args: string[], options?: { env?: Record<string,
   return `${JSON.stringify({ owner, me: USER_SID, command: codes })}\r\n`;
 }
 
+/** Nothing of macOS's: no launchctl, no shell command line. Only reg.exe and PowerShell were run. */
+function noLaunchctl(): void {
+  expect(execSync).not.toHaveBeenCalled();
+  for (const [file] of execFileSync.mock.calls) expect([REG_EXE, POWERSHELL]).toContain(file);
+}
+
 /** PowerShell's calls to identify a process. */
 function identifyCalls(): unknown[][] {
   return execFileSync.mock.calls.filter(([file]) => file === POWERSHELL);
@@ -502,7 +508,7 @@ describe("start at login on Windows (engram#602)", () => {
 
     // No plist, no ~/Library, no launchctl.
     expect(existsSync(join(home.dir, "Library"))).toBe(false);
-    expect(execSync).not.toHaveBeenCalled();
+    noLaunchctl();
 
     // launchctl load starts the agent on macOS; install starts it here too.
     expect(output()).toContain("Engram daemon started");
@@ -567,7 +573,7 @@ describe("start at login on Windows (engram#602)", () => {
     await daemonStart([], { install: "" });
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(registry.value).toBe(ENTRY);
-    expect(execSync).not.toHaveBeenCalled();
+    noLaunchctl();
   });
 
   it("engram start --install adds the entry when the daemon is already running", async () => {
@@ -654,7 +660,7 @@ describe("start at login on Windows (engram#602)", () => {
     expect(registry.value).toBeNull();
     expect(regCalls("delete")[0][1]).toEqual(["delete", RUN_KEY, "/v", "Engram", "/f"]);
     expect(existsSync(PLIST)).toBe(false);
-    expect(execSync).not.toHaveBeenCalled();
+    noLaunchctl();
   });
 
   it("engram uninstall clears a Startup apps switch along with the entry", async () => {
@@ -711,7 +717,7 @@ describe("start at login on Windows (engram#602)", () => {
     daemonRunning();
     await daemonStatus();
     expect(output()).not.toContain("Auto-start");
-    expect(execSync).not.toHaveBeenCalled();
+    noLaunchctl();
   });
 });
 
@@ -1276,7 +1282,7 @@ describe("auto-capture after sign-in to Engram, on Windows (engram#614)", () => 
       expect(regOpts).toMatchObject({ windowsHide: true, timeout: 15_000 });
     }
     expect(existsSync(join(home.dir, "Library"))).toBe(false);
-    expect(execSync).not.toHaveBeenCalled();
+    noLaunchctl();
 
     const said = output();
     expect(said).toContain("Auto-capture is on");
@@ -1491,36 +1497,6 @@ describe("auto-capture after any other command (engram#644)", () => {
     expect(text).toContain("Auto-capture is on");
     expect(registry.value).toBeNull();
     expect(process.exitCode).toBeUndefined();
-  });
-
-  it("on macOS, says so when it installs the launchd agent or updates an old one, then nothing", async () => {
-    onPlatform("darwin");
-    daemonRunning();
-    try {
-      await autoEnableCapture({ after: "command" });
-      expect(existsSync(PLIST)).toBe(true);
-      expect(execSync).toHaveBeenCalledWith(expect.stringContaining("launchctl load -w"), expect.anything());
-      let text = said();
-      expect(text).toContain("Auto-start enabled — daemon will start on login");
-      expect(text).toContain("Auto-capture is on");
-
-      await autoEnableCapture({ after: "command" });
-      expect(said()).toBe("");
-
-      // One an older CLI wrote: rewritten, and said.
-      strayPlist();
-      await autoEnableCapture({ after: "command" });
-      expect(readFileSync(PLIST, "utf-8")).not.toBe("<plist/>");
-      text = said();
-      expect(text).toContain("Updated auto-start configuration");
-      expect(text).toContain("Auto-capture is on");
-
-      await autoEnableCapture({ after: "command" });
-      expect(said()).toBe("");
-      expect(spawn).not.toHaveBeenCalled();
-    } finally {
-      rmSync(join(home.dir, "Library"), { recursive: true, force: true });
-    }
   });
 
   it("is told which it runs after: a login where one signs in, any other command in index.ts", () => {

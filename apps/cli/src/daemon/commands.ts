@@ -1165,26 +1165,24 @@ async function enableWindowsStartAtLogin(running: boolean): Promise<void> {
  * `engram install`, it leaves the Startup apps switch where the user put it,
  * as macOS leaves a login item switched off under Login Items, and it never
  * fails the command it runs after.
+ *
+ * "changed": it added or repaired the entry, and said so. "failed": it
+ * couldn't add one, which autoEnableCapture says along with the rest.
  */
-function autoEnableWindowsStartAtLogin(): void {
+function autoEnableWindowsStartAtLogin(): "changed" | "unchanged" | "failed" {
   const entry = readRunEntry();
-  if (entry !== null) {
-    repairRunEntryIfBroken(entry);
-    return;
-  }
+  if (entry !== null) return repairRunEntryIfBroken(entry) ? "changed" : "unchanged";
   // Only a source checkout run through tsx has no login-start.js: the build ships it.
-  if (!existsSync(loginStartPath())) return;
-  if (!writeRunEntry()) {
-    console.log(dim("  Couldn't turn on start at login. Run 'engram install' to try again."));
-    return;
-  }
+  if (!existsSync(loginStartPath())) return "unchanged";
+  if (!writeRunEntry()) return "failed";
   if (switchedOffInStartupApps()) {
     console.log(`${bold("Start at login is switched off")} in Windows Startup apps`);
     console.log(dim("  Switch Engram on there, or run 'engram install', to start the daemon when you sign in."));
-    return;
+    return "changed";
   }
   console.log(`${bold("Auto-start enabled")} — daemon will start when you sign in to Windows`);
   console.log(dim("  A console window flashes briefly at sign-in while it starts."));
+  return "changed";
 }
 
 async function disableStartAtLogin(): Promise<void> {
@@ -1226,8 +1224,14 @@ export async function daemonInstall(): Promise<void> {
  * one-line off switch. Never fatal — login must succeed even if the
  * daemon can't start. Skipped for scripted logins (no TTY) and when
  * ENGRAM_NO_AUTOCAPTURE is set.
+ *
+ * After any other command it makes sure capture is still on, and says so
+ * only when it had to do something: start the daemon, or turn on or repair
+ * start at login (engram#644). A reminder after every search pushes the
+ * command's own output up, and teaches people to skip what follows a
+ * command, which is where a real warning would be.
  */
-export async function autoEnableCapture(): Promise<void> {
+export async function autoEnableCapture({ after }: { after: "login" | "command" }): Promise<void> {
   if (process.env.ENGRAM_NO_AUTOCAPTURE) return;
   if (!process.stdin.isTTY) return;
   const platform = process.platform;
@@ -1236,6 +1240,7 @@ export async function autoEnableCapture(): Promise<void> {
     const config = await loadConfig();
     if (config.autocapture === "off") return; // user said stop; respect it
     if (!(process.env.ENGRAM_API_KEY ?? config.apiKey)) return; // nothing to capture into
+    let changed = false;
     const found = await findDaemon(500);
     if (found.state === "stopped" || found.state === "stopping") {
       // On Windows through the supervisor, as at sign-in, so a worker that
@@ -1243,14 +1248,26 @@ export async function autoEnableCapture(): Promise<void> {
       // it here, so it is never asked to report a failed start.
       if (platform === "win32") spawnSupervisor();
       else spawnWorker();
+      changed = true;
       await sleep(500);
     }
+    let startAtLoginFailed = false;
     if (platform === "darwin" && !isLaunchdInstalled()) {
       installLaunchd();
+      changed = true;
     } else if (platform === "win32") {
-      autoEnableWindowsStartAtLogin();
-    } else {
-      migrateLaunchdIfStale();
+      const startAtLogin = autoEnableWindowsStartAtLogin();
+      if (startAtLogin === "changed") changed = true;
+      startAtLoginFailed = startAtLogin === "failed";
+    } else if (migrateLaunchdIfStale()) {
+      changed = true;
+    }
+    if (after === "command" && !changed) return;
+    // Said with the rest, not after every command while it keeps failing:
+    // after a command, that is when the daemon had to be started, which is
+    // what start at login would have done.
+    if (startAtLoginFailed) {
+      console.log(dim("  Couldn't turn on start at login. Run 'engram install' to try again."));
     }
     console.log(
       `${bold("Auto-capture is on")} — conversations from supported agents on this machine save to your Engram.`,

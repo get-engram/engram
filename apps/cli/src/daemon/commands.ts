@@ -14,6 +14,7 @@ import {
 } from "./status.js";
 import { formatWait } from "./backoff.js";
 import { ALL_ADAPTERS } from "./adapters.js";
+import { rootForAnotherUser } from "./as-root.js";
 import {
   ENGRAM_DIR,
   LOG_FILE,
@@ -218,10 +219,29 @@ function readLaunchdPid(): number | null {
   return isLaunchdInstalled() ? agentPid() : null;
 }
 
+/**
+ * `sudo engram start` or `sudo engram install` would set capture up for
+ * root, not for the user (engram#653): say so, and change nothing.
+ */
+function refusedAsRoot(command: "start" | "install"): boolean {
+  if (!rootForAnotherUser()) return false;
+  console.error(
+    red(
+      command === "install"
+        ? "Start at login is per user, and this is running as root."
+        : "Engram's daemon runs as you, and this is running as root.",
+    ),
+  );
+  console.error(dim(`  Run 'engram ${command}' as yourself, without sudo.`));
+  process.exitCode = 1;
+  return true;
+}
+
 export async function daemonStart(
   _args: string[],
   flags: Record<string, string>,
 ): Promise<void> {
+  if (refusedAsRoot("start")) return;
   await recordCaptureIntent("on");
   // `engram stop` and then `engram start`: the last daemon may still be
   // finishing a send. A worker started now would only wait for it too.
@@ -1383,6 +1403,7 @@ async function disableStartAtLogin(): Promise<void> {
 }
 
 export async function daemonInstall(): Promise<void> {
+  if (refusedAsRoot("install")) return;
   await recordCaptureIntent("on");
   // A daemon that is stopping isn't counted: on Windows a new worker is
   // started, which takes over once that one has gone.
@@ -1394,8 +1415,9 @@ export async function daemonInstall(): Promise<void> {
  * Auto-capture is the product default: a successful interactive login
  * turns the capture daemon on and enables start-at-login, loudly, with a
  * one-line off switch. Never fatal — login must succeed even if the
- * daemon can't start. Skipped for scripted logins (no TTY) and when
- * ENGRAM_NO_AUTOCAPTURE is set.
+ * daemon can't start. Skipped for scripted logins (no TTY), when
+ * ENGRAM_NO_AUTOCAPTURE is set, and for root run for someone else, which
+ * would set capture up for root (engram#653).
  *
  * After any other command it makes sure capture is still on, and says so
  * only when it had to do something: start the daemon, or turn on or repair
@@ -1408,6 +1430,13 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
   if (!process.stdin.isTTY) return;
   const platform = process.platform;
   if (platform !== "darwin" && platform !== "linux" && platform !== "win32") return;
+  // It would start the daemon and start at login for root (engram#653).
+  if (rootForAnotherUser()) {
+    if (after === "login") {
+      console.log(dim("  Auto-capture runs as you, not as root, so it wasn't turned on: sign in again without sudo."));
+    }
+    return;
+  }
   try {
     const config = await loadConfig();
     if (config.autocapture === "off") return; // user said stop; respect it

@@ -235,6 +235,21 @@ function daemonGone(): void {
   rmSync(PID_FILE, { force: true });
 }
 
+/**
+ * A home with a newline in its name, which a unit can't hold, with this
+ * build's worker in it. Gives back what puts the home back.
+ */
+function homeWithNewline(): () => void {
+  const dir = home.dir;
+  home.dir = join(dir, "new\nline");
+  const worker = join(home.dir, "cli", "dist", "daemon", "worker.js");
+  mkdirSync(dirname(worker), { recursive: true });
+  writeFileSync(worker, "");
+  return () => {
+    home.dir = dir;
+  };
+}
+
 /** Signal 0 finds this process alive; any other signal fails the test before it reaches a process. */
 function fakeKill(pid: number, signal: string | number = "SIGTERM"): true {
   if (signal === 0 && pid === process.pid) return true;
@@ -579,6 +594,24 @@ describe("engram install on Linux (engram#615)", () => {
     expect(process.exitCode).toBe(1);
   });
 
+  posixIt("refuses a home a unit can't hold, says why, and writes nothing", async () => {
+    const restore = homeWithNewline();
+    try {
+      await daemonInstall();
+    } finally {
+      restore();
+    }
+    expect(existsSync(UNIT)).toBe(false);
+    expect(systemctlCalls()).toEqual(["show --property=Version"]);
+    const text = output();
+    expect(text).toContain("Can't turn on start at login: a systemd unit can't hold one of the paths it needs.");
+    // The worker's path as JSON: never a raw control character on the terminal.
+    expect(text).toContain(JSON.stringify(join(home.dir, "new\nline", "cli", "dist", "daemon", "worker.js")));
+    expect(text).not.toContain("new\nline");
+    expect(spawn).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+  });
+
   it("fails when this build has no worker to start", async () => {
     rmSync(WORKER);
     await daemonInstall();
@@ -841,6 +874,22 @@ describe("engram start on Linux (engram#615)", () => {
     expect(spawn).toHaveBeenCalledTimes(1);
   });
 
+  posixIt("starts the daemon all the same when a unit can't hold this home, and leaves the unit as it is", async () => {
+    const old = unitWith({}, 0);
+    writeUnit(old);
+    const restore = homeWithNewline();
+    try {
+      await daemonStart([], {});
+    } finally {
+      restore();
+    }
+    expect(readFileSync(UNIT, "utf-8")).toBe(old);
+    expect(execFileSync).not.toHaveBeenCalled();
+    expect(output()).not.toContain("Updated auto-start configuration");
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(process.exitCode).toBeUndefined();
+  });
+
   it("leaves the unit as it is when this build has no worker", async () => {
     const old = unitWith({}, 0);
     writeUnit(old);
@@ -984,6 +1033,21 @@ describe("auto-capture on Linux (engram#615)", () => {
     expect(text).toContain("Couldn't turn on start at login. Run 'engram install' to try again.");
     expect(text).toContain("Auto-capture is on");
     expect(text).not.toContain("isn't available");
+    expect(existsSync(UNIT)).toBe(false);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  posixIt("says it couldn't turn on start at login when a unit can't hold this home", async () => {
+    const restore = homeWithNewline();
+    try {
+      await autoEnableCapture({ after: "login" });
+    } finally {
+      restore();
+    }
+    expect(systemctlCalls()).toEqual(["show --property=Version"]);
+    const text = said();
+    expect(text).toContain("Couldn't turn on start at login. Run 'engram install' to try again.");
+    expect(text).toContain("Auto-capture is on");
     expect(existsSync(UNIT)).toBe(false);
     expect(process.exitCode).toBeUndefined();
   });

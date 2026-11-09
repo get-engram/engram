@@ -1134,17 +1134,27 @@ function removeStrayPlist(): void {
 // `systemctl --user enable`: the user's service manager starts the daemon at
 // login and again after a crash. See systemd.ts.
 
-/** The unit for this CLI: this Node, this build's worker, this home. */
-function unitForThisCli(): string {
+/**
+ * The unit for this CLI: this Node, this build's worker, this home. Or why
+ * there can't be one: a path with a control character in it, which a unit
+ * can't hold. The reason has the path JSON-escaped, so it is safe to print.
+ */
+function unitForThisCli(): { text: string } | { error: string } {
   const node = nodePathForEntry();
-  return generateUnit({
-    node,
-    worker: workerPath(),
-    log: LOG_FILE,
-    engramDir: ENGRAM_DIR,
-    home: homedir(),
-    path: `${dirname(node)}:/usr/local/bin:/usr/bin:/bin`,
-  });
+  try {
+    return {
+      text: generateUnit({
+        node,
+        worker: workerPath(),
+        log: LOG_FILE,
+        engramDir: ENGRAM_DIR,
+        home: homedir(),
+        path: `${dirname(node)}:/usr/local/bin:/usr/bin:/bin`,
+      }),
+    };
+  } catch (err: unknown) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 /**
@@ -1157,7 +1167,11 @@ export function repairSystemdUnitIfStale(unit: UnitState = readUnit()): boolean 
   if (unit.kind !== "ours" || !unit.enabled) return false;
   if (!unit.broken && unit.version >= UNIT_VERSION) return false;
   // Only a source checkout run through tsx has no worker.js: the build ships it.
-  if (!existsSync(workerPath()) || !rewriteUnit(unitForThisCli())) return false;
+  if (!existsSync(workerPath())) return false;
+  // Never fails the command it runs in: a unit that can't be made or written
+  // is left as it is, and `engram install` says why.
+  const made = unitForThisCli();
+  if ("error" in made || !rewriteUnit(made.text)) return false;
   console.log(`${bold("Updated auto-start configuration")} ${dim(`(systemd unit v${UNIT_VERSION})`)}`);
   return true;
 }
@@ -1182,7 +1196,14 @@ async function enableSystemdStartAtLogin(running: boolean): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const failed = installUnit(systemctl, unitForThisCli());
+  const made = unitForThisCli();
+  if ("error" in made) {
+    console.error(red("Can't turn on start at login: a systemd unit can't hold one of the paths it needs."));
+    console.error(dim(`  ${made.error}`));
+    process.exitCode = 1;
+    return;
+  }
+  const failed = installUnit(systemctl, made.text);
   if (failed !== null) {
     console.error(red("Couldn't turn on start at login."));
     console.error(dim(`  systemctl: ${failed}`));
@@ -1217,7 +1238,8 @@ function autoEnableSystemdStartAtLogin(): "changed" | "unchanged" | "failed" | "
   if (!existsSync(workerPath())) return "unchanged";
   const systemctl = systemctlPath();
   if (systemctl === null || !systemdReachable(systemctl)) return "unavailable";
-  if (installUnit(systemctl, unitForThisCli()) !== null) return "failed";
+  const made = unitForThisCli();
+  if ("error" in made || installUnit(systemctl, made.text) !== null) return "failed";
   console.log(`${bold("Auto-start enabled")} — daemon will start when you log in (systemd)`);
   return "changed";
 }

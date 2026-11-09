@@ -7,11 +7,12 @@
  * starts the worker detached and hidden, as `engram start` does, and exits:
  * the window only flashes.
  *
- * It starts the worker without consulting the PID file. Signing out ends
- * every program the user was running, so no daemon is up at sign-in; the
- * file is left over from the last session, and its PID may since have gone
- * to another program, which a liveness check would take for the daemon and
- * skip the start. The new worker writes its own PID over it.
+ * It starts the worker without checking for one. The worker does that
+ * itself (engram#612): if a daemon already answers on its named pipe, it
+ * exits at once. The PID file is never taken as a sign of one here.
+ * Signing out ends every program the user was running, so a file left from
+ * the last session names a PID that may since have gone to another program;
+ * the new worker writes its own PID over it.
  *
  * It never touches config. Like the macOS launchd agent, the entry runs at
  * every sign-in until `engram uninstall` removes it.

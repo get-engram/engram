@@ -25,13 +25,21 @@ import { ALL_ADAPTERS } from "./adapters.js";
 import {
   ENGRAM_DIR,
   LOG_FILE,
-  PID_FILE,
   loginStartPath,
   prepareLogSync,
-  readPidFile,
   spawnWorker,
   workerPath,
 } from "./launch.js";
+import {
+  STOPPING_WAIT_MS,
+  VERSION,
+  alive,
+  identifyProcess,
+  pidInFile,
+  probeDaemon,
+  removePidFileIf,
+  type Probe,
+} from "./instance.js";
 
 /** Render the per-host capture status (engram#261). `signedOut`: the
  *  daemon runs without a key, so nothing is captured (engram#594). */
@@ -61,9 +69,126 @@ const PLIST_PATH = join(PLIST_DIR, `${PLIST_NAME}.plist`);
 // v2: launch `worker.js` (preflight bootstrap) and give the job a PATH.
 const PLIST_VERSION = 2;
 
-function readPid(): number | null {
-  // The PID file first; a launchd-managed worker may not have written one.
-  return readPidFile() ?? readLaunchdPid();
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** What `engram start`, `stop` and `status` find (engram#612). */
+type DaemonFound =
+  /**
+   * A daemon answers on its socket, or, with nothing answering, launchd or
+   * the PID file names a process confirmed to be one. `older`: that one
+   * has no socket, so it is from before engram#612.
+   */
+  | { state: "running"; pid: number; version?: string; ready: boolean; older: boolean }
+  /** It answers, and is shutting down: finishing a send, then exiting. */
+  | { state: "stopping"; pid: number }
+  /**
+   * Something holds the socket and doesn't answer: most often a daemon
+   * whose preflight is rebuilding better-sqlite3, which keeps it busy for a
+   * minute or two. `pid`: when launchd or the PID file names the daemon.
+   */
+  | { state: "unresponsive"; pid: number | null }
+  | { state: "stopped" };
+
+function fromAnswer(probe: Probe): DaemonFound | null {
+  if (probe.state !== "answered") return null;
+  const { info } = probe;
+  if (info.stopping) return { state: "stopping", pid: info.pid };
+  return { state: "running", pid: info.pid, version: info.version, ready: info.ready, older: false };
+}
+
+/**
+ * Find the daemon. It answers on ~/.engram/daemon.sock (a named pipe on
+ * Windows) with its PID. The PID file alone is never trusted: one left by a
+ * daemon that didn't exit cleanly can name a PID that has since gone to
+ * another program, which this used to report as the daemon and `engram stop`
+ * signalled.
+ */
+async function findDaemon(timeoutMs?: number): Promise<DaemonFound> {
+  const probe = await probeDaemon({ timeoutMs });
+  const answered = fromAnswer(probe);
+  if (answered) return answered;
+  if (probe.state === "silent") {
+    // The PID file is left as it is: a daemon busy starting wrote it.
+    return { state: "unresponsive", pid: readLaunchdPid() ?? confirmedPidFile(false) };
+  }
+  // Nothing answers. A daemon from before engram#612 has no socket, but
+  // launchd, or its PID file confirmed, still finds it. (A daemon since
+  // listens before it writes the PID file.) Where no socket can be used
+  // (probe "unavailable"), that is how every daemon is found.
+  const pid = readLaunchdPid() ?? confirmedPidFile(true);
+  if (pid === null) return { state: "stopped" };
+  return { state: "running", pid, ready: true, older: probe.state === "none" };
+}
+
+/**
+ * The daemon the PID file names, when that process is confirmed to be it
+ * (see identifyProcess). `tidy`: remove a file that names a process that has
+ * exited, or another program.
+ */
+function confirmedPidFile(tidy: boolean): number | null {
+  const pid = pidInFile();
+  if (pid === null || pid === process.pid) return null;
+  if (!alive(pid)) {
+    if (tidy) removePidFileIf(pid);
+    return null;
+  }
+  const what = identifyProcess(pid);
+  if (what === "other" && tidy) removePidFileIf(pid);
+  return what === "daemon" ? pid : null;
+}
+
+/** "Daemon already running", for a start that finds one. */
+function printAlreadyRunning(found: Extract<DaemonFound, { state: "running" | "unresponsive" }>): void {
+  const pid = found.pid === null ? "" : ` (pid ${found.pid})`;
+  if (found.state === "unresponsive") {
+    console.log(`Daemon already running${pid}, but it isn't answering right now`);
+    console.log(dim(`  It may be busy, or still starting. Its log: ${LOG_FILE}`));
+    return;
+  }
+  console.log(`Daemon already running${pid}`);
+  printVersionHint(found);
+}
+
+/** When the running daemon isn't this CLI's version, how to switch to it. */
+function printVersionHint(found: { version?: string; older: boolean }): void {
+  if (found.older) {
+    console.log(dim("  It's from an older version of Engram: run 'engram stop' and then 'engram start' to update it."));
+  } else if (found.version && VERSION !== "unknown" && found.version !== VERSION) {
+    console.log(
+      dim(`  It runs version ${found.version}, and this CLI is ${VERSION}: run 'engram stop' and then 'engram start' to switch.`),
+    );
+  }
+}
+
+/**
+ * Wait, up to STOPPING_WAIT_MS, for a daemon that is stopping to exit, and
+ * then look again. Its exit, not its socket: it lets the socket go a moment
+ * before it exits, and in that moment launchd still names it.
+ */
+async function whileStopping(found: DaemonFound): Promise<DaemonFound> {
+  if (found.state !== "stopping") return found;
+  console.log(dim(`Waiting for the daemon that is stopping (pid ${found.pid}) to finish...`));
+  return (await exited(found.pid)) ? findDaemon() : found;
+}
+
+/**
+ * Wait, up to STOPPING_WAIT_MS, for `pid` to exit; true once it has.
+ * `slow`: said once, when it takes more than two seconds.
+ */
+async function exited(pid: number, slow?: () => void): Promise<boolean> {
+  const start = Date.now();
+  while (alive(pid)) {
+    const waited = Date.now() - start;
+    if (waited >= STOPPING_WAIT_MS) return false;
+    if (slow && waited >= 2_000) {
+      slow();
+      slow = undefined;
+    }
+    await sleep(100);
+  }
+  return true;
 }
 
 function readLaunchdPid(): number | null {
@@ -95,14 +220,20 @@ export async function daemonStart(
   flags: Record<string, string>,
 ): Promise<void> {
   await recordCaptureIntent("on");
-  const existing = readPid();
-  if (existing) {
-    console.log(`Daemon already running (pid ${existing})`);
-    // --install still asks for start at login (engram#602). Not on macOS:
-    // loading the launchd agent there starts a second worker beside this one.
-    if ("install" in flags && process.platform !== "darwin") {
-      await enableStartAtLogin(true);
-    }
+  // `engram stop` and then `engram start`: the last daemon may still be
+  // finishing a send. A worker started now would only wait for it too.
+  const found = await whileStopping(await findDaemon());
+  if (found.state === "stopping") {
+    console.error(red(`The daemon is still stopping (pid ${found.pid}). Run 'engram start' again in a moment.`));
+    process.exitCode = 1;
+    return;
+  }
+  if (found.state === "running" || found.state === "unresponsive") {
+    printAlreadyRunning(found);
+    // --install still asks for start at login (engram#602). On macOS,
+    // loading the launchd agent starts a worker there and then, which finds
+    // this daemon and exits (engram#612).
+    if ("install" in flags) await enableStartAtLogin(true);
     return;
   }
 
@@ -144,44 +275,70 @@ function reportStart(started: WorkerStart): boolean {
   } else {
     // Still loading: most often the preflight rebuilding better-sqlite3 for
     // a Node it wasn't built for, which takes a minute or two.
-    console.log(`${bold("Engram daemon is starting")} (pid ${started.pid}) — this one is taking a while`);
+    const pid = started.pid === null ? "" : ` (pid ${started.pid})`;
+    console.log(`${bold("Engram daemon is starting")}${pid} — this one is taking a while`);
     console.log(dim("  Check on it with 'engram status' in a minute."));
   }
   return true;
 }
 
 export type WorkerStart =
-  | { state: "running"; pid: number } // it has written its PID file
-  | { state: "starting"; pid: number } // alive, still loading
+  | { state: "running"; pid: number } // it answers, ready
+  | { state: "starting"; pid: number | null } // alive, still loading
   | { state: "failed" }; // it exited, or never started
 
 /**
- * Wait for a worker just spawned to write its PID file, which it does once
- * its modules have loaded. A fixed half-second pause was too short on
- * Windows, where Node loads slowly the first time while antivirus scans each
- * file: `engram start` reported a failure, exited 1 and skipped --install,
- * and the daemon came up a moment later (engram#602). Gives up as soon as
- * the worker exits.
+ * Wait for a worker just spawned to answer on the daemon's socket as ready:
+ * past the preflight, capture set up. A fixed half-second pause was too
+ * short on Windows, where Node loads slowly the first time while antivirus
+ * scans each file: `engram start` reported a failure, exited 1 and skipped
+ * --install, and the daemon came up a moment later (engram#602). Gives up as
+ * soon as the worker exits with an error.
  */
 export async function waitForWorker(child: ChildProcess, timeoutMs = 10_000): Promise<WorkerStart> {
-  let failed = false;
-  child.once("exit", () => {
-    failed = true;
+  // In an object: TypeScript doesn't see the callbacks assign plain locals.
+  const ended: { code?: number | null; error?: boolean } = {};
+  child.once("exit", (code: number | null) => {
+    ended.code = code;
   });
   child.once("error", () => {
-    failed = true;
+    ended.error = true;
   });
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 100));
-    // The PID file before the exit: a worker that wrote it and then died
-    // leaves a stale file, which readPid removes.
-    const pid = readPid();
-    if (pid !== null) return { state: "running", pid };
-    if (failed) return { state: "failed" };
+    await sleep(100);
+    if (ended.error || child.pid === undefined) return { state: "failed" };
+    if (ended.code !== undefined) return ended.code === 0 ? waitForOther(deadline) : { state: "failed" };
+    if (await answersReady(child.pid)) return { state: "running", pid: child.pid };
   }
-  if (failed || child.pid === undefined) return { state: "failed" };
+  if (ended.error || child.pid === undefined) return { state: "failed" };
+  if (ended.code !== undefined) return ended.code === 0 ? waitForOther(0) : { state: "failed" };
   return { state: "starting", pid: child.pid };
+}
+
+/** Whether `pid` answers on the daemon's socket, ready; where there is no socket, whether the PID file names it. */
+async function answersReady(pid: number): Promise<boolean> {
+  const probe = await probeDaemon({ timeoutMs: 1_000 });
+  if (probe.state === "answered") return probe.info.pid === pid && probe.info.ready;
+  // No socket on this machine (see daemonEndpoint): the PID file is all there is.
+  return probe.state === "unavailable" && pidInFile() === pid;
+}
+
+/**
+ * The worker exited 0 as soon as it started: another daemon was running, or
+ * started at that moment, and it left the capture to that one (engram#612).
+ * launchd starts one beside `engram start` when it loads an updated plist.
+ * Waits, until `deadline`, for that daemon to be ready.
+ */
+async function waitForOther(deadline: number): Promise<WorkerStart> {
+  for (;;) {
+    const found = await findDaemon(1_000);
+    if (found.state === "unresponsive") return { state: "starting", pid: found.pid };
+    if (found.state !== "running") return { state: "failed" };
+    if (found.ready) return { state: "running", pid: found.pid };
+    if (Date.now() >= deadline) return { state: "starting", pid: found.pid };
+    await sleep(100);
+  }
 }
 
 async function recordCaptureIntent(v: "on" | "off"): Promise<void> {
@@ -194,23 +351,58 @@ async function recordCaptureIntent(v: "on" | "off"): Promise<void> {
   }
 }
 
+/**
+ * Stop the daemon: only a process confirmed to be it is signalled
+ * (engram#612), and this waits for it to finish a send in progress and exit,
+ * so an `engram start` straight after starts a new one.
+ */
 export async function daemonStop(): Promise<void> {
   await recordCaptureIntent("off");
-  const pid = readPid();
-  if (!pid) {
+  const found = await findDaemon();
+  if (found.state === "stopped") {
     console.log("Daemon is not running.");
     return;
   }
-
-  try {
-    process.kill(pid, "SIGTERM");
-    console.log(`Daemon stopped (pid ${pid})`);
-  } catch {
-    console.error(`Failed to stop daemon (pid ${pid})`);
+  if (found.pid === null) {
+    console.error(red("The daemon isn't answering, and no process could be confirmed as it, so nothing was stopped."));
+    console.error(dim(`  It may be busy, or still starting: try again in a minute. Its log: ${LOG_FILE}`));
+    process.exitCode = 1;
+    return;
+  }
+  const pid = found.pid;
+  // One that answers as stopping is on its way out already, and is only
+  // waited for.
+  if (found.state !== "stopping") {
+    // A named pipe's name is one namespace for the whole machine, so on
+    // Windows the PID file, which only this user can write, must name the
+    // process the pipe's answer gives.
+    if (process.platform === "win32" && pidInFile() !== pid) {
+      console.error(red(`The daemon's pipe gives pid ${pid}, and ~/.engram/daemon.pid doesn't name it, so nothing was stopped.`));
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ESRCH") {
+        removePidFileIf(pid);
+        console.log("Daemon is not running.");
+        return;
+      }
+      console.error(red(`Failed to stop daemon (pid ${pid})`));
+      process.exitCode = 1;
+      return;
+    }
   }
 
-  // Clean up PID file
-  try { unlinkSync(PID_FILE); } catch { /* ignore */ }
+  const gone = await exited(pid, () => console.log(dim("  Waiting for it to finish what it was sending...")));
+  if (!gone) {
+    console.log(`Asked the daemon to stop (pid ${pid}); it is still finishing.`);
+    return;
+  }
+  // Its own exit removes the PID file; one killed outright can't.
+  removePidFileIf(pid);
+  console.log(`Daemon stopped (pid ${pid})`);
 }
 
 /**
@@ -262,9 +454,9 @@ async function printDbStats(): Promise<void> {
 }
 
 export async function daemonStatus(): Promise<void> {
-  const pid = readPid();
+  const found = await findDaemon();
 
-  if (!pid) {
+  if (found.state === "stopped") {
     console.log(`${bold("Status:")} stopped`);
 
     // Still show DB stats if available
@@ -274,7 +466,21 @@ export async function daemonStatus(): Promise<void> {
     return;
   }
 
-  console.log(`${bold("Status:")} running (pid ${pid})`);
+  if (found.state === "stopping") {
+    console.log(`${bold("Status:")} stopping (pid ${found.pid})`);
+  } else if (found.state === "unresponsive") {
+    const held = process.platform === "win32" ? "the daemon's named pipe" : "~/.engram/daemon.sock";
+    console.log(
+      found.pid === null
+        ? `${bold("Status:")} not answering — ${held} is held, but nothing replies`
+        : `${bold("Status:")} running (pid ${found.pid}) — not answering right now`,
+    );
+    console.log(dim("  Busy, or still starting: the first start after an update can take a minute or two."));
+  } else {
+    console.log(`${bold("Status:")} running (pid ${found.pid})`);
+    if (!found.ready) console.log(dim("  Still starting up."));
+    printVersionHint(found);
+  }
 
   await printDbStats();
 
@@ -789,7 +995,7 @@ async function enableWindowsStartAtLogin(running: boolean): Promise<void> {
   }
 }
 
-function disableStartAtLogin(): void {
+async function disableStartAtLogin(): Promise<void> {
   if (process.platform === "darwin") {
     uninstallLaunchd();
     return;
@@ -806,7 +1012,7 @@ function disableStartAtLogin(): void {
       console.error(dim(`  Remove "${RUN_VALUE}" from ${RUN_KEY}, or switch it off under Startup apps.`));
       return;
     }
-    if (readPid() !== null) {
+    if ((await findDaemon()).state !== "stopped") {
       console.log(dim("  The daemon keeps running until 'engram stop' or sign-out."));
     }
     return;
@@ -816,7 +1022,10 @@ function disableStartAtLogin(): void {
 
 export async function daemonInstall(): Promise<void> {
   await recordCaptureIntent("on");
-  await enableStartAtLogin(readPid() !== null);
+  // A daemon that is stopping isn't counted: on Windows a new worker is
+  // started, which takes over once that one has gone.
+  const found = await findDaemon();
+  await enableStartAtLogin(found.state === "running" || found.state === "unresponsive");
 }
 
 /**
@@ -834,9 +1043,10 @@ export async function autoEnableCapture(): Promise<void> {
     const config = await loadConfig();
     if (config.autocapture === "off") return; // user said stop; respect it
     if (!(process.env.ENGRAM_API_KEY ?? config.apiKey)) return; // nothing to capture into
-    if (!readPid()) {
+    const found = await findDaemon(500);
+    if (found.state === "stopped" || found.state === "stopping") {
       spawnWorker();
-      await new Promise((r) => setTimeout(r, 500));
+      await sleep(500);
     }
     if (process.platform === "darwin" && !isLaunchdInstalled()) {
       installLaunchd();
@@ -859,5 +1069,5 @@ export async function autoEnableCapture(): Promise<void> {
 
 export async function daemonUninstall(): Promise<void> {
   await recordCaptureIntent("off");
-  disableStartAtLogin();
+  await disableStartAtLogin();
 }

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { closeSync, openSync, readFileSync, unlinkSync } from "node:fs";
+import { closeSync, openSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,7 @@ import { createPrivateFileSync, ensurePrivateDirSync, PRIVATE_FILE_MODE, restric
 // would crash the start before the preflight could rebuild it (engram#496).
 
 export const ENGRAM_DIR = join(homedir(), ".engram");
+/** Written by the daemon for CLIs from before engram#612; see instance.ts. */
 export const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
 export const LOG_FILE = join(ENGRAM_DIR, "daemon.log");
 
@@ -78,22 +79,4 @@ export function spawnWorker(): ChildProcess {
     // The worker has its own handle on the log from here on.
     closeSync(logFd);
   }
-}
-
-/** The PID in the PID file when that process is alive; a stale file is removed. */
-export function readPidFile(): number | null {
-  try {
-    const pid = parseInt(readFileSync(PID_FILE, "utf-8").trim(), 10);
-    if (!isNaN(pid)) {
-      try {
-        process.kill(pid, 0);
-        return pid;
-      } catch {
-        try { unlinkSync(PID_FILE); } catch { /* ignore */ }
-      }
-    }
-  } catch {
-    // no PID file
-  }
-  return null;
 }

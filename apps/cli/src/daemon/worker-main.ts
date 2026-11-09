@@ -4,7 +4,6 @@
  * keep any new native-module imports behind that boundary.
  */
 
-import { writeFileSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Engram } from "@getengram/sdk";
@@ -17,10 +16,17 @@ import { SecretScrubber, type VaultLike } from "./scrubber.js";
 import { loadVaultKey } from "../commands/vault.js";
 import { availableAdapters } from "./adapters.js";
 import { configuredKey, ownedKeysAt } from "./key-source.js";
-import { makeDirPrivateSync, PRIVATE_FILE_MODE, type PrivateDirReport } from "../private-files.js";
+import { makeDirPrivateSync, type PrivateDirReport } from "../private-files.js";
+import {
+  claimDaemonLock,
+  markReady,
+  markStopping,
+  releaseDaemonLock,
+  setDisplacedHandler,
+  setStopHandler,
+} from "./instance.js";
 
 const ENGRAM_DIR = join(homedir(), ".engram");
-const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
 const DB_FILE = join(ENGRAM_DIR, "daemon.db");
 const LOG_FILE = join(ENGRAM_DIR, "daemon.log");
 
@@ -67,14 +73,20 @@ function logPrivacy(made: PrivateDirReport): void {
 }
 
 async function main(): Promise<void> {
+  // One daemon per user (engram#612). worker.ts has claimed the lock
+  // before its preflight, and this returns what that claim found. A
+  // launchd plist from before 0.4.2 starts this file directly
+  // (engram#469): for it, this is the claim. It writes the PID file.
+  const claim = await claimDaemonLock({ log });
+  if (claim.state === "taken") process.exit(claim.retry ? 1 : 0);
+
   // Everything the daemon creates is the user's alone (engram#627): the
-  // queue of transcript text, the log, status.json and the PID file. Set
-  // here, after worker.ts's preflight, so an `npm rebuild` it runs keeps
-  // the usual umask. Then what an older version left in ~/.engram is set
-  // to 0600 as well.
+  // queue of transcript text, the log and status.json. Set here, after
+  // worker.ts's preflight, so an `npm rebuild` it runs keeps the usual
+  // umask. Then what an older version left in ~/.engram is set to 0600 as
+  // well.
   if (process.platform !== "win32") process.umask(0o077);
   const made = makeDirPrivateSync(ENGRAM_DIR);
-  writeFileSync(PID_FILE, String(process.pid), { mode: PRIVATE_FILE_MODE });
 
   log(`daemon started (pid ${process.pid})`);
   log(`database: ${DB_FILE}`);
@@ -87,10 +99,13 @@ async function main(): Promise<void> {
   let pruner: Pruner | null = null;
   let shuttingDown = false;
 
-  const shutdown = async (): Promise<void> => {
+  const shutdown = async (options: { flush?: boolean } = {}): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     log("shutting down...");
+    // From here a start finds this daemon stopping, and waits for it
+    // rather than exiting beside it (engram#612).
+    markStopping();
     // A pass in progress stops at its next step and doesn't touch the
     // database after this, so it can be closed below.
     pruner?.stop();
@@ -100,8 +115,10 @@ async function main(): Promise<void> {
       syncer.stop();
       await within(syncer.idle(), SHUTDOWN_WAIT_MS);
       // Final flush — still scrubbed: the scrubber is stopped only after.
-      // It sends only with the key still configured.
-      await within(syncer.flush(), SHUTDOWN_WAIT_MS);
+      // It sends only with the key still configured. Not when another
+      // daemon has taken over: that one sends what is queued, and a flush
+      // here at the same time could send a message twice.
+      if (options.flush !== false) await within(syncer.flush(), SHUTDOWN_WAIT_MS);
     }
     scrubber?.stop();
 
@@ -111,18 +128,19 @@ async function main(): Promise<void> {
       log(`closing the database failed: ${errorText(err)}`);
     }
 
-    try {
-      unlinkSync(PID_FILE);
-    } catch {
-      // already gone
-    }
-
+    // The PID file and the socket go last: until now a start found this
+    // daemon stopping.
+    releaseDaemonLock();
     log("daemon stopped");
     process.exit(0);
   };
 
-  process.on("SIGTERM", () => void shutdown());
-  process.on("SIGINT", () => void shutdown());
+  // SIGTERM and SIGINT: `engram stop`, launchd, Ctrl-C in the foreground.
+  setStopHandler(() => void shutdown());
+  setDisplacedHandler(() => {
+    log("another daemon has taken over; this one is stopping");
+    void shutdown({ flush: false });
+  });
 
   // The API key: ENGRAM_API_KEY, fixed for this process, else config.json.
   // No key is not an error (engram#595): the daemon starts signed out,
@@ -276,6 +294,9 @@ async function main(): Promise<void> {
   pruner.start();
 
   log(`watching for transcripts across ${adapters.length} host(s)...`);
+  // Last: `engram start` reports the daemon started once it answers as
+  // ready, so everything above has run by then.
+  markReady();
 }
 
 main().catch((err) => {

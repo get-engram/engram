@@ -3,12 +3,16 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ParsedMessage } from "../daemon/types.js";
+import type { Probe } from "../daemon/instance.js";
 
 /**
  * engram#628 — `engram daemon status` printed "1 messages", and colored
  * output that went to a pipe. These run the real command against a
  * daemon.db and status.json in a temp home. Nothing reaches the real
  * ~/.engram, launchd or the registry, and no key is sent anywhere.
+ *
+ * A running daemon answers on its socket (engram#612). Here the PID file
+ * stands in for one: the process it names answers.
  */
 
 const { home, execSync, execFileSync, spawn } = vi.hoisted(() => ({
@@ -37,6 +41,17 @@ vi.mock("../config.js", () => ({
   getBaseUrl: () => "https://engram.invalid",
   resolveBaseUrl: () => "https://engram.invalid",
 }));
+
+vi.mock("../daemon/instance.js", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../daemon/instance.js")>();
+  const probeDaemon = async (): Promise<Probe> => {
+    const pid = real.pidInFile();
+    return pid === null
+      ? { state: "none", stale: false }
+      : { state: "answered", info: { pid, version: real.VERSION, ready: true, stopping: false } };
+  };
+  return { ...real, probeDaemon };
+});
 
 home.dir = mkdtempSync(join(tmpdir(), "engram-628-"));
 const ENGRAM_DIR = join(home.dir, ".engram");

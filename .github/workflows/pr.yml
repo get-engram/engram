@@ -14,7 +14,8 @@ jobs:
   check:
     name: Lint, typecheck, test, build
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # About 6 minutes with the daemon tests below; room for a slow runner.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -69,6 +70,14 @@ jobs:
       - name: Daemon delete-scope test
         working-directory: apps/cli
         run: node scripts/e2e-delete-scope.mjs
+
+      # Two starts at once, a launchd-style start beside a running daemon, a
+      # daemon killed outright, its socket removed, and one from before the
+      # lock: one daemon runs, and each message reaches the server once
+      # (engram#612).
+      - name: Daemon single-instance test
+        working-directory: apps/cli
+        run: node scripts/e2e-daemon-lock.mjs
 
       # `pnpm build` runs `wrangler deploy --dry-run`, which only bundles the
       # worker; nothing evaluates the result. Boot it in workerd so an error

@@ -7,6 +7,9 @@
  * `install` that only knew launchd. On macOS and Linux it also checks that
  * ~/.engram and every file in it are the user's alone (engram#627), on a new
  * install and on one an older version left readable by other users.
+ * On Linux, `install` with no systemd user session says start at login
+ * needs one and writes no unit (engram#615); scripts/e2e-systemd.mjs runs
+ * the real systemd.
  *
  * On Windows it also checks the supervisor (engram#613): every way of
  * starting the daemon runs the worker under one, `engram stop` asks the
@@ -113,6 +116,26 @@ const env = {
   ENGRAM_BASE_URL: "http://127.0.0.1:9",
   ENGRAM_NO_AUTOCAPTURE: "1",
 };
+// Linux: no systemd user session, whatever this machine has (engram#615).
+// First on PATH, a systemctl that fails as it does then, and logs how it was
+// run; a unit would go under a temporary XDG_CONFIG_HOME.
+const SYSTEMCTL_CALLS = join(root, "systemctl.calls");
+if (process.platform === "linux") {
+  const bin = join(root, "bin");
+  mkdirSync(bin);
+  writeFileSync(
+    join(bin, "systemctl"),
+    `#!/bin/sh\nprintf '%s\\n' "$*" >>"$ENGRAM_SMOKE_SYSTEMCTL_CALLS"\n` +
+      `echo "Failed to connect to bus: No medium found" >&2\nexit 1\n`,
+    { mode: 0o755 },
+  );
+  env.PATH = `${bin}:${env.PATH ?? ""}`;
+  env.XDG_CONFIG_HOME = join(root, "config");
+  env.ENGRAM_SMOKE_SYSTEMCTL_CALLS = SYSTEMCTL_CALLS;
+  delete env.XDG_RUNTIME_DIR;
+  delete env.DBUS_SESSION_BUS_ADDRESS;
+}
+
 const ENGRAM_DIR = join(home, ".engram");
 const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
 const LOG_FILE = join(ENGRAM_DIR, "daemon.log");
@@ -452,10 +475,24 @@ try {
     check(existsSync(win32.join(SYSTEM32, "rundll32.exe")), "rundll32.exe, the URL opener, is where upgrade.ts looks");
   } else if (process.platform === "linux") {
     // install used to write a macOS plist here and run launchctl (engram#602).
+    // With no systemd user session it writes no unit either (engram#615).
     r = engram("install");
     check(r.status === 0, "install exits 0");
-    check(/Start at login isn't available on Linux yet/.test(r.out), "install says what it can't do");
+    check(
+      /Start at login isn't available here: it needs a systemd user session/.test(r.out),
+      "install says start at login needs a systemd user session",
+    );
+    check(/keeps running until you sign out or restart/.test(r.out), "and that the daemon runs until then");
+    check(!existsSync(join(env.XDG_CONFIG_HOME, "systemd")), "install writes no systemd unit");
+    check(!existsSync(join(home, ".config")), "nor anything under ~/.config");
     check(!existsSync(join(home, "Library")), "install writes no plist");
+    check(
+      existsSync(SYSTEMCTL_CALLS) && readFileSync(SYSTEMCTL_CALLS, "utf-8") === "--user show --property=Version\n",
+      "install only asks systemctl --user whether a service manager answers",
+    );
+    r = engram("uninstall");
+    check(r.status === 0 && /Auto-start isn't on/.test(r.out), "uninstall says auto-start isn't on");
+    check(alive(daemonPid()), "the daemon keeps running");
   }
 
   let freshTemp = null;

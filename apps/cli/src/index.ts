@@ -178,7 +178,7 @@ ${bold("COMMANDS")}
   ${bold("start")}                    Start background daemon (auto-capture)
   ${bold("stop")}                     Stop the daemon
   ${bold("status")}                   Show daemon status, sync info, and plan usage
-  ${bold("install")}                  Start the daemon at login ${dim("(macOS, Windows)")}
+  ${bold("install")}                  Start the daemon at login ${dim("(macOS, Windows, Linux with systemd)")}
   ${bold("uninstall")}                Turn off start at login
 
   ${bold("version")}                  Show version

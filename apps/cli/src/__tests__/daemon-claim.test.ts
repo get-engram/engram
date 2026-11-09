@@ -1,8 +1,9 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { writePrivateFileSync } from "../private-files.js";
 
 /**
  * engram#612 — the daemon's hold on its socket, as the worker takes it:
@@ -10,8 +11,10 @@ import { join } from "node:path";
  * seconds. In a temp home: the PID file and the socket are this test's own,
  * and nothing reaches the real ~/.engram or a running daemon.
  *
- * The claim sets SIGTERM, SIGINT and exit handlers on this process. What
- * they do is set to nothing that exits, and they are removed after.
+ * The claim sets SIGTERM, SIGINT, SIGHUP and exit handlers on this process.
+ * What they do is set to nothing that exits, and they are removed after. It
+ * also looks for a stop request (engram#613) every second, in this test's
+ * ~/.engram.
  *
  * POSIX only: a named pipe can't be removed from under the daemon.
  */
@@ -30,10 +33,12 @@ home.dir = mkdtempSync(join(!POSIX || Buffer.byteLength(tmpdir()) <= 60 ? tmpdir
 const ENGRAM_DIR = join(home.dir, ".engram");
 const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
 const SOCK = join(ENGRAM_DIR, "daemon.sock");
+const STOP_FILE = join(ENGRAM_DIR, "daemon.stop");
 mkdirSync(ENGRAM_DIR, { recursive: true });
 
 const {
   checkDaemonLock,
+  checkStopRequest,
   claimDaemonLock,
   markReady,
   pidInFile,
@@ -44,7 +49,8 @@ const {
 } = await import("../daemon/instance.js");
 
 const endpoint = { path: SOCK, pipe: false };
-const EVENTS = ["SIGTERM", "SIGINT", "exit"];
+const SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"];
+const EVENTS = [...SIGNALS, "exit"];
 const emitter: NodeJS.EventEmitter = process;
 const listenersBefore = new Map(EVENTS.map((event) => [event, emitter.listeners(event)]));
 const logs: string[] = [];
@@ -65,6 +71,12 @@ afterAll(async () => {
 });
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** The listeners on `event` that weren't there before this test file claimed the lock. */
+function added(event: string): Array<(...args: unknown[]) => void> {
+  const before = listenersBefore.get(event) ?? [];
+  return emitter.listeners(event).filter((listener) => !before.includes(listener)) as Array<(...args: unknown[]) => void>;
+}
 
 /** The inode of the socket file at ~/.engram/daemon.sock, or null when there is none. */
 function inode(): number | null {
@@ -141,7 +153,7 @@ describe.skipIf(!POSIX)("the daemon's hold on its socket", () => {
   it("takes the lock: the socket answers as this process, and the PID file names it", async () => {
     setStopHandler(stopped);
     setDisplacedHandler(displaced);
-    const claim = await claimDaemonLock({ log: (msg) => logs.push(msg), settleMs: 20 });
+    const claim = await claimDaemonLock({ log: (msg) => logs.push(msg), settleMs: 20, stopFile: true });
     expect(claim).toEqual({ state: "held" });
     expect(await claimDaemonLock({ log: () => {} })).toBe(claim);
     expect(pidInFile()).toBe(process.pid);
@@ -149,7 +161,7 @@ describe.skipIf(!POSIX)("the daemon's hold on its socket", () => {
     expect(lstatSync(SOCK).mode & 0o077).toBe(0);
     expect(await probeDaemon({ endpoint })).toMatchObject({
       state: "answered",
-      info: { pid: process.pid, ready: false, stopping: false },
+      info: { pid: process.pid, ready: false, stopping: false, stopFile: true },
     });
     markReady();
     expect(await probeDaemon({ endpoint })).toMatchObject({ state: "answered", info: { ready: true } });
@@ -161,6 +173,67 @@ describe.skipIf(!POSIX)("the daemon's hold on its socket", () => {
     await checkDaemonLock();
     expect(inode()).toBe(before);
     expect(pidInFile()).toBe(process.pid);
+    expect(logs).toEqual([]);
+  });
+
+  it("stops when a stop request names it, by its PID and its id, once for each request (engram#613)", async () => {
+    const probe = await probeDaemon({ endpoint });
+    const id = probe.state === "answered" ? probe.info.id : undefined;
+    expect(id).toMatch(/^[0-9a-f]{32}$/);
+    // No await from here on: the daemon's own look, every second, can't come
+    // between a write and the check after it.
+    for (const request of [
+      // An earlier daemon's, whose PID this one has since: never its id.
+      JSON.stringify({ pid: process.pid, id: "0".repeat(32) }),
+      JSON.stringify({ pid: 4242, id }),
+      // From an `engram stop` that found no daemon running.
+      JSON.stringify({ pid: null }),
+      "not json",
+    ]) {
+      writePrivateFileSync(STOP_FILE, request);
+      checkStopRequest();
+    }
+    expect(stopped).not.toHaveBeenCalled();
+    writePrivateFileSync(STOP_FILE, JSON.stringify({ pid: process.pid, id }));
+    checkStopRequest();
+    expect(stopped).toHaveBeenCalledTimes(1);
+    expect(logs.splice(0)).toEqual(["stop requested ('engram stop')"]);
+    // Read once: a daemon still finishing its send isn't asked again.
+    checkStopRequest();
+    expect(stopped).toHaveBeenCalledTimes(1);
+    stopped.mockClear();
+    // And without being called: the daemon looks every second by itself.
+    // `engram stop` run again writes the request again.
+    writePrivateFileSync(STOP_FILE, JSON.stringify({ pid: process.pid, id }));
+    await vi.waitFor(() => expect(stopped).toHaveBeenCalledTimes(1), { timeout: 3_000, interval: 50 });
+    expect(logs.splice(0)).toEqual(["stop requested ('engram stop')"]);
+    stopped.mockClear();
+  });
+
+  it("removes the request it stopped for after a clean exit, and keeps it after an error, for the supervisor (engram#613)", () => {
+    const onExit = added("exit").filter((listener) => listener !== releaseDaemonLock);
+    expect(onExit).toHaveLength(1);
+    const exit = (code: number): void => onExit[0](code);
+    // The request the last test stopped it with is still there.
+    exit(1);
+    expect(existsSync(STOP_FILE)).toBe(true);
+    writePrivateFileSync(STOP_FILE, JSON.stringify({ pid: 4242, id: "0".repeat(32) }));
+    exit(0);
+    expect(existsSync(STOP_FILE)).toBe(true);
+    writePrivateFileSync(STOP_FILE, JSON.stringify({ pid: process.pid, id: "0".repeat(32) }));
+    exit(0);
+    expect(existsSync(STOP_FILE)).toBe(false);
+  });
+
+  it("stops on SIGTERM, SIGINT and SIGHUP, as when the console it runs in is closed", () => {
+    // Called directly: emitting a signal would reach vitest's handlers too.
+    for (const signal of SIGNALS) {
+      const handlers = added(signal);
+      expect(handlers, signal).toHaveLength(1);
+      handlers[0](signal);
+    }
+    expect(stopped).toHaveBeenCalledTimes(SIGNALS.length);
+    stopped.mockClear();
     expect(logs).toEqual([]);
   });
 

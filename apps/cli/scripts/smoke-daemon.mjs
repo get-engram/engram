@@ -8,6 +8,12 @@
  * ~/.engram and every file in it are the user's alone (engram#627), on a new
  * install and on one an older version left readable by other users.
  *
+ * On Windows it also checks the supervisor (engram#613): every way of
+ * starting the daemon runs the worker under one, `engram stop` asks the
+ * worker to stop through ~/.engram/daemon.stop and it shuts down as it does
+ * for SIGTERM, a worker ended outright is started again, and one ended
+ * after a stop request isn't.
+ *
  * Usage, after `pnpm build`:  node scripts/smoke-daemon.mjs
  *
  * Everything happens under a temporary home with a placeholder API key and
@@ -110,6 +116,7 @@ const env = {
 const ENGRAM_DIR = join(home, ".engram");
 const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
 const LOG_FILE = join(ENGRAM_DIR, "daemon.log");
+const STOP_FILE = join(ENGRAM_DIR, "daemon.stop");
 
 // The usual umask, whatever this shell's is: under it, what the CLI and the
 // daemon create is readable by other users unless they say otherwise
@@ -160,6 +167,39 @@ function daemonPid() {
   }
 }
 
+/** The daemon's log so far: the worker's lines, and on Windows the supervisor's. */
+function readLog() {
+  try {
+    return readFileSync(LOG_FILE, "utf-8");
+  } catch {
+    return "";
+  }
+}
+
+/** A process's parent PID and command line, read without Engram's code (Windows); null when it isn't running. */
+function processInfo(pid) {
+  const script =
+    "$ProgressPreference = 'SilentlyContinue'; " +
+    `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${Number(pid)}'; ` +
+    "if ($p) { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(" +
+    "(@{ parent = [int]$p.ParentProcessId; cmd = [string]$p.CommandLine } | ConvertTo-Json -Compress))) }";
+  const out = execFileSync(
+    POWERSHELL,
+    ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")],
+    { encoding: "utf-8", windowsHide: true },
+  ).trim();
+  return out ? JSON.parse(Buffer.from(out, "base64").toString("utf-8")) : null;
+}
+
+/** Whether `pid` is still one of the supervisors this test started, and not a process Windows has given its PID since. */
+function isSupervisor(pid) {
+  try {
+    return /supervisor\.js/.test(processInfo(pid)?.cmd ?? "");
+  } catch {
+    return false;
+  }
+}
+
 async function waitFor(what, test, ms = 30_000) {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
@@ -179,25 +219,67 @@ function reg(...args) {
   }
 }
 
+/** check(), for something that should come true within `ms`. */
+async function soon(what, test, ms) {
+  const value = await waitFor(what, test, ms);
+  if (value) check(true, what);
+  return value;
+}
+
 const pids = new Set();
+/** On Windows, the supervisors seen, by their PIDs (engram#613): ended before the workers when the test ends. */
+const supervisors = new Set();
+/** Worker PID → the supervisor that started it: { pid, cmd }. */
+const supervisorFor = new Map();
+
 /**
- * The PID of a worker that has written its PID file and is alive. `engram
- * stop` deletes the file, so after a stop any PID here is a new worker's:
- * comparing PIDs instead would trip over Windows reusing one.
+ * The PID of a worker that has written its PID file and is alive (and isn't
+ * `not`, one ended outright, whose PID file stays). `engram stop` deletes the
+ * file, so after a stop any PID here is a new worker's: comparing PIDs
+ * instead would trip over Windows reusing one. On Windows, the worker must
+ * have been started by a supervisor (engram#613).
  */
-async function started(what) {
+async function started(what, not = null) {
   const pid = await waitFor(what, () => {
     const p = daemonPid();
-    return p !== null && alive(p) ? p : null;
+    return p !== null && p !== not && alive(p) ? p : null;
   });
   if (pid) pids.add(pid);
+  if (pid && WINDOWS) {
+    const worker = processInfo(pid);
+    const parent = worker ? processInfo(worker.parent) : null;
+    if (check(/supervisor\.js/.test(parent?.cmd ?? ""), `${what}: under a supervisor (${parent?.cmd ?? "none"})`)) {
+      supervisors.add(worker.parent);
+      supervisorFor.set(pid, { pid: worker.parent, cmd: parent.cmd });
+    }
+  }
   return pid;
 }
+
 async function stopped(pid) {
+  const running = pid !== null && alive(pid);
+  const supervisor = running ? supervisorFor.get(pid) : undefined;
+  if (WINDOWS && supervisor) {
+    // From this line on it shuts down for a stop as for SIGTERM. Asked
+    // before, it exits at once, cleanly, with nothing yet to finish.
+    await waitFor("the worker is set up", () => readLog().includes(`daemon started (pid ${pid})`));
+  }
+  const logFrom = readLog().length;
   const r = engram("stop");
   check(r.status === 0, "stop exits 0");
   if (pid) await waitFor("the worker exits", () => !alive(pid));
   check(daemonPid() === null, "stop removes the PID file");
+  if (WINDOWS && supervisor) {
+    // Asked through the stop file, not ended outright (engram#613).
+    check(!/didn't take the request|ended outright/.test(r.out), "the worker takes the request to stop");
+    check(
+      /stop requested \('engram stop'\)[\s\S]*daemon stopped/.test(readLog().slice(logFrom)),
+      "the worker shuts down as it does for SIGTERM",
+    );
+    if (await soon("its supervisor exits", () => !alive(supervisor.pid), 15_000)) supervisors.delete(supervisor.pid);
+    check(!/supervisor: /.test(readLog().slice(logFrom)), "and doesn't start it again");
+    check(!existsSync(STOP_FILE), "the worker removes the request once it has stopped");
+  }
 }
 
 /** Permission bits, in octal. */
@@ -249,6 +331,12 @@ try {
   check(r.status === 0, "start exits 0");
   check(/Engram daemon (started|is starting)/.test(r.out), "start says the daemon started");
   let pid = await started("the worker writes its PID file");
+  if (WINDOWS) {
+    check(
+      /--report-until=\d+/.test(supervisorFor.get(pid)?.cmd ?? ""),
+      "start waits on the first worker: it reports one that can't start (engram#613)",
+    );
+  }
   check(!existsSync(join(home, "Library")), "nothing launchd-shaped is written");
   r = engram("daemon", "status");
   check(/Status: running/.test(r.out), "status says running");
@@ -292,6 +380,10 @@ try {
     const signIn = spawnSync(entry ?? expected, { shell: true, stdio: "ignore", env, timeout: 60_000, windowsHide: true });
     check(signIn.status === 0, "the sign-in entry runs and exits");
     pid = await started("the sign-in entry starts a worker");
+    check(
+      !/--report-until/.test(supervisorFor.get(pid)?.cmd ?? "--report-until"),
+      "at sign-in nothing waits on the worker: the supervisor starts it again whatever it exits with",
+    );
     r = engram("daemon", "status");
     check(/Status: running/.test(r.out), "status says running after sign-in");
 
@@ -320,6 +412,42 @@ try {
     pid = await started("install starts a worker");
     r = engram("uninstall");
     check(regValue(RUN_KEY, "string") === null, "uninstall removes it again");
+
+    // ── a worker ended outright is started again (engram#613) ──
+    // process.kill is TerminateProcess here: no handler runs, as in a crash.
+    const supervisor = supervisorFor.get(pid);
+    if (check(pid !== null && supervisor !== undefined, "a worker under a supervisor to end")) {
+      let logFrom = readLog().length;
+      const crashed = pid;
+      process.kill(crashed);
+      pid = await started("the supervisor starts the worker again after a crash", crashed);
+      check(pid !== null && supervisorFor.get(pid)?.pid === supervisor.pid, "the same supervisor");
+      check(
+        /supervisor: the daemon exited with code 1; starting it again in 10s/.test(readLog().slice(logFrom)),
+        "the supervisor's log says so",
+      );
+
+      // ── …and one ended after a stop request isn't ──
+      // As when `engram stop` ends a worker that didn't take its request (one
+      // from before #613). This request names another process, so the worker
+      // leaves it be.
+      if (pid !== null) {
+        logFrom = readLog().length;
+        writeFileSync(STOP_FILE, `${JSON.stringify({ pid: process.pid, id: "0".repeat(32) })}\n`);
+        await new Promise((res) => setTimeout(res, 2_500));
+        check(
+          alive(pid) && !/stop requested/.test(readLog().slice(logFrom)),
+          "the worker leaves a request for another process alone",
+        );
+        process.kill(pid);
+        if (await soon("the supervisor exits", () => !alive(supervisor.pid), 15_000)) supervisors.delete(supervisor.pid);
+        check(
+          /supervisor: stopped by 'engram stop'; not starting it again/.test(readLog().slice(logFrom)),
+          "the supervisor's log says it wasn't started again, and why",
+        );
+        check(!existsSync(STOP_FILE), "the supervisor removes the request");
+      }
+    }
 
     check(existsSync(win32.join(SYSTEM32, "rundll32.exe")), "rundll32.exe, the URL opener, is where upgrade.ts looks");
   } else if (process.platform === "linux") {
@@ -400,6 +528,16 @@ try {
 } catch (err) {
   check(false, `smoke test crashed: ${err instanceof Error ? err.stack : err}`);
 } finally {
+  // Supervisors first: one would start its worker again.
+  for (const pid of supervisors) {
+    if (alive(pid) && isSupervisor(pid)) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // gone
+      }
+    }
+  }
   const left = daemonPid();
   if (left !== null) pids.add(left);
   for (const pid of pids) {

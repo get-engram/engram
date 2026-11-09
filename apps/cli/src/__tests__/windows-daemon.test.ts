@@ -274,8 +274,11 @@ function output(): string {
 }
 
 const realPlatform = process.platform;
+function onPlatform(platform: NodeJS.Platform): void {
+  Object.defineProperty(process, "platform", { value: platform, configurable: true });
+}
 function onWindows(): void {
-  Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+  onPlatform("win32");
 }
 
 beforeEach(() => {
@@ -916,6 +919,11 @@ describe("one daemon, found by its pipe, on Windows (engram#612)", () => {
 describe("stopping the daemon on Windows through the stop file (engram#613)", () => {
   const ID = "a".repeat(32);
 
+  // ~/.engram, as on any machine a daemon has run on. Without it there is
+  // nowhere to write a request, and these would pass or fail by which test
+  // happened to create it first.
+  beforeEach(() => mkdirSync(dirname(STOP_FILE), { recursive: true }));
+
   /** What `engram stop` last asked through the stop file, or null. */
   function stopRequest(): unknown {
     return existsSync(STOP_FILE) ? JSON.parse(readFileSync(STOP_FILE, "utf-8")) : null;
@@ -1010,9 +1018,13 @@ describe("stopping the daemon on Windows through the stop file (engram#613)", ()
   });
 
   it("writes no request on macOS or Linux, where signals stop the daemon", async () => {
-    await daemonStop();
-    expect(output()).toContain("Daemon is not running.");
-    expect(stopRequest()).toBeNull();
+    // Set, not taken from the machine: CI runs this file on Windows too.
+    for (const platform of ["darwin", "linux"] as const) {
+      onPlatform(platform);
+      await daemonStop();
+      expect(output()).toContain("Daemon is not running.");
+      expect(stopRequest()).toBeNull();
+    }
   });
 
   it("engram status says when the daemon should be running and isn't", async () => {

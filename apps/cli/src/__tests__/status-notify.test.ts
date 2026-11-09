@@ -60,7 +60,7 @@ describe("desktop notifications (engram#581)", () => {
 
   it("shows a Linux notification with the numbers when memory is full", () => {
     onPlatform("linux");
-    recordFailure("storage_full", "storage_full", 12, { used: 1000, limit: 1000 });
+    recordFailure("storage_full", "storage_full", 12, { storage: { used: 1000, limit: 1000 } });
     expect(execFile).toHaveBeenCalledWith(
       "notify-send",
       ["Engram memory is full", "1,000/1,000 messages used. New captures are paused."],

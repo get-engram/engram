@@ -158,3 +158,46 @@ describe("engram daemon status (engram#628)", () => {
     expect(output()).toContain("\x1b[1mStatus:\x1b[0m stopped");
   });
 });
+
+describe("engram daemon status: when the daemon tries again (engram#596)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.UTC(2026, 10, 9, 12, 0, 0));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  /** A running daemon (this process stands in for it) whose sends fail. */
+  function failing(fields: Record<string, unknown>): void {
+    writeFileSync(join(ENGRAM_DIR, "daemon.pid"), String(process.pid));
+    writeFileSync(
+      join(ENGRAM_DIR, "status.json"),
+      JSON.stringify({ health: "warning", pending_messages: 3, last_error_at: "2026-11-09T11:59:30.000Z", ...fields }),
+    );
+  }
+
+  it("says a maintenance pause is one, when the last error was and when it tries again", async () => {
+    failing({ error_type: "paused", next_retry_at: "2026-11-09T12:01:30.000Z" });
+    await daemonStatus();
+    const lines = output();
+    expect(lines).toContain("  WARNING: Engram is paused for scheduled maintenance — messages queued, will retry.");
+    expect(lines).toContain("  3 messages waiting to sync");
+    expect(lines).toContain("  Last error: 2026-11-09T11:59:30.000Z");
+    expect(lines).toContain("  Next try:   in 1m 30s (2026-11-09T12:01:30.000Z)");
+    expect(lines.join("\n")).not.toContain(ESC);
+  });
+
+  it("says nothing of a try that is already due", async () => {
+    failing({ error_type: "server", next_retry_at: "2026-11-09T11:59:59.000Z" });
+    await daemonStatus();
+    expect(output()).toContain("  Last error: 2026-11-09T11:59:30.000Z");
+    expect(output().some((l) => l.includes("Next try"))).toBe(false);
+  });
+
+  it("says nothing of a next try when none is set, or an older daemon wrote status.json", async () => {
+    failing({ error_type: "network" });
+    await daemonStatus();
+    expect(output()).toContain("  WARNING: Can't reach Engram — messages queued, will retry.");
+    expect(output()).toContain("  Last error: 2026-11-09T11:59:30.000Z");
+    expect(output().some((l) => l.includes("Next try"))).toBe(false);
+  });
+});

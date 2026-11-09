@@ -16,7 +16,10 @@ export type SyncErrorType =
   | "billing"
   | "rate_limit"
   | "network"
-  | "server";
+  | "server"
+  /** Engram paused saving for scheduled maintenance (`writes_paused`). It
+   *  passes on its own, and nothing queued here is lost meanwhile. */
+  | "paused";
 
 /**
  * Transcripts that can't be queued in daemon.db (engram#584): a full disk,
@@ -57,6 +60,14 @@ export interface SyncStatus {
    * machine. Not an error: `health` stays healthy.
    */
   signed_out_at: string | null;
+  /**
+   * When the daemon next tries what failed (engram#596): sending, or
+   * creating a conversation. Failures that pass on their own (an error on
+   * the server's side, the server out of reach, a rate limit, a pause) are
+   * retried after a wait that doubles each time, up to a few minutes. Null
+   * when nothing waits for a set time.
+   */
+  next_retry_at: string | null;
   updated_at: string;
 }
 
@@ -71,6 +82,7 @@ const DEFAULT_STATUS: SyncStatus = {
   storage: null,
   capture_error: null,
   signed_out_at: null,
+  next_retry_at: null,
   updated_at: new Date().toISOString(),
 };
 
@@ -122,8 +134,18 @@ export function recordSuccess(pendingMessages: number): void {
   currentStatus.pending_messages = pendingMessages;
   currentStatus.consecutive_failures = 0;
   currentStatus.storage = null;
+  currentStatus.next_retry_at = null;
   lastNotifiedError = null;
   writeStatus();
+}
+
+/** What a failure carries besides its message and kind. */
+export interface FailureDetails {
+  /** A full memory's numbers, from the server's refusal. */
+  storage?: { used?: number; limit?: number } | null;
+  /** When the daemon tries again, in ms since the epoch; null or absent
+   *  when that isn't set by a timer. */
+  retryAt?: number | null;
 }
 
 /**
@@ -136,13 +158,15 @@ export function recordFailure(
   error: string,
   errorType: SyncStatus["error_type"],
   pendingMessages: number,
-  storage?: { used?: number; limit?: number } | null,
+  details: FailureDetails = {},
 ): void {
+  const { storage, retryAt } = details;
   currentStatus.consecutive_failures++;
   currentStatus.last_error = error;
   currentStatus.last_error_at = new Date().toISOString();
   currentStatus.error_type = errorType;
   currentStatus.pending_messages = pendingMessages;
+  currentStatus.next_retry_at = retryAt == null ? null : new Date(retryAt).toISOString();
   if (
     errorType === "storage_full" &&
     typeof storage?.used === "number" &&
@@ -176,6 +200,18 @@ export function recordFailure(
       );
     }
   }
+}
+
+/**
+ * When the daemon next tries what failed, between failures (engram#596):
+ * one conversation's wait can end, and another's go on, with no failure
+ * recorded in between. Written only when it changes.
+ */
+export function recordNextRetry(retryAt: number | null): void {
+  const next = retryAt === null ? null : new Date(retryAt).toISOString();
+  if (next === currentStatus.next_retry_at) return;
+  currentStatus.next_retry_at = next;
+  writeStatus();
 }
 
 /**
@@ -262,6 +298,7 @@ function clearSyncError(): void {
   currentStatus.error_type = null;
   currentStatus.consecutive_failures = 0;
   currentStatus.storage = null;
+  currentStatus.next_retry_at = null;
   lastNotifiedError = null;
 }
 
@@ -325,7 +362,7 @@ function classifyCode(code: string): SyncErrorType | null {
     case "rate_limit_exceeded":
       return "rate_limit";
     case "writes_paused":
-      return "server";
+      return "paused";
   }
   // message_limit_exceeded, indexing_quota_exceeded,
   // conversation_limit_exceeded, …: a plan limit.
@@ -451,8 +488,10 @@ export function syncErrorSummary(
       return "Rate limited — messages queued, will retry.";
     case "server":
       return "Server error — messages queued, will retry.";
+    case "paused":
+      return "Engram is paused for scheduled maintenance — messages queued, will retry.";
     default:
-      return "Can't reach servers — messages queued locally.";
+      return "Can't reach Engram — messages queued, will retry.";
   }
 }
 

@@ -14,6 +14,7 @@ import { dirname, join, win32 } from "node:path";
 import { bold, dim, plural, red } from "../output.js";
 import { loadConfig, saveConfig } from "../config.js";
 import { readStatus, syncErrorSummary, captureErrorSummary, type SyncStatus } from "./status.js";
+import { formatWait } from "./backoff.js";
 import { ALL_ADAPTERS } from "./adapters.js";
 import {
   ENGRAM_DIR,
@@ -334,8 +335,16 @@ function printSyncWarnings(status: SyncStatus): void {
   if (status.pending_messages > 0) {
     console.log(red(`  ${plural(status.pending_messages, "message")} waiting to sync`));
   }
+  // The latest failure: last_error_at moves with each one.
   if (status.last_error_at) {
-    console.log(dim(`  Since: ${status.last_error_at}`));
+    console.log(dim(`  Last error: ${status.last_error_at}`));
+  }
+  // When the daemon tries again (engram#596). A time already past means a
+  // try is due at the next flush, seconds away, so it says nothing.
+  const next = status.next_retry_at ? Date.parse(status.next_retry_at) : NaN;
+  const wait = next - Date.now();
+  if (wait > 0) {
+    console.log(dim(`  Next try:   in ${formatWait(wait)} (${status.next_retry_at})`));
   }
   console.log("");
 }

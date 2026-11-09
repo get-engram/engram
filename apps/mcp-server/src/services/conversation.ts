@@ -171,8 +171,11 @@ export function assertWritesEnabled(env: Env): void {
     // as a generic 500 on the REST path, and the tool guard (engram#513) would
     // hide it as an internal failure on the MCP path, which now passes the
     // JSON body through (engram#592). The CLI daemon reads `writes_paused` as
-    // a server-side pause: the rows stay queued and are resent on a later
-    // flush. It does not read Retry-After yet (engram#596).
+    // a maintenance pause (engram#596): the rows stay queued, and it holds
+    // every send for a jittered wait that doubles each time it meets the
+    // pause again (5 s up to 5 min), starting over once a send goes through.
+    // Retry-After never reaches it, since the MCP path carries only the body;
+    // the header is for clients calling the REST API.
     throw new HTTPException(503, {
       message,
       res: new Response(JSON.stringify({ error: "writes_paused", message }), {

@@ -58,15 +58,17 @@ describe("classifyError reads the error's structure first", () => {
     );
   });
 
-  it("a maintenance pause is server, with or without a status", () => {
-    expect(classifyError(refusal({ error: "writes_paused", message: "Paused for maintenance." }))).toBe("server");
+  it("a maintenance pause is paused, its own kind (engram#596)", () => {
+    // It passes on its own and holds the whole account, unlike an error on
+    // the server's side, which holds one conversation.
+    expect(classifyError(refusal({ error: "writes_paused", message: "Paused for maintenance." }))).toBe("paused");
   });
 
   it("the server's own code wins over the HTTP status", () => {
     // Maintenance is a 503 carrying writes_paused; a refusal body sent with
     // an auth-looking status is still the refusal it names.
     expect(classifyError(new EngramError(JSON.stringify({ error: "writes_paused" }), "undefined", 503))).toBe(
-      "server",
+      "paused",
     );
     expect(classifyError(new EngramError(JSON.stringify({ error: "storage_full" }), "undefined", 500))).toBe(
       "storage_full",

@@ -349,6 +349,39 @@ describe("capture and sending follow the configured key (engram#594)", () => {
     expect(server.copyOf(db, "s1", "key-a1")).toEqual(["A:m0", ...contents]);
   });
 
+  it("a logout is noticed within one key poll even while a send is stuck, not when the flush ends", async () => {
+    const keys = keySource("key-a1");
+    const capture = new FakeCapture(() => syncer);
+    syncer = newSyncer(keys, capture);
+    syncer.start();
+    await syncer.onMessages("s1", meta("s1"), msgs("A:m0"));
+    await syncer.flush();
+    await syncer.onMessages("s1", meta("s1"), msgs(...Array.from({ length: 30 }, (_, i) => `A:m${i + 1}`)));
+
+    let land = () => {};
+    server.storeGate = new Promise<void>((resolve) => {
+      land = resolve;
+    });
+    // The flush timer starts a flush, and its first batch hangs on a slow
+    // server. A flush in progress doesn't read the key again.
+    await vi.advanceTimersByTimeAsync(2_000);
+    for (let i = 0; i < 100 && server.count("store") < 2; i++) await Promise.resolve();
+    expect(server.count("store")).toBe(2);
+
+    keys.configured = undefined;
+    await vi.advanceTimersByTimeAsync(2_000);
+    for (let i = 0; i < 100 && capture.events.length < 2; i++) await Promise.resolve();
+    expect(capture.events).toEqual(["start", "stop+drain"]);
+    expect(recordSignedOut).toHaveBeenCalledTimes(1);
+    expect(linesWith("[engram] signed out")).toHaveLength(1);
+
+    land();
+    server.storeGate = null;
+    await syncer.idle();
+    expect(server.count("store")).toBe(2);
+    expect(db.getPendingCount(fp("key-a1"))).toBe(5);
+  });
+
   it("a login to another account drains capture under the old key, then captures under the new one", async () => {
     const keys = keySource("key-a1");
     const capture = new FakeCapture(() => syncer);

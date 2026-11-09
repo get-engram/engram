@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
-import { writeFileSync, readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { writePrivateFileSync } from "../private-files.js";
 
 const STATUS_FILE = join(homedir(), ".engram", "status.json");
 
@@ -103,7 +104,9 @@ export function readStatus(): SyncStatus {
 function writeStatus(): void {
   currentStatus.updated_at = new Date().toISOString();
   try {
-    writeFileSync(STATUS_FILE, JSON.stringify(currentStatus, null, 2));
+    // 0600, and replaced in one step (engram#627): a reader never sees
+    // half of it. Not flushed to disk: it is rewritten every few seconds.
+    writePrivateFileSync(STATUS_FILE, JSON.stringify(currentStatus, null, 2), { durable: false });
   } catch {
     // best effort
   }

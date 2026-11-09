@@ -262,8 +262,10 @@ async function main(): Promise<void> {
   // Capture is the product default: any authenticated interactive use of
   // the CLI ensures the daemon is running (unless the user explicitly ran
   // stop/uninstall — autoEnableCapture respects config.autocapture="off").
-  // Runs after the command so its output never interleaves; skipped for
-  // daemon-management and auth commands, which handle capture themselves.
+  // Runs after the command so its output never interleaves, and says
+  // something only when it had to start the daemon or turn on start at
+  // login (engram#644); skipped for daemon-management and auth commands,
+  // which handle capture themselves.
   const CAPTURE_EXEMPT = new Set([
     "help", "version", "start", "stop", "restart", "install", "uninstall",
     "status", "log", "signup", "login", "link", "auth login", "auth logout",
@@ -467,7 +469,7 @@ async function main(): Promise<void> {
   }
 
   if (ensureCaptureAfter) {
-    await autoEnableCapture();
+    await autoEnableCapture({ after: "command" });
   }
 }
 

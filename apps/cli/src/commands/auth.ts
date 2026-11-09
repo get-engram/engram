@@ -38,7 +38,7 @@ export async function authLogin(args: string[]): Promise<void> {
   console.log(green("✓ Authenticated successfully"));
   console.log(`  Key saved to ~/.engram/config.json`);
   console.log(`  Prefix: ${key.slice(0, 20)}...`);
-  await autoEnableCapture();
+  await autoEnableCapture({ after: "login" });
 }
 
 export async function authLogout(): Promise<void> {

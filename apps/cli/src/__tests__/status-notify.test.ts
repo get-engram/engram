@@ -75,6 +75,9 @@ describe("desktop notifications (engram#581)", () => {
   it("shows a Windows toast, with the title and body kept out of the script (engram#614)", () => {
     onPlatform("win32");
     vi.stubEnv("SystemRoot", "C:\\Windows");
+    // Set here, so its name keeps this case: Windows keeps an inherited
+    // variable's own, such as SYSTEMROOT, when the environment is copied.
+    vi.stubEnv("ENGRAM_TEST_KEPT", "kept");
     recordFailure("401 Unauthorized", "auth", 3);
     expect(execFile).toHaveBeenCalledTimes(1);
     const [file, args, options, callback] = execFile.mock.calls[0];
@@ -86,7 +89,7 @@ describe("desktop notifications (engram#581)", () => {
         ENGRAM_NOTIFY_TITLE: "Engram needs attention",
         ENGRAM_NOTIFY_BODY: expect.stringContaining("engram auth login"),
         // the rest of the daemon's environment comes along: PowerShell needs it
-        SystemRoot: "C:\\Windows",
+        ENGRAM_TEST_KEPT: "kept",
       }),
     );
     expect(callback).toEqual(expect.any(Function));

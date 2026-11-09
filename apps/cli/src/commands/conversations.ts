@@ -1,5 +1,5 @@
 import { Engram } from "@getengram/sdk";
-import { json, table, green, red, dim } from "../output.js";
+import { json, table, green, red, dim, plural } from "../output.js";
 
 export async function listConversations(
   engram: Engram,
@@ -25,8 +25,8 @@ export async function listConversations(
   const shown = result.conversations.length;
   console.log(
     shown < result.total
-      ? `Showing ${shown} of ${result.total} conversation(s) ${dim("(--limit/--offset to page)")}\n`
-      : `${result.total} conversation(s)\n`,
+      ? `Showing ${shown} of ${plural(result.total, "conversation")} ${dim("(--limit/--offset to page)")}\n`
+      : `${plural(result.total, "conversation")}\n`,
   );
   table(
     result.conversations.map((c) => ({

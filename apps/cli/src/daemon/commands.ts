@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, win32 } from "node:path";
-import { bold, dim, red } from "../output.js";
+import { bold, dim, plural, red } from "../output.js";
 import { loadConfig, saveConfig } from "../config.js";
 import { readStatus, syncErrorSummary, captureErrorSummary, type SyncStatus } from "./status.js";
 import { ALL_ADAPTERS } from "./adapters.js";
@@ -232,10 +232,10 @@ async function printDbStats(): Promise<void> {
       db.close();
     }
     console.log(`${dim("Sessions captured:")} ${stats.sessionsMapped}`);
-    console.log(`${dim("Pending sync:")}      ${stats.pendingMessages} messages`);
+    console.log(`${dim("Pending sync:")}      ${plural(stats.pendingMessages, "message")}`);
     if (stats.heldMessages > 0) {
       console.log(
-        `${dim("Held:")}              ${stats.heldMessages} messages ` +
+        `${dim("Held:")}              ${plural(stats.heldMessages, "message")} ` +
           dim(key ? "(another account's — sent when it signs in again)" : "(sent when their account signs in)"),
       );
     }
@@ -332,7 +332,7 @@ function printSyncWarnings(status: SyncStatus): void {
   console.log("");
   console.log(red(`  WARNING: ${msg}`));
   if (status.pending_messages > 0) {
-    console.log(red(`  ${status.pending_messages} messages waiting to sync`));
+    console.log(red(`  ${plural(status.pending_messages, "message")} waiting to sync`));
   }
   if (status.last_error_at) {
     console.log(dim(`  Since: ${status.last_error_at}`));

@@ -3,6 +3,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { writePrivateFileSync } from "../private-files.js";
+import { plural } from "../output.js";
 
 const STATUS_FILE = join(homedir(), ".engram", "status.json");
 
@@ -34,6 +35,19 @@ export interface CaptureError {
   since: string;
   /** How many transcripts are waiting. */
   files: number;
+}
+
+/**
+ * Opt-out deletes the key in use may not make (engram#597): the server
+ * refused one for want of the 'delete' permission. A key's permissions
+ * don't change, so they are kept on this machine and not tried again with
+ * that key; a different key gets its own try.
+ */
+export interface DeleteRefused {
+  /** When the server refused, under this key. */
+  since: string;
+  /** How many opt-out deletes wait for a key that can delete. */
+  deletes: number;
 }
 
 export interface SyncStatus {
@@ -68,6 +82,12 @@ export interface SyncStatus {
    * when nothing waits for a set time.
    */
   next_retry_at: string | null;
+  /**
+   * Set while the key in use can't delete conversations and opt-outs wait
+   * for one that can (engram#597). Separate from `health`, which is about
+   * sending: such a key still saves.
+   */
+  delete_refused: DeleteRefused | null;
   updated_at: string;
 }
 
@@ -83,6 +103,7 @@ const DEFAULT_STATUS: SyncStatus = {
   capture_error: null,
   signed_out_at: null,
   next_retry_at: null,
+  delete_refused: null,
   updated_at: new Date().toISOString(),
 };
 
@@ -215,6 +236,23 @@ export function recordNextRetry(retryAt: number | null): void {
 }
 
 /**
+ * The key in use can't delete conversations, and `deletes` opt-out deletes
+ * wait for one that can (engram#597). Written only when it changes; none
+ * waiting clears it.
+ */
+export function recordDeletesRefused(deletes: number): void {
+  const prev = currentStatus.delete_refused;
+  if (deletes <= 0) {
+    if (!prev) return;
+    currentStatus.delete_refused = null;
+  } else {
+    if (prev?.deletes === deletes) return;
+    currentStatus.delete_refused = { since: prev?.since ?? new Date().toISOString(), deletes };
+  }
+  writeStatus();
+}
+
+/**
  * A transcript's new lines couldn't be queued in daemon.db; the watcher
  * holds the file at the failing line and retries it (engram#584). The
  * first stall of an episode is logged as a warning and raised as a desktop
@@ -278,15 +316,18 @@ export function recordCaptureResumed(
  */
 export function recordSignedOut(): void {
   clearSyncError();
+  currentStatus.delete_refused = null;
   currentStatus.pending_messages = 0;
   currentStatus.signed_out_at = currentStatus.signed_out_at ?? new Date().toISOString();
   writeStatus();
 }
 
 /** A key is saved: capture and sync run. An error recorded under another
- *  key (or none) says nothing about this one, so it is cleared too. */
+ *  key (or none) says nothing about this one, so it is cleared too, and so
+ *  is another key's refusal to delete (engram#597). */
 export function recordSignedIn(): void {
   clearSyncError();
+  currentStatus.delete_refused = null;
   currentStatus.signed_out_at = null;
   writeStatus();
 }
@@ -476,6 +517,16 @@ export function isConversationGone(err: unknown): boolean {
   return bodyCode(message) === "conversation_not_found";
 }
 
+/**
+ * True when the server accepted the key but refused it a permission it
+ * doesn't have: its `insufficient_scope` code. Only a different key can
+ * fix that (engram#597). Read from the code, not the text: a message that
+ * merely mentions the phrase is not the server's refusal.
+ */
+export function isScopeRefusal(err: unknown): boolean {
+  return bodyCode(errorParts(err).message) === "insufficient_scope";
+}
+
 const n = (x: number) => x.toLocaleString("en-US");
 
 /**
@@ -525,6 +576,19 @@ export function captureErrorSummary(c: CaptureError): string {
     `Engram can't queue new messages on this machine (${c.message}), so ${files} ` +
     `waiting. Free up disk space, or check that ~/.engram/daemon.db can be ` +
     `written. Capture picks up where it stopped, so nothing is skipped.`
+  );
+}
+
+/**
+ * One-line summary of opt-out deletes the key in use may not make
+ * (engram#597), in the second person: `engram status`.
+ */
+export function deleteRefusedSummary(r: DeleteRefused): string {
+  const which = `${plural(r.deletes, "conversation")} you opted out of ${r.deletes === 1 ? "is" : "are"}`;
+  return (
+    `This API key can't delete conversations, so ${which} waiting to be deleted from ` +
+    `Engram. Create a key with the 'delete' permission at getengram.app/dashboard, then ` +
+    `run 'engram auth login <key>'.`
   );
 }
 

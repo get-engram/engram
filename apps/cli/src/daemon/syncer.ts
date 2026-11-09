@@ -7,9 +7,11 @@ import {
   recordNextRetry,
   recordSignedIn,
   recordSignedOut,
+  recordDeletesRefused,
   classifyError,
   isConversationGone,
   isNotFound,
+  isScopeRefusal,
 } from "./status.js";
 import { retryDelay, formatWait } from "./backoff.js";
 import { parseStorageFullError } from "../storage-error.js";
@@ -303,6 +305,15 @@ export class Syncer {
   /** Opt-out deletes that failed the same way: when each is tried again. */
   private deleteRetry = new Map<string, Wait>();
 
+  /**
+   * The key in use may not delete conversations: the server refused an
+   * opt-out's delete for want of the 'delete' permission (engram#597). A
+   * key's permissions don't change, so its deletes are kept and not tried
+   * again with it: they used to be retried, and logged, for as long as the
+   * key was in use. A different key tries again, and so does a restart.
+   */
+  private deletesRefused = false;
+
   /** Rows orphaned by a pre-#370 daemon are adopted once per process. */
   private orphansAdopted = false;
 
@@ -532,6 +543,8 @@ export class Syncer {
     this.createRetry.clear();
     this.sendRetry.clear();
     this.deleteRetry.clear();
+    // Another key's permissions are its own.
+    this.deletesRefused = false;
     this.batchOverride.clear();
     this.vaultHeld = false;
     this.ownership = freshOwnership();
@@ -667,7 +680,11 @@ export class Syncer {
     console.log(
       `[engram] session ${sessionId} excluded (${reason}) — ` +
         `${plural(dropped, "queued message")} dropped` +
-        (here > 0 ? ", deleting synced copy" : "") +
+        (here > 0
+          ? this.deletesRefused
+            ? "; the synced copy waits to be deleted: this API key can't delete conversations"
+            : ", deleting synced copy"
+          : "") +
         (elsewhere > 0
           ? `; ${plural(elsewhere, "copy", "copies")} synced under another API key ` +
             `will be deleted when that key's account signs in again`
@@ -686,10 +703,18 @@ export class Syncer {
     if (this.authHeld() || this.throttled()) return;
     const rows = this.db.getPendingRemoteDeletes(run.fp);
     forgetDone(this.deleteRetry, rows.map((r) => r.conversation_id));
+    // This key may not delete (engram#597): they wait for one that can.
+    // The status counts them, an opt-out made since included.
+    if (this.deletesRefused) {
+      recordDeletesRefused(rows.length);
+      return;
+    }
     const now = Date.now();
     for (const row of rows) {
       // The key changed: the rest wait for their account to sign in again.
       if (this.active !== run) return;
+      // Refused meanwhile, in another pass over these deletes (engram#597).
+      if (this.deletesRefused) return;
       // A delete that failed waits its turn (engram#596).
       if ((this.deleteRetry.get(row.conversation_id)?.until ?? 0) > now) continue;
       try {
@@ -716,10 +741,28 @@ export class Syncer {
         // Refused under a key no longer in use: that says nothing about the
         // key in use now, and the delete waits for its account.
         if (this.active !== run) return;
+        // The key works but may not delete (engram#597). It can still save,
+        // so nothing else pauses; every delete waits for a key that can.
+        if (isScopeRefusal(err)) {
+          this.requestWentThrough(run, false);
+          // Counted from daemon.db: an opt-out made since is waiting too.
+          const waiting = this.db.getPendingRemoteDeletes(run.fp).length;
+          // Said once, though two passes over the deletes may both be refused.
+          if (!this.deletesRefused) {
+            this.deletesRefused = true;
+            console.error(
+              `[engram] opt-out delete refused for ${row.conversation_id}: this API key can't ` +
+                `delete conversations. ${plural(waiting, "opt-out delete")} kept on this ` +
+                `machine, waiting for a key that can; not retried with this one. ` +
+                `Run 'engram status' for details.`,
+            );
+          }
+          recordDeletesRefused(waiting);
+          return;
+        }
         const errType = classifyError(err);
-        // Only a key refused outright pauses everything. A key that works
-        // but lacks the delete scope (insufficient_scope) can still save.
-        if (errType === "auth" && !isScopeRefusal(msg)) {
+        // Only a key refused outright pauses everything.
+        if (errType === "auth") {
           console.error(
             `[engram] opt-out delete failed for ${row.conversation_id} (will retry): ${msg}`,
           );
@@ -1562,11 +1605,6 @@ export class Syncer {
 
     return conversationId;
   }
-}
-
-/** The server's refusal of a key that works but lacks a scope. */
-function isScopeRefusal(msg: string): boolean {
-  return msg.includes('"insufficient_scope"');
 }
 
 function errorText(err: unknown): string {

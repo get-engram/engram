@@ -17,6 +17,7 @@ vi.mock("../daemon/status.js", async (importOriginal) => ({
   recordSignedOut: vi.fn(),
   recordSignedIn: vi.fn(),
   updatePending: vi.fn(),
+  recordNextRetry: vi.fn(),
 }));
 vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/exclusions.js")>()),
@@ -33,6 +34,7 @@ import {
   type PrunerOptions,
 } from "../daemon/prune.js";
 import { Syncer } from "../daemon/syncer.js";
+import { RETRY_BASE_MS } from "../daemon/backoff.js";
 import type { ParsedMessage, SessionMeta } from "../daemon/types.js";
 
 // engram#598: daemon.db kept every message it had ever sent. Sent rows now
@@ -413,6 +415,8 @@ describe("Pruner (engram#598)", () => {
   });
 
   it("a message the server didn't take stays queued and is sent later; one it took leaves once due", async () => {
+    // Only Date: the send that failed waits its turn (engram#596).
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
     const server = {
       stored: [] as string[],
       failing: true,
@@ -452,6 +456,7 @@ describe("Pruner (engram#598)", () => {
     ]);
 
     server.failing = false;
+    vi.setSystemTime(Date.now() + RETRY_BASE_MS);
     await syncer.flush();
     expect(server.stored).toEqual(["TAKEN-1", "TAKEN-2", "HELD-1"]);
     expect(db.getPendingCount()).toBe(0);

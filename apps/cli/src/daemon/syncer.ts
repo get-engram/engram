@@ -4,11 +4,13 @@ import { DaemonDb } from "./db.js";
 import {
   recordSuccess,
   recordFailure,
+  recordNextRetry,
   recordSignedIn,
   recordSignedOut,
   classifyError,
   isNotFound,
 } from "./status.js";
+import { retryDelay, formatWait } from "./backoff.js";
 import { parseStorageFullError } from "../storage-error.js";
 import { isPathExcluded, detectOptOut } from "./exclusions.js";
 import { queueing } from "./queue-error.js";
@@ -174,7 +176,15 @@ type SendOutcome =
   | "sent" // everything queued for it went out
   | "retry" // a send failed, or the key changed; its rows stay queued for a later flush
   | "backoff" // the account hit a billing or storage limit
-  | "auth"; // the API key was rejected; sending pauses (AUTH_RETRY_MS)
+  | "auth" // the API key was rejected; sending pauses (AUTH_RETRY_MS)
+  | "wait"; // a rate limit or a maintenance pause holds the account (engram#596)
+
+/** When one thing that failed is tried again, and how many times in a row
+ *  it has failed. */
+interface Wait {
+  until: number;
+  step: number;
+}
 
 /** Retry schedule for one session whose conversation create failed with an
  *  ordinary error (network, 5xx, rejected input). Its messages stay queued
@@ -237,7 +247,30 @@ export class Syncer {
   /** Sessions whose conversation create failed: when to try again. The
    *  sessions themselves live in daemon.db (engram#370) — losing this map
    *  on a restart only means an earlier retry. */
-  private createRetry = new Map<string, { until: number; step: number }>();
+  private createRetry = new Map<string, Wait>();
+
+  /**
+   * Nothing is sent from this account until this time, after the server
+   * refused a request for when it came rather than for what it carried: a
+   * rate limit, or a pause for maintenance (engram#596). `throttleStep`
+   * counts such pauses in a row without a request going through.
+   */
+  private throttledUntil = 0;
+  private throttleStep = 0;
+  /** A maintenance pause is among those pauses. It holds only sends, so a
+   *  create or a delete going through doesn't show it's over. */
+  private throttlePaused = false;
+
+  /**
+   * Conversations whose last send failed in a way that passes on its own
+   * (the server out of reach, a timeout, an error on the server's side):
+   * when each is tried again (engram#596). Like createRetry, a restart only
+   * means an earlier retry; the rows themselves stay queued in daemon.db.
+   */
+  private sendRetry = new Map<string, Wait>();
+
+  /** Opt-out deletes that failed the same way: when each is tried again. */
+  private deleteRetry = new Map<string, Wait>();
 
   /** Rows orphaned by a pre-#370 daemon are adopted once per process. */
   private orphansAdopted = false;
@@ -461,7 +494,13 @@ export class Syncer {
     // backoff would only delay finding out.
     this.billingBackoffUntil = 0;
     this.billingBackoffStep = 0;
+    // A rate limit is the account's, and the next key may be another's.
+    this.throttledUntil = 0;
+    this.throttleStep = 0;
+    this.throttlePaused = false;
     this.createRetry.clear();
+    this.sendRetry.clear();
+    this.deleteRetry.clear();
     this.batchOverride.clear();
     this.vaultHeld = false;
     this.ownership = freshOwnership();
@@ -611,14 +650,21 @@ export class Syncer {
    *  key of the account it is in; a delete is kept until the server
    *  confirms. */
   private async retryRemoteDeletes(run: Run): Promise<void> {
-    // A rejected key can't delete either; the deletes keep until it's fixed.
-    if (this.authHeld()) return;
-    for (const row of this.db.getPendingRemoteDeletes(run.fp)) {
+    // A rejected key can't delete either, and a rate limit or a maintenance
+    // pause holds deletes like any other request; they keep until then.
+    if (this.authHeld() || this.throttled()) return;
+    const rows = this.db.getPendingRemoteDeletes(run.fp);
+    forgetDone(this.deleteRetry, rows.map((r) => r.conversation_id));
+    const now = Date.now();
+    for (const row of rows) {
       // The key changed: the rest wait for their account to sign in again.
       if (this.active !== run) return;
+      // A delete that failed waits its turn (engram#596).
+      if ((this.deleteRetry.get(row.conversation_id)?.until ?? 0) > now) continue;
       try {
         await run.client.deleteConversation(row.conversation_id);
-        this.keyAccepted(run);
+        this.requestWentThrough(run, false);
+        this.deleteRetry.delete(row.conversation_id);
         this.db.clearPendingRemoteDelete(row.conversation_id);
         console.log(
           `[engram] deleted synced conversation ${row.conversation_id} for opted-out session`,
@@ -631,22 +677,36 @@ export class Syncer {
         // matching /not.?found/ or "404", and a DNS failure (ENOTFOUND)
         // matches that. The delete was dropped while the copy stayed.
         if (isNotFound(err)) {
-          this.keyAccepted(run);
+          this.requestWentThrough(run, false);
+          this.deleteRetry.delete(row.conversation_id);
           this.db.clearPendingRemoteDelete(row.conversation_id);
           continue;
         }
         // Refused under a key no longer in use: that says nothing about the
         // key in use now, and the delete waits for its account.
         if (this.active !== run) return;
-        console.error(
-          `[engram] opt-out delete failed for ${row.conversation_id} (will retry): ${msg}`,
-        );
+        const errType = classifyError(err);
         // Only a key refused outright pauses everything. A key that works
         // but lacks the delete scope (insufficient_scope) can still save.
-        if (classifyError(err) === "auth" && !isScopeRefusal(msg)) {
+        if (errType === "auth" && !isScopeRefusal(msg)) {
+          console.error(
+            `[engram] opt-out delete failed for ${row.conversation_id} (will retry): ${msg}`,
+          );
           this.enterAuthHold(msg);
           return;
         }
+        if (errType === "rate_limit" || errType === "paused") {
+          console.error(
+            `[engram] opt-out delete failed for ${row.conversation_id} (will retry): ${msg}`,
+          );
+          this.enterThrottle(msg, errType);
+          return;
+        }
+        const wait = waitAgain(this.deleteRetry, row.conversation_id);
+        console.error(
+          `[engram] opt-out delete failed for ${row.conversation_id} ` +
+            `(will retry in ${formatWait(wait)}): ${msg}`,
+        );
       }
     }
   }
@@ -696,7 +756,8 @@ export class Syncer {
     // before then would otherwise get a second conversation.
     if (!this.claim(run)) return;
 
-    // Nothing can send while the key is rejected or a billing backoff holds.
+    // Nothing can send while the key is rejected, a billing backoff holds,
+    // or the account waits out a rate limit or a maintenance pause.
     if (this.halted(run)) return;
 
     // What an earlier key of this account queued is sent with this one.
@@ -718,17 +779,25 @@ export class Syncer {
       (id) => !id.startsWith("pending:"),
     );
 
+    // A conversation whose last send failed waits its turn (engram#596).
+    // It used to be tried again at every flush, every 2 s, for as long as
+    // the failure lasted, and by every daemon at once.
+    forgetDone(this.sendRetry, convIds);
+    const now = Date.now();
+    const due = convIds.filter((id) => (this.sendRetry.get(id)?.until ?? 0) <= now);
+
     // Nothing is sent before the vault has been read: a message queued
     // before then wasn't scrubbed against it (engram#588).
-    if (convIds.length > 0 && !(await this.vaultReady(run))) return;
+    if (due.length > 0 && !(await this.vaultReady(run))) return;
 
     // Process conversations in parallel, up to CONCURRENCY at a time
     const chunks = [];
-    for (let i = 0; i < convIds.length; i += CONCURRENCY) {
-      chunks.push(convIds.slice(i, i + CONCURRENCY));
+    for (let i = 0; i < due.length; i += CONCURRENCY) {
+      chunks.push(due.slice(i, i + CONCURRENCY));
     }
 
-    let allSent = true;
+    // A conversation waiting its turn hasn't synced.
+    let allSent = due.length === convIds.length;
     for (const chunk of chunks) {
       const results = await Promise.allSettled(
         chunk.map((id) => this.flushConversation(run, id)),
@@ -752,11 +821,15 @@ export class Syncer {
     //
     // After a pause for a rejected key, a flush with nothing to send
     // proves nothing about the key: status keeps saying it was rejected
-    // until a request goes through (keyAccepted) or a new key is saved.
+    // until a request goes through (requestWentThrough) or a new key is
+    // saved.
     const pending = this.db.getPendingCount(run.fp);
     if (createsOk && allSent && this.authHoldStep === 0) {
       this.resetBillingBackoff();
       recordSuccess(pending);
+    } else {
+      // A wait can end, and another go on, with no failure in between.
+      recordNextRetry(this.nextRetryAt());
     }
   }
 
@@ -890,6 +963,7 @@ export class Syncer {
 
     const now = Date.now();
     const pending = this.db.getPendingSessions(run.fp);
+    forgetDone(this.createRetry, pending.map((s) => s.sessionId));
     let sessions = pending.filter(
       (s) => (this.createRetry.get(s.sessionId)?.until ?? 0) <= now,
     );
@@ -949,9 +1023,13 @@ export class Syncer {
           this.enterBillingBackoff(msg);
           return false;
         }
-        this.deferCreate(sessionId);
-        console.error(`[engram] create error (will retry): ${msg}`);
-        recordFailure(msg, errType, this.pendingCount());
+        if (errType === "rate_limit" || errType === "paused") {
+          this.enterThrottle(msg, errType);
+          return false;
+        }
+        const wait = this.deferCreate(sessionId);
+        console.error(`[engram] create error (will retry in ${formatWait(wait)}): ${msg}`);
+        recordFailure(msg, errType, this.pendingCount(), { retryAt: this.nextRetryAt() });
       }
     }
     return ok;
@@ -982,7 +1060,7 @@ export class Syncer {
     if (this.active !== run) return;
 
     const conversationId = await this.createConversation(run, sessionId, meta);
-    this.keyAccepted(run);
+    this.requestWentThrough(run, false);
 
     // Opt-out race (engram#462): the user may have said "don't save
     // this" while the create was in flight — excludeSession saw no
@@ -1005,12 +1083,14 @@ export class Syncer {
     });
   }
 
-  /** Pace retries for a session whose create failed: 30s → 2m → 10m … */
-  private deferCreate(sessionId: string): void {
+  /** Pace retries for a session whose create failed: 30s → 2m → 10m …
+   *  Returns the wait. */
+  private deferCreate(sessionId: string): number {
     const prev = this.createRetry.get(sessionId);
     const step = prev ? prev.step + 1 : 0;
     const delay = CREATE_RETRY_MS[Math.min(step, CREATE_RETRY_MS.length - 1)];
     this.createRetry.set(sessionId, { until: Date.now() + delay, step });
+    return delay;
   }
 
   private async flushConversation(run: Run, conversationId: string): Promise<SendOutcome> {
@@ -1023,6 +1103,7 @@ export class Syncer {
       // started: it could only fail the same way.
       if (this.authHeld()) return "auth";
       if (Date.now() < this.billingBackoffUntil) return "backoff";
+      if (this.throttled()) return "wait";
 
       const limit = this.batchOverride.get(conversationId) ?? BATCH_SIZE;
       let rows = this.db.dequeue(conversationId, limit, run.fp);
@@ -1051,9 +1132,12 @@ export class Syncer {
 
       try {
         await run.client.store({ conversationId, messages });
-        this.keyAccepted(run);
+        this.requestWentThrough(run, true);
         this.db.markSent(rows.map((r) => r.id));
-        if (this.active === run) this.batchOverride.delete(conversationId);
+        if (this.active === run) {
+          this.batchOverride.delete(conversationId);
+          this.sendRetry.delete(conversationId);
+        }
       } catch (err: unknown) {
         // Failed under a key no longer in use: that says nothing about the
         // key in use now. The rows stay queued for their account.
@@ -1074,21 +1158,32 @@ export class Syncer {
           return "backoff";
         }
 
-        // Network/timeout/server — leave in queue for next cycle, but halve
-        // this conversation's batch so an oversized batch self-resolves
-        // instead of retrying the identical payload forever. A rate limit
-        // refuses the request, not its size: halving it would only multiply
-        // the requests.
-        if (rows.length > 1 && errType !== "rate_limit") {
+        // A rate limit or a maintenance pause: nothing is sent from this
+        // account for a while (engram#596). It refuses the request for when
+        // it came, not for its size, so the batch keeps its size: halving
+        // it would only multiply the requests.
+        if (errType === "rate_limit" || errType === "paused") {
+          this.enterThrottle(msg, errType);
+          return "wait";
+        }
+
+        // Network/timeout/server — leave in queue, and try this conversation
+        // again after a wait that doubles with each failure in a row
+        // (engram#596). Halve its batch too, so an oversized batch
+        // self-resolves instead of retrying the identical payload forever.
+        // One conversation's failure doesn't hold the others: what fails for
+        // one batch (a payload a proxy refuses) may not fail for the rest.
+        const wait = waitAgain(this.sendRetry, conversationId);
+        if (rows.length > 1) {
           const next = Math.max(1, Math.floor(rows.length / 2));
           this.batchOverride.set(conversationId, next);
           console.error(
-            `[engram] send failed (will retry with batch ${next}): ${msg}`,
+            `[engram] send failed (will retry in ${formatWait(wait)} with batch ${next}): ${msg}`,
           );
         } else {
-          console.error(`[engram] send failed (will retry): ${msg}`);
+          console.error(`[engram] send failed (will retry in ${formatWait(wait)}): ${msg}`);
         }
-        recordFailure(msg, errType, this.pendingCount());
+        recordFailure(msg, errType, this.pendingCount(), { retryAt: this.nextRetryAt() });
         return "retry";
       }
     }
@@ -1213,11 +1308,11 @@ export class Syncer {
 
     if (storageFull) {
       recordFailure(msg, "storage_full", this.pendingCount(), {
-        used: storageFull.used,
-        limit: storageFull.limit,
+        storage: { used: storageFull.used, limit: storageFull.limit },
+        retryAt: this.nextRetryAt(),
       });
     } else {
-      recordFailure(msg, "billing", this.pendingCount());
+      recordFailure(msg, "billing", this.pendingCount(), { retryAt: this.nextRetryAt() });
     }
   }
 
@@ -1236,23 +1331,84 @@ export class Syncer {
           `or as soon as a new key is saved ('engram auth login'): ${msg}`,
       );
     }
-    recordFailure(msg, "auth", this.pendingCount());
+    recordFailure(msg, "auth", this.pendingCount(), { retryAt: this.nextRetryAt() });
   }
 
   private authHeld(): boolean {
     return Date.now() < this.authHeldUntil;
   }
 
-  /** A request with `run`'s key went through: the key works. */
-  private keyAccepted(run: Run): void {
-    if (this.active === run) this.authHoldStep = 0;
+  /**
+   * The server refused a request for when it came, not for what it carried:
+   * a rate limit, or a pause for maintenance (engram#596). Nothing is sent
+   * from this account until the wait is over, and each pause in a row
+   * without a request going through waits longer (retryDelay), up to a few
+   * minutes. Escalates once per pause, like the other holds: requests
+   * refused together are one refusal. The wait is drawn at random within
+   * its range, so daemons refused together don't all come back together.
+   */
+  private enterThrottle(msg: string, errType: "rate_limit" | "paused"): void {
+    if (errType === "paused") this.throttlePaused = true;
+    if (!this.throttled()) {
+      this.throttleStep++;
+      const delay = retryDelay(this.throttleStep);
+      this.throttledUntil = Date.now() + delay;
+      console.error(
+        `[engram] ${errType === "paused" ? "Engram is paused for maintenance" : "rate limited"} — ` +
+          `sending nothing for ${formatWait(delay)}, messages stay queued: ${msg}`,
+      );
+    }
+    recordFailure(msg, errType, this.pendingCount(), { retryAt: this.nextRetryAt() });
+  }
+
+  private throttled(): boolean {
+    return Date.now() < this.throttledUntil;
+  }
+
+  /**
+   * A request with `run`'s key went through: the key works, and the server
+   * takes requests again. A maintenance pause holds only sends, so only a
+   * send (`sent`) shows one is over. Lifts no pause early; the next one
+   * only starts over at the shortest wait.
+   */
+  private requestWentThrough(run: Run, sent: boolean): void {
+    if (this.active !== run) return;
+    this.authHoldStep = 0;
+    if (sent || !this.throttlePaused) {
+      this.throttleStep = 0;
+      this.throttlePaused = false;
+    }
   }
 
   /** True while sending with `run` must not or can only fail: its key is
-   *  no longer the one configured, the key was rejected, or the account is
-   *  inside a billing backoff. */
+   *  no longer the one configured, the key was rejected, the account is
+   *  inside a billing backoff, or it waits out a rate limit or a pause. */
   private halted(run: Run): boolean {
-    return this.active !== run || this.authHeld() || Date.now() < this.billingBackoffUntil;
+    return (
+      this.active !== run ||
+      this.authHeld() ||
+      Date.now() < this.billingBackoffUntil ||
+      this.throttled()
+    );
+  }
+
+  /**
+   * When the daemon next tries what failed, for the status (engram#596):
+   * the end of a pause that holds every send, else the earliest turn of a
+   * conversation or a session waiting after a failure of its own. Null when
+   * nothing waits for a set time.
+   */
+  private nextRetryAt(): number | null {
+    const now = Date.now();
+    const hold = Math.max(this.authHeldUntil, this.billingBackoffUntil, this.throttledUntil);
+    if (hold > now) return hold;
+    let next: number | null = null;
+    for (const waits of [this.sendRetry, this.createRetry]) {
+      for (const { until } of waits.values()) {
+        if (until > now && (next === null || until < next)) next = until;
+      }
+    }
+    return next;
   }
 
   /** Unsent messages the key in use will send, for the status: 0 while
@@ -1312,7 +1468,30 @@ function isScopeRefusal(msg: string): boolean {
 }
 
 function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  const text = err instanceof Error ? err.message : String(err);
+  if (text) return text;
+  // The SDK gives no text for an error body it doesn't read (a 429 says why
+  // in a field it doesn't look at); the status at least names it.
+  const status = (err as { status?: unknown } | null)?.status;
+  return typeof status === "number" ? `HTTP ${status}` : "unknown error";
+}
+
+/** Wait before trying one thing again that failed again: the wait doubles
+ *  with each failure in a row (retryDelay). Returns it. */
+function waitAgain(waits: Map<string, Wait>, id: string): number {
+  const step = (waits.get(id)?.step ?? 0) + 1;
+  const delay = retryDelay(step);
+  waits.set(id, { until: Date.now() + delay, step });
+  return delay;
+}
+
+/** Forget the waits of what no longer waits to go out. */
+function forgetDone(waits: Map<string, Wait>, still: readonly string[]): void {
+  if (waits.size === 0) return;
+  const keep = new Set(still);
+  for (const id of waits.keys()) {
+    if (!keep.has(id)) waits.delete(id);
+  }
 }
 
 function rowToMessage(row: PendingRow) {

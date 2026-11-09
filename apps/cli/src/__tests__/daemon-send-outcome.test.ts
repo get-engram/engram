@@ -16,6 +16,7 @@ vi.mock("../daemon/status.js", async (importOriginal) => ({
   recordSignedOut: vi.fn(),
   recordSignedIn: vi.fn(),
   updatePending: vi.fn(),
+  recordNextRetry: vi.fn(),
 }));
 vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/exclusions.js")>()),
@@ -24,7 +25,14 @@ vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
 
 import { DaemonDb } from "../daemon/db.js";
 import { FIXED_KEY_FP, Syncer, keyFingerprint } from "../daemon/syncer.js";
-import { recordFailure, recordSignedIn, recordSignedOut, recordSuccess } from "../daemon/status.js";
+import { RETRY_BASE_MS } from "../daemon/backoff.js";
+import {
+  recordFailure,
+  recordNextRetry,
+  recordSignedIn,
+  recordSignedOut,
+  recordSuccess,
+} from "../daemon/status.js";
 import type { ParsedMessage, SessionMeta } from "../daemon/types.js";
 
 // engram#580: a send that failed used to leave the flush looking like a
@@ -62,6 +70,11 @@ const refusal = (body: object) => new EngramError(JSON.stringify(body));
  */
 const httpError = (status: number) => new EngramError("", "undefined", status);
 
+/** What the SDK throws while Engram is paused for maintenance: the tool's
+ *  refusal (apps/mcp-server assertWritesEnabled). */
+const writesPaused = () =>
+  refusal({ error: "writes_paused", message: "Engram is paused for a few minutes of scheduled maintenance." });
+
 type StoreParams = { conversationId: string; messages: Array<{ content: string }> };
 type Op = "create" | "store" | "delete" | "owned";
 
@@ -75,6 +88,8 @@ class FakeServer {
   stored = new Map<string, string[]>();
   /** Error for every send while set. */
   sendError: Error | null = null;
+  /** Error for every conversation create while set. */
+  createError: Error | null = null;
   /** Per-send failure, decided from what is being sent. */
   failWhen: ((p: StoreParams) => Error | null) | null = null;
   /** Per-send latency in real milliseconds (only Date is faked). */
@@ -115,6 +130,7 @@ class FakeServer {
     return {
       createConversation: async () => {
         admit("create");
+        if (this.createError) throw this.createError;
         this.creates++;
         return { conversationId: `conv_${++this.seq}` };
       },
@@ -173,6 +189,9 @@ async function flushAfter(ms: number): Promise<number> {
 
 const failureTypes = () => vi.mocked(recordFailure).mock.calls.map((c) => c[1]);
 
+/** What the daemon logged as errors, one line per call. */
+const errorLog = () => vi.mocked(console.error).mock.calls.map((c) => c.join(" ")).join("\n");
+
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "engram-send-outcome-"));
   db = new DaemonDb(join(dir, "daemon.db"));
@@ -184,6 +203,7 @@ beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.mocked(recordSuccess).mockClear();
   vi.mocked(recordFailure).mockClear();
+  vi.mocked(recordNextRetry).mockClear();
   vi.mocked(recordSignedIn).mockClear();
   vi.mocked(recordSignedOut).mockClear();
 });
@@ -310,9 +330,10 @@ describe("a failed send is not a successful sync (engram#580)", () => {
     expect(recordSuccess).not.toHaveBeenCalled();
     expect(failureTypes()).toEqual(["network"]);
 
-    // An ordinary failure isn't a backoff: the next 2 s flush retries it.
+    // An ordinary failure holds only its own conversation, for a few
+    // seconds the first time (engram#596).
     server.failWhen = null;
-    await flushAfter(2_000);
+    await flushAfter(RETRY_BASE_MS);
     expect(server.copyOf(db, "s-b")).toEqual(["b1"]);
     expect(db.getPendingCount()).toBe(0);
     expect(recordSuccess).toHaveBeenCalledTimes(1);
@@ -642,10 +663,11 @@ describe("a rejected key pauses, and recovers without a restart (engram#587)", (
     await flushAfter(10 * 60_000 + 1_000);
     expect(server.creates).toBe(1);
 
-    // Rejected again: ten minutes, as after any key that worked, not thirty.
+    // Rejected again, once the send's own wait is over (engram#596): ten
+    // minutes, as after any key that worked, not thirty.
     server.sendError = null;
     server.acceptedKeys = new Set();
-    await flushAfter(2_000);
+    await flushAfter(RETRY_BASE_MS);
     const n = requests();
     await flushAfter(10 * 60_000 - 1_000);
     expect(requests()).toBe(n);
@@ -706,14 +728,17 @@ describe("refusals are read from the error, not from digits in its text (engram#
     expect(await flushAfter(10 * 60_000 - 1_000)).toBe(1);
   });
 
-  it("a rate limit is retried with the same batch, not split into more requests", async () => {
+  it.each([
+    ["a rate limit", () => httpError(429), "rate_limit"],
+    ["a maintenance pause", writesPaused, "paused"],
+  ])("%s is retried with the same batch, not split into more requests", async (_, error, type) => {
     const many = Array.from({ length: 30 }, (_, i) => `m-${i}`);
     await syncer.onMessages("s1", meta("s1"), msgs(...many));
-    server.failWhen = () => (server.sends.length === 1 ? httpError(429) : null);
+    server.failWhen = () => (server.sends.length === 1 ? error() : null);
 
     await syncer.flush();
-    expect(failureTypes()).toEqual(["rate_limit"]);
-    await flushAfter(2_000);
+    expect(failureTypes()).toEqual([type]);
+    await flushAfter(RETRY_BASE_MS);
     expect(server.sends.map((p) => p.messages.length)).toEqual([25, 25, 5]);
     expect(server.copyOf(db, "s1")).toEqual(many);
   });
@@ -740,12 +765,20 @@ describe("an opt-out's server delete is dropped only when Engram says it's gone 
   ])("keeps the delete after %s, and retries until it lands", async (_, err) => {
     await optOutAfterSync(err);
     expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toHaveLength(1);
+    const deletes = () => server.requests.filter((r) => r.op === "delete").length;
+    expect(deletes()).toBe(1);
 
+    // Tried again once its wait is over (engram#596), not at every flush,
+    // and kept again. The first wait is at least half of RETRY_BASE_MS.
     await flushAfter(2_000);
+    expect(deletes()).toBe(1);
+    await flushAfter(RETRY_BASE_MS - 2_000);
+    expect(deletes()).toBe(2);
     expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toHaveLength(1);
 
+    // The second wait is up to twice the first.
     server.deleteError = null;
-    await flushAfter(2_000);
+    await flushAfter(2 * RETRY_BASE_MS);
     expect(server.deleted).toEqual(["conv_1"]);
     expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toEqual([]);
   });
@@ -810,11 +843,12 @@ describe("an opt-out's server delete is dropped only when Engram says it's gone 
     expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toHaveLength(1);
     await syncer.onMessages("s2", meta("s2"), msgs("m2"));
 
-    // The key is revoked; the flush's first request, the delete, finds out.
+    // The key is revoked; the flush's first request, the delete (its wait
+    // over), finds out.
     server.deleteError = null;
     server.acceptedKeys = new Set();
     const before = server.requests.length;
-    await flushAfter(2_000);
+    await flushAfter(RETRY_BASE_MS);
     expect(server.requests.slice(before)).toEqual([{ op: "delete", key: "key-1" }]);
     expect(failureTypes().at(-1)).toBe("auth");
     expect(db.getPendingSessions(FIXED_KEY_FP).map((s) => s.sessionId)).toEqual(["s2"]);
@@ -833,5 +867,241 @@ describe("an opt-out's server delete is dropped only when Engram says it's gone 
     await flushAfter(10 * 60_000 + 1_000);
     expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toEqual([]);
     expect(recordSuccess).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("what fails for a while is tried again after a wait that doubles (engram#596)", () => {
+  // Every wait at the top of its range, so the schedule reads exactly:
+  // 5 s, then 10, then 20… (backoff.test.ts covers the range itself).
+  beforeEach(() => {
+    vi.spyOn(Math, "random").mockReturnValue(1 - 1e-9);
+  });
+
+  it("an error on the server's side holds only its own conversation: 5 s, then 10, then 20", async () => {
+    await syncer.onMessages("s-a", meta("s-a"), msgs("a1"));
+    await syncer.onMessages("s-b", meta("s-b"), msgs("b1"));
+    const isA = (p: StoreParams) => p.messages.some((m) => m.content.startsWith("a"));
+    const triesOfA = () => server.sends.filter(isA).length;
+    server.failWhen = (p) => (isA(p) ? httpError(503) : null);
+
+    await syncer.flush();
+    expect(triesOfA()).toBe(1);
+    expect(server.copyOf(db, "s-b")).toEqual(["b1"]);
+    expect(failureTypes()).toEqual(["server"]);
+    expect(errorLog()).toContain("send failed (will retry in 5s): HTTP 503");
+
+    // The other conversation isn't held: what it captures meanwhile goes
+    // out at the next flush. A flush isn't a sync while one waits.
+    await syncer.onMessages("s-b", meta("s-b"), msgs("b2"));
+    await flushAfter(2_000);
+    expect(server.copyOf(db, "s-b")).toEqual(["b1", "b2"]);
+    expect(recordSuccess).not.toHaveBeenCalled();
+
+    // It used to be tried again at every flush, every 2 s.
+    await flushAfter(2_000); // 4 s
+    expect(triesOfA()).toBe(1);
+    await flushAfter(1_000); // 5 s
+    expect(triesOfA()).toBe(2);
+    await flushAfter(9_000); // 14 s
+    expect(triesOfA()).toBe(2);
+    await flushAfter(1_000); // 15 s
+    expect(triesOfA()).toBe(3);
+    expect(errorLog()).toContain("send failed (will retry in 20s): HTTP 503");
+
+    server.failWhen = null;
+    await flushAfter(19_000); // 34 s
+    expect(triesOfA()).toBe(3);
+    await flushAfter(1_000); // 35 s
+    expect(server.copyOf(db, "s-a")).toEqual(["a1"]);
+    expect(db.getPendingCount()).toBe(0);
+    expect(recordSuccess).toHaveBeenCalledTimes(1);
+
+    // Its success started its schedule over: failing again waits 5 s.
+    await syncer.onMessages("s-a", meta("s-a"), msgs("a2"));
+    server.failWhen = (p) => (isA(p) ? httpError(503) : null);
+    await flushAfter(2_000);
+    expect(triesOfA()).toBe(5);
+    await flushAfter(4_000);
+    expect(triesOfA()).toBe(5);
+    await flushAfter(1_000);
+    expect(triesOfA()).toBe(6);
+  });
+
+  it.each([
+    ["a rate limit", () => httpError(429), "rate_limit"],
+    ["a maintenance pause", writesPaused, "paused"],
+  ])("%s holds every send from the account: 5 s, then 10, then 20", async (_, error, type) => {
+    const ids = Array.from({ length: 7 }, (_, i) => `s${i}`); // > one group of 5
+    for (const id of ids) await syncer.onMessages(id, meta(id), msgs(`m-${id}`));
+    server.sendError = error();
+
+    // The first group of five is refused together: one pause, and the
+    // other two aren't sent.
+    expect(await flushAfter(0)).toBe(5);
+    expect(new Set(failureTypes())).toEqual(new Set([type]));
+    expect(errorLog()).toContain("sending nothing for 5s");
+
+    expect(await flushAfter(4_000)).toBe(5);
+    expect(await flushAfter(1_000)).toBe(10); // 5 s: refused again, together
+    expect(await flushAfter(9_000)).toBe(10);
+    expect(await flushAfter(1_000)).toBe(15); // 15 s
+    expect(errorLog()).toContain("sending nothing for 20s");
+    expect(await flushAfter(19_000)).toBe(15);
+
+    // Taken again: all seven go out.
+    server.sendError = null;
+    expect(await flushAfter(1_000)).toBe(22); // 35 s
+    for (const id of ids) expect(server.copyOf(db, id)).toEqual([`m-${id}`]);
+    expect(recordSuccess).toHaveBeenCalledTimes(1);
+
+    // A send that went through started the schedule over.
+    await syncer.onMessages("s0", meta("s0"), msgs("again"));
+    server.sendError = error();
+    expect(await flushAfter(2_000)).toBe(23);
+    expect(await flushAfter(4_000)).toBe(23);
+    expect(await flushAfter(1_000)).toBe(24);
+  });
+
+  it.each([
+    ["a maintenance pause keeps its schedule: it holds only sends", writesPaused, 10_000],
+    ["a rate limit starts over: the create got through it", () => httpError(429), 5_000],
+  ])("after a create goes through, %s", async (_, error, wait) => {
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    server.sendError = error();
+    expect(await flushAfter(0)).toBe(1); // 5 s
+
+    // A new session's create goes through; both sends are refused again.
+    await syncer.onMessages("s2", meta("s2"), msgs("m2"));
+    expect(await flushAfter(5_000)).toBe(3);
+    expect(server.creates).toBe(2);
+    expect(await flushAfter(wait - 1_000)).toBe(3);
+    expect(await flushAfter(1_000)).toBe(5);
+  });
+
+  it("a rate limit on a create holds the account, and the create isn't put off for 30 s", async () => {
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    await syncer.onMessages("s2", meta("s2"), msgs("m2"));
+    server.createError = httpError(429);
+    await syncer.flush();
+    expect(server.requests.map((r) => r.op)).toEqual(["create", "create"]);
+    expect(failureTypes()).toEqual(["rate_limit"]);
+
+    server.createError = null;
+    await flushAfter(4_000);
+    expect(server.requests).toHaveLength(2);
+    await flushAfter(1_000);
+    expect(server.copyOf(db, "s1")).toEqual(["m1"]);
+    expect(server.copyOf(db, "s2")).toEqual(["m2"]);
+  });
+
+  it("an error on the server's side on a create keeps the create's own schedule", async () => {
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    server.createError = httpError(500);
+    const t0 = Date.now();
+    await syncer.flush();
+    expect(vi.mocked(recordFailure).mock.calls).toEqual([
+      ["HTTP 500", "server", 1, { retryAt: t0 + 30_000 }],
+    ]);
+    expect(errorLog()).toContain("create error (will retry in 30s): HTTP 500");
+
+    server.createError = null;
+    await flushAfter(29_000);
+    expect(server.creates).toBe(0);
+    await flushAfter(1_000);
+    expect(server.copyOf(db, "s1")).toEqual(["m1"]);
+  });
+
+  it("a rate limit on an opt-out's delete holds everything else too, then the delete lands", async () => {
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    await syncer.flush();
+    server.deleteError = httpError(429);
+    await syncer.onMessages("s1", meta("s1"), msgs("engram: ignore"));
+    expect(failureTypes()).toEqual(["rate_limit"]);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toHaveLength(1);
+
+    await syncer.onMessages("s2", meta("s2"), msgs("m2"));
+    const before = server.requests.length;
+    await flushAfter(4_000);
+    expect(server.requests).toHaveLength(before);
+
+    server.deleteError = null;
+    await flushAfter(1_000);
+    expect(server.requests.slice(before).map((r) => r.op)).toEqual(["delete", "create", "store"]);
+    expect(server.deleted).toEqual(["conv_1"]);
+    expect(server.copyOf(db, "s2")).toEqual(["m2"]);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toEqual([]);
+  });
+
+  it("an opt-out during a rate limit waits for it: the delete isn't sent into the limit", async () => {
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    await syncer.flush();
+    await syncer.onMessages("s1", meta("s1"), msgs("m2"));
+    server.sendError = httpError(429);
+    await flushAfter(2_000);
+    expect(failureTypes()).toEqual(["rate_limit"]);
+    const before = server.requests.length;
+
+    await syncer.onMessages("s1", meta("s1"), msgs("engram: ignore"));
+    expect(server.requests).toHaveLength(before);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toHaveLength(1);
+
+    // The limit's wait over, the delete is the first thing sent.
+    server.sendError = null;
+    await flushAfter(5_000);
+    expect(server.requests.slice(before)).toEqual([{ op: "delete", key: "key-1" }]);
+    expect(server.deleted).toEqual(["conv_1"]);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toEqual([]);
+  });
+
+  it("status says when the next try is, and a flush during the wait changes nothing", async () => {
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    server.sendError = httpError(503);
+    const t0 = Date.now();
+    await syncer.flush();
+    expect(vi.mocked(recordFailure).mock.calls).toEqual([
+      ["HTTP 503", "server", 1, { retryAt: t0 + 5_000 }],
+    ]);
+    expect(vi.mocked(recordNextRetry).mock.lastCall).toEqual([t0 + 5_000]);
+
+    await flushAfter(2_000);
+    expect(recordFailure).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordNextRetry).mock.lastCall).toEqual([t0 + 5_000]);
+
+    // Rate limited at the retry: the account's pause is what's next.
+    server.sendError = httpError(429);
+    await flushAfter(3_000); // 5 s
+    expect(vi.mocked(recordFailure).mock.lastCall).toEqual([
+      "HTTP 429",
+      "rate_limit",
+      1,
+      { retryAt: t0 + 10_000 },
+    ]);
+    expect(vi.mocked(recordNextRetry).mock.lastCall).toEqual([t0 + 10_000]);
+
+    server.sendError = null;
+    await flushAfter(5_000); // 10 s
+    expect(server.copyOf(db, "s1")).toEqual(["m1"]);
+    expect(recordSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  it("a new key isn't held by the old key's rate limit", async () => {
+    const keys = keySource("key-old");
+    syncer = new Syncer(db, server.client("key-old"), null, keys);
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    server.sendError = httpError(429);
+    await syncer.flush();
+    expect(failureTypes()).toEqual(["rate_limit"]);
+    server.sendError = null;
+
+    // `engram auth login` with another account's key, inside the old key's
+    // pause: what's captured under it goes out at once.
+    keys.configured = "key-new";
+    await flushAfter(1_000);
+    expect(keys.connected).toEqual(["key-new"]);
+    await syncer.onMessages("s2", meta("s2"), msgs("m2"));
+    await flushAfter(1_000);
+    expect(server.copyOf(db, "s2", keyFingerprint("key-new"))).toEqual(["m2"]);
+    // The old account's message waits for its key.
+    expect(db.getPendingCount(keyFingerprint("key-old"))).toBe(1);
   });
 });

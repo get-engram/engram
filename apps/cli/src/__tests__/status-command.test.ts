@@ -34,6 +34,7 @@ describe("engram status (engram#609)", () => {
     vi.doMock("../config.js", () => ({
       loadConfig: async () => (apiKey ? { apiKey } : {}),
       getBaseUrl: () => "http://127.0.0.1:9",
+      resolveBaseUrl: () => "http://127.0.0.1:9",
     }));
     const lines: string[] = [];
     const daemonStatus = vi.fn(async () => {

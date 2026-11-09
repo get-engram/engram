@@ -12,6 +12,11 @@ vi.mock("../daemon/status.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/status.js")>()),
   recordSuccess: vi.fn(),
   recordFailure: vi.fn(),
+  recordCaptureStall: vi.fn(),
+  recordCaptureResumed: vi.fn(),
+  recordSignedOut: vi.fn(),
+  recordSignedIn: vi.fn(),
+  updatePending: vi.fn(),
 }));
 vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/exclusions.js")>()),
@@ -23,7 +28,7 @@ import {
   pendingConversationId,
   recoveredSessionMeta,
 } from "../daemon/db.js";
-import { Syncer } from "../daemon/syncer.js";
+import { Syncer, FIXED_KEY_FP } from "../daemon/syncer.js";
 import { recordSuccess } from "../daemon/status.js";
 import type { ParsedMessage, SessionMeta } from "../daemon/types.js";
 
@@ -83,7 +88,7 @@ class FakeEngram {
 
   /** Messages the server holds for a session, via daemon.db's mapping. */
   copyOf(db: DaemonDb, sessionId: string): string[] | undefined {
-    const conv = db.getConversationId(sessionId);
+    const conv = db.getConversationId(sessionId, FIXED_KEY_FP);
     return conv ? this.stored.get(conv) : undefined;
   }
 }
@@ -159,10 +164,10 @@ describe("pending sessions are durable (engram#370)", () => {
 
     expect(server.creates).toHaveLength(1);
     expect(server.copyOf(db, "s1")).toEqual(["question", "answer"]);
-    expect(db.getPendingSessions()).toEqual([]);
+    expect(db.getPendingSessions(FIXED_KEY_FP)).toEqual([]);
     expect(db.getPendingCount()).toBe(0);
     // The session's own metadata survived the restart (not rebuilt).
-    const created = server.conversations.get(db.getConversationId("s1")!)!;
+    const created = server.conversations.get(db.getConversationId("s1", FIXED_KEY_FP)!)!;
     expect(created.title).toMatch(/^myproj \(/);
     expect(created.metadata).toMatchObject({ cwd: "/work/myproj", gitBranch: "main" });
     expect(created.metadata).not.toHaveProperty("recovered");
@@ -180,7 +185,7 @@ describe("pending sessions are durable (engram#370)", () => {
     expect(server.creates).toHaveLength(2);
     expect(server.copyOf(db, "s-a")).toBeUndefined();
     expect(server.copyOf(db, "s-b")).toEqual(["b1"]);
-    expect(db.getPendingSessions().map((s) => s.sessionId)).toEqual(["s-a"]);
+    expect(db.getPendingSessions(FIXED_KEY_FP).map((s) => s.sessionId)).toEqual(["s-a"]);
     expect(recordSuccess).not.toHaveBeenCalled();
 
     // Inside the retry delay: no new attempt, and still not "healthy".
@@ -196,7 +201,7 @@ describe("pending sessions are durable (engram#370)", () => {
     await syncer.flush();
     expect(server.creates).toHaveLength(3);
     expect(server.copyOf(db, "s-a")).toEqual(["a1", "a2"]);
-    expect(db.getPendingSessions()).toEqual([]);
+    expect(db.getPendingSessions(FIXED_KEY_FP)).toEqual([]);
     expect(db.getPendingCount()).toBe(0);
     expect(recordSuccess).toHaveBeenCalled();
   });
@@ -208,7 +213,7 @@ describe("pending sessions are durable (engram#370)", () => {
     const syncer = new Syncer(db, rejected.client());
     await syncer.onMessages("s1", meta("s1"), msgs("keep"));
     await syncer.flush();
-    expect(db.getPendingSessions()).toHaveLength(1);
+    expect(db.getPendingSessions(FIXED_KEY_FP)).toHaveLength(1);
 
     // `engram login` + daemon restart
     const server = new FakeEngram();
@@ -226,7 +231,7 @@ describe("pending sessions are durable (engram#370)", () => {
     server.createError = new Error('402 {"error":"storage_full","used":100,"limit":100}');
 
     await syncer.flush();
-    expect(db.getPendingSessions()).toHaveLength(7);
+    expect(db.getPendingSessions(FIXED_KEY_FP)).toHaveLength(7);
     const attempts = server.creates.length;
 
     // The billing backoff must hold: a flush 2 s later doesn't call again.
@@ -239,7 +244,7 @@ describe("pending sessions are durable (engram#370)", () => {
     later(5 * 60_000);
     await syncer.flush();
     for (const id of ids) expect(server.copyOf(db, id)).toEqual([`m-${id}`]);
-    expect(db.getPendingSessions()).toEqual([]);
+    expect(db.getPendingSessions(FIXED_KEY_FP)).toEqual([]);
     expect(db.getPendingCount()).toBe(0);
   });
 
@@ -258,7 +263,7 @@ describe("pending sessions are durable (engram#370)", () => {
 
     expect(server.creates).toHaveLength(1);
     expect(server.copyOf(db, "s1")).toEqual(["first", "second"]);
-    expect(db.getPendingSessions()).toEqual([]);
+    expect(db.getPendingSessions(FIXED_KEY_FP)).toEqual([]);
     expect(db.getPendingCount()).toBe(0);
   });
 
@@ -269,12 +274,12 @@ describe("pending sessions are durable (engram#370)", () => {
     await syncer.onMessages("s1", meta("s1"), msgs("private"));
     await syncer.onMessages("s1", meta("s1"), msgs("don't save this to engram"));
     // Dropped at once, not left for the flush to clean up.
-    expect(db.getPendingSessions()).toEqual([]);
+    expect(db.getPendingSessions(FIXED_KEY_FP)).toEqual([]);
     expect(db.getPendingCount()).toBe(0);
     await syncer.flush();
 
     expect(server.creates).toHaveLength(0);
-    expect(db.getPendingSessions()).toEqual([]);
+    expect(db.getPendingSessions(FIXED_KEY_FP)).toEqual([]);
     expect(db.getPendingCount()).toBe(0);
   });
 
@@ -294,7 +299,7 @@ describe("pending sessions are durable (engram#370)", () => {
 
     expect(server.deleted).toEqual(["conv_1"]);
     expect(server.stored.get("conv_1")).toBeUndefined();
-    expect(db.getPendingSessions()).toEqual([]);
+    expect(db.getPendingSessions(FIXED_KEY_FP)).toEqual([]);
     expect(db.getPendingCount()).toBe(0);
   });
 
@@ -324,9 +329,9 @@ describe("rows orphaned by an older daemon (engram#370)", () => {
   it("adopts them and syncs each with metadata rebuilt from its transcript path", async () => {
     const db = openDb();
     // What a pre-#370 daemon left behind: rows under pending:<id>, no record.
-    db.enqueue(pendingConversationId(claudeId), msgs("c1", "c2"));
-    db.enqueue(pendingConversationId(codexId), msgs("x1"));
-    db.enqueue(pendingConversationId(lostId), msgs("l1"));
+    db.enqueue(pendingConversationId(claudeId), msgs("c1", "c2"), null);
+    db.enqueue(pendingConversationId(codexId), msgs("x1"), null);
+    db.enqueue(pendingConversationId(lostId), msgs("l1"), null);
     db.setFileOffset(`/Users/u/.claude/projects/-Users-u-code-myproj/${claudeId}.jsonl`, 10);
     db.setFileOffset(
       `/Users/u/.codex/sessions/2026/07/23/rollout-2026-07-23T04-46-50-${codexId}.jsonl`,
@@ -338,7 +343,7 @@ describe("rows orphaned by an older daemon (engram#370)", () => {
     const server = new FakeEngram();
     await new Syncer(db, server.client()).flush();
 
-    const conv = (id: string) => server.conversations.get(db.getConversationId(id)!)!;
+    const conv = (id: string) => server.conversations.get(db.getConversationId(id, FIXED_KEY_FP)!)!;
     expect(conv(claudeId).title).toMatch(/^myproj \(/);
     expect(conv(claudeId).agentId).toBe("claude-code");
     expect(conv(claudeId).metadata).toMatchObject({ sessionId: claudeId, recovered: true });
@@ -351,13 +356,14 @@ describe("rows orphaned by an older daemon (engram#370)", () => {
     expect(server.copyOf(db, codexId)).toEqual(["x1"]);
     expect(server.copyOf(db, lostId)).toEqual(["l1"]);
     expect(db.getPendingCount()).toBe(0);
-    expect(db.getPendingSessions()).toEqual([]);
+    expect(db.getPendingSessions(FIXED_KEY_FP)).toEqual([]);
   });
 
   it("moves an already-mapped session's leftover rows without a second conversation", async () => {
     const db = openDb();
-    db.setSessionMap("s1", "conv_existing", { projectDir: "p" });
-    db.enqueue(pendingConversationId("s1"), msgs("left", "over"));
+    // Mapped and queued before daemon.db recorded keys: the first key claims both.
+    db.setSessionMap("s1", "conv_existing", { projectDir: "p" }, "");
+    db.enqueue(pendingConversationId("s1"), msgs("left", "over"), null);
 
     const server = new FakeEngram();
     await new Syncer(db, server.client()).flush();
@@ -369,7 +375,7 @@ describe("rows orphaned by an older daemon (engram#370)", () => {
 
   it("a failed orphan check is retried and isn't reported healthy meanwhile", async () => {
     const db = openDb();
-    db.enqueue(pendingConversationId("s1"), msgs("old"));
+    db.enqueue(pendingConversationId("s1"), msgs("old"), null);
     const server = new FakeEngram();
     const syncer = new Syncer(db, server.client());
     const adopt = vi
@@ -392,21 +398,21 @@ describe("rows orphaned by an older daemon (engram#370)", () => {
   it("never creates a conversation for an opted-out session's leftover rows", async () => {
     const db = openDb();
     db.markSessionExcluded("s1", "in-chat opt-out");
-    db.enqueue(pendingConversationId("s1"), msgs("private"));
+    db.enqueue(pendingConversationId("s1"), msgs("private"), null);
 
     const server = new FakeEngram();
     await new Syncer(db, server.client()).flush();
 
     expect(server.creates).toHaveLength(0);
     expect(db.getPendingCount()).toBe(0);
-    expect(db.getPendingSessions()).toEqual([]);
+    expect(db.getPendingSessions(FIXED_KEY_FP)).toEqual([]);
   });
 
   it("leaves a live session's own record alone", () => {
     const db = openDb();
-    db.enqueuePendingSession("s1", meta("s1", { projectDir: "real" }), msgs("m"));
+    db.enqueuePendingSession("s1", meta("s1", { projectDir: "real" }), msgs("m"), "fp");
     expect(db.adoptOrphanedPendingRows()).toEqual([]);
-    expect(db.getPendingSessions()).toEqual([
+    expect(db.getPendingSessions("fp")).toEqual([
       { sessionId: "s1", meta: meta("s1", { projectDir: "real" }) },
     ]);
   });
@@ -416,24 +422,24 @@ describe("DaemonDb pending-session writes are all-or-nothing", () => {
   it("a session is never recorded without its messages, or the reverse", () => {
     const db = openDb();
     const bad = [{ role: "user", content: null }] as unknown as ParsedMessage[];
-    expect(() => db.enqueuePendingSession("s1", meta("s1"), bad)).toThrow();
-    expect(db.getPendingSessions()).toEqual([]);
+    expect(() => db.enqueuePendingSession("s1", meta("s1"), bad, "fp")).toThrow();
+    expect(db.getPendingSessions("fp")).toEqual([]);
     expect(db.getPendingCount()).toBe(0);
   });
 
   it("a failed completion leaves the messages queued under the session", () => {
     const db = openDb();
-    db.enqueuePendingSession("s1", meta("s1"), msgs("a", "b"));
+    db.enqueuePendingSession("s1", meta("s1"), msgs("a", "b"), "fp");
     const raw = new Database(dbPath);
     raw.exec(
       "CREATE TRIGGER no_forget BEFORE DELETE ON pending_sessions BEGIN SELECT RAISE(ABORT, 'boom'); END",
     );
     raw.close();
 
-    expect(() => db.completePendingSession("s1", "conv_1", { projectDir: "p" })).toThrow();
-    expect(db.getConversationId("s1")).toBeNull();
-    expect(db.dequeue(pendingConversationId("s1"), 10)).toHaveLength(2);
-    expect(db.getPendingSessions()).toHaveLength(1);
+    expect(() => db.completePendingSession("s1", "conv_1", "fp", { projectDir: "p" })).toThrow();
+    expect(db.getConversationId("s1", "fp")).toBeNull();
+    expect(db.dequeue(pendingConversationId("s1"), 10, "fp")).toHaveLength(2);
+    expect(db.getPendingSessions("fp")).toHaveLength(1);
   });
 });
 

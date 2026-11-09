@@ -1,8 +1,7 @@
-import { loadConfig, getBaseUrl } from "../config.js";
+import { loadConfig, resolveBaseUrl } from "../config.js";
 import { bold, dim, red, json as printJson } from "../output.js";
 import { readStatus } from "../daemon/status.js";
 
-const API_URL = process.env.ENGRAM_BASE_URL ?? getBaseUrl();
 
 /** How long to wait for the API before calling it unreachable. */
 const USAGE_TIMEOUT_MS = 15_000;
@@ -38,18 +37,19 @@ export type UsageResult =
 /** Fetch the account's plan and usage. Never throws. */
 export async function fetchUsage(): Promise<UsageResult> {
   const config = await loadConfig();
+  const baseUrl = resolveBaseUrl(config);
   const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
   if (!apiKey) return { kind: "signed-out" };
 
   let res: Response;
   try {
-    res = await fetch(`${API_URL}/api/usage`, {
+    res = await fetch(`${baseUrl}/api/usage`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(USAGE_TIMEOUT_MS),
     });
   } catch {
     // Offline, a DNS failure, a refused connection, or no answer in time.
-    return { kind: "unreachable", url: API_URL };
+    return { kind: "unreachable", url: baseUrl };
   }
   if (res.status === 401 || res.status === 403) return { kind: "rejected" };
   if (!res.ok) return { kind: "failed", status: res.status };

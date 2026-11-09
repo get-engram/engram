@@ -11,6 +11,11 @@ vi.mock("../daemon/status.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/status.js")>()),
   recordSuccess: vi.fn(),
   recordFailure: vi.fn(),
+  recordCaptureStall: vi.fn(),
+  recordCaptureResumed: vi.fn(),
+  recordSignedOut: vi.fn(),
+  recordSignedIn: vi.fn(),
+  updatePending: vi.fn(),
 }));
 vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/exclusions.js")>()),
@@ -788,6 +793,9 @@ describe("nothing is sent before the vault has been read (engram#588)", () => {
         void scrubber.reconnect(vaults[key]);
         return server.client();
       },
+      // The new key is a re-issued key of the same account, so what the old
+      // one queued is sent with it (engram#594).
+      ownedKeys: async (_key, hashes) => hashes,
     };
     const syncer = new Syncer(db, server.client(), scrubber, keys);
 

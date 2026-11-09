@@ -22,6 +22,9 @@ vi.mock("../daemon/status.js", async (importOriginal) => ({
   recordFailure: vi.fn(),
   recordCaptureStall: vi.fn(),
   recordCaptureResumed: vi.fn(),
+  recordSignedOut: vi.fn(),
+  recordSignedIn: vi.fn(),
+  updatePending: vi.fn(),
 }));
 vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/exclusions.js")>()),
@@ -31,7 +34,7 @@ vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
 import { DaemonDb, pendingConversationId } from "../daemon/db.js";
 import { Parser, REDACTED_TOOL_OUTPUT } from "../daemon/parser.js";
 import { CodexParser } from "../daemon/codex-parser.js";
-import { Syncer } from "../daemon/syncer.js";
+import { Syncer, FIXED_KEY_FP } from "../daemon/syncer.js";
 import { Watcher, readLines } from "../daemon/watcher.js";
 import type {
   HostAdapter,
@@ -579,7 +582,7 @@ describe("an opted-out or excluded session next to a live one (via the Syncer)",
     });
   }
   const queued = (db: DaemonDb, sessionId: string) =>
-    db.dequeue(pendingConversationId(sessionId), 100).map((r) => r.content);
+    db.dequeue(pendingConversationId(sessionId), 100, FIXED_KEY_FP).map((r) => r.content);
 
   it("Claude: a live session's reply isn't dropped with an opted-out neighbour", () => {
     const db = openDb();

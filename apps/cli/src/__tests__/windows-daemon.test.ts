@@ -97,7 +97,7 @@ const PLIST = join(home.dir, "Library", "LaunchAgents", "app.getengram.daemon.pl
 const LOGIN_START = join(home.dir, "login-start.js");
 writeFileSync(LOGIN_START, "");
 
-const { workerPathFor, loginStartPathFor, supervisorPathFor, supervisorPath, START_WAIT_MS } = await import(
+const { workerPathFor, loginStartPathFor, supervisorPathFor, supervisorPath, workerPath, START_WAIT_MS } = await import(
   "../daemon/launch.js"
 );
 const { IDENTIFY_STATEMENTS, VERSION } = await import("../daemon/instance.js");
@@ -1229,7 +1229,12 @@ describe("stopping the daemon on Windows through the stop file (engram#613)", ()
   });
 });
 
-describe("auto-capture after sign-in to Engram, on Windows (engram#614)", () => {
+/**
+ * Signed in, at a terminal, with nothing set to keep auto-capture off: what
+ * autoEnableCapture needs before it does anything. For the describe it is
+ * called in.
+ */
+function signedInAtATerminal(): void {
   const realIsTTY = process.stdin.isTTY;
   const config = vi.mocked(loadConfig);
 
@@ -1245,10 +1250,15 @@ describe("auto-capture after sign-in to Engram, on Windows (engram#614)", () => 
     Object.defineProperty(process.stdin, "isTTY", { value: realIsTTY, configurable: true });
     config.mockReset().mockImplementation(async () => ({}) as never);
   });
+}
+
+describe("auto-capture after sign-in to Engram, on Windows (engram#614)", () => {
+  const config = vi.mocked(loadConfig);
+  signedInAtATerminal();
 
   it("starts the daemon through the supervisor and turns on start at login", async () => {
     onWindows();
-    await autoEnableCapture();
+    await autoEnableCapture({ after: "login" });
 
     expect(spawn).toHaveBeenCalledTimes(1);
     const [file, args, opts] = spawn.mock.calls[0];
@@ -1280,7 +1290,7 @@ describe("auto-capture after sign-in to Engram, on Windows (engram#614)", () => 
     onWindows();
     daemonRunning();
     registry.approved = SWITCHED_OFF;
-    await autoEnableCapture();
+    await autoEnableCapture({ after: "login" });
     expect(spawn).not.toHaveBeenCalled();
     expect(registry.value).toBe(ENTRY);
     expect(registry.approved).toBe(SWITCHED_OFF);
@@ -1296,14 +1306,14 @@ describe("auto-capture after sign-in to Engram, on Windows (engram#614)", () => 
     daemonRunning();
     registry.value = BROKEN_ENTRY;
     registry.approved = SWITCHED_OFF;
-    await autoEnableCapture();
+    await autoEnableCapture({ after: "login" });
     expect(registry.value).toBe(ENTRY);
     expect(registry.approved).toBe(SWITCHED_OFF);
     expect(output()).toContain("Updated the start-at-login entry");
 
     vi.mocked(console.log).mockClear();
     execFileSync.mockClear();
-    await autoEnableCapture();
+    await autoEnableCapture({ after: "login" });
     expect(regCalls("add")).toHaveLength(0);
     expect(regCalls("delete")).toHaveLength(0);
     expect(registry.approved).toBe(SWITCHED_OFF);
@@ -1320,7 +1330,7 @@ describe("auto-capture after sign-in to Engram, on Windows (engram#614)", () => 
       if (args[0] === "add") throw Object.assign(new Error("ERROR: Access is denied."), { status: 1 });
       return fakeReg(file, args);
     });
-    await autoEnableCapture();
+    await autoEnableCapture({ after: "login" });
     expect(registry.value).toBeNull();
     const said = output();
     expect(said).toContain("Couldn't turn on start at login. Run 'engram install' to try again.");
@@ -1335,7 +1345,7 @@ describe("auto-capture after sign-in to Engram, on Windows (engram#614)", () => 
     daemonRunning();
     rmSync(LOGIN_START);
     try {
-      await autoEnableCapture();
+      await autoEnableCapture({ after: "login" });
     } finally {
       writeFileSync(LOGIN_START, "");
     }
@@ -1352,10 +1362,15 @@ describe("auto-capture after sign-in to Engram, on Windows (engram#614)", () => 
     for (const setup of [
       () => config.mockResolvedValue({ apiKey: "eng_test_614", autocapture: "off" } as never),
       () => config.mockResolvedValue({} as never),
-      () => Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true }),
+      () => {
+        config.mockResolvedValue({ apiKey: "eng_test_614" } as never);
+        Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
+      },
     ]) {
       setup();
-      await autoEnableCapture();
+      // Neither after a login nor after any other command (engram#644).
+      await autoEnableCapture({ after: "login" });
+      await autoEnableCapture({ after: "command" });
     }
     expect(spawn).not.toHaveBeenCalled();
     expect(execFileSync).not.toHaveBeenCalled();
@@ -1366,9 +1381,179 @@ describe("auto-capture after sign-in to Engram, on Windows (engram#614)", () => 
   it("still says start at login isn't there yet on Linux", async () => {
     onPlatform("linux");
     daemonRunning();
-    await autoEnableCapture();
+    await autoEnableCapture({ after: "login" });
     expect(execFileSync).not.toHaveBeenCalled();
     expect(output()).toContain("Start at login isn't available on Linux yet");
+  });
+});
+
+describe("auto-capture after any other command (engram#644)", () => {
+  signedInAtATerminal();
+
+  /** What was said since the last call. */
+  function said(): string {
+    const text = output();
+    vi.mocked(console.log).mockClear();
+    vi.mocked(console.error).mockClear();
+    return text;
+  }
+
+  /** The daemon is gone, as after a restart. */
+  function daemonGone(): void {
+    daemon.answering = null;
+    rmSync(PID_FILE, { force: true });
+  }
+
+  it("says nothing after a second command, with the daemon running and start at login on", async () => {
+    onWindows();
+    await autoEnableCapture({ after: "login" });
+    expect(said()).toContain("Auto-capture is on");
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(registry.value).toBe(ENTRY);
+
+    spawn.mockClear();
+    execFileSync.mockClear();
+    for (let command = 0; command < 3; command++) {
+      await autoEnableCapture({ after: "command" });
+      expect(said()).toBe("");
+    }
+    expect(spawn).not.toHaveBeenCalled();
+    expect(regCalls("add")).toHaveLength(0);
+    expect(registry.value).toBe(ENTRY);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("starts a daemon that isn't running, through the supervisor, and says so", async () => {
+    onWindows();
+    registry.value = ENTRY;
+    await autoEnableCapture({ after: "command" });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn.mock.calls[0][1]).toEqual([supervisorPath()]);
+    expect(regCalls("add")).toHaveLength(0);
+    const text = said();
+    expect(text).toContain("Auto-capture is on");
+    expect(text).toContain("Turn off anytime");
+    expect(text).not.toContain("Auto-start enabled");
+  });
+
+  it("turns on start at login when there is no entry, and says so", async () => {
+    onWindows();
+    daemonRunning();
+    await autoEnableCapture({ after: "command" });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(registry.value).toBe(ENTRY);
+    const text = said();
+    expect(text).toContain("Auto-start enabled");
+    expect(text).toContain("Auto-capture is on");
+  });
+
+  it("says once that the entry it added is switched off in Startup apps, then nothing", async () => {
+    onWindows();
+    daemonRunning();
+    registry.approved = SWITCHED_OFF;
+    await autoEnableCapture({ after: "command" });
+    expect(registry.value).toBe(ENTRY);
+    const text = said();
+    expect(text).toContain("Start at login is switched off");
+    expect(text).toContain("Auto-capture is on");
+
+    await autoEnableCapture({ after: "command" });
+    expect(said()).toBe("");
+    expect(registry.approved).toBe(SWITCHED_OFF);
+  });
+
+  it("points an entry whose programs are gone at this CLI, says so, then nothing", async () => {
+    onWindows();
+    daemonRunning();
+    registry.value = BROKEN_ENTRY;
+    await autoEnableCapture({ after: "command" });
+    expect(registry.value).toBe(ENTRY);
+    const text = said();
+    expect(text).toContain("Updated the start-at-login entry");
+    expect(text).toContain("Auto-capture is on");
+
+    await autoEnableCapture({ after: "command" });
+    expect(said()).toBe("");
+  });
+
+  it("says it can't add the entry when it had to start the daemon, not after every command", async () => {
+    onWindows();
+    daemonRunning();
+    execFileSync.mockImplementation((file: string, args: string[], options?: { env?: Record<string, string | undefined> }) => {
+      if (file === REG_EXE && args[0] === "add") {
+        throw Object.assign(new Error("ERROR: Access is denied."), { status: 1 });
+      }
+      return fakeExec(file, args, options);
+    });
+    await autoEnableCapture({ after: "command" });
+    await autoEnableCapture({ after: "command" });
+    expect(regCalls("add")).toHaveLength(2);
+    expect(said()).toBe("");
+
+    // After a restart: start at login would have started it.
+    daemonGone();
+    await autoEnableCapture({ after: "command" });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const text = said();
+    expect(text).toContain("Couldn't turn on start at login. Run 'engram install' to try again.");
+    expect(text).toContain("Auto-capture is on");
+    expect(registry.value).toBeNull();
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("on Linux, says nothing while the daemon runs, and starts one that isn't", async () => {
+    onPlatform("linux");
+    daemonRunning();
+    await autoEnableCapture({ after: "command" });
+    expect(said()).toBe("");
+    expect(spawn).not.toHaveBeenCalled();
+
+    daemonGone();
+    await autoEnableCapture({ after: "command" });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn.mock.calls[0][1]).toEqual([workerPath()]);
+    const text = said();
+    expect(text).toContain("Auto-capture is on");
+    expect(text).toContain("Start at login isn't available on Linux yet");
+    expect(execFileSync).not.toHaveBeenCalled();
+  });
+
+  it("on macOS, says so when it installs the launchd agent or updates an old one, then nothing", async () => {
+    onPlatform("darwin");
+    daemonRunning();
+    try {
+      await autoEnableCapture({ after: "command" });
+      expect(existsSync(PLIST)).toBe(true);
+      expect(execSync).toHaveBeenCalledWith(expect.stringContaining("launchctl load -w"), expect.anything());
+      let text = said();
+      expect(text).toContain("Auto-start enabled — daemon will start on login");
+      expect(text).toContain("Auto-capture is on");
+
+      await autoEnableCapture({ after: "command" });
+      expect(said()).toBe("");
+
+      // One an older CLI wrote: rewritten, and said.
+      strayPlist();
+      await autoEnableCapture({ after: "command" });
+      expect(readFileSync(PLIST, "utf-8")).not.toBe("<plist/>");
+      text = said();
+      expect(text).toContain("Updated auto-start configuration");
+      expect(text).toContain("Auto-capture is on");
+
+      await autoEnableCapture({ after: "command" });
+      expect(said()).toBe("");
+      expect(spawn).not.toHaveBeenCalled();
+    } finally {
+      rmSync(join(home.dir, "Library"), { recursive: true, force: true });
+    }
+  });
+
+  it("is told which it runs after: a login where one signs in, any other command in index.ts", () => {
+    const read = (...path: string[]) => readFileSync(join(__dirname, "..", ...path), "utf-8");
+    const calls = (src: string) => src.match(/autoEnableCapture\([^)]*\)/g) ?? [];
+    expect(calls(read("index.ts"))).toEqual(['autoEnableCapture({ after: "command" })']);
+    expect(calls(read("commands", "login.ts"))).toEqual(Array(3).fill('autoEnableCapture({ after: "login" })'));
+    expect(calls(read("commands", "auth.ts"))).toEqual(['autoEnableCapture({ after: "login" })']);
   });
 });
 

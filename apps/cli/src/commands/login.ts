@@ -90,7 +90,7 @@ export async function signup(): Promise<void> {
   console.log(green("✓ Account created"));
   console.log(`  Organization: ${data.organization_id}`);
   console.log(`  API key saved to ~/.engram/config.json`);
-  await autoEnableCapture();
+  await autoEnableCapture({ after: "login" });
   console.log(
     dim("  Tip: run 'engram link <email>' to claim your account for upgrades"),
   );
@@ -318,7 +318,7 @@ export async function login(args: string[] = [], flags: Record<string, string> =
       await confirmSavedKeyIsFor(email.trim(), orgId, config.apiKey);
       console.log(green(`✓ Signed in as ${email.trim()}`));
       console.log(`  Using existing API key from ~/.engram/config.json`);
-      await autoEnableCapture();
+      await autoEnableCapture({ after: "login" });
       return;
     }
     console.error(
@@ -345,5 +345,5 @@ export async function login(args: string[] = [], flags: Record<string, string> =
 
   console.log(green(`✓ Signed in as ${email.trim()}`));
   console.log(`  API key saved to ~/.engram/config.json`);
-  await autoEnableCapture();
+  await autoEnableCapture({ after: "login" });
 }

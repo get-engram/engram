@@ -128,6 +128,7 @@ describe("engram login when the account already has a key (engram#594)", () => {
     expect(out.join("\n")).toContain(`✓ Signed in as ${EMAIL}`);
     expect(out.join("\n")).toContain("Using existing API key from ~/.engram/config.json");
     expect(autoEnableCapture).toHaveBeenCalledTimes(1);
+    expect(autoEnableCapture).toHaveBeenCalledWith({ after: "login" });
     expect(saveConfig).not.toHaveBeenCalled();
   });
 
@@ -174,6 +175,7 @@ describe("engram login when the account already has a key (engram#594)", () => {
     expect(r.exit).toBeNull();
     expect(out.join("\n")).toContain(`✓ Signed in as a@EXAMPLE.com`);
     expect(autoEnableCapture).toHaveBeenCalledTimes(1);
+    expect(autoEnableCapture).toHaveBeenCalledWith({ after: "login" });
   });
 
   it.each([
@@ -202,6 +204,7 @@ describe("engram login when the account already has a key (engram#594)", () => {
     });
     expect(r.exit).toBeNull();
     expect(autoEnableCapture).toHaveBeenCalledTimes(1);
+    expect(autoEnableCapture).toHaveBeenCalledWith({ after: "login" });
   });
 
   it.each([
@@ -255,6 +258,7 @@ describe("engram login when the account already has a key (engram#594)", () => {
     expect(saveConfig).toHaveBeenCalledWith({ apiKey: minted });
     expect(accountChecks()).toEqual([]);
     expect(autoEnableCapture).toHaveBeenCalledTimes(1);
+    expect(autoEnableCapture).toHaveBeenCalledWith({ after: "login" });
     expect(allOutput()).not.toContain(minted);
   });
 });

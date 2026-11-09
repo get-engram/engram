@@ -148,8 +148,9 @@ async function staleSocket(): Promise<void> {
 
 const AGAIN = "~/.engram/daemon.sock was removed; listening on it again";
 
-// In order: each test starts where the last left the lock.
-describe.skipIf(!POSIX)("the daemon's hold on its socket", () => {
+// In order, even when the run shuffles tests (engram#656): each test starts
+// where the last left the lock.
+describe.skipIf(!POSIX)("the daemon's hold on its socket", { shuffle: false }, () => {
   it("takes the lock: the socket answers as this process, and the PID file names it", async () => {
     setStopHandler(stopped);
     setDisplacedHandler(displaced);

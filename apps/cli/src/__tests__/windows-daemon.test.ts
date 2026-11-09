@@ -100,7 +100,7 @@ writeFileSync(LOGIN_START, "");
 const { workerPathFor, loginStartPathFor, supervisorPathFor, supervisorPath, START_WAIT_MS } = await import(
   "../daemon/launch.js"
 );
-const { VERSION } = await import("../daemon/instance.js");
+const { IDENTIFY_STATEMENTS, VERSION } = await import("../daemon/instance.js");
 const { loadConfig } = await import("../config.js");
 const {
   autoEnableCapture,
@@ -197,6 +197,39 @@ function fakeReg(_file: string, args: string[]): string {
   }
 }
 
+const POWERSHELL = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+const USER_SID = "S-1-5-21-1004336348-1177238915-682003330-1001";
+const OTHER_SID = "S-1-5-21-1004336348-1177238915-682003330-1002";
+/** A daemon from before engram#612, as Windows gives its command line. */
+const OLDER_WORKER =
+  '"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\Op Name\\AppData\\Roaming\\npm\\node_modules\\@getengram\\cli\\dist\\daemon\\worker.js"';
+const NOTEPAD = '"C:\\Windows\\System32\\notepad.exe" C:\\Users\\op\\notes.txt';
+
+/**
+ * What PowerShell finds for a PID it is asked about (engram#640): no such
+ * process, or one with this owner (the user, unless set) and command line
+ * (null when Windows won't give it). A PID not here makes PowerShell fail,
+ * as it does when it can't be run.
+ */
+const identities = new Map<number, "none" | { owner?: string; command: string | null }>();
+
+/** reg.exe as fakeReg, and PowerShell asked about a process as `identities` says. */
+function fakeExec(file: string, args: string[], options?: { env?: Record<string, string | undefined> }): string {
+  if (file !== POWERSHELL) return fakeReg(file, args);
+  if (args[3] !== IDENTIFY_STATEMENTS.join("; ")) throw new Error(`unexpected PowerShell script ${args[3]}`);
+  const found = identities.get(Number(options?.env?.ENGRAM_IDENTIFY_PID));
+  if (found === undefined) throw Object.assign(new Error("Get-CimInstance : Access is denied."), { status: 1 });
+  if (found === "none") return "none\r\n";
+  const { owner = USER_SID, command } = found;
+  const codes = command === null ? null : Array.from(command, (_, i) => command.charCodeAt(i)).join(",");
+  return `${JSON.stringify({ owner, me: USER_SID, command: codes })}\r\n`;
+}
+
+/** PowerShell's calls to identify a process. */
+function identifyCalls(): unknown[][] {
+  return execFileSync.mock.calls.filter(([file]) => file === POWERSHELL);
+}
+
 /** A spawned worker, as far as the CLI looks at one. */
 function fakeChild(pid: number | undefined = process.pid) {
   return Object.assign(new EventEmitter(), { pid, unref: vi.fn() });
@@ -287,6 +320,7 @@ beforeEach(() => {
   registry.approved = null;
   daemon.answering = null;
   processes.clear();
+  identities.clear();
   signalled.length = 0;
   vi.spyOn(process, "kill").mockImplementation(fakeKill);
   rmSync(PID_FILE, { force: true });
@@ -294,7 +328,7 @@ beforeEach(() => {
   rmSync(join(home.dir, "Library"), { recursive: true, force: true });
   spawn.mockReset().mockImplementation(fakeSpawn);
   execSync.mockReset();
-  execFileSync.mockReset().mockImplementation(fakeReg);
+  execFileSync.mockReset().mockImplementation(fakeExec);
   vi.stubEnv("SystemRoot", "C:\\Windows");
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
@@ -816,6 +850,7 @@ describe("one daemon, found by its pipe, on Windows (engram#612)", () => {
     onWindows();
     pidFile(4242);
     madeUp(4242);
+    identities.set(4242, { command: NOTEPAD });
     await daemonStop();
     expect(signalled).toEqual([]);
     expect(output()).toContain("Daemon is not running.");
@@ -850,6 +885,7 @@ describe("one daemon, found by its pipe, on Windows (engram#612)", () => {
     onWindows();
     pidFile(4242);
     madeUp(4242);
+    identities.set(4242, { command: NOTEPAD });
     await daemonStatus();
     expect(output()).toContain("Status: stopped");
     expect(output()).not.toContain("4242");
@@ -891,6 +927,7 @@ describe("one daemon, found by its pipe, on Windows (engram#612)", () => {
     onWindows();
     pidFile(4242);
     madeUp(4242);
+    identities.set(4242, { command: NOTEPAD });
     await daemonStart([], {});
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(output()).toContain("Engram daemon started");
@@ -914,6 +951,140 @@ describe("one daemon, found by its pipe, on Windows (engram#612)", () => {
     await daemonStart([], {});
     expect(spawn).not.toHaveBeenCalled();
     expect(output()).toContain("Daemon already running, but it isn't answering right now");
+  });
+});
+
+describe("a daemon from before engram#612, found by its PID file, on Windows (engram#640)", () => {
+  // It has no pipe: its PID file, confirmed through PowerShell, is the only
+  // sign of it. Until engram#640 Windows couldn't confirm one, so `engram
+  // stop` said it wasn't running and `engram start` started a second daemon
+  // beside it.
+
+  it("engram status shows it, and how to update it, asking PowerShell with the PID kept out of the script", async () => {
+    onWindows();
+    pidFile(4242);
+    madeUp(4242);
+    identities.set(4242, { command: OLDER_WORKER });
+    await daemonStatus();
+    expect(output()).toContain("Status: running (pid 4242)");
+    expect(output()).toContain(
+      "It's from an older version of Engram: run 'engram stop' and then 'engram start' to update it.",
+    );
+    expect(identifyCalls()).toHaveLength(1);
+    const [, args, options] = identifyCalls()[0] as [string, string[], Record<string, unknown>];
+    expect(args).toEqual(["-NoProfile", "-NonInteractive", "-Command", IDENTIFY_STATEMENTS.join("; ")]);
+    expect(args.join(" ")).not.toContain("4242");
+    expect(options).toMatchObject({
+      encoding: "utf-8",
+      env: expect.objectContaining({ ENGRAM_IDENTIFY_PID: "4242" }),
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10_000,
+      windowsHide: true,
+    });
+  });
+
+  it("engram start starts no second daemon beside it", async () => {
+    onWindows();
+    pidFile(4242);
+    madeUp(4242);
+    identities.set(4242, { command: OLDER_WORKER });
+    await daemonStart([], {});
+    expect(spawn).not.toHaveBeenCalled();
+    expect(output()).toContain("Daemon already running (pid 4242)");
+    expect(output()).toContain("It's from an older version of Engram");
+    expect(signalled).toEqual([]);
+  });
+
+  it("engram stop ends it, as its own 'engram stop' did, and removes its PID file", async () => {
+    // It looks for no request in the stop file: ending it is the only way
+    // to stop it, as it always was on Windows.
+    onWindows();
+    pidFile(4242);
+    madeUp(4242, { onTermExitsIn: 300 });
+    identities.set(4242, { command: OLDER_WORKER });
+    await daemonStop();
+    expect(signalled).toEqual([[4242, "SIGTERM"]]);
+    expect(output()).toContain("Daemon stopped (pid 4242)");
+    expect(existsSync(PID_FILE)).toBe(false);
+    expect(existsSync(STOP_FILE)).toBe(false);
+    expect(process.exitCode).toBeUndefined();
+
+    // And then `engram start` starts this version's.
+    await daemonStart([], {});
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(output()).toContain("Engram daemon started");
+  });
+
+  it("engram stop leaves a daemon that holds its pipe and doesn't answer running, so a rebuild isn't cut off", async () => {
+    // Most often its preflight rebuilding better-sqlite3, which keeps it
+    // from answering for a minute or two; ending it there would leave the
+    // rebuild half done.
+    onWindows();
+    pidFile(4242);
+    madeUp(4242);
+    identities.set(4242, { command: OLDER_WORKER });
+    daemon.answering = "silent";
+    await daemonStop();
+    expect(signalled).toEqual([]);
+    expect(output()).toContain("The daemon (pid 4242) isn't answering right now, so it wasn't stopped.");
+    expect(output()).toContain("try again in a minute");
+    expect(readFileSync(PID_FILE, "utf-8")).toBe("4242");
+    expect(existsSync(STOP_FILE)).toBe(false);
+    expect(process.exitCode).toBe(1);
+
+    (console.log as Mock).mockClear();
+    await daemonStatus();
+    expect(output()).toContain("Status: running (pid 4242) — not answering right now");
+    await daemonStart([], {});
+    expect(spawn).not.toHaveBeenCalled();
+    expect(output()).toContain("Daemon already running (pid 4242), but it isn't answering right now");
+  });
+
+  it("takes nothing else for it: another program, another user's process, or one that has exited", async () => {
+    onWindows();
+    for (const identity of [{ command: NOTEPAD }, { owner: OTHER_SID, command: OLDER_WORKER }, "none"] as const) {
+      const what = JSON.stringify(identity);
+      pidFile(4242);
+      madeUp(4242);
+      identities.set(4242, identity);
+      (console.log as Mock).mockClear();
+      await daemonStatus();
+      expect(output(), what).toContain("Status: stopped");
+      // It names another program: the file goes.
+      expect(existsSync(PID_FILE), what).toBe(false);
+    }
+    expect(signalled).toEqual([]);
+  });
+
+  it("keeps the PID file and signals nothing when Windows won't say, as for a daemon run as administrator", async () => {
+    onWindows();
+    pidFile(4242);
+    madeUp(4242);
+    identities.set(4242, { command: null });
+    await daemonStop();
+    expect(signalled).toEqual([]);
+    expect(readFileSync(PID_FILE, "utf-8")).toBe("4242");
+
+    // PowerShell couldn't be run, or failed: the same.
+    identities.delete(4242);
+    await daemonStatus();
+    expect(output()).toContain("Status: stopped");
+    expect(readFileSync(PID_FILE, "utf-8")).toBe("4242");
+    expect(signalled).toEqual([]);
+  });
+
+  it("asks PowerShell nothing while the daemon answers on its pipe, or when the PID file names a process that has exited", async () => {
+    onWindows();
+    daemonRunning(4242);
+    madeUp(4242);
+    identities.set(4242, { command: OLDER_WORKER });
+    await daemonStatus();
+    expect(output()).toContain("Status: running (pid 4242)");
+
+    daemon.answering = null;
+    processes.delete(4242);
+    await daemonStatus();
+    expect(identifyCalls()).toEqual([]);
   });
 });
 
@@ -1264,6 +1435,7 @@ describe("the Windows sign-in launcher (engram#602)", () => {
     expect(modulesLoaded(["worker.ts"], false)).toEqual([
       "instance.ts",
       "launch.ts",
+      "powershell.ts",
       "preflight.ts",
       "private-files.ts",
       "supervise.ts",
@@ -1279,6 +1451,7 @@ describe("the Windows sign-in launcher (engram#602)", () => {
     expect(modulesLoaded(["supervisor.ts"], true)).toEqual([
       "instance.ts",
       "launch.ts",
+      "powershell.ts",
       "private-files.ts",
       "supervise.ts",
       "supervisor.ts",

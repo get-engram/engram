@@ -53,6 +53,7 @@ const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
 mkdirSync(ENGRAM_DIR, { recursive: true });
 
 const {
+  IDENTIFY_STATEMENTS,
   VERSION,
   alive,
   confirmedDaemonInPidFile,
@@ -68,6 +69,8 @@ const {
   removePidFileIf,
   removeStopFileIf,
   unlockEndpoint,
+  windowsIdentifyCommand,
+  windowsIdentity,
 } = await import("../daemon/instance.js");
 
 /** No process has this PID: Linux tops out at 2^22, macOS at 99999. */
@@ -468,7 +471,8 @@ describe("the PID file", () => {
     expect(() => removePidFileIf(4242, file)).not.toThrow();
   });
 
-  it("names the daemon only when the process is confirmed to be one", async () => {
+  // On Windows each check runs PowerShell, which takes a second or two.
+  it("names the daemon only when the process is confirmed to be one", { timeout: 120_000 }, async () => {
     expect(confirmedDaemonInPidFile()).toBeNull();
 
     writeFileSync(PID_FILE, String(process.pid));
@@ -483,40 +487,191 @@ describe("the PID file", () => {
 
     const daemon = await sleeper(join(home.dir, "dist", "daemon", "worker.js"));
     writeFileSync(PID_FILE, String(daemon));
-    // Windows can't tell what a process runs, and never takes one for the daemon.
-    expect(confirmedDaemonInPidFile()).toBe(POSIX ? daemon : null);
+    // On Windows too, through PowerShell (engram#640).
+    expect(confirmedDaemonInPidFile()).toBe(daemon);
   });
 });
 
 describe("telling the daemon's process from others", () => {
-  it("is the daemon only when the user's process runs the worker's script", async () => {
-    expect(identifyProcess(process.pid)).toBe(POSIX ? "other" : "unknown");
-    expect(identifyProcess(await sleeper(join(home.dir, "dist", "daemon", "worker.js")))).toBe(
-      POSIX ? "daemon" : "unknown",
-    );
+  // The same on every platform: on Windows through PowerShell (engram#640),
+  // which takes a second or two each time.
+  it("is the daemon only when the user's process runs the worker's script", { timeout: 120_000 }, async () => {
+    expect(identifyProcess(process.pid)).toBe("other");
+    expect(identifyProcess(await sleeper(join(home.dir, "dist", "daemon", "worker.js")))).toBe("daemon");
     // A plist from before 0.4.2 starts worker-main.js.
-    expect(identifyProcess(await sleeper(join(home.dir, "dist", "daemon", "worker-main.js")))).toBe(
-      POSIX ? "daemon" : "unknown",
-    );
-    for (const script of ["worker.js", join("dist", "daemon", "worker.json"), join("dist", "daemon", "my-worker.js")]) {
-      expect(identifyProcess(await sleeper(join(home.dir, script))), script).toBe(POSIX ? "other" : "unknown");
+    expect(identifyProcess(await sleeper(join(home.dir, "dist", "daemon", "worker-main.js")))).toBe("daemon");
+    // Windows puts a path with a space in quotes. Letters outside ASCII
+    // come through PowerShell as they are, whatever the console's code page.
+    expect(identifyProcess(await sleeper(join(home.dir, "Zoë ソウタ", "dist", "daemon", "worker.js")))).toBe("daemon");
+    for (const script of [
+      "worker.js",
+      join("dist", "daemon", "worker.json"),
+      join("dist", "daemon", "my-worker.js"),
+      join("my-dist", "daemon", "worker.js"),
+    ]) {
+      expect(identifyProcess(await sleeper(join(home.dir, script))), script).toBe("other");
     }
-    expect(identifyProcess(NO_SUCH_PID)).toBe(POSIX ? "other" : "unknown");
+    expect(identifyProcess(NO_SUCH_PID)).toBe("other");
   });
 
-  it("can't tell on Windows", () => {
+  it("says unknown when PowerShell can't be run on Windows, which is never taken for the daemon", () => {
     const platform = process.platform;
     Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    vi.stubEnv("SystemRoot", join(dir, "no-windows"));
     try {
       expect(identifyProcess(process.pid)).toBe("unknown");
     } finally {
       Object.defineProperty(process, "platform", { value: platform, configurable: true });
+      vi.unstubAllEnvs();
     }
   });
 
   it("knows a process is alive", () => {
     expect(alive(process.pid)).toBe(true);
     expect(alive(NO_SUCH_PID)).toBe(false);
+  });
+});
+
+describe("identifying a process on Windows (engram#640)", () => {
+  const ME = "S-1-5-21-1004336348-1177238915-682003330-1001";
+  const SOMEONE_ELSE = "S-1-5-21-1004336348-1177238915-682003330-1002";
+  const WORKER = '"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\Op Name\\AppData\\Roaming\\npm\\node_modules\\@getengram\\cli\\dist\\daemon\\worker.js"';
+
+  /** A command line as IDENTIFY_STATEMENTS gives it: its character codes, joined by commas. */
+  function codes(text: string): string {
+    return Array.from({ length: text.length }, (_, i) => text.charCodeAt(i)).join(",");
+  }
+
+  /** What IDENTIFY_STATEMENTS prints for a process; `command` as plain text, null for none. */
+  function printed(found: { owner?: unknown; me?: unknown; command?: string | null } = {}): string {
+    const { owner = ME, me = ME, command = WORKER } = found;
+    return `${JSON.stringify({ owner, me, command: command === null ? null : codes(command) })}\r\n`;
+  }
+
+  it("is the daemon for a process of the user's that runs the worker's script", () => {
+    expect(windowsIdentity(printed())).toBe("daemon");
+    expect(windowsIdentity(printed({ command: "node C:/Users/op/cli/dist/daemon/worker-main.js" }))).toBe("daemon");
+    // Quotes and backslashes come through as they are.
+    expect(windowsIdentity(printed({ command: `${WORKER} --x "y \\"z\\""` }))).toBe("daemon");
+    // So do letters outside ASCII, which the console's code page can't show.
+    expect(windowsIdentity(printed({ command: '"C:\\Users\\Zoë ソウタ\\cli\\dist\\daemon\\worker.js"' }))).toBe("daemon");
+    // Windows writes SIDs in capitals; either way, it is the same user.
+    expect(windowsIdentity(printed({ owner: ME.toLowerCase() }))).toBe("daemon");
+  });
+
+  it("is another program for another script, another user's process, or none at all", () => {
+    for (const command of [
+      '"C:\\Windows\\System32\\notepad.exe"',
+      "node C:\\Users\\op\\dist\\daemon\\worker.json",
+      "node C:\\Users\\op\\dist\\daemon\\my-worker.js",
+      "node C:\\Users\\op\\my-dist\\daemon\\worker.js",
+      "",
+    ]) {
+      expect(windowsIdentity(printed({ command })), command).toBe("other");
+    }
+    expect(windowsIdentity(printed({ owner: SOMEONE_ELSE }))).toBe("other");
+    expect(windowsIdentity("none\r\n")).toBe("other");
+    // Windows PowerShell can start its output with a byte-order mark.
+    expect(windowsIdentity("\uFEFFnone\r\n")).toBe("other");
+  });
+
+  it("reads the last line: anything PowerShell warns of comes before it", () => {
+    expect(windowsIdentity(`WARNING: something PowerShell says\r\n${printed()}\r\n`)).toBe("daemon");
+  });
+
+  it("says unknown when Windows won't say, as for a process run as administrator", () => {
+    expect(windowsIdentity(printed({ command: null }))).toBe("unknown");
+    expect(windowsIdentity(printed({ owner: null }))).toBe("unknown");
+    expect(windowsIdentity(printed({ me: null }))).toBe("unknown");
+  });
+
+  it("says unknown for anything else, and never takes it for the daemon", () => {
+    for (const out of [
+      "",
+      "\r\n",
+      "not json",
+      "null",
+      "42",
+      "[]",
+      '"none"',
+      printed({ owner: "Administrator" }),
+      printed({ owner: "S-1-5-21-1-x", me: "S-1-5-21-1-x" }),
+      printed({ me: 1001 }),
+      // A command line as plain text, not character codes, isn't trusted:
+      // the console's code page may have changed it.
+      `${JSON.stringify({ owner: ME, me: ME, command: WORKER })}\r\n`,
+      `${JSON.stringify({ owner: ME, me: ME, command: "65,,66" })}\r\n`,
+      `${JSON.stringify({ owner: ME, me: ME, command: "65,66," })}\r\n`,
+      `${JSON.stringify({ owner: ME, me: ME, command: "65,65536" })}\r\n`,
+      `${JSON.stringify({ owner: ME, me: ME, command: ["65", "66"] })}\r\n`,
+    ]) {
+      expect(windowsIdentity(out), out).toBe("unknown");
+    }
+  });
+
+  it("runs Windows PowerShell with the PID only in the environment", () => {
+    const command = windowsIdentifyCommand(4242, "C:\\Windows");
+    expect(command.file).toBe("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    expect(command.args).toEqual(["-NoProfile", "-NonInteractive", "-Command", IDENTIFY_STATEMENTS.join("; ")]);
+    expect(command.env).toEqual({ ENGRAM_IDENTIFY_PID: "4242" });
+    expect(command.args.join(" ")).not.toContain("4242");
+    expect(windowsIdentifyCommand(4, "D:\\WINDOWS").file).toBe(
+      "D:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    );
+  });
+
+  it("builds a script the Windows command line passes through unchanged, with no .NET calls", () => {
+    const script = windowsIdentifyCommand(4242, "C:\\Windows").args[3];
+    // Double quotes and line breaks are what Windows argument quoting rewrites.
+    expect(script).not.toMatch(/["\r\n]/);
+    expect(IDENTIFY_STATEMENTS[0]).toBe("$ErrorActionPreference = 'Stop'");
+    // Constrained Language allows none of these (see the test below, on Windows).
+    expect(script).not.toMatch(/::|New-Object|Add-Type|\[System\.|\.Invoke\(/i);
+    // Nothing that turns off PowerShell's own checks, or hides what it runs.
+    const flags = windowsIdentifyCommand(4242).args.join(" ").toLowerCase();
+    for (const flag of ["-encodedcommand", "-executionpolicy", "bypass", "-file"]) {
+      expect(flags).not.toContain(flag);
+    }
+  });
+
+  // On Windows only: real PowerShell, locked down the way AppLocker and WDAC
+  // lock it, and a real process of this test's.
+  it.runIf(!POSIX)("identifies the daemon where PowerShell runs in Constrained Language", { timeout: 120_000 }, async () => {
+    const pid = await sleeper(join(home.dir, "dist", "daemon", "worker.js"));
+    const { file, env } = windowsIdentifyCommand(pid);
+    // The scripts come in environment variables, and run after the switch:
+    // Constrained Language applies to what is parsed after it.
+    const out = execFileSync(
+      file,
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        [
+          "$ErrorActionPreference = 'Stop'",
+          "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'",
+          "'mode=' + $ExecutionContext.SessionState.LanguageMode",
+          "try { Invoke-Expression $env:ENGRAM_TEST_DOTNET; 'dotnet=allowed' } catch { 'dotnet=blocked' }",
+          "Invoke-Expression $env:ENGRAM_TEST_SCRIPT",
+        ].join("; "),
+      ],
+      {
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          ...env,
+          // What Constrained Language refuses: proof that it is in force.
+          ENGRAM_TEST_DOTNET: "$null = New-Object -TypeName System.Net.WebClient",
+          ENGRAM_TEST_SCRIPT: IDENTIFY_STATEMENTS.join("; "),
+        },
+        windowsHide: true,
+        timeout: 60_000,
+      },
+    );
+    const lines = out.split(/\r?\n/).filter(Boolean);
+    expect(lines[0]).toBe("mode=ConstrainedLanguage");
+    expect(lines[1]).toBe("dotnet=blocked");
+    expect(windowsIdentity(out)).toBe("daemon");
   });
 });
 

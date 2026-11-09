@@ -11,6 +11,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -18,6 +19,8 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -106,6 +109,20 @@ const codeOf = (fn: () => unknown): string | undefined => {
 function asAnotherUser(): void {
   const uid = process.geteuid!();
   vi.spyOn(process as Required<NodeJS.Process>, "geteuid").mockReturnValue(uid + 1);
+}
+
+/**
+ * A package in `at`/store, linked from `at`/app/node_modules the way pnpm
+ * installs one. Returns where its main file really is.
+ */
+function linkedPackage(at: string, name: string): string {
+  const pkg = join(at, "store", name);
+  mkdirSync(pkg, { recursive: true });
+  writeFileSync(join(pkg, "package.json"), JSON.stringify({ name, main: "index.js" }));
+  writeFileSync(join(pkg, "index.js"), "module.exports = {};\n");
+  mkdirSync(join(at, "app", "node_modules"), { recursive: true });
+  symlinkSync(pkg, join(at, "app", "node_modules", name), "dir");
+  return realpathSync.native(join(pkg, "index.js"));
 }
 
 /** Root, as `sudo engram …` is when sudo keeps HOME. */
@@ -426,10 +443,10 @@ describe("makeDirPrivateSync: the daemon's start (engram#627)", () => {
     for (const name of FILES) expect(mode(join(engram, name)), name).toBe(0o644);
   });
 
-  it("removes stale temp files of config.json and status.json, and nothing else", () => {
+  it("removes stale temp files of config.json, status.json and daemon.pid, and nothing else", () => {
     const engram = join(dir, ".engram");
     mkdirSync(engram);
-    const stale = ["config.json.123.deadbeef.tmp", "status.json.45678.0badf00d.tmp"];
+    const stale = ["config.json.123.deadbeef.tmp", "status.json.45678.0badf00d.tmp", "daemon.pid.910.c0ffee00.tmp"];
     const writing = "config.json.123.cafef00d.tmp"; // a write in progress
     const kept = [
       "vault-key.123.deadbeef.tmp",
@@ -447,6 +464,35 @@ describe("makeDirPrivateSync: the daemon's start (engram#627)", () => {
     const report = makeDirPrivateSync(engram);
     expect([...report.removed].sort()).toEqual([...stale].sort());
     expect(readdirSync(engram).sort()).toEqual([writing, ...kept].sort());
+  });
+
+  // engram#612: the daemon's socket is in ~/.engram. A plain stat of a
+  // socket made Node resolve the next package it loaded to its symlink, not
+  // to where it is, and that package then couldn't find its own
+  // dependencies.
+  posixIt("leaves how Node finds packages as it was when ~/.engram holds the daemon's socket", async () => {
+    // A socket path can be 103 bytes at most on macOS: a long TMPDIR won't do.
+    const base = mkdtempSync(join(Buffer.byteLength(tmpdir()) <= 60 ? tmpdir() : "/tmp", "e612p-"));
+    const server = createServer();
+    try {
+      const engram = join(base, ".engram");
+      mkdirSync(engram, { mode: 0o700 });
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(join(engram, "daemon.sock"), () => resolve());
+      });
+      const req = createRequire(join(base, "app", "main.js"));
+      // A running CLI has resolved its own packages: the folders on the way are known.
+      linkedPackage(base, "first");
+      req.resolve("first");
+      const second = linkedPackage(base, "second");
+
+      expect(makeDirPrivateSync(engram)).toEqual({ dir: "private", changed: [], skipped: [], removed: [] });
+      expect(req.resolve("second")).toBe(second);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });
 

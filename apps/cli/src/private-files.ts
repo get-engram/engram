@@ -32,7 +32,7 @@ import {
   statSync,
   unlinkSync,
   writeFileSync,
-  type Stats,
+  type BigIntStats,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
@@ -59,8 +59,8 @@ function errCode(err: unknown): string | undefined {
  * Whether this process owns `st`. Only what the user owns is changed: root
  * could change anyone's file, but another user's stays as it is.
  */
-function ours(st: Stats): boolean {
-  return st.uid === process.geteuid?.();
+function ours(st: { uid: number | bigint }): boolean {
+  return Number(st.uid) === process.geteuid?.();
 }
 
 /**
@@ -249,7 +249,7 @@ export function writePrivateFileSync(file: string, data: string, options: Privat
 }
 
 /** Only these temp files are ever removed: the rest of ~/.engram is left as it is. */
-const TEMP_FILES_FOR = new Set(["config.json", "status.json"]);
+const TEMP_FILES_FOR = new Set(["config.json", "status.json", "daemon.pid"]);
 
 /**
  * How old a leftover temp file must be before it is removed. A write in
@@ -264,7 +264,7 @@ export interface PrivateDirReport {
   changed: string[];
   /** Files left as they were: another user's, or the change failed. */
   skipped: string[];
-  /** Temp files of config.json and status.json that a write cut short left behind. */
+  /** Temp files of config.json, status.json and daemon.pid that a write cut short left behind. */
   removed: string[];
 }
 
@@ -273,8 +273,8 @@ export interface PrivateDirReport {
  * regular file directly in it set to 0600, so an install from before this
  * fix is covered as well as a new one. Symlinks and subdirectories are left
  * alone, so nothing outside `dir` changes. Temp files that an interrupted
- * write of config.json or status.json left behind are removed once they
- * are STALE_TEMP_MS old.
+ * write of config.json, status.json or daemon.pid left behind are removed
+ * once they are STALE_TEMP_MS old.
  *
  * Throws only when `dir` can't be created or read.
  */
@@ -282,15 +282,19 @@ export function makeDirPrivateSync(dir: string, now = Date.now()): PrivateDirRep
   const report: PrivateDirReport = { dir: ensurePrivateDirSync(dir), changed: [], skipped: [], removed: [] };
   for (const name of readdirSync(dir)) {
     const path = join(dir, name);
-    let st: Stats;
+    let st: BigIntStats;
     try {
-      st = lstatSync(path);
+      // BigInt fields: the daemon's socket is in ~/.engram, and a plain
+      // stat of a socket throws off how Node loads modules after it (see
+      // lstatSocketPath in daemon/instance.ts).
+      st = lstatSync(path, { bigint: true });
     } catch {
       continue; // gone since the listing
     }
     if (!st.isFile()) continue;
+    const mode = Number(st.mode);
     const temp = TEMP_FILE.exec(name);
-    if (temp && TEMP_FILES_FOR.has(temp[1]) && now - st.mtimeMs >= STALE_TEMP_MS) {
+    if (temp && TEMP_FILES_FOR.has(temp[1]) && now - Number(st.mtimeMs) >= STALE_TEMP_MS) {
       try {
         unlinkSync(path);
         report.removed.push(name);
@@ -299,13 +303,13 @@ export function makeDirPrivateSync(dir: string, now = Date.now()): PrivateDirRep
         // restricted below, like any other file
       }
     }
-    if (!posix() || (st.mode & SHARED_BITS) === 0) continue;
+    if (!posix() || (mode & SHARED_BITS) === 0) continue;
     if (!ours(st)) {
       report.skipped.push(name);
       continue;
     }
     try {
-      chmodSync(path, unshared(st.mode));
+      chmodSync(path, unshared(mode));
       report.changed.push(name);
     } catch {
       report.skipped.push(name);

@@ -436,7 +436,10 @@ export const STOP_PICKUP_MS = 10_000;
  * STOP_FILE, and it stops as it does for SIGTERM elsewhere (engram#613).
  * Only a daemon from before that, or one that doesn't take the request in
  * STOP_PICKUP_MS, is ended outright. Nothing queued is lost either way: what
- * it was sending is sent again when it next starts.
+ * it was sending is sent again when it next starts. One that holds its pipe
+ * and doesn't answer is left running there: that is most often a daemon
+ * rebuilding better-sqlite3, which ending it would cut off half done
+ * (engram#640).
  */
 export async function daemonStop(): Promise<void> {
   await recordCaptureIntent("off");
@@ -463,6 +466,12 @@ export async function daemonStop(): Promise<void> {
     // process the pipe's answer gives.
     if (process.platform === "win32" && pidInFile() !== pid) {
       console.error(red(`The daemon's pipe gives pid ${pid}, and ~/.engram/daemon.pid doesn't name it, so nothing was stopped.`));
+      process.exitCode = 1;
+      return;
+    }
+    if (process.platform === "win32" && found.state === "unresponsive") {
+      console.error(red(`The daemon (pid ${pid}) isn't answering right now, so it wasn't stopped.`));
+      console.error(dim(`  It may be busy, or still starting: try again in a minute. Its log: ${LOG_FILE}`));
       process.exitCode = 1;
       return;
     }

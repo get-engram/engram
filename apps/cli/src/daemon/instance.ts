@@ -46,6 +46,7 @@ import { createRequire } from "node:module";
 import { connect, createServer, type Server } from "node:net";
 import { dirname, join } from "node:path";
 import { ENGRAM_DIR, PID_FILE } from "./launch.js";
+import { powerShellArgs, windowsPowerShellPath } from "./powershell.js";
 import { ensurePrivateDirSync, writePrivateFileSync } from "../private-files.js";
 
 /** This package's version, which the daemon gives when it answers. */
@@ -568,18 +569,23 @@ export function alive(pid: number): boolean {
   }
 }
 
-/** The worker's script, as an install runs it: dist/daemon/worker.js, or worker-main.js from a plist before 0.4.2. */
-const WORKER_SCRIPT = /(?:^|[\s/\\])dist[\\/]daemon[\\/]worker(?:-main)?\.js(?:\s|$)/;
+/**
+ * The worker's script, as an install runs it: dist/daemon/worker.js, or
+ * worker-main.js from a plist before 0.4.2. A quote may end it: Windows
+ * puts a path with a space in it in quotes on the command line.
+ */
+const WORKER_SCRIPT = /(?:^|[\s/\\])dist[\\/]daemon[\\/]worker(?:-main)?\.js(?:["\s]|$)/;
 
 /**
  * Whether `pid` is this user's daemon: a process of the user's running the
- * worker's script. "unknown" when that can't be found out (Windows, or `ps`
- * failed), which is never taken for the daemon. A daemon started with
- * `engram start --foreground` runs the CLI's script, and is found through
- * its socket only.
+ * worker's script. "unknown" when that can't be found out (`ps` or
+ * PowerShell failed, or Windows won't say, as for a process run as
+ * administrator), which is never taken for the daemon. A daemon started
+ * with `engram start --foreground` runs the CLI's script, and is found
+ * through its socket only.
  */
 export function identifyProcess(pid: number): "daemon" | "other" | "unknown" {
-  if (process.platform === "win32") return "unknown";
+  if (process.platform === "win32") return identifyOnWindows(pid);
   const uid = process.geteuid?.();
   if (process.platform === "linux") {
     try {
@@ -604,6 +610,121 @@ export function identifyProcess(pid: number): "daemon" | "other" | "unknown" {
   const match = /^\s*(\d+)\s+(.*)$/.exec(out.split("\n")[0] ?? "");
   if (!match) return "other";
   return Number(match[1]) === uid && WORKER_SCRIPT.test(match[2].trim()) ? "daemon" : "other";
+}
+
+// ── Identifying a process on Windows (engram#640) ──
+
+/**
+ * PowerShell's start and its two process queries take a second or two; this
+ * leaves room for a busy machine. Past it, "unknown".
+ */
+const IDENTIFY_TIMEOUT_MS = 10_000;
+
+/**
+ * What identifies a process on Windows, one PowerShell statement each: its
+ * owner, the owner of this PowerShell, which runs as the user, and its
+ * command line, as one line of JSON; or "none" when there is no such
+ * process. The PID comes in ENGRAM_IDENTIFY_PID, never in the script.
+ *
+ * The command line comes as its character codes, joined by commas.
+ * PowerShell writes to a pipe in the console's code page, which turns what
+ * it can't show into something else: on a Japanese system, the second byte
+ * of a character can be a backslash, and Windows' "best fit" turns a
+ * full-width quote into a plain one. Either would break the JSON, or change
+ * what it says. Character codes are plain ASCII, whatever the code page.
+ *
+ * Cmdlets, operators and casts to plain types only, no .NET calls, so it
+ * runs the same where PowerShell is locked down to Constrained Language
+ * (AppLocker, WDAC).
+ */
+export const IDENTIFY_STATEMENTS: readonly string[] = [
+  "$ErrorActionPreference = 'Stop'",
+  "$ProgressPreference = 'SilentlyContinue'",
+  "$target = Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId = ' + [int]$env:ENGRAM_IDENTIFY_PID)",
+  "if ($null -eq $target) { 'none'; exit 0 }",
+  "$self = Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId = ' + $PID)",
+  "$owner = Invoke-CimMethod -InputObject $target -MethodName GetOwnerSid",
+  "$me = Invoke-CimMethod -InputObject $self -MethodName GetOwnerSid",
+  "$command = $target.CommandLine",
+  "if ($null -ne $command) { $command = [int[]][char[]]$command -join ',' }",
+  "ConvertTo-Json -Compress -InputObject @{ owner = $owner.Sid; me = $me.Sid; command = $command }",
+];
+
+/** How to run IDENTIFY_STATEMENTS for `pid`. */
+export function windowsIdentifyCommand(
+  pid: number,
+  systemRoot?: string,
+): { file: string; args: string[]; env: Record<string, string> } {
+  return {
+    file: windowsPowerShellPath(systemRoot),
+    args: powerShellArgs(IDENTIFY_STATEMENTS),
+    env: { ENGRAM_IDENTIFY_PID: String(pid) },
+  };
+}
+
+function identifyOnWindows(pid: number): "daemon" | "other" | "unknown" {
+  const { file, args, env } = windowsIdentifyCommand(pid);
+  let out: string;
+  try {
+    out = execFileSync(file, args, {
+      encoding: "utf-8",
+      env: { ...process.env, ...env },
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: IDENTIFY_TIMEOUT_MS,
+      windowsHide: true,
+    });
+  } catch {
+    // No PowerShell, an error in it, or too slow.
+    return "unknown";
+  }
+  return windowsIdentity(out);
+}
+
+const SID = /^S-1(?:-\d+)+$/i;
+
+/** A command line as IDENTIFY_STATEMENTS gives it, or null for anything else. */
+function fromCharCodes(codes: string): string | null {
+  if (!/^(?:\d{1,5}(?:,\d{1,5})*)?$/.test(codes)) return null;
+  let text = "";
+  for (const code of codes.match(/\d+/g) ?? []) {
+    const unit = Number(code);
+    if (unit > 0xffff) return null;
+    text += String.fromCharCode(unit);
+  }
+  return text;
+}
+
+/**
+ * What IDENTIFY_STATEMENTS printed, read: "other" for no such process, or
+ * another user's; "daemon" for one of the user's running the worker's
+ * script; "unknown" when it says too little, as for a process run as
+ * administrator, whose owner or command line Windows doesn't give a process
+ * that isn't.
+ */
+export function windowsIdentity(out: string): "daemon" | "other" | "unknown" {
+  // The last line: anything PowerShell warns of comes before it. Trimming
+  // drops a byte-order mark as well.
+  const lines = out
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const last = lines[lines.length - 1];
+  if (last === undefined) return "unknown";
+  if (last === "none") return "other";
+  let found: unknown;
+  try {
+    found = JSON.parse(last);
+  } catch {
+    return "unknown";
+  }
+  if (typeof found !== "object" || found === null) return "unknown";
+  const { owner, me, command } = found as Record<string, unknown>;
+  if (typeof owner !== "string" || typeof me !== "string" || !SID.test(owner) || !SID.test(me)) return "unknown";
+  if (owner.toUpperCase() !== me.toUpperCase()) return "other";
+  // No command line: Windows didn't give it, as for a process run as administrator.
+  const line = typeof command === "string" ? fromCharCodes(command) : null;
+  if (line === null) return "unknown";
+  return WORKER_SCRIPT.test(line) ? "daemon" : "other";
 }
 
 // ── Stopping on Windows ──

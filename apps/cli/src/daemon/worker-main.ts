@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { Engram } from "@getengram/sdk";
 import { loadConfigStrict, resolveBaseUrl } from "../config.js";
 import { DaemonDb } from "./db.js";
+import { Pruner } from "./prune.js";
 import { Watcher } from "./watcher.js";
 import { Syncer, type CaptureControl, type KeySource } from "./syncer.js";
 import { SecretScrubber, type VaultLike } from "./scrubber.js";
@@ -83,12 +84,16 @@ async function main(): Promise<void> {
   let db: DaemonDb | null = null;
   let scrubber: SecretScrubber | null = null;
   let syncer: Syncer | null = null;
+  let pruner: Pruner | null = null;
   let shuttingDown = false;
 
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     log("shutting down...");
+    // A pass in progress stops at its next step and doesn't touch the
+    // database after this, so it can be closed below.
+    pruner?.stop();
     if (syncer) {
       // Capture stops, and no new flush starts. A flush in progress
       // finishes first, so a send that went through is recorded as sent.
@@ -264,6 +269,11 @@ async function main(): Promise<void> {
   // Start
   sync.setCaptureControl(capture);
   sync.start();
+
+  // Sent messages leave the local queue a while after the server has them
+  // (engram#598); unsent ones never do.
+  pruner = new Pruner(queue, DB_FILE, { log });
+  pruner.start();
 
   log(`watching for transcripts across ${adapters.length} host(s)...`);
 }

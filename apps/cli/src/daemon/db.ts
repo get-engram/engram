@@ -119,24 +119,72 @@ CREATE TABLE IF NOT EXISTS remote_deletes (
 );
 `;
 
+/**
+ * Schema version 2 (engram#598): sent rows are found by when they were
+ * sent, so pruning them reads this index, never the text they hold. Only
+ * sent rows are in it.
+ */
+const SCHEMA_V2 = `
+CREATE INDEX IF NOT EXISTS idx_pending_sent
+  ON pending_messages(sent_at) WHERE sent_at IS NOT NULL;
+`;
+
+/** The schema version this code brings a daemon.db up to (user_version). */
+export const SCHEMA_VERSION = 2;
+
+/**
+ * Deletes up to `limit` rows sent before a time, oldest first (engram#598).
+ * The outer `sent_at IS NOT NULL` repeats the subquery's on purpose: a row
+ * that hasn't been sent is never deleted here, whatever the subquery picks.
+ * Exported for the query-plan test.
+ */
+export const PRUNE_SENT_SQL = `
+DELETE FROM pending_messages
+ WHERE id IN (SELECT id FROM pending_messages
+               WHERE sent_at IS NOT NULL AND sent_at < ?
+               ORDER BY sent_at LIMIT ?)
+   AND sent_at IS NOT NULL`;
+
+/** `at` the way SQLite's datetime('now') writes sent_at: UTC, to the second. */
+export function sqliteTime(at: Date): string {
+  return at.toISOString().slice(0, 19).replace("T", " ");
+}
+
 function hasColumn(db: Database.Database, table: string, column: string): boolean {
   return (db.pragma(`table_info(${table})`) as Array<{ name: string }>).some(
     (c) => c.name === column,
   );
 }
 
-/** Bring a daemon.db up to version 1 in ONE transaction: a crash part-way
- *  leaves it at version 0, exactly as it was, and the next start retries. */
+/** Bring a daemon.db up to SCHEMA_VERSION in ONE transaction: a crash
+ *  part-way leaves it at the version it had, exactly as it was, and the
+ *  next start retries. */
 function migrate(db: Database.Database): void {
   db.transaction(() => {
-    if ((db.pragma("user_version", { simple: true }) as number) >= 1) return;
-    if (!hasColumn(db, "pending_messages", "key_fp")) {
-      db.exec("ALTER TABLE pending_messages ADD COLUMN key_fp TEXT");
+    const version = db.pragma("user_version", { simple: true }) as number;
+    if (version >= SCHEMA_VERSION) return;
+    if (version < 1) {
+      if (!hasColumn(db, "pending_messages", "key_fp")) {
+        db.exec("ALTER TABLE pending_messages ADD COLUMN key_fp TEXT");
+      }
+      if (!hasColumn(db, "session_map", "key_fp")) db.exec(SESSION_MAP_V1);
+      db.exec(SCHEMA_V1);
     }
-    if (!hasColumn(db, "session_map", "key_fp")) db.exec(SESSION_MAP_V1);
-    db.exec(SCHEMA_V1);
-    db.pragma("user_version = 1");
+    db.exec(SCHEMA_V2);
+    db.pragma(`user_version = ${SCHEMA_VERSION}`);
   }).immediate();
+}
+
+/** How daemon.db's file is used, in pages (engram#598). */
+export interface DbStorage {
+  pageSize: number;
+  /** Pages in the file. */
+  pages: number;
+  /** Pages in the file that hold nothing (zeroed: see secure_delete). */
+  freePages: number;
+  /** Whether free pages can be given back to the disk without a VACUUM
+   *  (auto_vacuum = INCREMENTAL). */
+  incremental: boolean;
 }
 
 type SessionPlace = { projectDir?: string; cwd?: string; gitBranch?: string };
@@ -169,7 +217,19 @@ export class DaemonDb {
     createPrivateFileSync(dbPath);
     for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) restrictSync(file);
     this.db = new Database(dbPath);
+    // What is deleted from the queue doesn't stay in the file (engram#598).
+    // A new file gives the space it frees back to the disk (only possible
+    // before its first table; an older file is converted by compact()).
+    // secure_delete overwrites deleted text with zeros instead of leaving
+    // it in free pages, and journal_size_limit = 0 cuts the write-ahead log
+    // back each time it starts over, so earlier versions of pages don't
+    // linger at its end either.
+    if (this.db.prepare("SELECT 1 FROM sqlite_schema LIMIT 1").get() === undefined) {
+      this.db.pragma("auto_vacuum = INCREMENTAL");
+    }
     this.db.pragma("journal_mode = WAL");
+    this.db.pragma("secure_delete = ON");
+    this.db.pragma("journal_size_limit = 0");
     this.db.exec(SCHEMA);
     migrate(this.db);
     this.keyed = true;
@@ -556,6 +616,65 @@ export class DaemonDb {
          WHERE id IN (${placeholders})`,
       )
       .run(...ids);
+  }
+
+  // ── Pruning sent rows (engram#598) ──
+
+  /**
+   * Delete up to `limit` rows that were sent before `before`, oldest first,
+   * and return how many were deleted. A row is marked sent only once the
+   * server has confirmed it has the messages (markSent), and a row that
+   * hasn't been sent is never deleted here, however old it is.
+   */
+  pruneSent(before: Date, limit: number): number {
+    return this.db.prepare(PRUNE_SENT_SQL).run(sqliteTime(before), limit).changes;
+  }
+
+  storage(): DbStorage {
+    const read = (pragma: string) => this.db.pragma(pragma, { simple: true }) as number;
+    return {
+      pageSize: read("page_size"),
+      pages: read("page_count"),
+      freePages: read("freelist_count"),
+      incremental: read("auto_vacuum") === 2,
+    };
+  }
+
+  /** Give up to `pages` free pages back to the disk (a file in incremental
+   *  mode only; elsewhere this does nothing). Returns how many went. */
+  releaseFreePages(pages: number): number {
+    const before = this.storage().freePages;
+    this.db.pragma(`incremental_vacuum(${Math.max(1, Math.floor(pages))})`);
+    return before - this.storage().freePages;
+  }
+
+  /** Copy the write-ahead log into the file and empty it, so the log
+   *  keeps no copy of pages since changed. False when a reader in another
+   *  process kept it from finishing; the next one does. */
+  checkpoint(): boolean {
+    // Without waiting: for a reader that is behind, it would wait out the
+    // whole busy timeout, and the daemon with it.
+    const wait = this.db.pragma("busy_timeout", { simple: true }) as number;
+    this.db.pragma("busy_timeout = 0");
+    try {
+      const [result] = this.db.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number }>;
+      return result?.busy === 0;
+    } finally {
+      this.db.pragma(`busy_timeout = ${wait}`);
+    }
+  }
+
+  /**
+   * Rewrite the file with only what it holds now, and switch it to giving
+   * freed space back from then on (engram#598). For a daemon.db from
+   * before that: its free pages may still hold text deleted or rewritten
+   * before secure_delete was on, and its space never went back to the
+   * disk. One VACUUM, which is a single transaction: if it fails part-way
+   * (a full disk), the file is as it was. Every row keeps its rowid.
+   */
+  compact(): void {
+    this.db.pragma("auto_vacuum = INCREMENTAL");
+    this.db.exec("VACUUM");
   }
 
   /** Unsent messages queued under `keyFp`; every unsent message when no

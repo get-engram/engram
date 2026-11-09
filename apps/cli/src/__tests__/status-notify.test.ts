@@ -26,7 +26,7 @@ vi.mock("node:child_process", async (importOriginal) => ({
 home.dir = mkdtempSync(join(tmpdir(), "engram-581-"));
 mkdirSync(join(home.dir, ".engram"));
 
-const { recordFailure, recordSuccess } = await import("../daemon/status.js");
+const { recordFailure, recordSuccess, notifyCommand, TOAST_STATEMENTS } = await import("../daemon/status.js");
 
 const realPlatform = process.platform;
 function onPlatform(platform: NodeJS.Platform) {
@@ -41,6 +41,7 @@ beforeEach(() => {
 
 afterEach(() => {
   Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 
@@ -64,8 +65,37 @@ describe("desktop notifications (engram#581)", () => {
     expect(execFile).toHaveBeenCalledWith(
       "notify-send",
       ["Engram memory is full", "1,000/1,000 messages used. New captures are paused."],
+      expect.objectContaining({ windowsHide: true, timeout: 30_000 }),
       expect.any(Function),
     );
+    // The environment is left alone: notify-send inherits the daemon's.
+    expect(execFile.mock.calls[0][2].env).toBeUndefined();
+  });
+
+  it("shows a Windows toast, with the title and body kept out of the script (engram#614)", () => {
+    onPlatform("win32");
+    vi.stubEnv("SystemRoot", "C:\\Windows");
+    recordFailure("401 Unauthorized", "auth", 3);
+    expect(execFile).toHaveBeenCalledTimes(1);
+    const [file, args, options, callback] = execFile.mock.calls[0];
+    expect(file).toBe("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    expect(args).toEqual(["-NoProfile", "-NonInteractive", "-Command", TOAST_STATEMENTS.join("; ")]);
+    expect(options).toEqual(expect.objectContaining({ windowsHide: true, timeout: 30_000 }));
+    expect(options.env).toEqual(
+      expect.objectContaining({
+        ENGRAM_NOTIFY_TITLE: "Engram needs attention",
+        ENGRAM_NOTIFY_BODY: expect.stringContaining("engram auth login"),
+        // the rest of the daemon's environment comes along: PowerShell needs it
+        SystemRoot: "C:\\Windows",
+      }),
+    );
+    expect(callback).toEqual(expect.any(Function));
+  });
+
+  it("shows nothing where there is no way to (engram#614)", () => {
+    onPlatform("freebsd");
+    expect(() => recordFailure("401", "auth", 1)).not.toThrow();
+    expect(execFile).not.toHaveBeenCalled();
   });
 
   it("notifies once per error type until a sync succeeds", () => {
@@ -99,5 +129,62 @@ describe("desktop notifications (engram#581)", () => {
     const status = JSON.parse(readFileSync(join(home.dir, ".engram", "status.json"), "utf-8"));
     expect(status.error_type).toBe("auth");
     expect(status.pending_messages).toBe(4);
+  });
+});
+
+describe("how a notification is shown on each platform (engram#614)", () => {
+  // What a title or body could hold that a shell, PowerShell, the Windows
+  // command line or XML would act on, were it put into a script or markup.
+  const TITLE = `Engram's "test" $(Write-Output pwned) \`whoami\``;
+  const BODY = `<b>not bold</b> & %PATH% C:\\Users\\O'Brien\\.engram $env:USERPROFILE; exit 1 — …`;
+
+  it("passes the title and body to PowerShell only as environment variables", () => {
+    const command = notifyCommand(TITLE, BODY, "win32", "C:\\Windows");
+    expect(command).not.toBeNull();
+    const { file, args, env } = command!;
+    expect(file).toBe("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    expect(args).toEqual(["-NoProfile", "-NonInteractive", "-Command", TOAST_STATEMENTS.join("; ")]);
+    expect(env).toEqual({ ENGRAM_NOTIFY_TITLE: TITLE, ENGRAM_NOTIFY_BODY: BODY });
+    for (const arg of args) {
+      for (const part of ["pwned", "whoami", "O'Brien", "<b>", "%PATH%", "USERPROFILE", "exit 1"]) {
+        expect(arg).not.toContain(part);
+      }
+    }
+  });
+
+  it("builds a script the Windows command line passes through unchanged", () => {
+    const script = notifyCommand(TITLE, BODY, "win32", "C:\\Windows")!.args[3];
+    // Double quotes and line breaks are what Windows argument quoting rewrites.
+    expect(script).not.toMatch(/["\r\n]/);
+    expect(script).toContain("$template.CreateTextNode($env:ENGRAM_NOTIFY_TITLE)");
+    expect(script).toContain("$template.CreateTextNode($env:ENGRAM_NOTIFY_BODY)");
+    expect(TOAST_STATEMENTS[0]).toBe("$ErrorActionPreference = 'Stop'");
+    // Nothing that turns off PowerShell's own checks, or hides what it runs.
+    const flags = notifyCommand(TITLE, BODY, "win32")!.args.join(" ").toLowerCase();
+    for (const flag of ["-encodedcommand", "-executionpolicy", "bypass", "-file"]) {
+      expect(flags).not.toContain(flag);
+    }
+  });
+
+  it("finds Windows PowerShell under the system root, wherever Windows is", () => {
+    expect(notifyCommand("t", "b", "win32", "D:\\WINDOWS")!.file).toBe(
+      "D:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    );
+  });
+
+  it("escapes what AppleScript would read on macOS", () => {
+    expect(notifyCommand('say "hi" \\ there', 'a "b"', "darwin")).toEqual({
+      file: "osascript",
+      args: ["-e", 'display notification "a \\"b\\"" with title "say \\"hi\\" \\\\ there"'],
+    });
+  });
+
+  it("hands Linux the title and body as two arguments", () => {
+    expect(notifyCommand(TITLE, BODY, "linux")).toEqual({ file: "notify-send", args: [TITLE, BODY] });
+  });
+
+  it("has no way on other platforms", () => {
+    expect(notifyCommand(TITLE, BODY, "freebsd")).toBeNull();
+    expect(notifyCommand(TITLE, BODY, "aix")).toBeNull();
   });
 });

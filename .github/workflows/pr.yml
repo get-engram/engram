@@ -62,6 +62,14 @@ jobs:
         working-directory: apps/cli
         run: node scripts/e2e-conversation-gone.mjs
 
+      # An opt-out the API key can't delete, under the real daemon, against a
+      # fake server that refuses as the real one does: the delete is kept, not
+      # tried again with that key, said once in status, and made once a key
+      # that can is saved (engram#597).
+      - name: Daemon delete-scope test
+        working-directory: apps/cli
+        run: node scripts/e2e-delete-scope.mjs
+
       # `pnpm build` runs `wrangler deploy --dry-run`, which only bundles the
       # worker; nothing evaluates the result. Boot it in workerd so an error
       # thrown while the module graph loads blocks the merge instead of failing

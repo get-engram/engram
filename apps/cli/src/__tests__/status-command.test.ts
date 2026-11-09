@@ -41,7 +41,7 @@ describe("engram status (engram#609)", () => {
       lines.push("out: Status: stopped");
     });
     vi.doMock("../daemon/index.js", () => ({ daemonStatus }));
-    const fetchMock = vi.fn(respond);
+    const fetchMock = vi.fn<typeof fetch>(respond);
     vi.stubGlobal("fetch", fetchMock);
     vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
       lines.push(`out: ${args.map(String).join(" ")}`);

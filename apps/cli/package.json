@@ -12,7 +12,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run",
     "dev": "tsx src/index.ts",
     "prepublishOnly": "node scripts/check-publish.mjs && npm run build"

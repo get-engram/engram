@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import {
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -18,6 +19,7 @@ import { connect, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Endpoint, Held, LockOptions, LockResult } from "../daemon/instance.js";
+import { writePrivateFileSync } from "../private-files.js";
 
 /**
  * engram#612 — one daemon per user, found by what answers on its socket
@@ -62,7 +64,9 @@ const {
   parseAnswer,
   pidInFile,
   probeDaemon,
+  readStopFile,
   removePidFileIf,
+  removeStopFileIf,
   unlockEndpoint,
 } = await import("../daemon/instance.js");
 
@@ -285,7 +289,16 @@ describe("reading the daemon's answer", () => {
       id: "0".repeat(32),
       ready: true,
       stopping: false,
+      stopFile: false,
     });
+  });
+
+  it("reads whether it takes a request to stop from the stop file (engram#613)", () => {
+    expect(parseAnswer(answerLine({ stop_file: true }).trim())?.stopFile).toBe(true);
+    // A daemon from before then says nothing of it; only true is taken for yes.
+    for (const value of [false, "true", 1, null]) {
+      expect(parseAnswer(answerLine({ stop_file: value }).trim())?.stopFile, String(value)).toBe(false);
+    }
   });
 
   it("takes nothing else for a daemon", () => {
@@ -330,6 +343,87 @@ describe("reading the daemon's answer", () => {
       ready: false,
       stopping: true,
     });
+  });
+});
+
+describe("the stop file (engram#613)", () => {
+  const ID = "c".repeat(32);
+  const STAMP = /^\d+:\d+:\d+:\d+$/;
+
+  it("reads a request: the PID and the id of the daemon it is for", () => {
+    const file = join(dir, "daemon.stop");
+    writePrivateFileSync(file, `${JSON.stringify({ pid: 4242, id: ID })}\n`);
+    expect(readStopFile(file)).toEqual({ pid: 4242, id: ID, stamp: expect.stringMatching(STAMP) });
+    // From an `engram stop` that found no daemon running: for a supervisor
+    // waiting to start one again, and for no daemon.
+    writePrivateFileSync(file, `${JSON.stringify({ pid: null })}\n`);
+    expect(readStopFile(file)).toEqual({ pid: null, id: null, stamp: expect.stringMatching(STAMP) });
+  });
+
+  it("takes anything else written there for a request for no daemon", () => {
+    const file = join(dir, "daemon.stop");
+    for (const text of [
+      "",
+      "not json",
+      "null",
+      "[]",
+      JSON.stringify({ pid: "4242", id: ID }),
+      JSON.stringify({ pid: 0, id: ID }),
+      JSON.stringify({ pid: -1, id: ID }),
+      JSON.stringify({ pid: 1.5, id: ID }),
+      JSON.stringify({ pid: 2 ** 53, id: ID }),
+    ]) {
+      writePrivateFileSync(file, text);
+      expect(readStopFile(file), text).toMatchObject({ pid: null });
+    }
+    for (const id of ["C".repeat(32), "c".repeat(31), "c".repeat(33), `${"c".repeat(31)}g`, 42, null]) {
+      writePrivateFileSync(file, JSON.stringify({ pid: 4242, id }));
+      expect(readStopFile(file), String(id)).toMatchObject({ pid: 4242, id: null });
+    }
+  });
+
+  it("tells each request from the last by its stamp", () => {
+    const file = join(dir, "daemon.stop");
+    const request = JSON.stringify({ pid: 4242, id: ID });
+    writePrivateFileSync(file, request);
+    const first = readStopFile(file)?.stamp;
+    expect(readStopFile(file)?.stamp).toBe(first);
+    // The same request again: `engram stop` run twice.
+    writePrivateFileSync(file, request);
+    expect(readStopFile(file)?.stamp).not.toBe(first);
+  });
+
+  it("is no request when there is none, or when it isn't a small regular file", () => {
+    const file = join(dir, "daemon.stop");
+    expect(readStopFile(file)).toBeNull();
+    mkdirSync(file);
+    expect(readStopFile(file)).toBeNull();
+    rmSync(file, { recursive: true });
+    writeFileSync(file, JSON.stringify({ pid: 4242, id: ID, pad: "x".repeat(1_100) }));
+    expect(readStopFile(file)).toBeNull();
+  });
+
+  it.skipIf(!POSIX)("doesn't wait on a FIFO put in its place", () => {
+    // Read without O_NONBLOCK, a FIFO would stop the daemon's event loop
+    // until something wrote to it. A writer comes along after a second here,
+    // so that such a read fails the timing below rather than hanging the run.
+    const file = join(dir, "daemon.stop");
+    execFileSync("mkfifo", [file]);
+    children.push(spawn("/bin/sh", ["-c", 'sleep 1; echo x > "$0"', file], { stdio: "ignore" }));
+    const before = Date.now();
+    expect(readStopFile(file)).toBeNull();
+    expect(Date.now() - before).toBeLessThan(500);
+  });
+
+  it("is removed only when it holds the request asked for", () => {
+    const file = join(dir, "daemon.stop");
+    writePrivateFileSync(file, JSON.stringify({ pid: 4242, id: ID }));
+    removeStopFileIf((request) => request.pid === 5151, file);
+    expect(existsSync(file)).toBe(true);
+    removeStopFileIf((request) => request.pid === 4242, file);
+    expect(existsSync(file)).toBe(false);
+    removeStopFileIf(() => true, file);
+    expect(existsSync(file)).toBe(false);
   });
 });
 
@@ -442,6 +536,7 @@ describe("asking what listens", () => {
         id: "0".repeat(32),
         ready: false,
         stopping: false,
+        stopFile: false,
       },
     });
   });
@@ -506,6 +601,7 @@ describe("taking the endpoint", () => {
         id: held.id,
         ready: false,
         stopping: false,
+        stopFile: false,
       },
     });
   });

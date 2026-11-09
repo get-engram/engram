@@ -48,7 +48,7 @@ vi.mock("../daemon/instance.js", async (importOriginal) => {
     const pid = real.pidInFile();
     return pid === null
       ? { state: "none", stale: false }
-      : { state: "answered", info: { pid, version: real.VERSION, ready: true, stopping: false } };
+      : { state: "answered", info: { pid, version: real.VERSION, ready: true, stopping: false, stopFile: false } };
   };
   return { ...real, probeDaemon };
 });

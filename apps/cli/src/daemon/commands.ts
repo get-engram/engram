@@ -13,6 +13,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join, win32 } from "node:path";
 import { bold, dim, plural, red } from "../output.js";
 import { loadConfig, saveConfig } from "../config.js";
+import { writePrivateFileSync } from "../private-files.js";
 import {
   readStatus,
   syncErrorSummary,
@@ -25,13 +26,16 @@ import { ALL_ADAPTERS } from "./adapters.js";
 import {
   ENGRAM_DIR,
   LOG_FILE,
+  START_WAIT_MS,
   loginStartPath,
   prepareLogSync,
+  spawnSupervisor,
   spawnWorker,
   workerPath,
 } from "./launch.js";
 import {
   STOPPING_WAIT_MS,
+  STOP_FILE,
   VERSION,
   alive,
   identifyProcess,
@@ -80,7 +84,16 @@ type DaemonFound =
    * the PID file names a process confirmed to be one. `older`: that one
    * has no socket, so it is from before engram#612.
    */
-  | { state: "running"; pid: number; version?: string; ready: boolean; older: boolean }
+  | {
+      state: "running";
+      pid: number;
+      version?: string;
+      ready: boolean;
+      older: boolean;
+      /** From its answer: which server it is, and whether it stops when STOP_FILE asks it to (engram#613). */
+      id?: string;
+      stopFile?: boolean;
+    }
   /** It answers, and is shutting down: finishing a send, then exiting. */
   | { state: "stopping"; pid: number }
   /**
@@ -95,7 +108,15 @@ function fromAnswer(probe: Probe): DaemonFound | null {
   if (probe.state !== "answered") return null;
   const { info } = probe;
   if (info.stopping) return { state: "stopping", pid: info.pid };
-  return { state: "running", pid: info.pid, version: info.version, ready: info.ready, older: false };
+  return {
+    state: "running",
+    pid: info.pid,
+    version: info.version,
+    ready: info.ready,
+    older: false,
+    id: info.id,
+    stopFile: info.stopFile,
+  };
 }
 
 /**
@@ -251,7 +272,7 @@ export async function daemonStart(
   migrateLaunchdIfStale();
   repairRunEntryIfBroken();
 
-  if (!reportStart(await waitForWorker(spawnWorker()))) {
+  if (!reportStart(await startInBackground())) {
     process.exit(1);
     return;
   }
@@ -261,6 +282,27 @@ export async function daemonStart(
   if ("install" in flags) {
     await enableStartAtLogin(true);
   }
+}
+
+/**
+ * How long before `engram start` gives up waiting on the Windows
+ * supervisor's first worker the supervisor stops reporting that it couldn't
+ * start (engram#613), so that a failure it reports is always seen here. It
+ * starts one that fails after that again.
+ */
+const REPORT_MARGIN_MS = 2_000;
+
+/**
+ * Start the daemon in the background, and wait for it to be ready (see
+ * waitForWorker). On Windows through the supervisor, which starts it again
+ * after an error (engram#613); launchd does that on macOS.
+ */
+function startInBackground(): Promise<WorkerStart> {
+  if (process.platform === "win32") {
+    const reportUntil = Date.now() + START_WAIT_MS - REPORT_MARGIN_MS;
+    return waitForWorker(spawnSupervisor(reportUntil), START_WAIT_MS, { supervisor: true });
+  }
+  return waitForWorker(spawnWorker());
 }
 
 /** Say how a worker just spawned got on; false when it didn't start. */
@@ -294,8 +336,18 @@ export type WorkerStart =
  * scans each file: `engram start` reported a failure, exited 1 and skipped
  * --install, and the daemon came up a moment later (engram#602). Gives up as
  * soon as the worker exits with an error.
+ *
+ * `supervisor`: `child` is the Windows supervisor (engram#613), which starts
+ * the worker, so the worker's PID is the one that answers. While this
+ * waits, the supervisor exits only when its first worker does: with
+ * START_FAILED_EXIT when that one couldn't start, and 0 when it found
+ * another daemon running. After any other error it starts the worker again.
  */
-export async function waitForWorker(child: ChildProcess, timeoutMs = 10_000): Promise<WorkerStart> {
+export async function waitForWorker(
+  child: ChildProcess,
+  timeoutMs = START_WAIT_MS,
+  options: { supervisor?: boolean } = {},
+): Promise<WorkerStart> {
   // In an object: TypeScript doesn't see the callbacks assign plain locals.
   const ended: { code?: number | null; error?: boolean } = {};
   child.once("exit", (code: number | null) => {
@@ -304,16 +356,32 @@ export async function waitForWorker(child: ChildProcess, timeoutMs = 10_000): Pr
   child.once("error", () => {
     ended.error = true;
   });
+  const ready = async (pid: number): Promise<number | null> => {
+    if (options.supervisor) return supervisedReady();
+    return (await answersReady(pid)) ? pid : null;
+  };
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await sleep(100);
     if (ended.error || child.pid === undefined) return { state: "failed" };
     if (ended.code !== undefined) return ended.code === 0 ? waitForOther(deadline) : { state: "failed" };
-    if (await answersReady(child.pid)) return { state: "running", pid: child.pid };
+    const pid = await ready(child.pid);
+    if (pid !== null) return { state: "running", pid };
   }
   if (ended.error || child.pid === undefined) return { state: "failed" };
   if (ended.code !== undefined) return ended.code === 0 ? waitForOther(0) : { state: "failed" };
-  return { state: "starting", pid: child.pid };
+  return { state: "starting", pid: options.supervisor ? null : child.pid };
+}
+
+/**
+ * The PID of the daemon that answers, ready and not stopping: the
+ * supervisor's worker, or one started beside it, which that worker then
+ * leaves the capture to. Only on Windows, where the named pipe can always
+ * be used.
+ */
+async function supervisedReady(): Promise<number | null> {
+  const probe = await probeDaemon({ timeoutMs: 1_000 });
+  return probe.state === "answered" && probe.info.ready && !probe.info.stopping ? probe.info.pid : null;
 }
 
 /** Whether `pid` answers on the daemon's socket, ready; where there is no socket, whether the PID file names it. */
@@ -352,14 +420,31 @@ async function recordCaptureIntent(v: "on" | "off"): Promise<void> {
 }
 
 /**
+ * How long `engram stop` waits on Windows for the daemon to take its request
+ * to stop (engram#613). The daemon looks for one every second.
+ */
+export const STOP_PICKUP_MS = 10_000;
+
+/**
  * Stop the daemon: only a process confirmed to be it is signalled
  * (engram#612), and this waits for it to finish a send in progress and exit,
  * so an `engram start` straight after starts a new one.
+ *
+ * On Windows a signal can't be caught there: process.kill ends the process
+ * wherever it is (TerminateProcess), in the middle of a send or of writing
+ * its queue. So there `engram stop` asks the daemon to stop through
+ * STOP_FILE, and it stops as it does for SIGTERM elsewhere (engram#613).
+ * Only a daemon from before that, or one that doesn't take the request in
+ * STOP_PICKUP_MS, is ended outright. Nothing queued is lost either way: what
+ * it was sending is sent again when it next starts.
  */
 export async function daemonStop(): Promise<void> {
   await recordCaptureIntent("off");
   const found = await findDaemon();
   if (found.state === "stopped") {
+    // A supervisor waiting to start the daemon again after an error finds
+    // this, and doesn't (engram#613).
+    if (process.platform === "win32") writeStopRequest({ pid: null });
     console.log("Daemon is not running.");
     return;
   }
@@ -381,17 +466,31 @@ export async function daemonStop(): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ESRCH") {
-        removePidFileIf(pid);
-        console.log("Daemon is not running.");
+    const asked =
+      process.platform === "win32" && found.state === "running" && found.stopFile && found.id
+        ? await askToStop(pid, found.id)
+        : "unasked";
+    if (asked !== "taken") {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ESRCH") {
+          removePidFileIf(pid);
+          console.log("Daemon is not running.");
+          return;
+        }
+        console.error(red(`Failed to stop daemon (pid ${pid})`));
+        process.exitCode = 1;
         return;
       }
-      console.error(red(`Failed to stop daemon (pid ${pid})`));
-      process.exitCode = 1;
-      return;
+      if (asked === "ignored") {
+        console.log(dim(`  It didn't take the request to stop within ${STOP_PICKUP_MS / 1000}s, so it was ended.`));
+        console.log(dim("  Nothing queued is lost: what it hadn't sent goes when it next starts."));
+      } else if (asked === "unwritten") {
+        // Its supervisor finds no request, so it takes this for a crash.
+        console.log(dim(`  Couldn't write ${STOP_FILE}, so it was ended outright, and may start again in a few seconds.`));
+        console.log(dim("  If 'engram status' shows it running again, run 'engram stop' again."));
+      }
     }
   }
 
@@ -403,6 +502,42 @@ export async function daemonStop(): Promise<void> {
   // Its own exit removes the PID file; one killed outright can't.
   removePidFileIf(pid);
   console.log(`Daemon stopped (pid ${pid})`);
+}
+
+/**
+ * Write a stop request to STOP_FILE (engram#613); false when it couldn't be
+ * written. Through a temp file, so the daemon never reads half of one.
+ */
+function writeStopRequest(request: { pid: number | null; id?: string }): boolean {
+  try {
+    writePrivateFileSync(STOP_FILE, `${JSON.stringify(request)}\n`, { durable: false });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ask the daemon `pid`, whose answer gave `id`, to stop, and wait up to
+ * STOP_PICKUP_MS for it to take the request: it then answers as stopping,
+ * or has let its pipe go. "taken": it did, or it is gone. "ignored": it
+ * didn't, and is still the daemon, by its answer or by the PID file. The
+ * request is left in place then, so the supervisor doesn't start it again
+ * once it is ended. "unwritten": the request couldn't be written.
+ */
+async function askToStop(pid: number, id: string): Promise<"taken" | "ignored" | "unwritten"> {
+  if (!writeStopRequest({ pid, id })) return "unwritten";
+  const deadline = Date.now() + STOP_PICKUP_MS;
+  for (;;) {
+    await sleep(250);
+    if (!alive(pid)) return "taken";
+    const probe = await probeDaemon({ timeoutMs: 1_000 });
+    if (probe.state === "none") return "taken";
+    if (probe.state === "answered" && (probe.info.pid !== pid || probe.info.stopping)) return "taken";
+    if (Date.now() >= deadline) {
+      return probe.state === "answered" || pidInFile() === pid ? "ignored" : "taken";
+    }
+  }
 }
 
 /**
@@ -462,7 +597,13 @@ export async function daemonStatus(): Promise<void> {
     // Still show DB stats if available
     await printDbStats();
     // A broken start-at-login entry is often why it's stopped.
-    printAutoStart();
+    if (printAutoStart() && (await loadConfig()).autocapture !== "off") {
+      // Not stopped by 'engram stop', which records autocapture "off", and
+      // started at sign-in, so it stopped by itself (engram#613).
+      console.log(dim("  It should be running: start at login is on. It may have stopped after an error."));
+      console.log(dim(`  The end of its log says why: ${LOG_FILE}`));
+      console.log(dim("  Run 'engram start' to start it again."));
+    }
     return;
   }
 
@@ -495,17 +636,20 @@ export async function daemonStatus(): Promise<void> {
   printAutoStart();
 }
 
-function printAutoStart(): void {
+/** Print how the daemon starts at login; true when it is set to and should work. */
+function printAutoStart(): boolean {
+  let on = false;
   if (isLaunchdInstalled()) {
     const stale = installedPlistVersion() < PLIST_VERSION;
     console.log(
       `${dim("Auto-start:")} enabled (launchd)` +
         (stale ? red("  — outdated config, run 'engram start' to update") : ""),
     );
+    on = true;
   }
 
   const entry = readRunEntry();
-  if (entry === null) return;
+  if (entry === null) return on;
   if (runEntryBroken(entry)) {
     console.log(`${dim("Auto-start:")} enabled (Windows sign-in)` + red("  — broken, run 'engram start' to repair"));
   } else if (switchedOffInStartupApps()) {
@@ -515,7 +659,9 @@ function printAutoStart(): void {
     );
   } else {
     console.log(`${dim("Auto-start:")} enabled (Windows sign-in)`);
+    on = true;
   }
+  return on;
 }
 
 function printSyncWarnings(status: SyncStatus): void {
@@ -989,8 +1135,9 @@ async function enableWindowsStartAtLogin(running: boolean): Promise<void> {
   console.log(dim("  A console window flashes briefly at sign-in while it starts."));
   console.log(`${dim("Startup entry:")} ${RUN_KEY}\\${RUN_VALUE}`);
   // launchctl load starts the agent right away on macOS; match that, but
-  // never start a second worker beside a running one.
-  if (!running && !reportStart(await waitForWorker(spawnWorker()))) {
+  // never start a second worker beside a running one. Through the
+  // supervisor, as at sign-in, so it is started again after an error too.
+  if (!running && !reportStart(await startInBackground())) {
     process.exitCode = 1;
   }
 }

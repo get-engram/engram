@@ -249,7 +249,7 @@ export function writePrivateFileSync(file: string, data: string, options: Privat
 }
 
 /** Only these temp files are ever removed: the rest of ~/.engram is left as it is. */
-const TEMP_FILES_FOR = new Set(["config.json", "status.json", "daemon.pid"]);
+const TEMP_FILES_FOR = new Set(["config.json", "status.json", "daemon.pid", "daemon.stop"]);
 
 /**
  * How old a leftover temp file must be before it is removed. A write in
@@ -264,7 +264,7 @@ export interface PrivateDirReport {
   changed: string[];
   /** Files left as they were: another user's, or the change failed. */
   skipped: string[];
-  /** Temp files of config.json, status.json and daemon.pid that a write cut short left behind. */
+  /** Temp files of config.json, status.json, daemon.pid and daemon.stop that a write cut short left behind. */
   removed: string[];
 }
 
@@ -273,8 +273,8 @@ export interface PrivateDirReport {
  * regular file directly in it set to 0600, so an install from before this
  * fix is covered as well as a new one. Symlinks and subdirectories are left
  * alone, so nothing outside `dir` changes. Temp files that an interrupted
- * write of config.json, status.json or daemon.pid left behind are removed
- * once they are STALE_TEMP_MS old.
+ * write of config.json, status.json, daemon.pid or daemon.stop left behind
+ * are removed once they are STALE_TEMP_MS old.
  *
  * Throws only when `dir` can't be created or read.
  */

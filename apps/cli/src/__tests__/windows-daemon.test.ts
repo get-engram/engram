@@ -6,6 +6,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { EventEmitter } from "node:events";
@@ -38,7 +39,7 @@ const { home, registry, daemon, spawn, execSync, execFileSync } = vi.hoisted(() 
     // holds it and doesn't answer, no pipe to be had at all, or nothing.
     daemon: {
       answering: null as
-        | { pid: number; ready?: boolean; stopping?: boolean; version?: string }
+        | { pid: number; ready?: boolean; stopping?: boolean; version?: string; id?: string; stopFile?: boolean }
         | "silent"
         | "unavailable"
         | null,
@@ -83,7 +84,7 @@ vi.mock("../daemon/instance.js", async (importOriginal) => {
     if (a === null) return { state: "none", stale: false };
     if (a === "silent") return { state: "silent" };
     if (a === "unavailable") return { state: "unavailable", reason: "no pipe in this test" };
-    return { state: "answered", info: { ready: true, stopping: false, version: real.VERSION, ...a } };
+    return { state: "answered", info: { ready: true, stopping: false, stopFile: false, version: real.VERSION, ...a } };
   };
   return { ...real, probeDaemon };
 });
@@ -91,12 +92,16 @@ vi.mock("../daemon/instance.js", async (importOriginal) => {
 home.dir = mkdtempSync(join(tmpdir(), "engram-602-"));
 const ENGRAM_DIR = join(home.dir, ".engram");
 const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
+const STOP_FILE = join(ENGRAM_DIR, "daemon.stop");
 const PLIST = join(home.dir, "Library", "LaunchAgents", "app.getengram.daemon.plist");
 const LOGIN_START = join(home.dir, "login-start.js");
 writeFileSync(LOGIN_START, "");
 
-const { workerPathFor, loginStartPathFor, workerPath } = await import("../daemon/launch.js");
+const { workerPathFor, loginStartPathFor, supervisorPathFor, supervisorPath, START_WAIT_MS } = await import(
+  "../daemon/launch.js"
+);
 const { VERSION } = await import("../daemon/instance.js");
+const { loadConfig } = await import("../config.js");
 const {
   daemonInstall,
   daemonStart,
@@ -107,6 +112,7 @@ const {
   parseRunExport,
   runEntryCommand,
   waitForWorker,
+  STOP_PICKUP_MS,
 } = await import("../daemon/commands.js");
 const { claudeProjectDir } = await import("../daemon/parser.js");
 const { recoveredSessionMeta } = await import("../daemon/db.js");
@@ -280,6 +286,7 @@ beforeEach(() => {
   signalled.length = 0;
   vi.spyOn(process, "kill").mockImplementation(fakeKill);
   rmSync(PID_FILE, { force: true });
+  rmSync(STOP_FILE, { recursive: true, force: true });
   rmSync(join(home.dir, "Library"), { recursive: true, force: true });
   spawn.mockReset().mockImplementation(fakeSpawn);
   execSync.mockReset();
@@ -290,6 +297,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   for (const t of timers.splice(0)) clearTimeout(t);
   Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
   process.exitCode = undefined;
@@ -307,6 +315,7 @@ describe("the worker's path (engram#602)", () => {
   it("is a Windows path with one drive prefix and the space decoded", () => {
     expect(workerPathFor(url, true)).toBe(`${dir}worker.js`);
     expect(loginStartPathFor(url, true)).toBe(`${dir}login-start.js`);
+    expect(supervisorPathFor(url, true)).toBe(`${dir}supervisor.js`);
   });
 
   it("decodes letters outside ASCII", () => {
@@ -329,7 +338,7 @@ describe("the worker's path (engram#602)", () => {
   });
 
   it("is never built from URL#pathname", () => {
-    for (const file of ["launch.ts", "login-start.ts", "commands.ts", "instance.ts"]) {
+    for (const file of ["launch.ts", "login-start.ts", "supervisor.ts", "commands.ts", "instance.ts"]) {
       const src = readFileSync(join(__dirname, "..", "daemon", file), "utf-8");
       expect(src).not.toMatch(/\.pathname\b/);
     }
@@ -441,7 +450,9 @@ describe("opening checkout in the browser (engram#602)", () => {
 describe("start at login on Windows (engram#602)", () => {
   it("engram install adds a Run entry and starts the daemon, with no launchd", async () => {
     onWindows();
+    const before = Date.now();
     await daemonInstall();
+    const after = Date.now();
 
     expect(registry.value).toBe(ENTRY);
     expect(regCalls("add")).toHaveLength(1);
@@ -458,9 +469,16 @@ describe("start at login on Windows (engram#602)", () => {
     // launchctl load starts the agent on macOS; install starts it here too.
     expect(output()).toContain("Engram daemon started");
     expect(spawn).toHaveBeenCalledTimes(1);
+    // Through the supervisor, which starts the worker again after an error
+    // (engram#613), and reports a first worker that can't start by the time
+    // install stops waiting, 2s before it does.
     const [file, args, opts] = spawn.mock.calls[0];
     expect(file).toBe(process.execPath);
-    expect(args).toEqual([workerPath()]);
+    expect(args).toHaveLength(2);
+    expect(args[0]).toBe(supervisorPath());
+    const until = Number(/^--report-until=(\d+)$/.exec(args[1])?.[1]);
+    expect(until).toBeGreaterThanOrEqual(before + START_WAIT_MS - 2_000);
+    expect(until).toBeLessThanOrEqual(after + START_WAIT_MS - 2_000);
     expect(opts).toMatchObject({ detached: true, windowsHide: true });
   });
 
@@ -708,6 +726,8 @@ describe("waiting for the worker to start (engram#602, engram#612)", () => {
 
 describe("one daemon, found by its pipe, on Windows (engram#612)", () => {
   it("engram stop signals the daemon, waits for it to exit, and removes its PID file", async () => {
+    // A daemon from before engram#613, which doesn't look for a request in
+    // the stop file: it is ended outright, as before.
     onWindows();
     daemonRunning(4242);
     madeUp(4242, { onTermExitsIn: 300 });
@@ -716,6 +736,8 @@ describe("one daemon, found by its pipe, on Windows (engram#612)", () => {
     expect(output()).toContain("Daemon stopped (pid 4242)");
     // On Windows SIGTERM ends the process outright: it removes nothing itself.
     expect(existsSync(PID_FILE)).toBe(false);
+    expect(existsSync(STOP_FILE)).toBe(false);
+    expect(output()).not.toContain("so it was ended");
     expect(process.exitCode).toBeUndefined();
   });
 
@@ -836,9 +858,126 @@ describe("one daemon, found by its pipe, on Windows (engram#612)", () => {
   });
 });
 
+describe("stopping the daemon on Windows through the stop file (engram#613)", () => {
+  const ID = "a".repeat(32);
+
+  /** What `engram stop` last asked through the stop file, or null. */
+  function stopRequest(): unknown {
+    return existsSync(STOP_FILE) ? JSON.parse(readFileSync(STOP_FILE, "utf-8")) : null;
+  }
+
+  /**
+   * A daemon from engram#613 on, as the made-up process `pid`. With `takes`,
+   * it takes a request in the stop file that names it, as the real one does
+   * within a second: it answers as stopping, and exits `exitsIn` ms later,
+   * once it has finished a send.
+   */
+  function daemonWithStopFile(pid: number, takes: { exitsIn: number } | null): void {
+    daemonRunning(pid);
+    daemon.answering = { pid, id: ID, stopFile: true };
+    madeUp(pid, { onTermExitsIn: 100 });
+    if (!takes) return;
+    const poll = setInterval(() => {
+      const request = stopRequest() as { pid?: unknown; id?: unknown } | null;
+      if (request?.pid !== pid || request.id !== ID) return;
+      clearInterval(poll);
+      daemon.answering = { pid, id: ID, stopFile: true, stopping: true };
+      timers.push(
+        setTimeout(() => {
+          processes.delete(pid);
+          daemon.answering = null;
+        }, takes.exitsIn),
+      );
+    }, 50);
+    timers.push(poll);
+  }
+
+  it("asks the daemon to stop, and ends nothing: it finishes what it was sending", async () => {
+    onWindows();
+    daemonWithStopFile(4242, { exitsIn: 300 });
+    await daemonStop();
+    expect(signalled).toEqual([]);
+    expect(stopRequest()).toEqual({ pid: 4242, id: ID });
+    if (realPlatform !== "win32") expect(statSync(STOP_FILE).mode & 0o077).toBe(0);
+    expect(output()).toContain("Daemon stopped (pid 4242)");
+    expect(output()).not.toContain("so it was ended");
+    expect(existsSync(PID_FILE)).toBe(false);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("ends one that doesn't take the request in time, and leaves the request for its supervisor", async () => {
+    // The supervisor, finding the request, doesn't start it again.
+    onWindows();
+    daemonWithStopFile(4242, null);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const stopping = daemonStop();
+    await vi.advanceTimersByTimeAsync(STOP_PICKUP_MS - 500);
+    expect(signalled).toEqual([]);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await stopping;
+    expect(signalled).toEqual([[4242, "SIGTERM"]]);
+    expect(output()).toContain(`It didn't take the request to stop within ${STOP_PICKUP_MS / 1000}s, so it was ended.`);
+    expect(output()).toContain("Nothing queued is lost");
+    expect(output()).toContain("Daemon stopped (pid 4242)");
+    expect(stopRequest()).toEqual({ pid: 4242, id: ID });
+  });
+
+  it("ends it, and says it may start again, when the request can't be written", async () => {
+    onWindows();
+    daemonWithStopFile(4242, null);
+    mkdirSync(STOP_FILE, { recursive: true });
+    await daemonStop();
+    expect(signalled).toEqual([[4242, "SIGTERM"]]);
+    expect(output()).toContain(`Couldn't write ${STOP_FILE}, so it was ended outright, and may start again in a few seconds.`);
+    expect(output()).toContain("Daemon stopped (pid 4242)");
+  });
+
+  it("leaves a request for a supervisor waiting to start the daemon again, when none is running", async () => {
+    onWindows();
+    await daemonStop();
+    expect(output()).toContain("Daemon is not running.");
+    expect(stopRequest()).toEqual({ pid: null });
+  });
+
+  it("writes no request on macOS or Linux, where signals stop the daemon", async () => {
+    await daemonStop();
+    expect(output()).toContain("Daemon is not running.");
+    expect(stopRequest()).toBeNull();
+  });
+
+  it("engram status says when the daemon should be running and isn't", async () => {
+    // Start at login is on and 'engram stop' wasn't run: it stopped by itself.
+    onWindows();
+    registry.value = ENTRY;
+    await daemonStatus();
+    expect(output()).toContain("Status: stopped");
+    expect(output()).toContain("It should be running: start at login is on. It may have stopped after an error.");
+    expect(output()).toContain(`The end of its log says why: ${join(ENGRAM_DIR, "daemon.log")}`);
+    expect(output()).toContain("Run 'engram start' to start it again.");
+
+    // Not once 'engram stop' has recorded that capture is off.
+    (console.log as Mock).mockClear();
+    vi.mocked(loadConfig).mockResolvedValueOnce({ autocapture: "off" } as never);
+    await daemonStatus();
+    expect(output()).toContain("Status: stopped");
+    expect(output()).not.toContain("It should be running");
+
+    // Nor when start at login is switched off in Startup apps, or isn't set up.
+    (console.log as Mock).mockClear();
+    registry.approved = SWITCHED_OFF;
+    await daemonStatus();
+    expect(output()).not.toContain("It should be running");
+    (console.log as Mock).mockClear();
+    registry.value = null;
+    registry.approved = null;
+    await daemonStatus();
+    expect(output()).not.toContain("It should be running");
+  });
+});
+
 // Last: resetModules leaves the modules imported above on their old instances.
 describe("the Windows sign-in launcher (engram#602)", () => {
-  it("starts the worker hidden, without trusting the last session's PID file", async () => {
+  it("starts the supervisor hidden, without trusting the last session's PID file", async () => {
     // Signing out ended the old daemon; its PID may belong to another program
     // now, as this test's PID file (naming a live process) stands in for.
     // The worker finds out for itself whether a daemon runs (engram#612).
@@ -846,6 +985,9 @@ describe("the Windows sign-in launcher (engram#602)", () => {
     vi.resetModules();
     await import("../daemon/login-start.js");
     expect(spawn).toHaveBeenCalledTimes(1);
+    // The supervisor, which starts the worker again after an error
+    // (engram#613). No --report-until: nothing waits on it to report.
+    expect(spawn.mock.calls[0][1]).toEqual([supervisorPath()]);
     expect(spawn.mock.calls[0][2]).toMatchObject({ detached: true, windowsHide: true });
   });
 
@@ -853,7 +995,11 @@ describe("the Windows sign-in launcher (engram#602)", () => {
    * The modules of ours that `entries` (in src/daemon) load, all the way
    * down, failing on any import that is neither a Node built-in nor ours.
    * `dynamic`: import() too, not only the imports that load first.
+   * Every module imports something, except those in NO_IMPORTS, which
+   * import nothing at all: a module that seems to import nothing otherwise
+   * means the pattern has stopped matching.
    */
+  const NO_IMPORTS = new Set(["supervise.ts"]);
   function modulesLoaded(entries: string[], dynamic: boolean): string[] {
     const imports = dynamic ? /\b(?:from|import)\s*\(?\s*["']([^"']+)["']/g : /\b(?:from|import)\s+["']([^"']+)["']/g;
     const seen = new Set<string>();
@@ -862,7 +1008,8 @@ describe("the Windows sign-in launcher (engram#602)", () => {
       seen.add(file);
       const src = readFileSync(file, "utf-8");
       const specifiers = [...src.matchAll(imports)].map((m) => m[1]);
-      expect(specifiers.length).toBeGreaterThan(0);
+      if (NO_IMPORTS.has(basename(file))) expect(specifiers, basename(file)).toEqual([]);
+      else expect(specifiers.length, basename(file)).toBeGreaterThan(0);
       for (const s of specifiers) {
         if (s.startsWith("node:")) continue;
         expect(s.startsWith("./") || s.startsWith("../"), `${basename(file)} imports ${s}`).toBe(true);
@@ -893,9 +1040,22 @@ describe("the Windows sign-in launcher (engram#602)", () => {
       "launch.ts",
       "preflight.ts",
       "private-files.ts",
+      "supervise.ts",
       "worker.ts",
     ]);
     const worker = readFileSync(join(__dirname, "..", "daemon", "worker.ts"), "utf-8");
     expect(worker).toContain('await import("./worker-main.js")');
+  });
+
+  it("the supervisor never loads better-sqlite3 (engram#613)", () => {
+    // It runs from sign-in to sign-out, beside the worker and before its
+    // preflight: Node built-ins only, import() included.
+    expect(modulesLoaded(["supervisor.ts"], true)).toEqual([
+      "instance.ts",
+      "launch.ts",
+      "private-files.ts",
+      "supervise.ts",
+      "supervisor.ts",
+    ]);
   });
 });

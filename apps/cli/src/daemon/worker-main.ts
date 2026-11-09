@@ -17,6 +17,7 @@ import { loadVaultKey } from "../commands/vault.js";
 import { availableAdapters } from "./adapters.js";
 import { configuredKey, ownedKeysAt } from "./key-source.js";
 import { makeDirPrivateSync, type PrivateDirReport } from "../private-files.js";
+import { START_FAILED_EXIT } from "./supervise.js";
 import {
   claimDaemonLock,
   markReady,
@@ -299,7 +300,9 @@ async function main(): Promise<void> {
   markReady();
 }
 
+// main() has failed before it marked the daemon ready, so this is never one
+// that `engram start` reported as started (engram#613; see supervise.ts).
 main().catch((err) => {
   log(`fatal: ${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
+  process.exit(START_FAILED_EXIT);
 });

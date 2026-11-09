@@ -48,6 +48,12 @@ jobs:
         working-directory: apps/cli
         run: node scripts/smoke-daemon.mjs
 
+      # Sign in, out and between accounts under the real daemon, against a
+      # fake server: what reaches it, with which key (engram#594, #595, #625).
+      - name: Daemon account-switch test
+        working-directory: apps/cli
+        run: node scripts/e2e-account-switch.mjs
+
       # `pnpm build` runs `wrangler deploy --dry-run`, which only bundles the
       # worker; nothing evaluates the result. Boot it in workerd so an error
       # thrown while the module graph loads blocks the merge instead of failing

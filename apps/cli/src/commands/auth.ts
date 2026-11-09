@@ -1,4 +1,4 @@
-import { saveConfig, loadConfig } from "../config.js";
+import { saveConfig, loadConfig, resolveBaseUrl } from "../config.js";
 import { green, red } from "../output.js";
 import { Engram } from "@getengram/sdk";
 import { autoEnableCapture } from "../daemon/commands.js";
@@ -18,16 +18,20 @@ export async function authLogin(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Verify the key works
+  const config = await loadConfig();
+
+  // Check the key against the server it will be used with, the one every
+  // other command and the daemon use (engram#625). This used the SDK's
+  // default server whatever was configured: it refused keys for any other
+  // server, and sent them to that one.
   try {
-    const engram = new Engram({ apiKey: key });
+    const engram = new Engram({ apiKey: key, baseUrl: resolveBaseUrl(config) });
     await engram.listConversations({ limit: 1 });
   } catch {
     console.error(red("Authentication failed. Check your API key."));
     process.exit(1);
   }
 
-  const config = await loadConfig();
   config.apiKey = key;
   await saveConfig(config);
 
@@ -42,6 +46,17 @@ export async function authLogout(): Promise<void> {
   delete config.apiKey;
   await saveConfig(config);
   console.log(green("✓ Logged out"));
+  // The daemon reads config.json every few seconds (engram#594).
+  console.log("  Auto-capture stops sending within a few seconds.");
+  console.log("  Messages already queued stay on this machine and are sent only with a key");
+  console.log("  for the account they were captured under.");
+  console.log("  Anything written while signed out is captured for the next account that signs in.");
+  if (process.env.ENGRAM_API_KEY) {
+    console.log(
+      red("  ENGRAM_API_KEY is set in this shell: commands run here, and a daemon started from here,\n") +
+        red("  keep using that key. Unset it to sign out completely."),
+    );
+  }
 }
 
 export async function authStatus(): Promise<void> {

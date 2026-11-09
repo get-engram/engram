@@ -117,5 +117,7 @@ export interface DaemonStats {
   pid: number | null;
   trackedFiles: number;
   pendingMessages: number;
+  /** Queued under another account's key (engram#594). */
+  heldMessages: number;
   sessionsMapped: number;
 }

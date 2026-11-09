@@ -26,6 +26,29 @@ export async function loadConfig(): Promise<Config> {
   }
 }
 
+/**
+ * Like loadConfig, but a config.json that exists and can't be read or
+ * parsed THROWS instead of reading as empty. The daemon re-reads the key
+ * every couple of seconds and treats "no key" as a logout (engram#594), so
+ * a file caught half-written, or one damaged by hand, must not look like
+ * one: that would stop capture for nothing. Only a missing file means
+ * there is no config.
+ */
+export async function loadConfigStrict(): Promise<Config> {
+  let raw: string;
+  try {
+    raw = await readFile(CONFIG_FILE, "utf-8");
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException | null)?.code === "ENOENT") return {};
+    throw err;
+  }
+  const parsed = JSON.parse(raw) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("config.json is not a JSON object");
+  }
+  return parsed as Config;
+}
+
 export async function saveConfig(config: Config): Promise<void> {
   await mkdir(CONFIG_DIR, { recursive: true });
   await writeFile(CONFIG_FILE, JSON.stringify(config, null, 2) + "\n");
@@ -46,6 +69,23 @@ export function getApiKey(): string {
   return key;
 }
 
+const DEFAULT_BASE_URL = "https://mcp.getengram.app";
+
 export function getBaseUrl(): string {
-  return process.env.ENGRAM_BASE_URL ?? "https://mcp.getengram.app";
+  return process.env.ENGRAM_BASE_URL ?? DEFAULT_BASE_URL;
+}
+
+/**
+ * The server the CLI and the daemon talk to: ENGRAM_BASE_URL, then baseUrl
+ * in config.json, then the default (docs/cli.md). Everything that sends a
+ * key, checks one or signs in for one resolves it here (engram#625).
+ * `engram auth login` checked keys against the default server whatever was
+ * configured, and the account commands skipped config.json, so a key could
+ * be checked or minted on one server, used on another, and sent to a server
+ * the user hadn't configured.
+ */
+export function resolveBaseUrl(config: { baseUrl?: unknown }): string {
+  const configured =
+    typeof config.baseUrl === "string" && config.baseUrl.trim() !== "" ? config.baseUrl.trim() : undefined;
+  return (process.env.ENGRAM_BASE_URL ?? configured ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
 }

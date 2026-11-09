@@ -25,13 +25,14 @@ import {
   workerPath,
 } from "./launch.js";
 
-/** Render the per-host capture status (engram#261). */
-function printHostStatus(): void {
+/** Render the per-host capture status (engram#261). `signedOut`: the
+ *  daemon runs without a key, so nothing is captured (engram#594). */
+function printHostStatus(signedOut = false): void {
   console.log(`${dim("Hosts:")}`);
   for (const a of ALL_ADAPTERS) {
     const on = a.available();
     const mark = on ? "✓" : "·";
-    const state = on ? "capturing" : "not installed";
+    const state = on ? (signedOut ? "paused (signed out)" : "capturing") : "not installed";
     console.log(`  ${mark} ${a.label.padEnd(14)} ${dim(state)}`);
   }
 }
@@ -204,16 +205,39 @@ export async function daemonStop(): Promise<void> {
   try { unlinkSync(PID_FILE); } catch { /* ignore */ }
 }
 
-/** Print local capture stats; never let a broken native module crash status. */
+/**
+ * Print local capture stats; never let a broken native module crash status.
+ *
+ * Read-only: daemon.db belongs to the daemon, which may be an older version
+ * than this CLI. Opening it read-write here used to bring its schema up to
+ * this CLI's version under a daemon that doesn't know that schema.
+ *
+ * "Pending" counts what the configured key will send. What another
+ * account's key queued is "held" (engram#594): it stays on this machine
+ * and is sent only when that account signs in again.
+ */
 async function printDbStats(): Promise<void> {
   if (!existsSync(DB_FILE)) return;
   try {
     const { DaemonDb } = await import("./db.js");
-    const db = new DaemonDb(DB_FILE);
-    const stats = db.getStats();
-    db.close();
+    const { keyFingerprint } = await import("./syncer.js");
+    const config = await loadConfig();
+    const key = process.env.ENGRAM_API_KEY || config.apiKey;
+    const db = new DaemonDb(DB_FILE, { readonly: true });
+    let stats: ReturnType<typeof db.getStats>;
+    try {
+      stats = db.getStats(key ? keyFingerprint(key) : null);
+    } finally {
+      db.close();
+    }
     console.log(`${dim("Sessions captured:")} ${stats.sessionsMapped}`);
     console.log(`${dim("Pending sync:")}      ${stats.pendingMessages} messages`);
+    if (stats.heldMessages > 0) {
+      console.log(
+        `${dim("Held:")}              ${stats.heldMessages} messages ` +
+          dim(key ? "(another account's — sent when it signs in again)" : "(sent when their account signs in)"),
+      );
+    }
     console.log(`${dim("Files tracked:")}     ${stats.trackedFiles}`);
   } catch {
     console.log(dim("Local capture DB unreadable (native module mismatch?) — the daemon rebuilds it on start."));
@@ -237,10 +261,10 @@ export async function daemonStatus(): Promise<void> {
 
   await printDbStats();
 
-  printHostStatus();
+  const syncStatus = readStatus();
+  printHostStatus(Boolean(syncStatus.signed_out_at));
 
   // Show sync health warnings
-  const syncStatus = readStatus();
   printSyncWarnings(syncStatus);
 
   console.log(`${dim("Log:")} ${LOG_FILE}`);
@@ -272,6 +296,17 @@ function printAutoStart(): void {
 }
 
 function printSyncWarnings(status: SyncStatus): void {
+  // No key saved (engram#594): the daemon runs, but captures and sends
+  // nothing until one is. Nothing queued is lost meanwhile.
+  if (status.signed_out_at) {
+    console.log("");
+    console.log(red("  Signed out — capture is paused and nothing is sent."));
+    console.log(dim("  Run 'engram auth login' to resume. Queued messages stay on this machine."));
+    console.log(dim(`  Since: ${status.signed_out_at}`));
+    console.log("");
+    return;
+  }
+
   // Capture comes before sending: what can't be queued here can't be sent
   // either, however healthy syncing is (engram#584).
   if (status.capture_error) {

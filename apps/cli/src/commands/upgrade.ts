@@ -1,9 +1,8 @@
 import { spawn } from "node:child_process";
 import { win32 } from "node:path";
-import { loadConfig, getBaseUrl } from "../config.js";
+import { loadConfig, resolveBaseUrl } from "../config.js";
 import { green, red, dim } from "../output.js";
 
-const API_URL = process.env.ENGRAM_BASE_URL ?? getBaseUrl();
 
 /**
  * The program, and its arguments, that opens `url` in the default browser:
@@ -66,7 +65,7 @@ export async function upgrade(
   const plan = args[0] === "team" ? "team" : "pro";
   const json = "json" in flags;
 
-  const res = await fetch(`${API_URL}/api/billing/checkout`, {
+  const res = await fetch(`${resolveBaseUrl(config)}/api/billing/checkout`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

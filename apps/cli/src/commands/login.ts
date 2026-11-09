@@ -1,10 +1,11 @@
 import { createInterface } from "node:readline";
-import { saveConfig, loadConfig, getBaseUrl } from "../config.js";
+import { saveConfig, loadConfig, resolveBaseUrl } from "../config.js";
 import { green, red, dim, bold } from "../output.js";
 import { Engram } from "@getengram/sdk";
 import { autoEnableCapture } from "../daemon/commands.js";
 
-const API_URL = process.env.ENGRAM_BASE_URL ?? getBaseUrl();
+/** The server these commands talk to: see resolveBaseUrl (engram#625). */
+const apiUrl = async (): Promise<string> => resolveBaseUrl(await loadConfig());
 
 /** Prompt for input (hides input for passwords). */
 function prompt(question: string, hidden = false): Promise<string> {
@@ -66,7 +67,7 @@ export async function signup(): Promise<void> {
 
   console.log("Creating account...");
 
-  const res = await fetch(`${API_URL}/signup/anonymous`, {
+  const res = await fetch(`${await apiUrl()}/signup/anonymous`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
   });
@@ -120,7 +121,7 @@ export async function link(args: string[] = [], flags: Record<string, string> = 
   // Link email to org via worker. Supabase user creation happens
   // lazily on first dashboard login — the CLI only needs the email
   // attached to the org for billing.
-  const linkRes = await fetch(`${API_URL}/signup/link`, {
+  const linkRes = await fetch(`${await apiUrl()}/signup/link`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -163,7 +164,7 @@ export async function link(args: string[] = [], flags: Record<string, string> = 
 
 /** POST /signup/set-password — create the Supabase login for this org. */
 async function setWebPassword(apiKey: string, password: string): Promise<void> {
-  const res = await fetch(`${API_URL}/signup/set-password`, {
+  const res = await fetch(`${await apiUrl()}/signup/set-password`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -202,7 +203,7 @@ export async function whoami(): Promise<void> {
     process.exit(1);
   }
 
-  const res = await fetch(`${API_URL}/api/account`, {
+  const res = await fetch(`${await apiUrl()}/api/account`, {
     headers: { Authorization: `Bearer ${apiKey}` },
   });
   if (!res.ok) {
@@ -229,6 +230,62 @@ export async function whoami(): Promise<void> {
 }
 
 /**
+ * Exit, without touching config.json, unless the saved API key belongs to
+ * the account `email` signed in to (engram#594). The server's 409 names
+ * that account's id, and GET /api/account names the key's; only when the
+ * 409 carries no id do the emails decide, compared without regard to case.
+ */
+async function confirmSavedKeyIsFor(
+  email: string,
+  orgId: string | null,
+  apiKey: string,
+): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(`${await apiUrl()}/api/account`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (err: unknown) {
+    console.error(
+      red(`Couldn't check which account the saved API key belongs to (${err instanceof Error ? err.message : String(err)}).\n`) +
+        "  Nothing was changed. Run 'engram whoami' to see the account in use.",
+    );
+    process.exit(1);
+  }
+  if (res.status === 401) {
+    console.error(
+      red("The API key saved in ~/.engram/config.json was rejected.\n") +
+        "  Get a key for this account at getengram.app/dashboard, then run 'engram auth login <key>'.",
+    );
+    process.exit(1);
+  }
+  if (!res.ok) {
+    console.error(
+      red(`Couldn't check which account the saved API key belongs to (HTTP ${res.status}).\n`) +
+        "  Nothing was changed. Run 'engram whoami' to see the account in use.",
+    );
+    process.exit(1);
+  }
+  const acct = (await res.json().catch(() => ({}))) as { org_id?: unknown; email?: unknown };
+  const saved = typeof acct.email === "string" ? acct.email : null;
+  const same =
+    orgId !== null
+      ? acct.org_id === orgId
+      : saved !== null && saved.trim().toLowerCase() === email.toLowerCase();
+  if (same) return;
+  console.error(
+    red(
+      `The API key saved in ~/.engram/config.json belongs to ` +
+        `${saved ? `another account (${saved})` : "another account (one with no email)"}, not ${email}.\n`,
+    ) +
+      "  Nothing was changed, and capture still goes to that account.\n" +
+      `  To switch: get a key for ${email} at getengram.app/dashboard, then run 'engram auth login <key>'.`,
+  );
+  process.exit(1);
+}
+
+/**
  * `engram login` — sign in with email + password.
  * Calls Supabase auth, then the worker /signup to get an API key.
  */
@@ -244,16 +301,21 @@ export async function login(args: string[] = [], flags: Record<string, string> =
   console.log("Signing in...");
 
   // Authenticate via worker — keeps Supabase credentials server-side
-  const signupRes = await fetch(`${API_URL}/signup/login`, {
+  const signupRes = await fetch(`${await apiUrl()}/signup/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ email: email.trim(), password }),
   });
 
   if (signupRes.status === 409) {
-    // Account already has a key — check if we have one locally
+    // Account already has a key — check if we have one locally. It has to
+    // be THIS account's: this used to say "signed in" whatever account the
+    // saved key belonged to, and capture went on into that one (engram#594).
+    const conflict = (await signupRes.json().catch(() => ({}))) as { organization_id?: unknown };
+    const orgId = typeof conflict.organization_id === "string" ? conflict.organization_id : null;
     const config = await loadConfig();
     if (config.apiKey) {
+      await confirmSavedKeyIsFor(email.trim(), orgId, config.apiKey);
       console.log(green(`✓ Signed in as ${email.trim()}`));
       console.log(`  Using existing API key from ~/.engram/config.json`);
       await autoEnableCapture();

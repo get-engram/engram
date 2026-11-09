@@ -50,6 +50,7 @@ vi.mock("../config.js", () => ({
   loadConfig: vi.fn(async () => ({})),
   saveConfig: vi.fn(async () => {}),
   getBaseUrl: () => "https://engram.invalid",
+  resolveBaseUrl: () => "https://engram.invalid",
 }));
 // An install has dist/daemon/login-start.js beside launch.js; under vitest the
 // module beside launch.ts is login-start.ts. Point at a file that exists.

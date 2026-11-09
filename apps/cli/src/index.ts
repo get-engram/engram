@@ -2,7 +2,7 @@
 
 import { createRequire } from "node:module";
 import { Engram } from "@getengram/sdk";
-import { loadConfig, getBaseUrl } from "./config.js";
+import { loadConfig, resolveBaseUrl } from "./config.js";
 import { authLogin, authLogout, authStatus } from "./commands/auth.js";
 import { signup, login, link, whoami } from "./commands/login.js";
 import {
@@ -125,7 +125,7 @@ async function getClient(): Promise<Engram> {
 
   return new Engram({
     apiKey,
-    baseUrl: process.env.ENGRAM_BASE_URL ?? config.baseUrl ?? getBaseUrl(),
+    baseUrl: resolveBaseUrl(config),
     vault: vaultKey ? { encryptionKey: vaultKey } : undefined,
   });
 }

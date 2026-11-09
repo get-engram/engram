@@ -1,6 +1,14 @@
+import { createHash } from "node:crypto";
 import type { Engram } from "@getengram/sdk";
 import { DaemonDb } from "./db.js";
-import { recordSuccess, recordFailure, classifyError, isNotFound } from "./status.js";
+import {
+  recordSuccess,
+  recordFailure,
+  recordSignedIn,
+  recordSignedOut,
+  classifyError,
+  isNotFound,
+} from "./status.js";
 import { parseStorageFullError } from "../storage-error.js";
 import { isPathExcluded, detectOptOut } from "./exclusions.js";
 import { queueing } from "./queue-error.js";
@@ -38,30 +46,122 @@ const STORAGE_FULL_BACKOFF_MS = [60_000, 2 * 60_000, 5 * 60_000];
  * Pause schedule while the API key is rejected: 10min → 30min → 1hr → 1hr …
  * (engram#587). A rejected key used to stop syncing until the daemon
  * restarted, and nothing restarts it: `engram auth login` saves the new key
- * and leaves this process running with the old one. Now a paused daemon
- * looks for a new key every KEY_CHECK_MS and switches to it at once; this
- * schedule only paces retries of the same key, for a key that was refused
- * for a while and accepted again.
+ * and leaves this process running with the old one. Now the daemon reads
+ * the configured key every KEY_POLL_MS and switches to a new one at once;
+ * this schedule only paces retries of the same key, for a key that was
+ * refused for a while and accepted again.
  */
 const AUTH_RETRY_MS = [10 * 60_000, 30 * 60_000, 60 * 60_000];
 
-/** How often a paused daemon reads the configured key. */
-const KEY_CHECK_MS = 10_000;
+/**
+ * How often the daemon reads the configured key (engram#594). A logout must
+ * stop sending within seconds, and a new key must be used without a
+ * restart. The read is of one small local file.
+ */
+const KEY_POLL_MS = 2_000;
+
+/**
+ * Retry schedule for asking the server which earlier keys are the current
+ * key's account's, when it can't answer (network, 5xx, rate limit).
+ */
+const OWNERSHIP_RETRY_MS = [30_000, 2 * 60_000, 10 * 60_000];
+
+/**
+ * How long a session that already has a conversation under an earlier key
+ * waits for that answer before it gets a conversation of its own under the
+ * current key. Without the wait, a rotated key would give every session it
+ * continues a second conversation in the same account. Past it, a server
+ * that can't answer mustn't hold captures back for good: the worst case is
+ * a session split across two conversations, never a lost message.
+ */
+const OWNERSHIP_GATE_MS = 15 * 60_000;
+
+/**
+ * The key fingerprint of a Syncer built with a fixed client and no
+ * KeySource (tests, and callers that manage the key themselves). Not a
+ * SHA-256, so the server is never asked about it.
+ */
+export const FIXED_KEY_FP = "fixed";
+
+/** What a real key's fingerprint looks like (keyFingerprint). */
+const KEY_HASH = /^[0-9a-f]{64}$/;
+
+/**
+ * What daemon.db records about the key a message was captured under: the
+ * key's SHA-256 as lowercase hex (engram#594). It is the hash the server
+ * keeps of the key, so the server can say which earlier keys are the same
+ * account's. The key itself is never written to daemon.db.
+ */
+export function keyFingerprint(key: string): string {
+  return createHash("sha256").update(key).digest("hex");
+}
 
 /** A settled promise, for the paths of onMessages that have nothing left to do. */
 const DONE: Promise<void> = Promise.resolve();
 
 /**
- * Where the daemon's API key comes from, so a rejected key can be replaced
- * without a restart.
+ * Where the daemon's API key comes from (engram#587, engram#594). The key
+ * is read again every KEY_POLL_MS: a new key is used without a restart, and
+ * no key stops capture and sending.
  */
 export interface KeySource {
-  /** The key the client was built with. */
-  current: string;
-  /** The key configured now: ENGRAM_API_KEY, else ~/.engram/config.json. */
+  /** The key configured at start, if any. */
+  current?: string;
+  /**
+   * The key configured now: ENGRAM_API_KEY, else ~/.engram/config.json.
+   * Throws when config.json can't be read or parsed. That is not a logout:
+   * the key in use stays until the file can be read.
+   */
   read(): Promise<string | undefined>;
-  /** A client for a new key. */
+  /** A client for a key. */
   connect(key: string): Engram;
+  /** No key is configured any more: let go of what was built for the last
+   *  one (the vault read through it). Called after capture has stopped. */
+  disconnect?(): void;
+  /**
+   * Which of `keyHashes` (key fingerprints) are keys of the account `key`
+   * belongs to. Throws when the server doesn't answer; an Error with a
+   * numeric `status` when it refused.
+   */
+  ownedKeys?(key: string, keyHashes: string[]): Promise<string[]>;
+}
+
+/**
+ * Starts and stops reading transcripts (engram#594). Capture runs only
+ * while a key is configured, so whatever is read is queued for the account
+ * signed in at the time. `stop(true)` first reads what was written but not
+ * read yet: when the account changes, those lines are queued for the
+ * account they were written under.
+ */
+export interface CaptureControl {
+  start(): void;
+  stop(drain: boolean): void;
+}
+
+/**
+ * One key in use: its fingerprint and client. A flush works with one Run
+ * from start to end, and once the key changes a Run that is no longer
+ * `active` starts no new request.
+ */
+interface Run {
+  fp: string;
+  client: Engram;
+  /** The key itself, in memory only (absent for a fixed client). */
+  key?: string;
+}
+
+/** What the server has said about which earlier keys are the current key's
+ *  account's (checkOwnership). */
+interface Ownership {
+  answered: boolean;
+  /** When the current key first asked (0: not yet). */
+  firstAskedAt: number;
+  retryAt: number;
+  step: number;
+}
+
+function freshOwnership(): Ownership {
+  return { answered: false, firstAskedAt: 0, retryAt: 0, step: 0 };
 }
 
 /**
@@ -71,7 +171,7 @@ export interface KeySource {
  */
 type SendOutcome =
   | "sent" // everything queued for it went out
-  | "retry" // a send failed; its rows stay queued for a later flush
+  | "retry" // a send failed, or the key changed; its rows stay queued for a later flush
   | "backoff" // the account hit a billing or storage limit
   | "auth"; // the API key was rejected; sending pauses (AUTH_RETRY_MS)
 
@@ -84,21 +184,50 @@ const CREATE_RETRY_MS = [30_000, 2 * 60_000, 10 * 60_000];
  * Batches parsed messages and sends them to the Engram API.
  * If offline, messages sit in the SQLite queue and are retried
  * on the next flush cycle.
+ *
+ * Every queued message records the key it was captured under (engram#594),
+ * as a fingerprint, and is sent only with that key or with a key the server
+ * confirmed is the same account's (a rotated or re-issued key). The
+ * configured key is read every KEY_POLL_MS. A new key is used from the next
+ * request on; no key, after `engram auth logout`, stops capture and sending
+ * at once. Nothing queued is deleted either way: it waits on this machine
+ * until its account signs in again.
+ *
+ * While signed out, capture stops and each transcript's read offset stays
+ * where it was, so what is written meanwhile is read, and queued, for the
+ * next account that signs in.
  */
 export class Syncer {
   private db: DaemonDb;
-  private client: Engram;
+  /** The key in use; null while signed out. */
+  private active: Run | null;
+  /** The key captures are queued under (null: signed out). */
+  private captureFp: string | null;
   private timer: ReturnType<typeof setInterval> | null = null;
-  private flushing = false;
+  private keyTimer: ReturnType<typeof setInterval> | null = null;
+  private running: Promise<void> | null = null;
+  /** A read of the configured key in progress, shared by its callers. */
+  private keyCheck: Promise<void> | null = null;
+  /** stop() was called: capture doesn't start again, and a key change only
+   *  stops sending. */
+  private stopped = false;
+  private capture: CaptureControl | null = null;
+  private capturing = false;
 
   /** Paused because the API key was rejected: until when, and how many
    *  pauses in a row without a request going through. */
   private authHeldUntil = 0;
   private authHoldStep = 0;
-  /** The key the client was built with, and when the configured key was
-   *  last read for a new one. */
+  /** The key configured when it was last read (undefined: none). */
   private currentKey: string | undefined;
-  private lastKeyCheck = 0;
+  /** The fingerprint rows that belonged to no key were last handed to. */
+  private claimedFor: string | null = null;
+  private ownership: Ownership = freshOwnership();
+  /** The sessions the ownership gate holds were logged, under this key. */
+  private gateLogged = false;
+  /** The last message logged for each lasting problem, so a problem that
+   *  lasts is logged once, not on every poll. */
+  private problems = new Map<string, string>();
 
   /** Billing backoff state */
   private billingBackoffUntil: number = 0;
@@ -115,15 +244,256 @@ export class Syncer {
   /** Sends are waiting for the vault to be read (engram#588). */
   private vaultHeld = false;
 
+  /** Per-conversation reduced batch size after a failed send (halves down to
+   *  1 so even a single pathological message eventually goes alone; restored
+   *  to the full batch on the next success). */
+  private batchOverride = new Map<string, number>();
+
+  /**
+   * With `keys`, `client` is the client for `keys.current` (built from it
+   * when null), and no `keys.current` starts the Syncer signed out. Without
+   * `keys`, `client` sends everything, under FIXED_KEY_FP.
+   */
   constructor(
     db: DaemonDb,
-    client: Engram,
+    client: Engram | null,
     private readonly scrubber: SecretScrubber | null = null,
     private readonly keys: KeySource | null = null,
   ) {
     this.db = db;
-    this.client = client;
-    this.currentKey = keys?.current;
+    if (!keys) {
+      if (!client) throw new Error("Syncer needs a client or a KeySource");
+      this.active = { fp: FIXED_KEY_FP, client };
+    } else if (keys.current) {
+      const key = keys.current;
+      this.active = { fp: keyFingerprint(key), client: client ?? keys.connect(key), key };
+      this.currentKey = key;
+    } else {
+      this.active = null;
+    }
+    this.captureFp = this.active?.fp ?? null;
+    if (this.active) this.claim(this.active);
+  }
+
+  /** Hand capture to the Syncer (engram#594), which runs it while a key is
+   *  configured. Set before start(). */
+  setCaptureControl(control: CaptureControl): void {
+    this.capture = control;
+  }
+
+  /** Start syncing, and capturing while a key is configured. */
+  start(): void {
+    this.stopped = false;
+    if (this.active) {
+      if (this.keys) recordSignedIn();
+      this.startCapture();
+    } else {
+      recordSignedOut();
+      this.logSignedOut();
+    }
+    // flush() and checkKey() handle their own errors; the catch only keeps
+    // a failure in that handling from becoming an unhandled rejection.
+    this.timer ??= setInterval(() => {
+      this.flush().catch(() => {});
+    }, FLUSH_INTERVAL_MS);
+    if (this.keys) {
+      this.keyTimer ??= setInterval(() => {
+        this.checkKey().catch(() => {});
+      }, KEY_POLL_MS);
+    }
+  }
+
+  /**
+   * Stop capturing and syncing. Queued messages stay in daemon.db. A final
+   * flush() may follow; it sends only with the key still configured.
+   */
+  stop(): void {
+    this.stopped = true;
+    this.stopCapture(false);
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    if (this.keyTimer) {
+      clearInterval(this.keyTimer);
+      this.keyTimer = null;
+    }
+  }
+
+  private startCapture(): void {
+    if (this.capturing || this.stopped || !this.capture) return;
+    this.capturing = true;
+    try {
+      this.capture.start();
+    } catch (err: unknown) {
+      console.error(`[engram] starting capture failed: ${errorText(err)}`);
+    }
+  }
+
+  private stopCapture(drain: boolean): void {
+    if (!this.capturing || !this.capture) return;
+    this.capturing = false;
+    try {
+      this.capture.stop(drain);
+    } catch (err: unknown) {
+      console.error(`[engram] stopping capture failed: ${errorText(err)}`);
+    }
+  }
+
+  /**
+   * Read the configured key and act on a change (engram#594): no key stops
+   * capture and sending at once, and a new key is used from the next
+   * request on. Calls made while a read is in progress share it.
+   */
+  checkKey(): Promise<void> {
+    const keys = this.keys;
+    if (!keys) return DONE;
+    this.keyCheck ??= this.readKey(keys).finally(() => {
+      this.keyCheck = null;
+    });
+    return this.keyCheck;
+  }
+
+  private async readKey(keys: KeySource): Promise<void> {
+    let key: string | undefined;
+    try {
+      key = (await keys.read()) || undefined;
+    } catch (err: unknown) {
+      this.logProblem("key", `[engram] reading the API key failed (will retry): ${errorText(err)}`);
+      return;
+    }
+    if (key === this.currentKey) {
+      this.problems.delete("key");
+      return;
+    }
+    if (this.stopped) {
+      // Shutting down, and the key changed since it was last read: nothing
+      // more is sent with a key that is no longer configured, and capture
+      // doesn't start again.
+      this.active = null;
+      this.captureFp = null;
+      this.currentKey = undefined;
+      return;
+    }
+    if (key === undefined) this.signOut();
+    else this.signIn(keys, key);
+  }
+
+  /** A key is configured that isn't the one in use: a sign-in, or a change
+   *  of key or account. */
+  private signIn(keys: KeySource, key: string): void {
+    const switching = this.active !== null;
+    // What was written under the key in use is read and queued under it
+    // first, scrubbed against the vault read through it.
+    this.stopCapture(true);
+    let run: Run;
+    try {
+      run = { fp: keyFingerprint(key), client: keys.connect(key), key };
+    } catch (err: unknown) {
+      // Another key is configured: nothing more is captured or sent under
+      // the one in use.
+      if (this.active) this.deactivate();
+      this.logProblem("key", `[engram] the new API key can't be used yet (will retry): ${errorText(err)}`);
+      return;
+    }
+    this.active = run;
+    this.captureFp = run.fp;
+    this.currentKey = key;
+    this.resetForNewKey();
+    this.problems.delete("key");
+    this.claim(run);
+    recordSignedIn();
+    this.startCapture();
+    console.log(
+      switching
+        ? "[engram] new API key found — capturing and sending with it (messages queued under the previous key are sent only if it's the same account's)"
+        : "[engram] signed in — capture and sync resumed",
+    );
+  }
+
+  /** Stop capturing and sending under the key in use. Nothing queued is
+   *  touched. */
+  private deactivate(): void {
+    // What was written under the key is read and queued under it first,
+    // scrubbed against the vault read through it — so the vault is let go
+    // of only after.
+    this.stopCapture(true);
+    this.active = null;
+    this.captureFp = null;
+    this.currentKey = undefined;
+    this.resetForNewKey();
+    try {
+      this.keys?.disconnect?.();
+    } catch (err: unknown) {
+      console.error(`[engram] letting go of the previous API key failed: ${errorText(err)}`);
+    }
+    recordSignedOut();
+  }
+
+  /** No key is configured any more (`engram auth logout`). */
+  private signOut(): void {
+    this.deactivate();
+    this.problems.delete("key");
+    this.logSignedOut();
+  }
+
+  private logSignedOut(): void {
+    let queued = 0;
+    try {
+      queued = this.db.getHeldCount(null);
+    } catch {
+      // The count only informs the line below.
+    }
+    console.log(
+      `[engram] signed out — capture paused and nothing is sent; ${queued} queued message(s) ` +
+        `stay on this machine, to be sent only with their account's key. ` +
+        `Capture resumes when 'engram auth login' saves a key.`,
+    );
+  }
+
+  /** Forget what was learned under the previous key: its pauses, retry
+   *  timers and batch sizes say nothing about the next one. */
+  private resetForNewKey(): void {
+    this.authHeldUntil = 0;
+    this.authHoldStep = 0;
+    // The new key may belong to an account with room, and a held billing
+    // backoff would only delay finding out.
+    this.billingBackoffUntil = 0;
+    this.billingBackoffStep = 0;
+    this.createRetry.clear();
+    this.batchOverride.clear();
+    this.vaultHeld = false;
+    this.ownership = freshOwnership();
+    this.gateLogged = false;
+    // What was queued while no key was in use goes to the next key.
+    this.claimedFor = null;
+  }
+
+  /**
+   * Hand what belongs to no key to the key in use: rows queued before
+   * daemon.db recorded keys, or while no key was in use. Once per key; a
+   * failure is retried on the next flush.
+   */
+  private claim(run: Run): boolean {
+    if (this.claimedFor === run.fp) return true;
+    try {
+      this.db.claimLegacy(run.fp);
+      this.claimedFor = run.fp;
+      this.problems.delete("claim");
+      return true;
+    } catch (err: unknown) {
+      this.logProblem(
+        "claim",
+        `[engram] couldn't assign queued messages to this API key (will retry): ${errorText(err)}`,
+      );
+      return false;
+    }
+  }
+
+  private logProblem(kind: string, msg: string): void {
+    if (this.problems.get(kind) === msg) return;
+    this.problems.set(kind, msg);
+    console.error(msg);
   }
 
   /**
@@ -160,8 +530,12 @@ export class Syncer {
       return this.excludeSession(sessionId, "in-chat opt-out");
     }
 
-    // Check if we already have a mapping
-    const conversationId = queueing(() => this.db.getConversationId(sessionId));
+    // Queued under the key signed in now (engram#594), so only that key's
+    // account receives them; onto the session's conversation in that
+    // account, if it has one there.
+    const keyFp = this.captureFp;
+    const conversationId =
+      keyFp === null ? null : queueing(() => this.db.getConversationId(sessionId, keyFp));
 
     // Value-exact scrubbing of known vault secrets, applied to every role
     // (tool output is where `engram vault get` lands), before the messages
@@ -185,14 +559,14 @@ export class Syncer {
     }
 
     if (conversationId) {
-      queueing(() => this.db.enqueue(conversationId, messages));
+      queueing(() => this.db.enqueue(conversationId, messages, keyFp));
     } else {
       // No conversation yet. Creating it is deferred to the flush loop so
       // the parser never waits on the network; until then the messages wait
       // under pending:<sessionId>, recorded together with the session in
       // daemon.db (engram#370) so a restart or a failed create can't strand
       // them.
-      queueing(() => this.db.enqueuePendingSession(sessionId, meta, messages));
+      queueing(() => this.db.enqueuePendingSession(sessionId, meta, messages, keyFp));
     }
     return DONE;
   }
@@ -201,55 +575,70 @@ export class Syncer {
    * The user said not to save this session. Semantics are "this session was
    * never captured": stop future capture, wipe the local queue, and delete
    * whatever already reached the server. The remote delete is persisted in
-   * excluded_sessions.delete_pending and retried from the flush loop until
-   * it succeeds — offline opt-out must still stick.
+   * remote_deletes and retried from the flush loop until it succeeds —
+   * offline opt-out must still stick. A copy synced under another key is
+   * deleted with that key's account's key (engram#594), once it signs in
+   * again.
    *
    * The local part happens before this returns, in one transaction; if it
    * fails, the QueueWriteError stops the watcher at the opt-out line, so
    * nothing after it is read until the opt-out has taken (engram#584).
    */
   private excludeSession(sessionId: string, reason: string): Promise<void> {
-    const { conversationId, dropped } = queueing(() =>
+    const { conversations, dropped } = queueing(() =>
       this.db.excludeSession(sessionId, reason),
     );
     this.createRetry.delete(sessionId);
 
+    const run = this.active;
+    const here = run ? conversations.filter((c) => c.keyFp === run.fp).length : 0;
+    const elsewhere = conversations.length - here;
     console.log(
       `[engram] session ${sessionId} excluded (${reason}) — ` +
         `${dropped} queued message(s) dropped` +
-        (conversationId ? ", deleting synced copy" : ""),
+        (here > 0 ? ", deleting synced copy" : "") +
+        (elsewhere > 0
+          ? `; ${elsewhere} cop${elsewhere === 1 ? "y" : "ies"} synced under another API key ` +
+            `will be deleted when that key's account signs in again`
+          : ""),
     );
 
-    return conversationId ? this.retryRemoteDeletes() : DONE;
+    return run && here > 0 ? this.retryRemoteDeletes(run) : DONE;
   }
 
-  /** Delete server-side conversations for opted-out sessions; keeps
-   *  delete_pending until the server confirms. */
-  private async retryRemoteDeletes(): Promise<void> {
+  /** Delete server-side conversations for opted-out sessions, each with the
+   *  key of the account it is in; a delete is kept until the server
+   *  confirms. */
+  private async retryRemoteDeletes(run: Run): Promise<void> {
     // A rejected key can't delete either; the deletes keep until it's fixed.
     if (this.authHeld()) return;
-    for (const row of this.db.getPendingRemoteDeletes()) {
+    for (const row of this.db.getPendingRemoteDeletes(run.fp)) {
+      // The key changed: the rest wait for their account to sign in again.
+      if (this.active !== run) return;
       try {
-        await this.client.deleteConversation(row.delete_pending);
-        this.keyAccepted();
-        this.db.clearPendingRemoteDelete(row.session_id);
+        await run.client.deleteConversation(row.conversation_id);
+        this.keyAccepted(run);
+        this.db.clearPendingRemoteDelete(row.conversation_id);
         console.log(
-          `[engram] deleted synced conversation ${row.delete_pending} for opted-out session`,
+          `[engram] deleted synced conversation ${row.conversation_id} for opted-out session`,
         );
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = errorText(err);
         // Engram saying "not found" means it's already gone (or was never
         // fully created) — the promise is kept either way. Only Engram's
         // own answer counts (engram#587): this used to accept any text
         // matching /not.?found/ or "404", and a DNS failure (ENOTFOUND)
         // matches that. The delete was dropped while the copy stayed.
         if (isNotFound(err)) {
-          this.keyAccepted();
-          this.db.clearPendingRemoteDelete(row.session_id);
+          this.keyAccepted(run);
+          this.db.clearPendingRemoteDelete(row.conversation_id);
           continue;
         }
+        // Refused under a key no longer in use: that says nothing about the
+        // key in use now, and the delete waits for its account.
+        if (this.active !== run) return;
         console.error(
-          `[engram] opt-out delete failed for ${row.delete_pending} (will retry): ${msg}`,
+          `[engram] opt-out delete failed for ${row.conversation_id} (will retry): ${msg}`,
         );
         // Only a key refused outright pauses everything. A key that works
         // but lacks the delete scope (insufficient_scope) can still save.
@@ -261,87 +650,215 @@ export class Syncer {
     }
   }
 
-  startFlushLoop(): void {
-    this.timer = setInterval(() => this.flush(), FLUSH_INTERVAL_MS);
+  /**
+   * Flush all pending messages to the API, with the key configured now. A
+   * call while a flush is in progress returns at once.
+   */
+  flush(): Promise<void> {
+    if (this.running) return DONE;
+    const flushing = this.runFlush().finally(() => {
+      this.running = null;
+    });
+    this.running = flushing;
+    return flushing;
   }
 
-  stopFlushLoop(): void {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
+  /** Settles once no flush is in progress: shutdown waits for it before
+   *  closing daemon.db, so a send that went through is recorded as sent. */
+  idle(): Promise<void> {
+    return this.running ?? DONE;
+  }
+
+  private async runFlush(): Promise<void> {
+    let run: Run | null = null;
+    try {
+      // A logout or a new key takes effect before anything is sent
+      // (engram#594).
+      await this.checkKey();
+      run = this.active;
+      if (!run) return; // signed out: nothing is sent
+      await this.flushWith(run);
+    } catch (err: unknown) {
+      const msg = errorText(err);
+      console.error(`[engram] flush error: ${msg}`);
+      // After a logout or a new key, the error belongs to a key no longer
+      // in use; the status speaks for the one configured now.
+      if (this.active !== null && (run === null || this.active === run)) {
+        recordFailure(msg, classifyError(err), this.pendingCount());
+      }
     }
   }
 
-  /** Flush all pending messages to the API. */
-  async flush(): Promise<void> {
-    if (this.flushing) return;
+  private async flushWith(run: Run): Promise<void> {
+    // What was queued before daemon.db recorded keys is this key's (see
+    // claim). Nothing is sent until that is recorded: a session mapped
+    // before then would otherwise get a second conversation.
+    if (!this.claim(run)) return;
 
-    this.flushing = true;
+    // Nothing can send while the key is rejected or a billing backoff holds.
+    if (this.halted(run)) return;
 
-    try {
-      // A rejected key: `engram auth login` may have saved a new one.
-      if (this.authHeld()) await this.pickUpNewKey();
+    // What an earlier key of this account queued is sent with this one.
+    await this.checkOwnership(run);
+    if (this.halted(run)) return; // the key was rejected, or changed, there
 
-      // Nothing can send while the key is rejected or a billing backoff holds.
-      if (this.halted()) return;
+    // Step 0: Honor opt-outs whose server-side delete hasn't landed yet
+    // (e.g. the machine was offline when the user said "don't save this").
+    await this.retryRemoteDeletes(run);
+    if (this.halted(run)) return; // the key was rejected, or changed, there
 
-      // Step 0: Honor opt-outs whose server-side delete hasn't landed yet
-      // (e.g. the machine was offline when the user said "don't save this").
-      await this.retryRemoteDeletes();
-      if (this.halted()) return; // the key was rejected there
+    // Step 1: Create any pending conversations. A create carries no
+    // message content, so it doesn't wait for the vault.
+    const createsOk = await this.createPendingConversations(run);
+    if (this.halted(run)) return; // the key was rejected, or a limit hit, there
 
-      // Step 1: Create any pending conversations. A create carries no
-      // message content, so it doesn't wait for the vault.
-      const createsOk = await this.createPendingConversations();
-      if (this.halted()) return; // the key was rejected, or a limit hit, there
+    // Step 2: Flush messages for all conversations (with concurrency)
+    const convIds = this.db.getPendingConversationIds(run.fp).filter(
+      (id) => !id.startsWith("pending:"),
+    );
 
-      // Step 2: Flush messages for all conversations (with concurrency)
-      const convIds = this.db.getPendingConversationIds().filter(
-        (id) => !id.startsWith("pending:"),
+    // Nothing is sent before the vault has been read: a message queued
+    // before then wasn't scrubbed against it (engram#588).
+    if (convIds.length > 0 && !(await this.vaultReady(run))) return;
+
+    // Process conversations in parallel, up to CONCURRENCY at a time
+    const chunks = [];
+    for (let i = 0; i < convIds.length; i += CONCURRENCY) {
+      chunks.push(convIds.slice(i, i + CONCURRENCY));
+    }
+
+    let allSent = true;
+    for (const chunk of chunks) {
+      const results = await Promise.allSettled(
+        chunk.map((id) => this.flushConversation(run, id)),
       );
-
-      // Nothing is sent before the vault has been read: a message queued
-      // before then wasn't scrubbed against it (engram#588).
-      if (convIds.length > 0 && !(await this.vaultReady())) return;
-
-      // Process conversations in parallel, up to CONCURRENCY at a time
-      const chunks = [];
-      for (let i = 0; i < convIds.length; i += CONCURRENCY) {
-        chunks.push(convIds.slice(i, i + CONCURRENCY));
+      if (results.some((r) => r.status === "rejected" || r.value !== "sent")) {
+        allSent = false;
       }
+    }
 
-      let allSent = true;
-      for (const chunk of chunks) {
-        const results = await Promise.allSettled(
-          chunk.map((id) => this.flushConversation(id)),
-        );
-        if (results.some((r) => r.status === "rejected" || r.value !== "sent")) {
-          allSent = false;
-        }
-      }
+    // The key changed during the flush: what this flush did says nothing
+    // about the key in use now.
+    if (this.active !== run) return;
 
-      // Report sync health. Only a flush in which every create and every
-      // send went through is a successful sync: a session still waiting on
-      // its create, or a conversation whose send failed, is not synced.
-      // A failed send used to count as a success (engram#580): status read
-      // "healthy" while nothing synced, and the billing backoff a full
-      // memory had just entered was cleared again, so the account was
-      // retried every 2 s instead of backing off.
-      //
-      // After a pause for a rejected key, a flush with nothing to send
-      // proves nothing about the key: status keeps saying it was rejected
-      // until a request goes through (keyAccepted) or a new key is saved.
-      const pending = this.db.getPendingCount();
-      if (createsOk && allSent && this.authHoldStep === 0) {
-        this.resetBillingBackoff();
-        recordSuccess(pending);
-      }
+    // Report sync health. Only a flush in which every create and every
+    // send went through is a successful sync: a session still waiting on
+    // its create, or a conversation whose send failed, is not synced.
+    // A failed send used to count as a success (engram#580): status read
+    // "healthy" while nothing synced, and the billing backoff a full
+    // memory had just entered was cleared again, so the account was
+    // retried every 2 s instead of backing off.
+    //
+    // After a pause for a rejected key, a flush with nothing to send
+    // proves nothing about the key: status keeps saying it was rejected
+    // until a request goes through (keyAccepted) or a new key is saved.
+    const pending = this.db.getPendingCount(run.fp);
+    if (createsOk && allSent && this.authHoldStep === 0) {
+      this.resetBillingBackoff();
+      recordSuccess(pending);
+    }
+  }
+
+  /**
+   * Ask the server, once per key, which of the other keys something here is
+   * queued or mapped under are keys of this key's account (engram#594): a
+   * rotated or re-issued key. Theirs is handed to this key, so it is sent
+   * with this key, and a session continues in the conversation it already
+   * has. The rest keep waiting for their own account. Only fingerprints go
+   * to the server, never a key. When the server can't answer, it is asked
+   * again on OWNERSHIP_RETRY_MS.
+   */
+  private async checkOwnership(run: Run): Promise<void> {
+    const own = this.ownership;
+    if (own.answered || Date.now() < own.retryAt) return;
+    const others = this.db.otherKeyFps(run.fp).filter((fp) => KEY_HASH.test(fp));
+    if (others.length === 0) {
+      own.answered = true;
+      return;
+    }
+    const keys = this.keys;
+    if (!keys?.ownedKeys || !run.key) {
+      own.answered = true;
+      this.logHeld(run);
+      return;
+    }
+    if (own.firstAskedAt === 0) own.firstAskedAt = Date.now();
+
+    let owned: string[];
+    try {
+      owned = await keys.ownedKeys(run.key, others);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[engram] flush error: ${msg}`);
-      recordFailure(msg, classifyError(err), this.db.getPendingCount());
-    } finally {
-      this.flushing = false;
+      // The key changed while the server was asked: the answer is about a
+      // key no longer in use.
+      if (this.active !== run || this.ownership !== own) return;
+      const msg = errorText(err);
+      const status = (err as { status?: unknown } | null)?.status;
+      if (status === 401) {
+        this.enterAuthHold(msg);
+        return;
+      }
+      if (status === 400 || status === 403 || status === 404) {
+        // Asking again would get the same answer. What another key queued
+        // keeps waiting for that key's account.
+        own.answered = true;
+        console.error(`[engram] couldn't check which earlier API keys are this account's: ${msg}`);
+        this.logHeld(run);
+        return;
+      }
+      this.retryOwnership(own, msg);
+      return;
+    }
+    if (this.active !== run || this.ownership !== own) return;
+
+    const mine = new Set(owned);
+    const adopted = others.filter((fp) => mine.has(fp));
+    if (adopted.length > 0) {
+      let moved: { messages: number };
+      try {
+        moved = this.db.adoptKeys(adopted, run.fp);
+      } catch (err: unknown) {
+        this.retryOwnership(own, errorText(err));
+        return;
+      }
+      console.log(
+        `[engram] ${adopted.length} earlier API key(s) are this account's — ` +
+          `sending their ${moved.messages} queued message(s) with this key`,
+      );
+    }
+    own.answered = true;
+    this.logHeld(run);
+  }
+
+  private retryOwnership(own: Ownership, msg: string): void {
+    const delay = OWNERSHIP_RETRY_MS[Math.min(own.step, OWNERSHIP_RETRY_MS.length - 1)];
+    own.step++;
+    own.retryAt = Date.now() + delay;
+    console.error(
+      `[engram] couldn't check which earlier API keys are this account's ` +
+        `(will retry in ${Math.round(delay / 1000)}s): ${msg}`,
+    );
+  }
+
+  /** While a session with a conversation under an earlier key waits for the
+   *  server to say whether that key is this account's (OWNERSHIP_GATE_MS). */
+  private awaitingOwnership(now: number): boolean {
+    const own = this.ownership;
+    return !own.answered && (own.firstAskedAt === 0 || now - own.firstAskedAt < OWNERSHIP_GATE_MS);
+  }
+
+  /** Say how many queued messages wait for another account's key. */
+  private logHeld(run: Run): void {
+    let held = 0;
+    try {
+      held = this.db.getHeldCount(run.fp);
+    } catch {
+      return; // the count only informs the line below
+    }
+    if (held > 0) {
+      console.log(
+        `[engram] ${held} queued message(s) wait for another API key's account — they stay ` +
+          `on this machine and are sent only with a key of that account`,
+      );
     }
   }
 
@@ -351,7 +868,7 @@ export class Syncer {
    * messages have moved onto it — a failure here only means "try again".
    * Returns false while any session is still waiting on a failed create.
    */
-  private async createPendingConversations(): Promise<boolean> {
+  private async createPendingConversations(run: Run): Promise<boolean> {
     let ok = true;
     if (!this.orphansAdopted) {
       try {
@@ -364,25 +881,50 @@ export class Syncer {
         }
       } catch (err: unknown) {
         // Not fatal: the orphans keep, and this runs again next flush.
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = errorText(err);
         console.error(`[engram] orphaned-queue check failed (will retry): ${msg}`);
         ok = false;
       }
     }
 
     const now = Date.now();
-    const pending = this.db.getPendingSessions();
-    const sessions = pending.filter(
+    const pending = this.db.getPendingSessions(run.fp);
+    let sessions = pending.filter(
       (s) => (this.createRetry.get(s.sessionId)?.until ?? 0) <= now,
     );
     // A session sitting out a retry delay hasn't synced.
     if (sessions.length < pending.length) ok = false;
 
+    // A session with a conversation under an earlier key waits to learn
+    // whether that key is this account's: if it is, the session continues
+    // in that conversation instead of starting a second one
+    // (checkOwnership).
+    if (this.awaitingOwnership(now)) {
+      const waiting = new Set(
+        sessions
+          .filter((s) => this.db.mappedUnderOtherKey(s.sessionId, run.fp))
+          .map((s) => s.sessionId),
+      );
+      if (waiting.size > 0) {
+        ok = false;
+        sessions = sessions.filter((s) => !waiting.has(s.sessionId));
+        if (!this.gateLogged) {
+          this.gateLogged = true;
+          console.log(
+            `[engram] ${waiting.size} session(s) synced under an earlier API key wait to learn ` +
+              `whether it is this account's before they continue`,
+          );
+        }
+      }
+    }
+
     // Create conversations in parallel batches
     for (let i = 0; i < sessions.length; i += CONCURRENCY) {
+      // The key changed: the rest wait for the next flush.
+      if (this.active !== run) return false;
       const batch = sessions.slice(i, i + CONCURRENCY);
       const results = await Promise.allSettled(
-        batch.map((s) => this.createPendingConversation(s.sessionId, s.meta)),
+        batch.map((s) => this.createPendingConversation(run, s.sessionId, s.meta)),
       );
 
       for (let j = 0; j < results.length; j++) {
@@ -393,7 +935,10 @@ export class Syncer {
           continue;
         }
         ok = false;
-        const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
+        // Refused under a key no longer in use: that says nothing about the
+        // key in use now.
+        if (this.active !== run) continue;
+        const msg = errorText(r.reason);
         const errType = classifyError(r.reason);
         if (errType === "auth") {
           this.enterAuthHold(msg);
@@ -405,13 +950,14 @@ export class Syncer {
         }
         this.deferCreate(sessionId);
         console.error(`[engram] create error (will retry): ${msg}`);
-        recordFailure(msg, errType, this.db.getPendingCount());
+        recordFailure(msg, errType, this.pendingCount());
       }
     }
     return ok;
   }
 
   private async createPendingConversation(
+    run: Run,
     sessionId: string,
     meta: SessionMeta,
   ): Promise<void> {
@@ -421,32 +967,37 @@ export class Syncer {
       return;
     }
 
-    // Already mapped (rows an older daemon left under the temporary id after
-    // the conversation was created) — move them; never create a second
-    // conversation for the session.
-    const existing = this.db.getConversationId(sessionId);
+    // Already mapped in this key's account (rows an older daemon left under
+    // the temporary id after the conversation was created, or rows queued
+    // before the server said an earlier key is this account's) — move them;
+    // never create a second conversation for the session.
+    const existing = this.db.getConversationId(sessionId, run.fp);
     if (existing) {
-      this.db.completePendingSession(sessionId, existing);
+      this.db.completePendingSession(sessionId, existing, run.fp);
       return;
     }
 
-    const conversationId = await this.createConversation(sessionId, meta);
-    this.keyAccepted();
+    // The key changed: the session waits for the next flush.
+    if (this.active !== run) return;
+
+    const conversationId = await this.createConversation(run, sessionId, meta);
+    this.keyAccepted(run);
 
     // Opt-out race (engram#462): the user may have said "don't save
     // this" while the create was in flight — excludeSession saw no
     // conversation id yet, so it couldn't schedule the remote delete.
-    // Schedule it now; the flush loop's retryRemoteDeletes handles it.
+    // Schedule it now, for the key that created it; the flush loop's
+    // retryRemoteDeletes handles it.
     if (this.db.isSessionExcluded(sessionId)) {
-      this.db.markSessionExcluded(sessionId, "in-chat opt-out", conversationId);
-      this.db.dropPendingSession(sessionId);
-      this.db.deleteAllForConversation(conversationId);
+      this.db.excludeCreatedConversation(sessionId, conversationId, run.fp);
       return;
     }
 
     // Map the session and move its messages onto the conversation (one
-    // transaction — see DaemonDb.completePendingSession).
-    this.db.completePendingSession(sessionId, conversationId, {
+    // transaction — see DaemonDb.completePendingSession). Done even if the
+    // key changed meanwhile: the conversation exists in this key's account,
+    // and only what was queued under this key moves onto it.
+    this.db.completePendingSession(sessionId, conversationId, run.fp, {
       projectDir: meta.projectDir,
       cwd: meta.cwd,
       gitBranch: meta.gitBranch,
@@ -461,13 +1012,11 @@ export class Syncer {
     this.createRetry.set(sessionId, { until: Date.now() + delay, step });
   }
 
-  /** Per-conversation reduced batch size after a failed send (halves down to
-   *  1 so even a single pathological message eventually goes alone; restored
-   *  to the full batch on the next success). */
-  private batchOverride = new Map<string, number>();
-
-  private async flushConversation(conversationId: string): Promise<SendOutcome> {
+  private async flushConversation(run: Run, conversationId: string): Promise<SendOutcome> {
     while (true) {
+      // The key changed or was removed (engram#594): no new batch goes out
+      // with this one. What is left stays queued for its account.
+      if (this.active !== run) return "retry";
       // An auth failure or a billing limit applies to the whole account.
       // Once any conversation in this flush has hit one, no new batch is
       // started: it could only fail the same way.
@@ -475,7 +1024,7 @@ export class Syncer {
       if (Date.now() < this.billingBackoffUntil) return "backoff";
 
       const limit = this.batchOverride.get(conversationId) ?? BATCH_SIZE;
-      let rows = this.db.dequeue(conversationId, limit);
+      let rows = this.db.dequeue(conversationId, limit, run.fp);
       if (rows.length === 0) return "sent";
 
       // Scrubbed again against the set held now (engram#588): a row queued
@@ -500,12 +1049,15 @@ export class Syncer {
       const messages = rows.map(rowToMessage);
 
       try {
-        await this.client.store({ conversationId, messages });
-        this.keyAccepted();
+        await run.client.store({ conversationId, messages });
+        this.keyAccepted(run);
         this.db.markSent(rows.map((r) => r.id));
-        this.batchOverride.delete(conversationId);
+        if (this.active === run) this.batchOverride.delete(conversationId);
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
+        // Failed under a key no longer in use: that says nothing about the
+        // key in use now. The rows stay queued for their account.
+        if (this.active !== run) return "retry";
+        const msg = errorText(err);
         const errType = classifyError(err);
 
         // The key was rejected: pause, and recover without a restart. This
@@ -535,7 +1087,7 @@ export class Syncer {
         } else {
           console.error(`[engram] send failed (will retry): ${msg}`);
         }
-        recordFailure(msg, errType, this.db.getPendingCount());
+        recordFailure(msg, errType, this.pendingCount());
         return "retry";
       }
     }
@@ -547,9 +1099,12 @@ export class Syncer {
    * then nothing is sent — captures keep queueing in daemon.db — and the
    * status says why.
    */
-  private async vaultReady(): Promise<boolean> {
+  private async vaultReady(run: Run): Promise<boolean> {
     if (!this.scrubber) return true;
-    if (await this.scrubber.ready()) {
+    const ready = await this.scrubber.ready();
+    // The key changed while the vault was read: the next flush starts over.
+    if (this.active !== run) return false;
+    if (ready) {
       if (this.vaultHeld) {
         this.vaultHeld = false;
         console.log("[engram] vault read — sending the messages held for it");
@@ -588,7 +1143,7 @@ export class Syncer {
     // scrubber treats it as final), so what holds is the server or the
     // network.
     const kind = errType === "billing" || errType === "storage_full" ? "server" : errType;
-    recordFailure(`holding messages until the vault is read: ${reason}`, kind, this.db.getPendingCount());
+    recordFailure(`holding messages until the vault is read: ${reason}`, kind, this.pendingCount());
   }
 
   /**
@@ -614,7 +1169,7 @@ export class Syncer {
     try {
       this.db.updateContents(changed);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = errorText(err);
       console.error(`[engram] rewriting scrubbed queued messages failed (sending them scrubbed): ${msg}`);
     }
     console.error(`[engram] scrubbed ${hits} vault value occurrence(s) from queued messages before sending`);
@@ -656,12 +1211,12 @@ export class Syncer {
     }
 
     if (storageFull) {
-      recordFailure(msg, "storage_full", this.db.getPendingCount(), {
+      recordFailure(msg, "storage_full", this.pendingCount(), {
         used: storageFull.used,
         limit: storageFull.limit,
       });
     } else {
-      recordFailure(msg, "billing", this.db.getPendingCount());
+      recordFailure(msg, "billing", this.pendingCount());
     }
   }
 
@@ -680,56 +1235,35 @@ export class Syncer {
           `or as soon as a new key is saved ('engram auth login'): ${msg}`,
       );
     }
-    recordFailure(msg, "auth", this.db.getPendingCount());
+    recordFailure(msg, "auth", this.pendingCount());
   }
 
   private authHeld(): boolean {
     return Date.now() < this.authHeldUntil;
   }
 
-  /** A request went through: the key works. */
-  private keyAccepted(): void {
-    this.authHoldStep = 0;
+  /** A request with `run`'s key went through: the key works. */
+  private keyAccepted(run: Run): void {
+    if (this.active === run) this.authHoldStep = 0;
   }
 
-  /**
-   * While the key is rejected, switch to a new one as soon as it's saved
-   * (`engram auth login` writes config.json and leaves the daemon running).
-   * Throttled to KEY_CHECK_MS. Never throws: a config.json read mid-write
-   * has no key, and is read again on the next check.
-   */
-  private async pickUpNewKey(): Promise<void> {
-    if (!this.keys) return;
-    const now = Date.now();
-    if (now - this.lastKeyCheck < KEY_CHECK_MS) return;
-    this.lastKeyCheck = now;
+  /** True while sending with `run` must not or can only fail: its key is
+   *  no longer the one configured, the key was rejected, or the account is
+   *  inside a billing backoff. */
+  private halted(run: Run): boolean {
+    return this.active !== run || this.authHeld() || Date.now() < this.billingBackoffUntil;
+  }
 
-    let client: Engram;
-    let key: string | undefined;
+  /** Unsent messages the key in use will send, for the status: 0 while
+   *  signed out, and when daemon.db can't be read. */
+  private pendingCount(): number {
+    const run = this.active;
+    if (!run) return 0;
     try {
-      key = await this.keys.read();
-      if (!key || key === this.currentKey) return;
-      client = this.keys.connect(key);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[engram] reading the API key failed (will retry): ${msg}`);
-      return;
+      return this.db.getPendingCount(run.fp);
+    } catch {
+      return 0;
     }
-
-    this.client = client;
-    this.currentKey = key;
-    this.authHeldUntil = 0;
-    this.authHoldStep = 0;
-    // The new key may belong to an account with room, and a held billing
-    // backoff would only delay finding out.
-    this.resetBillingBackoff();
-    console.log("[engram] new API key found — resuming sync");
-  }
-
-  /** True while sending can only fail: the API key was rejected, or the
-   *  account is inside a billing backoff. */
-  private halted(): boolean {
-    return this.authHeld() || Date.now() < this.billingBackoffUntil;
   }
 
   /** Reset billing backoff after a successful sync. */
@@ -742,13 +1276,14 @@ export class Syncer {
   }
 
   private async createConversation(
+    run: Run,
     sessionId: string,
     meta: SessionMeta,
   ): Promise<string> {
     const host = meta.host ?? "claude-code";
     const title = `${meta.projectDir || host} (${new Date().toISOString().slice(0, 16).replace("T", " ")})`;
 
-    const { conversationId } = await this.client.createConversation({
+    const { conversationId } = await run.client.createConversation({
       title,
       // Per-host tagging (engram#261) so captures are attributable and
       // filterable by source tool.
@@ -773,6 +1308,10 @@ export class Syncer {
 /** The server's refusal of a key that works but lacks a scope. */
 function isScopeRefusal(msg: string): boolean {
   return msg.includes('"insufficient_scope"');
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function rowToMessage(row: PendingRow) {

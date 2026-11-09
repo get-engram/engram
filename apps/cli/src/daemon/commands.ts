@@ -13,7 +13,13 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join, win32 } from "node:path";
 import { bold, dim, plural, red } from "../output.js";
 import { loadConfig, saveConfig } from "../config.js";
-import { readStatus, syncErrorSummary, captureErrorSummary, type SyncStatus } from "./status.js";
+import {
+  readStatus,
+  syncErrorSummary,
+  captureErrorSummary,
+  deleteRefusedSummary,
+  type SyncStatus,
+} from "./status.js";
 import { formatWait } from "./backoff.js";
 import { ALL_ADAPTERS } from "./adapters.js";
 import {
@@ -324,6 +330,16 @@ function printSyncWarnings(status: SyncStatus): void {
     console.log("");
     console.log(red(`  WARNING: ${captureErrorSummary(status.capture_error)}`));
     console.log(dim(`  Since: ${status.capture_error.since}`));
+    console.log("");
+  }
+
+  // Opt-outs the key in use may not delete (engram#597). Sending goes on
+  // regardless, so this doesn't wait for a sync error.
+  if (status.delete_refused) {
+    console.log("");
+    console.log(red(`  WARNING: ${deleteRefusedSummary(status.delete_refused)}`));
+    console.log(dim("  Kept on this machine; not tried again with this key."));
+    console.log(dim(`  Since: ${status.delete_refused.since}`));
     console.log("");
   }
 

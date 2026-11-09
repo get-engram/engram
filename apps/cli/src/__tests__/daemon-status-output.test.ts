@@ -243,3 +243,48 @@ describe("engram daemon status: messages of a conversation Engram no longer has 
     expect(output().some((l) => l.startsWith("Not sent:"))).toBe(false);
   });
 });
+
+describe("engram daemon status: opt-outs the API key can't delete (engram#597)", () => {
+  /** A running daemon (this process stands in for it) that syncs. */
+  function running(fields: Record<string, unknown>): void {
+    writeFileSync(join(ENGRAM_DIR, "daemon.pid"), String(process.pid));
+    writeFileSync(
+      join(ENGRAM_DIR, "status.json"),
+      JSON.stringify({ health: "healthy", last_sync_at: "2026-11-09T11:59:58.000Z", ...fields }),
+    );
+  }
+
+  const REFUSED = { since: "2026-11-09T11:00:00.000Z", deletes: 2 };
+  const WARNING =
+    "  WARNING: This API key can't delete conversations, so 2 conversations you opted out of are " +
+    "waiting to be deleted from Engram. Create a key with the 'delete' permission at " +
+    "getengram.app/dashboard, then run 'engram auth login <key>'.";
+
+  it("says how many wait, why, what to do and since when, while syncing goes on", async () => {
+    running({ delete_refused: REFUSED });
+    await daemonStatus();
+    const lines = output();
+    expect(lines).toContain(WARNING);
+    expect(lines).toContain("  Kept on this machine; not tried again with this key.");
+    expect(lines).toContain("  Since: 2026-11-09T11:00:00.000Z");
+    expect(lines).toContain("Last sync:        2026-11-09T11:59:58.000Z");
+    expect(lines.join("\n")).not.toContain(ESC);
+  });
+
+  it("comes with the sync warning when sending fails too", async () => {
+    running({ health: "warning", error_type: "network", pending_messages: 1, delete_refused: REFUSED });
+    await daemonStatus();
+    expect(output()).toContain(WARNING);
+    expect(output()).toContain("  WARNING: Can't reach Engram — messages queued, will retry.");
+  });
+
+  it.each([
+    ["nothing waits", { delete_refused: null }],
+    ["an older daemon wrote status.json", {}],
+  ])("has no such warning when %s", async (_, fields) => {
+    running(fields);
+    await daemonStatus();
+    expect(output().some((l) => l.includes("can't delete"))).toBe(false);
+    expect(output()).toContain("Last sync:        2026-11-09T11:59:58.000Z");
+  });
+});

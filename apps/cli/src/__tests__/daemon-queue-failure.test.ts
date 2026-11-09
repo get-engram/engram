@@ -18,6 +18,9 @@ vi.mock("../daemon/status.js", async (importOriginal) => ({
   recordFailure: vi.fn(),
   recordCaptureStall: vi.fn(),
   recordCaptureResumed: vi.fn(),
+  recordSignedOut: vi.fn(),
+  recordSignedIn: vi.fn(),
+  updatePending: vi.fn(),
 }));
 vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/exclusions.js")>()),
@@ -27,7 +30,7 @@ vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
 import { DaemonDb, pendingConversationId } from "../daemon/db.js";
 import { Parser, REDACTED_TOOL_OUTPUT } from "../daemon/parser.js";
 import { CodexParser } from "../daemon/codex-parser.js";
-import { Syncer } from "../daemon/syncer.js";
+import { Syncer, FIXED_KEY_FP } from "../daemon/syncer.js";
 import { Watcher, RETRY_DELAYS_MS } from "../daemon/watcher.js";
 import { QueueWriteError } from "../daemon/queue-error.js";
 import { recordCaptureStall, recordCaptureResumed } from "../daemon/status.js";
@@ -103,9 +106,10 @@ function append(path: string, ...records: unknown[]): void {
   appendFileSync(path, records.map(lineOf).join(""));
 }
 
-/** What daemon.db holds for a session that has no conversation yet. */
+/** What daemon.db holds for a session that has no conversation yet (the
+ *  Syncers here run with a fixed client, so under FIXED_KEY_FP). */
 const queued = (db: DaemonDb, sessionId: string) =>
-  db.dequeue(pendingConversationId(sessionId), 100).map((r) => r.content);
+  db.dequeue(pendingConversationId(sessionId), 100, FIXED_KEY_FP).map((r) => r.content);
 
 /**
  * A watcher fed through a real Syncer into a real daemon.db, wired the way
@@ -147,12 +151,12 @@ function failQueueOnce(db: DaemonDb, when: (contents: string[]) => boolean = () 
   let armed = true;
   return vi
     .spyOn(db, "enqueuePendingSession")
-    .mockImplementation((sessionId, meta, messages) => {
+    .mockImplementation((sessionId, meta, messages, keyFp) => {
       if (armed && when(messages.map((m) => m.content))) {
         armed = false;
         throw new Error(FULL);
       }
-      real(sessionId, meta, messages);
+      real(sessionId, meta, messages, keyFp);
     });
 }
 
@@ -205,7 +209,7 @@ describe("Syncer.onMessages and a daemon.db that can't queue", () => {
 
   it("throws for a session that already has a conversation, too", () => {
     const db = openDb();
-    db.setSessionMap("s1", "conv_1", {});
+    db.setSessionMap("s1", "conv_1", {}, FIXED_KEY_FP);
     const syncer = new Syncer(db, {} as Engram);
     vi.spyOn(db, "enqueue").mockImplementation(() => {
       throw new Error(FULL);
@@ -516,7 +520,7 @@ describe("stopping while daemon.db can't queue", () => {
 describe("DaemonDb.excludeSession", () => {
   it("opts a session out in one transaction: all of it, or none of it", () => {
     const db = openDb();
-    db.enqueuePendingSession("s1", META, [{ role: "user", content: "hello" }]);
+    db.enqueuePendingSession("s1", META, [{ role: "user", content: "hello" }], FIXED_KEY_FP);
 
     vi.spyOn(db, "dropPendingSession").mockImplementationOnce(() => {
       throw new Error(FULL);
@@ -527,7 +531,7 @@ describe("DaemonDb.excludeSession", () => {
     expect(db.isSessionExcluded("s1")).toBe(false);
     expect(queued(db, "s1")).toEqual(["hello"]);
 
-    expect(db.excludeSession("s1", "in-chat opt-out")).toEqual({ conversationId: null, dropped: 1 });
+    expect(db.excludeSession("s1", "in-chat opt-out")).toEqual({ conversations: [], dropped: 1 });
     expect(db.isSessionExcluded("s1")).toBe(true);
     expect(queued(db, "s1")).toEqual([]);
   });

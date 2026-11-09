@@ -42,6 +42,17 @@ export async function authLogout(): Promise<void> {
   delete config.apiKey;
   await saveConfig(config);
   console.log(green("✓ Logged out"));
+  // The daemon reads config.json every few seconds (engram#594).
+  console.log("  Auto-capture stops sending within a few seconds.");
+  console.log("  Messages already queued stay on this machine and are sent only with a key");
+  console.log("  for the account they were captured under.");
+  console.log("  Anything written while signed out is captured for the next account that signs in.");
+  if (process.env.ENGRAM_API_KEY) {
+    console.log(
+      red("  ENGRAM_API_KEY is set in this shell: commands run here, and a daemon started from here,\n") +
+        red("  keep using that key. Unset it to sign out completely."),
+    );
+  }
 }
 
 export async function authStatus(): Promise<void> {

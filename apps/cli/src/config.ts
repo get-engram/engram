@@ -26,6 +26,29 @@ export async function loadConfig(): Promise<Config> {
   }
 }
 
+/**
+ * Like loadConfig, but a config.json that exists and can't be read or
+ * parsed THROWS instead of reading as empty. The daemon re-reads the key
+ * every couple of seconds and treats "no key" as a logout (engram#594), so
+ * a file caught half-written, or one damaged by hand, must not look like
+ * one: that would stop capture for nothing. Only a missing file means
+ * there is no config.
+ */
+export async function loadConfigStrict(): Promise<Config> {
+  let raw: string;
+  try {
+    raw = await readFile(CONFIG_FILE, "utf-8");
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException | null)?.code === "ENOENT") return {};
+    throw err;
+  }
+  const parsed = JSON.parse(raw) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("config.json is not a JSON object");
+  }
+  return parsed as Config;
+}
+
 export async function saveConfig(config: Config): Promise<void> {
   await mkdir(CONFIG_DIR, { recursive: true });
   await writeFile(CONFIG_FILE, JSON.stringify(config, null, 2) + "\n");

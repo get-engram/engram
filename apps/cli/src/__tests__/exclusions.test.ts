@@ -205,13 +205,24 @@ describe("DaemonDb excluded_sessions", () => {
     expect(db.isSessionExcluded("s1")).toBe(true);
   });
 
-  it("tracks and clears pending remote deletes", () => {
-    db.markSessionExcluded("s2", "in-chat opt-out", "conv_abc");
-    expect(db.getPendingRemoteDeletes()).toEqual([
-      { session_id: "s2", delete_pending: "conv_abc" },
+  it("tracks and clears pending remote deletes, each under its account's key (engram#594)", () => {
+    // One session synced under two accounts' keys has a conversation in each.
+    db.setSessionMap("s2", "conv_abc", { projectDir: "p" }, "fp-a");
+    db.setSessionMap("s2", "conv_def", { projectDir: "p" }, "fp-b");
+    expect(db.excludeSession("s2", "in-chat opt-out").conversations).toEqual([
+      { conversationId: "conv_abc", keyFp: "fp-a" },
+      { conversationId: "conv_def", keyFp: "fp-b" },
     ]);
-    db.clearPendingRemoteDelete("s2");
-    expect(db.getPendingRemoteDeletes()).toEqual([]);
+    // Each delete is sent only with its own account's key.
+    expect(db.getPendingRemoteDeletes("fp-a")).toEqual([
+      { conversation_id: "conv_abc", session_id: "s2" },
+    ]);
+    expect(db.getPendingRemoteDeletes("fp-b")).toEqual([
+      { conversation_id: "conv_def", session_id: "s2" },
+    ]);
+    db.clearPendingRemoteDelete("conv_abc");
+    expect(db.getPendingRemoteDeletes("fp-a")).toEqual([]);
+    expect(db.getPendingRemoteDeletes("fp-b")).toHaveLength(1);
     // Still excluded after the delete lands.
     expect(db.isSessionExcluded("s2")).toBe(true);
   });
@@ -220,7 +231,7 @@ describe("DaemonDb excluded_sessions", () => {
     db.enqueue("conv_x", [
       { role: "user", content: "a" },
       { role: "assistant", content: "b" },
-    ]);
+    ], null);
     expect(db.getPendingCount()).toBe(2);
     expect(db.deleteAllForConversation("conv_x")).toBe(2);
     expect(db.getPendingCount()).toBe(0);

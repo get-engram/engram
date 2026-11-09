@@ -1,5 +1,6 @@
 import { watch, type FSWatcher } from "chokidar";
 import { openSync, readSync, closeSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { DaemonDb } from "./db.js";
 import { QueueWriteError } from "./queue-error.js";
 import { recordCaptureStall, recordCaptureResumed } from "./status.js";
@@ -121,12 +122,23 @@ export class Watcher {
    * offset past it: after a graceful stop, a restart must not read those
    * lines again. What can't be queued now keeps its offset, and the next
    * start reads it again.
+   *
+   * `drain`: first read what was written but not read yet (engram#594).
+   * Capture stops this way when the account changes, so those lines are
+   * queued for the account they were written under, not the next one.
    */
-  stop(): void {
+  stop(options: { drain?: boolean } = {}): void {
+    if (options.drain && !this.stopped) this.drain();
     this.stopped = true;
     this.fsWatcher?.close();
     this.fsWatcher = null;
-    for (const hold of this.held.values()) clearTimeout(hold.timer);
+    // A file held here is read again by the next watcher, from the line it
+    // was held at; a failure there is a stall of its own.
+    for (const [filePath, hold] of this.held) {
+      clearTimeout(hold.timer);
+      recordCaptureResumed(filePath, { quiet: true });
+    }
+    this.held.clear();
     for (const [filePath, cursor] of this.cursors) {
       if (this.parser.bufferedFrom(filePath) === null) continue;
       try {
@@ -146,6 +158,27 @@ export class Watcher {
     } catch (err: unknown) {
       console.error(`[engram] couldn't queue a buffered message at shutdown: ${reasonOf(err)}`);
     }
+  }
+
+  /**
+   * Reads every transcript as far as it is written now: the files this
+   * process has read, and any the watcher has found but not reported yet
+   * (it waits for a new file's writes to settle first).
+   */
+  private drain(): void {
+    const paths = [...this.cursors.keys()];
+    const known = new Set(paths.map((p) => resolve(p)));
+    const watched = this.fsWatcher?.getWatched() ?? {};
+    for (const [dir, names] of Object.entries(watched)) {
+      for (const name of names) {
+        const p = join(dir, name);
+        if (p.endsWith(".jsonl") && !known.has(resolve(p))) {
+          known.add(resolve(p));
+          paths.push(p);
+        }
+      }
+    }
+    for (const p of paths) this.processFile(p, true);
   }
 
   private processFile(filePath: string, retrying = false): void {

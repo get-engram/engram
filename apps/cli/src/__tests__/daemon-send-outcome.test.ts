@@ -11,6 +11,11 @@ vi.mock("../daemon/status.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/status.js")>()),
   recordSuccess: vi.fn(),
   recordFailure: vi.fn(),
+  recordCaptureStall: vi.fn(),
+  recordCaptureResumed: vi.fn(),
+  recordSignedOut: vi.fn(),
+  recordSignedIn: vi.fn(),
+  updatePending: vi.fn(),
 }));
 vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/exclusions.js")>()),
@@ -18,8 +23,8 @@ vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
 }));
 
 import { DaemonDb } from "../daemon/db.js";
-import { Syncer } from "../daemon/syncer.js";
-import { recordFailure, recordSuccess } from "../daemon/status.js";
+import { FIXED_KEY_FP, Syncer, keyFingerprint } from "../daemon/syncer.js";
+import { recordFailure, recordSignedIn, recordSignedOut, recordSuccess } from "../daemon/status.js";
 import type { ParsedMessage, SessionMeta } from "../daemon/types.js";
 
 // engram#580: a send that failed used to leave the flush looking like a
@@ -58,7 +63,10 @@ const refusal = (body: object) => new EngramError(JSON.stringify(body));
 const httpError = (status: number) => new EngramError("", "undefined", status);
 
 type StoreParams = { conversationId: string; messages: Array<{ content: string }> };
-type Op = "create" | "store" | "delete";
+type Op = "create" | "store" | "delete" | "owned";
+
+/** Every key these tests use. */
+const TEST_KEYS = ["key-1", "key-old", "key-new", "key-typo"];
 
 class FakeServer {
   /** Every send attempt, failed or not. */
@@ -82,7 +90,21 @@ class FakeServer {
   acceptedKeys: Set<string> | null = null;
   /** Every request, with the key it carried. */
   requests: Array<{ op: Op; key: string }> = [];
+  /** Each key's account; a key not listed is an account of its own. */
+  accounts = new Map<string, string>();
   private seq = 0;
+
+  /** POST /api/account/owned-keys, as worker-main.ts asks it: which of
+   *  `hashes` are fingerprints of keys of `key`'s account. */
+  async ownedKeys(key: string, hashes: string[]): Promise<string[]> {
+    this.requests.push({ op: "owned", key });
+    if (this.acceptedKeys && !this.acceptedKeys.has(key)) {
+      throw Object.assign(new Error("HTTP 401"), { status: 401 });
+    }
+    const account = (k: string) => this.accounts.get(k) ?? k;
+    const same = TEST_KEYS.filter((k) => account(k) === account(key)).map(keyFingerprint);
+    return hashes.filter((h) => same.includes(h));
+  }
 
   /** A client for one key, as `new Engram({ apiKey })` makes. */
   client(key = "key-1"): Engram {
@@ -117,9 +139,10 @@ class FakeServer {
     } as unknown as Engram;
   }
 
-  /** Messages the server holds for a session, via daemon.db's mapping. */
-  copyOf(db: DaemonDb, sessionId: string): string[] | undefined {
-    const conv = db.getConversationId(sessionId);
+  /** Messages the server holds for a session in the account of the key
+   *  `keyFp`, via daemon.db's mapping. */
+  copyOf(db: DaemonDb, sessionId: string, keyFp = FIXED_KEY_FP): string[] | undefined {
+    const conv = db.getConversationId(sessionId, keyFp);
     return conv ? this.stored.get(conv) : undefined;
   }
 }
@@ -161,6 +184,8 @@ beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.mocked(recordSuccess).mockClear();
   vi.mocked(recordFailure).mockClear();
+  vi.mocked(recordSignedIn).mockClear();
+  vi.mocked(recordSignedOut).mockClear();
 });
 
 afterEach(() => {
@@ -309,7 +334,7 @@ describe("a failed send is not a successful sync (engram#580)", () => {
     expect(server.creates).toBe(2);
     expect(recordSuccess).not.toHaveBeenCalled();
     expect(db.getPendingCount()).toBe(3);
-    expect(db.getPendingSessions().map((s) => s.sessionId)).toEqual(["s3"]);
+    expect(db.getPendingSessions(FIXED_KEY_FP).map((s) => s.sessionId)).toEqual(["s3"]);
 
     // Two sends rejected together were one pause: the key is tried again
     // after ten minutes, not thirty.
@@ -350,6 +375,9 @@ function keySource(initial: string) {
     connect(key: string): Engram {
       keys.connected.push(key);
       return server.client(key);
+    },
+    ownedKeys(key: string, hashes: string[]): Promise<string[]> {
+      return server.ownedKeys(key, hashes);
     },
   };
   return keys;
@@ -402,7 +430,7 @@ describe("a rejected key pauses, and recovers without a restart (engram#587)", (
     // sends everything.
     server.acceptedKeys = null;
     expect(await attempts(60 * 60_000)).toBe(5 + 2); // create + store
-    expect(server.copyOf(db, "s1")).toEqual(["m1"]);
+    expect(server.copyOf(db, "s1", keyFingerprint("key-old"))).toEqual(["m1"]);
     expect(recordSuccess).toHaveBeenCalledTimes(1);
 
     // And the schedule starts over: a new rejection pauses ten minutes.
@@ -413,59 +441,107 @@ describe("a rejected key pauses, and recovers without a restart (engram#587)", (
     expect(await attempts(2_000)).toBe(9);
   });
 
-  it("switches to a key saved by 'engram auth login' within 10 s, without a restart", async () => {
+  it("switches to a key saved by 'engram auth login' at the next flush, without a restart", async () => {
+    server.accounts.set("key-new", "key-old"); // a re-issued key of the same account
     await syncer.onMessages("s1", meta("s1"), msgs("m1"));
     await syncer.flush();
     expect(failureTypes()).toEqual(["auth"]);
 
-    // The first flush of the pause reads config.json: still the old key.
+    // Every flush reads the key, paused or not.
     await flushAfter(2_000);
-    expect(keys.reads).toBe(1);
+    expect(keys.reads).toBe(2);
+    expect(keys.connected).toEqual([]);
 
     // The user runs `engram auth login`. It saves the key and leaves the
     // daemon running.
     keys.configured = "key-new";
-    for (let i = 0; i < 4; i++) await flushAfter(2_000); // 8 s since the read
-    expect(keys.reads).toBe(1);
-    expect(keys.connected).toEqual([]);
-
-    await flushAfter(2_000); // 10 s
+    await flushAfter(2_000);
     expect(keys.connected).toEqual(["key-new"]);
     expect(server.requests.slice(1)).toEqual([
+      { op: "owned", key: "key-new" }, // the server says key-old is this account's
       { op: "create", key: "key-new" },
       { op: "store", key: "key-new" },
     ]);
-    expect(server.copyOf(db, "s1")).toEqual(["m1"]);
+    expect(server.copyOf(db, "s1", keyFingerprint("key-new"))).toEqual(["m1"]);
     expect(db.getPendingCount()).toBe(0);
     expect(recordSuccess).toHaveBeenCalledTimes(1);
 
-    // The key isn't read again while it works.
+    // The key stays in use; it isn't connected again while it's configured.
     await syncer.onMessages("s1", meta("s1"), msgs("m2"));
-    await flushAfter(60_000);
-    expect(keys.reads).toBe(2);
-    expect(server.copyOf(db, "s1")).toEqual(["m1", "m2"]);
+    await flushAfter(2_000);
+    expect(keys.connected).toEqual(["key-new"]);
+    expect(server.copyOf(db, "s1", keyFingerprint("key-new"))).toEqual(["m1", "m2"]);
   });
 
-  it("ignores a removed key, an empty one, and a config.json it can't read", async () => {
+  it("a key for another account sends only what's captured under it; the old key's queue waits for its account", async () => {
+    server.acceptedKeys = null; // both keys work
     await syncer.onMessages("s1", meta("s1"), msgs("m1"));
     await syncer.flush();
+    await syncer.onMessages("s1", meta("s1"), msgs("m2"));
+    server.sendError = new EngramError("Network error: fetch failed"); // m2 isn't sent
+    await flushAfter(2_000);
+    server.sendError = null;
+    const before = server.requests.length;
 
-    keys.configured = undefined; // `engram auth logout`, or a file mid-write
-    await flushAfter(10_000);
-    keys.configured = "";
-    await flushAfter(10_000);
-    keys.readError = new Error("EACCES: permission denied");
-    await flushAfter(10_000);
-    expect(keys.reads).toBe(3);
-    expect(keys.connected).toEqual([]);
-    expect(requests()).toBe(1);
-
-    // The next read finds a key, and that one is used.
-    keys.readError = null;
+    // `engram auth login` with a key for another account.
     keys.configured = "key-new";
-    await flushAfter(10_000);
+    await flushAfter(2_000);
     expect(keys.connected).toEqual(["key-new"]);
-    expect(server.copyOf(db, "s1")).toEqual(["m1"]);
+    // It asked whether key-old is its account's, heard no, and sent nothing.
+    expect(server.requests.slice(before)).toEqual([{ op: "owned", key: "key-new" }]);
+    expect(db.getPendingCount(keyFingerprint("key-old"))).toBe(1);
+
+    // The session goes on in the other account, in a conversation of its own.
+    await syncer.onMessages("s1", meta("s1"), msgs("m3"));
+    await flushAfter(2_000);
+    expect(server.copyOf(db, "s1", keyFingerprint("key-new"))).toEqual(["m3"]);
+    expect(server.copyOf(db, "s1", keyFingerprint("key-old"))).toEqual(["m1"]);
+    expect(server.requests.filter((r) => r.op === "store" && r.key === "key-new")).toHaveLength(1);
+
+    // Signing in to the first account again sends what waited for it.
+    keys.configured = "key-old";
+    await flushAfter(2_000);
+    expect(server.copyOf(db, "s1", keyFingerprint("key-old"))).toEqual(["m1", "m2"]);
+    expect(server.copyOf(db, "s1", keyFingerprint("key-new"))).toEqual(["m3"]);
+    expect(db.getPendingCount()).toBe(0);
+  });
+
+  it("a removed or empty key signs out at once; a config.json it can't read changes nothing", async () => {
+    server.acceptedKeys = null; // the key works
+    await syncer.onMessages("s1", meta("s1"), msgs("m1"));
+    await syncer.flush();
+    expect(server.copyOf(db, "s1", keyFingerprint("key-old"))).toEqual(["m1"]);
+
+    // A config.json that can't be read isn't a logout: the key in use stays.
+    keys.readError = new Error("EACCES: permission denied");
+    await syncer.onMessages("s1", meta("s1"), msgs("m2"));
+    await flushAfter(2_000);
+    expect(server.copyOf(db, "s1", keyFingerprint("key-old"))).toEqual(["m1", "m2"]);
+    expect(recordSignedOut).not.toHaveBeenCalled();
+
+    // `engram auth logout`, then a config.json saved with an empty key:
+    // nothing more is sent, and what's queued stays on this machine.
+    keys.readError = null;
+    keys.configured = undefined;
+    const sent = server.requests.length;
+    await flushAfter(2_000);
+    expect(recordSignedOut).toHaveBeenCalledTimes(1);
+    await syncer.onMessages("s1", meta("s1"), msgs("m3"));
+    await flushAfter(2_000);
+    keys.configured = "";
+    await flushAfter(2_000);
+    expect(server.requests).toHaveLength(sent);
+    expect(db.getPendingCount()).toBe(1);
+    expect(keys.connected).toEqual([]);
+
+    // Signing in again is picked up without a restart, and what was queued
+    // meanwhile goes to that key's account.
+    keys.configured = "key-old";
+    await flushAfter(2_000);
+    expect(keys.connected).toEqual(["key-old"]);
+    expect(recordSignedIn).toHaveBeenCalledTimes(1);
+    expect(server.copyOf(db, "s1", keyFingerprint("key-old"))).toEqual(["m1", "m2", "m3"]);
+    expect(db.getPendingCount()).toBe(0);
   });
 
   it("a flush with nothing to send doesn't clear a rejected key's status", async () => {
@@ -477,7 +553,7 @@ describe("a rejected key pauses, and recovers without a restart (engram#587)", (
     // to send, and nothing reached the server to delete.
     await syncer.onMessages("s1", meta("s1"), msgs("engram: ignore"));
     expect(db.getPendingCount()).toBe(0);
-    expect(db.getPendingRemoteDeletes()).toEqual([]);
+    expect(db.getPendingRemoteDeletes(keyFingerprint("key-old"))).toEqual([]);
 
     // The pause ends with nothing to try the key on. Nothing proved the key
     // works, so status keeps asking for a login.
@@ -486,8 +562,9 @@ describe("a rejected key pauses, and recovers without a restart (engram#587)", (
     expect(recordSuccess).not.toHaveBeenCalled();
   });
 
-  it("a new key also lifts a plan-limit backoff, so a different account syncs at once", async () => {
-    // s1 synced; then the memory filled up.
+  /** s1 synced and s2 hit a full memory; then the old key was revoked, and
+   *  an opt-out of s1 found out. */
+  async function fullThenRevoked(): Promise<void> {
     server.acceptedKeys = new Set(["key-old", "key-new"]);
     await syncer.onMessages("s1", meta("s1"), msgs("m1"));
     await syncer.flush();
@@ -496,17 +573,44 @@ describe("a rejected key pauses, and recovers without a restart (engram#587)", (
     await flushAfter(2_000);
     expect(failureTypes()).toEqual(["storage_full"]);
 
-    // The old key is revoked, and an opt-out's delete finds out.
     server.acceptedKeys = new Set(["key-new"]);
     await syncer.onMessages("s1", meta("s1"), msgs("engram: ignore"));
     expect(failureTypes()).toEqual(["storage_full", "auth"]);
-
-    // The user logs in to an account with room.
     server.sendError = null;
+  }
+
+  it("a new key also lifts a plan-limit backoff, so a different account syncs at once", async () => {
+    await fullThenRevoked();
+
+    // The user logs in to another account, one with room. What is captured
+    // from then on is sent at once, inside the old key's minute of backoff.
+    keys.configured = "key-new";
+    await flushAfter(2_000);
+    await syncer.onMessages("s3", meta("s3"), msgs("m3"));
+    await flushAfter(2_000);
+    expect(server.copyOf(db, "s3", keyFingerprint("key-new"))).toEqual(["m3"]);
+
+    // The full account's queue and its opt-out's delete wait for that
+    // account's key: neither goes out with the other account's.
+    expect(server.copyOf(db, "s2", keyFingerprint("key-new"))).toBeUndefined();
+    expect(db.getPendingCount(keyFingerprint("key-old"))).toBe(1);
+    expect(server.deleted).toEqual([]);
+    expect(server.requests.filter((r) => r.op === "delete" && r.key === "key-new")).toEqual([]);
+    expect(db.getPendingRemoteDeletes(keyFingerprint("key-old"))).toEqual([
+      { conversation_id: "conv_1", session_id: "s1" },
+    ]);
+  });
+
+  it("a re-issued key of the same account lifts the backoff too, and sends what the old key queued", async () => {
+    server.accounts.set("key-new", "key-old");
+    await fullThenRevoked();
+
     keys.configured = "key-new";
     await flushAfter(2_000);
     expect(server.deleted).toEqual(["conv_1"]);
-    expect(server.copyOf(db, "s2")).toEqual(["m2"]);
+    expect(server.copyOf(db, "s2", keyFingerprint("key-new"))).toEqual(["m2"]);
+    expect(db.getPendingCount()).toBe(0);
+    expect(db.getPendingRemoteDeletes(keyFingerprint("key-new"))).toEqual([]);
   });
 
   it("after the pause, a send that goes through clears the status", async () => {
@@ -524,7 +628,7 @@ describe("a rejected key pauses, and recovers without a restart (engram#587)", (
     server.acceptedKeys = new Set(["key-old"]); // the revocation is undone
     await flushAfter(10 * 60_000 + 1_000);
     expect(server.requests.slice(-1)).toEqual([{ op: "store", key: "key-old" }]);
-    expect(server.copyOf(db, "s1")).toEqual(["m1", "m2"]);
+    expect(server.copyOf(db, "s1", keyFingerprint("key-old"))).toEqual(["m1", "m2"]);
     expect(recordSuccess).toHaveBeenCalledTimes(1);
   });
 
@@ -559,7 +663,8 @@ describe("a rejected key pauses, and recovers without a restart (engram#587)", (
     keys.configured = "key-typo"; // a login with a mistyped key
     await flushAfter(10_000);
     expect(keys.connected).toEqual(["key-typo"]);
-    expect(server.requests.slice(-1)).toEqual([{ op: "create", key: "key-typo" }]);
+    // Its first request, asking whether key-old is its account's, is refused.
+    expect(server.requests.slice(-1)).toEqual([{ op: "owned", key: "key-typo" }]);
     const n = requests();
 
     // A fresh key gets the first pause, ten minutes. Reading the same key
@@ -634,38 +739,38 @@ describe("an opt-out's server delete is dropped only when Engram says it's gone 
     ["the SDK's NotFoundError", new NotFoundError()],
   ])("keeps the delete after %s, and retries until it lands", async (_, err) => {
     await optOutAfterSync(err);
-    expect(db.getPendingRemoteDeletes()).toHaveLength(1);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toHaveLength(1);
 
     await flushAfter(2_000);
-    expect(db.getPendingRemoteDeletes()).toHaveLength(1);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toHaveLength(1);
 
     server.deleteError = null;
     await flushAfter(2_000);
     expect(server.deleted).toEqual(["conv_1"]);
-    expect(db.getPendingRemoteDeletes()).toEqual([]);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toEqual([]);
   });
 
   it("drops the delete when Engram says the conversation is already gone", async () => {
     await optOutAfterSync(refusal({ error: "Conversation not found" }));
-    expect(db.getPendingRemoteDeletes()).toEqual([]);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toEqual([]);
   });
 
   it("a key without the delete scope keeps the delete, and doesn't pause syncing", async () => {
     await optOutAfterSync(
       refusal({ error: "insufficient_scope", required: "delete", message: "No 'delete' scope." }),
     );
-    expect(db.getPendingRemoteDeletes()).toHaveLength(1);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toHaveLength(1);
 
     await syncer.onMessages("s2", meta("s2"), msgs("m2"));
     await flushAfter(2_000);
     expect(server.copyOf(db, "s2")).toEqual(["m2"]);
-    expect(db.getPendingRemoteDeletes()).toHaveLength(1);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toHaveLength(1);
   });
 
   it("a rejected key pauses the deletes with everything else", async () => {
     await optOutAfterSync(new AuthenticationError());
     expect(failureTypes()).toEqual(["auth"]);
-    expect(db.getPendingRemoteDeletes()).toHaveLength(1);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toHaveLength(1);
 
     await syncer.onMessages("s2", meta("s2"), msgs("m2"));
     const before = server.requests.length;
@@ -677,7 +782,7 @@ describe("an opt-out's server delete is dropped only when Engram says it's gone 
     await flushAfter(10 * 60_000);
     expect(server.deleted).toEqual(["conv_1"]);
     expect(server.copyOf(db, "s2")).toEqual(["m2"]);
-    expect(db.getPendingRemoteDeletes()).toEqual([]);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toEqual([]);
   });
   it("an opt-out during the pause waits for it: the delete isn't sent with the rejected key", async () => {
     await syncer.onMessages("s1", meta("s1"), msgs("m1"));
@@ -690,19 +795,19 @@ describe("an opt-out's server delete is dropped only when Engram says it's gone 
 
     await syncer.onMessages("s1", meta("s1"), msgs("engram: ignore"));
     expect(server.requests).toHaveLength(before);
-    expect(db.getPendingRemoteDeletes()).toHaveLength(1);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toHaveLength(1);
 
     // Accepted after the pause: the delete is the first thing sent.
     server.acceptedKeys = null;
     await flushAfter(10 * 60_000 + 1_000);
     expect(server.requests.slice(before)).toEqual([{ op: "delete", key: "key-1" }]);
     expect(server.deleted).toEqual(["conv_1"]);
-    expect(db.getPendingRemoteDeletes()).toEqual([]);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toEqual([]);
   });
 
   it("a delete rejected in a flush ends that flush: nothing else is sent with the key", async () => {
     await optOutAfterSync(new EngramError("Network error: fetch failed"));
-    expect(db.getPendingRemoteDeletes()).toHaveLength(1);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toHaveLength(1);
     await syncer.onMessages("s2", meta("s2"), msgs("m2"));
 
     // The key is revoked; the flush's first request, the delete, finds out.
@@ -712,7 +817,7 @@ describe("an opt-out's server delete is dropped only when Engram says it's gone 
     await flushAfter(2_000);
     expect(server.requests.slice(before)).toEqual([{ op: "delete", key: "key-1" }]);
     expect(failureTypes().at(-1)).toBe("auth");
-    expect(db.getPendingSessions().map((s) => s.sessionId)).toEqual(["s2"]);
+    expect(db.getPendingSessions(FIXED_KEY_FP).map((s) => s.sessionId)).toEqual(["s2"]);
   });
 
   it.each([
@@ -726,7 +831,7 @@ describe("an opt-out's server delete is dropped only when Engram says it's gone 
     // Nothing else is waiting: the delete is the only proof there can be.
     server.deleteError = answer;
     await flushAfter(10 * 60_000 + 1_000);
-    expect(db.getPendingRemoteDeletes()).toEqual([]);
+    expect(db.getPendingRemoteDeletes(FIXED_KEY_FP)).toEqual([]);
     expect(recordSuccess).toHaveBeenCalledTimes(1);
   });
 });

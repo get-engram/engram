@@ -66,14 +66,104 @@ CREATE TABLE IF NOT EXISTS pending_sessions (
 );
 `;
 
+/**
+ * Schema version 1 (engram#594): every queued capture, session mapping and
+ * pending remote delete records WHICH API key it belongs to, so a capture
+ * queued while one account was signed in is never sent with another
+ * account's key.
+ *
+ * key_fp is the SHA-256 hex of the key, the same hash the server keeps in
+ * api_keys.key_hash; the key itself is never stored here. NULL or '' means
+ * "no key": a row from before version 1, or one queued while signed out.
+ * The next key the daemon runs with claims those (claimLegacy).
+ *
+ * session_map is rebuilt with the conversation id as its key, because one
+ * transcript session can now have a conversation in each account that
+ * captured part of it, and an opt-out has to find every one of them.
+ */
+const SESSION_MAP_V1 = `
+CREATE TABLE session_map_v1 (
+  conversation_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  key_fp TEXT NOT NULL DEFAULT '',
+  project_dir TEXT,
+  cwd TEXT,
+  git_branch TEXT,
+  created_at TEXT NOT NULL
+);
+INSERT OR IGNORE INTO session_map_v1
+  (conversation_id, session_id, key_fp, project_dir, cwd, git_branch, created_at)
+  SELECT conversation_id, session_id, '', project_dir, cwd, git_branch, created_at
+    FROM session_map ORDER BY created_at, rowid;
+DROP TABLE session_map;
+ALTER TABLE session_map_v1 RENAME TO session_map;
+`;
+
+const SCHEMA_V1 = `
+CREATE INDEX IF NOT EXISTS idx_session_map_session
+  ON session_map(session_id, key_fp);
+
+CREATE INDEX IF NOT EXISTS idx_pending_unsent_key
+  ON pending_messages(key_fp, conversation_id) WHERE sent_at IS NULL;
+
+-- Conversations to delete on the server because their session was opted
+-- out (engram#462), each under the key of the account that holds it. A
+-- delete is only ever sent with that account's key; one for an account
+-- that isn't signed in waits here until it is.
+CREATE TABLE IF NOT EXISTS remote_deletes (
+  conversation_id TEXT PRIMARY KEY,
+  key_fp TEXT,
+  session_id TEXT,
+  created_at TEXT NOT NULL
+);
+`;
+
+function hasColumn(db: Database.Database, table: string, column: string): boolean {
+  return (db.pragma(`table_info(${table})`) as Array<{ name: string }>).some(
+    (c) => c.name === column,
+  );
+}
+
+/** Bring a daemon.db up to version 1 in ONE transaction: a crash part-way
+ *  leaves it at version 0, exactly as it was, and the next start retries. */
+function migrate(db: Database.Database): void {
+  db.transaction(() => {
+    if ((db.pragma("user_version", { simple: true }) as number) >= 1) return;
+    if (!hasColumn(db, "pending_messages", "key_fp")) {
+      db.exec("ALTER TABLE pending_messages ADD COLUMN key_fp TEXT");
+    }
+    if (!hasColumn(db, "session_map", "key_fp")) db.exec(SESSION_MAP_V1);
+    db.exec(SCHEMA_V1);
+    db.pragma("user_version = 1");
+  }).immediate();
+}
+
+type SessionPlace = { projectDir?: string; cwd?: string; gitBranch?: string };
+
 export class DaemonDb {
   private db: Database.Database;
+  /** False only for a read-only open of a daemon.db that an older daemon
+   *  still owns (no key_fp yet). That daemon sends every queued row with
+   *  its own key, so they all count as pending, none as held. */
+  private keyed: boolean;
 
-  constructor(dbPath: string) {
+  /**
+   * `readonly` is for the CLI reading a daemon's database while the daemon
+   * runs: it changes nothing (no schema, no migration, no -wal file of its
+   * own making) and throws instead of creating a file that isn't there.
+   */
+  constructor(dbPath: string, options: { readonly?: boolean } = {}) {
+    if (options.readonly) {
+      this.db = new Database(dbPath, { readonly: true, fileMustExist: true });
+      this.keyed = hasColumn(this.db, "pending_messages", "key_fp");
+      return;
+    }
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.exec(SCHEMA);
+    migrate(this.db);
+    this.keyed = true;
   }
 
   // ── File offsets ──
@@ -98,31 +188,49 @@ export class DaemonDb {
 
   // ── Session map ──
 
-  getConversationId(sessionId: string): string | null {
+  /** The session's conversation in the account `keyFp` belongs to (the
+   *  newest, if more than one was ever created there). */
+  getConversationId(sessionId: string, keyFp: string): string | null {
     const row = this.db
-      .prepare("SELECT conversation_id FROM session_map WHERE session_id = ?")
-      .get(sessionId) as { conversation_id: string } | undefined;
+      .prepare(
+        `SELECT conversation_id FROM session_map
+          WHERE session_id = ? AND key_fp = ?
+          ORDER BY rowid DESC LIMIT 1`,
+      )
+      .get(sessionId, keyFp) as { conversation_id: string } | undefined;
     return row?.conversation_id ?? null;
   }
 
   setSessionMap(
     sessionId: string,
     conversationId: string,
-    meta: { projectDir?: string; cwd?: string; gitBranch?: string },
+    meta: SessionPlace,
+    keyFp: string,
   ): void {
     this.db
       .prepare(
         `INSERT OR REPLACE INTO session_map
-           (session_id, conversation_id, project_dir, cwd, git_branch, created_at)
-         VALUES (?, ?, ?, ?, ?, datetime('now'))`,
+           (conversation_id, session_id, key_fp, project_dir, cwd, git_branch, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`,
       )
       .run(
-        sessionId,
         conversationId,
+        sessionId,
+        keyFp,
         meta.projectDir ?? null,
         meta.cwd ?? null,
         meta.gitBranch ?? null,
       );
+  }
+
+  /** True when the session already has a conversation under a key other
+   *  than `keyFp` — one that may turn out to be the same account's. */
+  mappedUnderOtherKey(sessionId: string, keyFp: string): boolean {
+    return (
+      this.db
+        .prepare("SELECT 1 FROM session_map WHERE session_id = ? AND key_fp <> ? LIMIT 1")
+        .get(sessionId, keyFp) !== undefined
+    );
   }
 
   // ── Excluded sessions (engram#462) ──
@@ -135,36 +243,36 @@ export class DaemonDb {
     );
   }
 
-  markSessionExcluded(
-    sessionId: string,
-    reason: string,
-    deletePendingConversationId?: string,
-  ): void {
+  /** Record the opt-out. An existing row is kept as it is: a delete it still
+   *  carries from before version 1 is claimed later (claimLegacy). */
+  markSessionExcluded(sessionId: string, reason: string): void {
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO excluded_sessions
+        `INSERT OR IGNORE INTO excluded_sessions
            (session_id, reason, delete_pending, created_at)
-         VALUES (?, ?, ?, datetime('now'))`,
+         VALUES (?, ?, NULL, datetime('now'))`,
       )
-      .run(sessionId, reason, deletePendingConversationId ?? null);
+      .run(sessionId, reason);
   }
 
-  /** Conversations that still need a server-side delete (opt-out arrived
-   *  after part of the session had synced). */
-  getPendingRemoteDeletes(): Array<{ session_id: string; delete_pending: string }> {
+  /** Conversations still to delete on the server with the key `keyFp`
+   *  (the opt-out arrived after part of the session had synced), oldest
+   *  first. */
+  getPendingRemoteDeletes(
+    keyFp: string,
+  ): Array<{ conversation_id: string; session_id: string | null }> {
     return this.db
       .prepare(
-        "SELECT session_id, delete_pending FROM excluded_sessions WHERE delete_pending IS NOT NULL",
+        `SELECT conversation_id, session_id FROM remote_deletes
+          WHERE key_fp = ? ORDER BY created_at, rowid`,
       )
-      .all() as Array<{ session_id: string; delete_pending: string }>;
+      .all(keyFp) as Array<{ conversation_id: string; session_id: string | null }>;
   }
 
-  clearPendingRemoteDelete(sessionId: string): void {
+  clearPendingRemoteDelete(conversationId: string): void {
     this.db
-      .prepare(
-        "UPDATE excluded_sessions SET delete_pending = NULL WHERE session_id = ?",
-      )
-      .run(sessionId);
+      .prepare("DELETE FROM remote_deletes WHERE conversation_id = ?")
+      .run(conversationId);
   }
 
   /** Drop every queued (sent or not) local row for a conversation — used when
@@ -177,9 +285,10 @@ export class DaemonDb {
 
   /**
    * Opt a session out on this machine, in ONE transaction (engram#584):
-   * mark it excluded, with its conversation's server-side delete pending,
-   * and drop everything queued for it. Returns the conversation and the
-   * number of messages dropped.
+   * mark it excluded, record a server-side delete for its conversation in
+   * EVERY account that has one (each under that account's key), and drop
+   * everything queued for it, whichever key it was queued under. Returns
+   * those conversations and the number of messages dropped.
    *
    * As separate steps, a failure part-way could mark the session excluded
    * and leave its queue in place, still due to be sent. Nothing would ever
@@ -188,14 +297,42 @@ export class DaemonDb {
   excludeSession(
     sessionId: string,
     reason: string,
-  ): { conversationId: string | null; dropped: number } {
+  ): { conversations: Array<{ conversationId: string; keyFp: string }>; dropped: number } {
     return this.db.transaction(() => {
-      const conversationId = this.getConversationId(sessionId);
-      this.markSessionExcluded(sessionId, reason, conversationId ?? undefined);
-      const dropped =
-        this.dropPendingSession(sessionId) +
-        (conversationId ? this.deleteAllForConversation(conversationId) : 0);
-      return { conversationId, dropped };
+      this.markSessionExcluded(sessionId, reason);
+      const conversations = (
+        this.db
+          .prepare(
+            "SELECT conversation_id, key_fp FROM session_map WHERE session_id = ? ORDER BY rowid",
+          )
+          .all(sessionId) as Array<{ conversation_id: string; key_fp: string }>
+      ).map((r) => ({ conversationId: r.conversation_id, keyFp: r.key_fp }));
+      const remember = this.db.prepare(
+        `INSERT OR IGNORE INTO remote_deletes (conversation_id, key_fp, session_id, created_at)
+         VALUES (?, ?, ?, datetime('now'))`,
+      );
+      let dropped = this.dropPendingSession(sessionId);
+      for (const c of conversations) {
+        remember.run(c.conversationId, c.keyFp || null, sessionId);
+        dropped += this.deleteAllForConversation(c.conversationId);
+      }
+      return { conversations, dropped };
+    })();
+  }
+
+  /** A create that was in flight when its session was opted out: delete
+   *  the new conversation on the server (with the key that created it) and
+   *  drop whatever is queued for the session, in ONE transaction. */
+  excludeCreatedConversation(sessionId: string, conversationId: string, keyFp: string): void {
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO remote_deletes (conversation_id, key_fp, session_id, created_at)
+           VALUES (?, ?, ?, datetime('now'))`,
+        )
+        .run(conversationId, keyFp, sessionId);
+      this.dropPendingSession(sessionId);
+      this.deleteAllForConversation(conversationId);
     })();
   }
 
@@ -207,6 +344,7 @@ export class DaemonDb {
     sessionId: string,
     meta: SessionMeta,
     messages: ParsedMessage[],
+    keyFp: string | null,
   ): void {
     const upsert = this.db.prepare(
       `INSERT INTO pending_sessions (session_id, meta, created_at, updated_at)
@@ -216,19 +354,25 @@ export class DaemonDb {
     );
     this.db.transaction(() => {
       upsert.run(sessionId, JSON.stringify({ ...meta, sessionId }));
-      this.enqueue(pendingConversationId(sessionId), messages);
+      this.enqueue(pendingConversationId(sessionId), messages, keyFp);
     })();
   }
 
-  /** Sessions still waiting for their conversation, oldest first. A row
-   *  whose metadata can't be read still comes back (with placeholder
-   *  metadata): its messages must never be stranded by a bad meta blob. */
-  getPendingSessions(): Array<{ sessionId: string; meta: SessionMeta }> {
+  /** Sessions waiting for their conversation that have messages queued
+   *  under `keyFp`, oldest first. A row whose metadata can't be read still
+   *  comes back (with placeholder metadata): its messages must never be
+   *  stranded by a bad meta blob. */
+  getPendingSessions(keyFp: string | null): Array<{ sessionId: string; meta: SessionMeta }> {
     const rows = this.db
       .prepare(
-        "SELECT session_id, meta FROM pending_sessions ORDER BY created_at, session_id",
+        `SELECT session_id, meta FROM pending_sessions ps
+          WHERE EXISTS (
+            SELECT 1 FROM pending_messages pm
+             WHERE pm.sent_at IS NULL AND pm.key_fp IS ?
+               AND pm.conversation_id = 'pending:' || ps.session_id)
+          ORDER BY created_at, session_id`,
       )
-      .all() as Array<{ session_id: string; meta: string }>;
+      .all(keyFp) as Array<{ session_id: string; meta: string }>;
     return rows.map((r) => ({
       sessionId: r.session_id,
       meta: parseStoredMeta(r.session_id, r.meta),
@@ -236,27 +380,37 @@ export class DaemonDb {
   }
 
   /**
-   * Finish a pending session in ONE transaction: record the mapping (when
-   * `meta` is given — a fresh create), move its queued messages onto the
-   * real conversation, and forget the pending row. A crash can't leave
-   * messages under the temporary id with nothing left to retry them.
-   * Returns the number of messages moved.
+   * Finish a pending session for one account in ONE transaction: record the
+   * mapping (when `meta` is given — a fresh create), move the messages
+   * queued under `keyFp` onto the real conversation, and forget the
+   * pending row once nothing is left under the temporary id. Messages
+   * another key queued for the same session stay where they are, for that
+   * account. A crash can't leave messages under the temporary id with
+   * nothing left to retry them. Returns the number of messages moved.
    */
   completePendingSession(
     sessionId: string,
     conversationId: string,
-    meta?: { projectDir?: string; cwd?: string; gitBranch?: string },
+    keyFp: string,
+    meta?: SessionPlace,
   ): number {
     return this.db.transaction(() => {
-      if (meta) this.setSessionMap(sessionId, conversationId, meta);
+      if (meta) this.setSessionMap(sessionId, conversationId, meta, keyFp);
+      const pendingId = pendingConversationId(sessionId);
       const moved = this.db
         .prepare(
-          "UPDATE pending_messages SET conversation_id = ? WHERE conversation_id = ? AND sent_at IS NULL",
+          `UPDATE pending_messages SET conversation_id = ?
+            WHERE conversation_id = ? AND sent_at IS NULL AND key_fp = ?`,
         )
-        .run(conversationId, pendingConversationId(sessionId)).changes;
-      this.db
-        .prepare("DELETE FROM pending_sessions WHERE session_id = ?")
-        .run(sessionId);
+        .run(conversationId, pendingId, keyFp).changes;
+      const left = this.db
+        .prepare(
+          "SELECT 1 FROM pending_messages WHERE conversation_id = ? AND sent_at IS NULL LIMIT 1",
+        )
+        .get(pendingId);
+      if (left === undefined) {
+        this.db.prepare("DELETE FROM pending_sessions WHERE session_id = ?").run(sessionId);
+      }
       return moved;
     })();
   }
@@ -318,11 +472,13 @@ export class DaemonDb {
 
   // ── Pending messages ──
 
-  enqueue(conversationId: string, messages: ParsedMessage[]): void {
+  /** Queue messages under the key of the account signed in when they were
+   *  captured (`null`: none was). */
+  enqueue(conversationId: string, messages: ParsedMessage[], keyFp: string | null): void {
     const stmt = this.db.prepare(
       `INSERT INTO pending_messages
-         (conversation_id, role, content, tool_call_id, tool_name, metadata, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`,
+         (conversation_id, role, content, tool_call_id, tool_name, metadata, created_at, key_fp)
+       VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?)`,
     );
 
     const insertMany = this.db.transaction((msgs: ParsedMessage[]) => {
@@ -334,6 +490,7 @@ export class DaemonDb {
           m.toolCallId ?? null,
           m.toolName ?? null,
           m.metadata ? JSON.stringify(m.metadata) : null,
+          keyFp,
         );
       }
     });
@@ -341,25 +498,25 @@ export class DaemonDb {
     insertMany(messages);
   }
 
-  /** Get conversation IDs that have unsent messages. */
-  getPendingConversationIds(): string[] {
+  /** Conversation ids with unsent messages queued under `keyFp`. */
+  getPendingConversationIds(keyFp: string | null): string[] {
     const rows = this.db
       .prepare(
-        "SELECT DISTINCT conversation_id FROM pending_messages WHERE sent_at IS NULL",
+        "SELECT DISTINCT conversation_id FROM pending_messages WHERE sent_at IS NULL AND key_fp IS ?",
       )
-      .all() as { conversation_id: string }[];
+      .all(keyFp) as { conversation_id: string }[];
     return rows.map((r) => r.conversation_id);
   }
 
-  /** Dequeue up to `limit` unsent messages for a conversation. */
-  dequeue(conversationId: string, limit: number): PendingRow[] {
+  /** Dequeue up to `limit` unsent messages a conversation has under `keyFp`. */
+  dequeue(conversationId: string, limit: number, keyFp: string | null): PendingRow[] {
     return this.db
       .prepare(
         `SELECT * FROM pending_messages
-         WHERE conversation_id = ? AND sent_at IS NULL
+         WHERE conversation_id = ? AND sent_at IS NULL AND key_fp IS ?
          ORDER BY id ASC LIMIT ?`,
       )
-      .all(conversationId, limit) as PendingRow[];
+      .all(conversationId, keyFp, limit) as PendingRow[];
   }
 
   /** Replace queued messages' content with its scrubbed text (engram#588). */
@@ -382,20 +539,116 @@ export class DaemonDb {
       .run(...ids);
   }
 
-  /** Count of unsent messages across all conversations. */
-  getPendingCount(): number {
+  /** Unsent messages queued under `keyFp`; every unsent message when no
+   *  key is given. */
+  getPendingCount(keyFp?: string): number {
+    if (keyFp === undefined || !this.keyed) return this.count("1 = 1");
+    return this.count("key_fp IS ?", keyFp);
+  }
+
+  /** Unsent messages waiting for an account other than `keyFp` (`null`:
+   *  every unsent message — nobody is signed in to send them). */
+  getHeldCount(keyFp: string | null): number {
+    if (!this.keyed) return 0;
+    if (keyFp === null) return this.count("1 = 1");
+    return this.count("key_fp IS NOT ?", keyFp);
+  }
+
+  private count(where: string, ...params: Array<string | null>): number {
     return (
       this.db
-        .prepare("SELECT COUNT(*) as c FROM pending_messages WHERE sent_at IS NULL")
-        .get() as { c: number }
+        .prepare(`SELECT COUNT(*) AS c FROM pending_messages WHERE sent_at IS NULL AND ${where}`)
+        .get(...params) as { c: number }
     ).c;
+  }
+
+  // ── Which key a queued row belongs to (engram#594) ──
+
+  /** Every other key something here is queued or mapped under. */
+  otherKeyFps(keyFp: string): string[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT key_fp FROM pending_messages
+            WHERE sent_at IS NULL AND key_fp IS NOT NULL AND key_fp <> '' AND key_fp <> ?
+           UNION
+           SELECT key_fp FROM session_map WHERE key_fp <> '' AND key_fp <> ?
+           UNION
+           SELECT key_fp FROM remote_deletes
+            WHERE key_fp IS NOT NULL AND key_fp <> '' AND key_fp <> ?`,
+        )
+        .all(keyFp, keyFp, keyFp) as Array<{ key_fp: string }>
+    ).map((r) => r.key_fp);
+  }
+
+  /** Hand everything queued or mapped under `fromFps` to `toFp`, in ONE
+   *  transaction — for keys the server confirmed are the same account's
+   *  (a rotated or re-issued key). */
+  adoptKeys(
+    fromFps: string[],
+    toFp: string,
+  ): { messages: number; sessions: number; deletes: number } {
+    const messagesStmt = this.db.prepare(
+      "UPDATE pending_messages SET key_fp = ? WHERE sent_at IS NULL AND key_fp = ?",
+    );
+    const sessionsStmt = this.db.prepare("UPDATE session_map SET key_fp = ? WHERE key_fp = ?");
+    const deletesStmt = this.db.prepare("UPDATE remote_deletes SET key_fp = ? WHERE key_fp = ?");
+    return this.db.transaction(() => {
+      const moved = { messages: 0, sessions: 0, deletes: 0 };
+      for (const from of new Set(fromFps)) {
+        if (!from || from === toFp) continue;
+        moved.messages += messagesStmt.run(toFp, from).changes;
+        moved.sessions += sessionsStmt.run(toFp, from).changes;
+        moved.deletes += deletesStmt.run(toFp, from).changes;
+      }
+      return moved;
+    })();
+  }
+
+  /**
+   * Give `keyFp` everything that belongs to no key: rows from before
+   * version 1 and rows queued while signed out, the session mappings from
+   * before version 1, and the opt-out deletes an older daemon left in
+   * excluded_sessions. ONE transaction.
+   */
+  claimLegacy(keyFp: string): void {
+    this.db.transaction(() => {
+      // Two statements so each is an index search, not a scan of the queue.
+      this.db
+        .prepare("UPDATE pending_messages SET key_fp = ? WHERE sent_at IS NULL AND key_fp IS NULL")
+        .run(keyFp);
+      this.db
+        .prepare("UPDATE pending_messages SET key_fp = ? WHERE sent_at IS NULL AND key_fp = ''")
+        .run(keyFp);
+      this.db.prepare("UPDATE session_map SET key_fp = ? WHERE key_fp = ''").run(keyFp);
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO remote_deletes (conversation_id, key_fp, session_id, created_at)
+           SELECT delete_pending, ?, session_id, created_at
+             FROM excluded_sessions WHERE delete_pending IS NOT NULL`,
+        )
+        .run(keyFp);
+      this.db
+        .prepare("UPDATE excluded_sessions SET delete_pending = NULL WHERE delete_pending IS NOT NULL")
+        .run();
+      this.db
+        .prepare("UPDATE remote_deletes SET key_fp = ? WHERE key_fp IS NULL OR key_fp = ''")
+        .run(keyFp);
+    })();
   }
 
   // ── Stats ──
 
-  getStats(): {
+  /**
+   * `pendingMessages` are the unsent messages `keyFp` will send, and
+   * `heldMessages` the ones waiting for another account. No `keyFp`: every
+   * unsent message is pending. `null`: nobody is signed in, so every unsent
+   * message is held.
+   */
+  getStats(keyFp?: string | null): {
     trackedFiles: number;
     pendingMessages: number;
+    heldMessages: number;
     sessionsMapped: number;
   } {
     const files = (
@@ -403,21 +656,27 @@ export class DaemonDb {
         .prepare("SELECT COUNT(*) as c FROM file_offsets")
         .get() as { c: number }
     ).c;
-    const pending = (
-      this.db
-        .prepare(
-          "SELECT COUNT(*) as c FROM pending_messages WHERE sent_at IS NULL",
-        )
-        .get() as { c: number }
-    ).c;
     const sessions = (
       this.db
-        .prepare("SELECT COUNT(*) as c FROM session_map")
+        .prepare("SELECT COUNT(DISTINCT session_id) as c FROM session_map")
         .get() as { c: number }
     ).c;
+    let pending: number;
+    let held: number;
+    if (keyFp === undefined || !this.keyed) {
+      pending = this.getPendingCount();
+      held = 0;
+    } else if (keyFp === null) {
+      pending = 0;
+      held = this.getHeldCount(null);
+    } else {
+      pending = this.getPendingCount(keyFp);
+      held = this.getHeldCount(keyFp);
+    }
     return {
       trackedFiles: files,
       pendingMessages: pending,
+      heldMessages: held,
       sessionsMapped: sessions,
     };
   }

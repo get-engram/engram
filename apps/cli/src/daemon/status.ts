@@ -49,6 +49,13 @@ export interface SyncStatus {
    * about whether new lines can be queued.
    */
   capture_error: CaptureError | null;
+  /**
+   * Set while no API key is saved on this machine (engram#594): after
+   * `engram auth logout`, or a daemon started before any login. Nothing is
+   * sent and nothing new is captured; what is already queued stays on this
+   * machine. Not an error: `health` stays healthy.
+   */
+  signed_out_at: string | null;
   updated_at: string;
 }
 
@@ -62,6 +69,7 @@ const DEFAULT_STATUS: SyncStatus = {
   consecutive_failures: 0,
   storage: null,
   capture_error: null,
+  signed_out_at: null,
   updated_at: new Date().toISOString(),
 };
 
@@ -202,16 +210,56 @@ export function recordCaptureStall(filePath: string, message: string): void {
 }
 
 /** A stalled transcript was queued again, or there is nothing left to
- *  retry (the file is gone). The error clears once no file is waiting. */
-export function recordCaptureResumed(filePath: string): void {
+ *  retry (the file is gone). The error clears once no file is waiting.
+ *
+ *  `quiet`: the watcher holding the file stopped (a sign-out or a switch of
+ *  account, engram#594), so the hold is dropped without claiming capture
+ *  resumed. The lines were never queued; the next watcher reads them again
+ *  from the saved offset, and a failure there is a new stall. */
+export function recordCaptureResumed(
+  filePath: string,
+  options: { quiet?: boolean } = {},
+): void {
   if (!stalledFiles.delete(filePath)) return;
   if (stalledFiles.size > 0 && currentStatus.capture_error) {
     currentStatus.capture_error = { ...currentStatus.capture_error, files: stalledFiles.size };
   } else {
     currentStatus.capture_error = null;
-    console.error("[engram] capture resumed: new messages are being queued again");
+    if (!options.quiet) {
+      console.error("[engram] capture resumed: new messages are being queued again");
+    }
   }
   writeStatus();
+}
+
+/**
+ * No API key is saved: capture is paused and nothing is sent (engram#594).
+ * Clears any sync error, since a rejected key's warning no longer applies
+ * once the key is gone, and the pending count, since nothing is due to go.
+ */
+export function recordSignedOut(): void {
+  clearSyncError();
+  currentStatus.pending_messages = 0;
+  currentStatus.signed_out_at = currentStatus.signed_out_at ?? new Date().toISOString();
+  writeStatus();
+}
+
+/** A key is saved: capture and sync run. An error recorded under another
+ *  key (or none) says nothing about this one, so it is cleared too. */
+export function recordSignedIn(): void {
+  clearSyncError();
+  currentStatus.signed_out_at = null;
+  writeStatus();
+}
+
+function clearSyncError(): void {
+  currentStatus.health = "healthy";
+  currentStatus.last_error = null;
+  currentStatus.last_error_at = null;
+  currentStatus.error_type = null;
+  currentStatus.consecutive_failures = 0;
+  currentStatus.storage = null;
+  lastNotifiedError = null;
 }
 
 /** Update pending count without changing health. */

@@ -377,6 +377,7 @@ describe("makeDirPrivateSync: the daemon's start (engram#627)", () => {
     "daemon.db-shm",
     "daemon.log",
     "daemon.pid",
+    "daemon.stop",
     "status.json",
     "vault-key",
     "vault-key.bak-2026-01-01T00-00-00-000Z",
@@ -443,10 +444,15 @@ describe("makeDirPrivateSync: the daemon's start (engram#627)", () => {
     for (const name of FILES) expect(mode(join(engram, name)), name).toBe(0o644);
   });
 
-  it("removes stale temp files of config.json, status.json and daemon.pid, and nothing else", () => {
+  it("removes stale temp files of config.json, status.json, daemon.pid and daemon.stop, and nothing else", () => {
     const engram = join(dir, ".engram");
     mkdirSync(engram);
-    const stale = ["config.json.123.deadbeef.tmp", "status.json.45678.0badf00d.tmp", "daemon.pid.910.c0ffee00.tmp"];
+    const stale = [
+      "config.json.123.deadbeef.tmp",
+      "status.json.45678.0badf00d.tmp",
+      "daemon.pid.910.c0ffee00.tmp",
+      "daemon.stop.1112.0123abcd.tmp",
+    ];
     const writing = "config.json.123.cafef00d.tmp"; // a write in progress
     const kept = [
       "vault-key.123.deadbeef.tmp",

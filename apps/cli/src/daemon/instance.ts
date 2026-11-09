@@ -16,7 +16,9 @@
  *
  * The socket is one-way. A client gets one line of JSON and the connection
  * ends; nothing a client sends is read, so nothing that reaches the socket
- * can make the daemon do anything.
+ * can make the daemon do anything. On Windows `engram stop` asks the daemon
+ * to stop through a file in ~/.engram instead (STOP_FILE, engram#613),
+ * which only the user can write.
  *
  * daemon.pid is still written, for CLIs from before this change, and is
  * trusted only for a process confirmed to be the daemon (identifyProcess).
@@ -28,7 +30,18 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { lstatSync, readFileSync, statSync, unlinkSync, type BigIntStats } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+  unlinkSync,
+  type BigIntStats,
+} from "node:fs";
 import { createRequire } from "node:module";
 import { connect, createServer, type Server } from "node:net";
 import { dirname, join } from "node:path";
@@ -65,6 +78,10 @@ const POLL_MS = 250;
 const SETTLE_MS = 250;
 /** How often the daemon checks that its socket and PID file are still there. */
 const SELF_CHECK_MS = 30_000;
+/** How often the daemon looks for a stop request (STOP_FILE). */
+const STOP_POLL_MS = 1_000;
+/** A stop request is a few dozen bytes: anything longer isn't one. */
+const MAX_STOP_BYTES = 1_024;
 
 function errCode(err: unknown): string | undefined {
   return (err as NodeJS.ErrnoException | null)?.code;
@@ -158,6 +175,8 @@ export interface DaemonInfo {
   ready: boolean;
   /** It is shutting down: finishing a send, then exiting. */
   stopping: boolean;
+  /** It stops when STOP_FILE asks it to (engram#613): on Windows, from this version on. */
+  stopFile: boolean;
 }
 
 const self = {
@@ -176,6 +195,7 @@ function answer(id: string): string {
     id,
     ready: self.ready,
     stopping: self.stopping,
+    stop_file: watchStopFile,
   })}\n`;
 }
 
@@ -204,6 +224,7 @@ export function parseAnswer(line: string): DaemonInfo | null {
     id: text(a.id, /^[0-9a-f]{32}$/),
     ready: a.ready === true,
     stopping: a.stopping === true,
+    stopFile: a.stop_file === true,
   };
 }
 
@@ -585,6 +606,82 @@ export function identifyProcess(pid: number): "daemon" | "other" | "unknown" {
   return Number(match[1]) === uid && WORKER_SCRIPT.test(match[2].trim()) ? "daemon" : "other";
 }
 
+// ── Stopping on Windows ──
+
+/**
+ * Where `engram stop` asks the daemon to stop on Windows (engram#613).
+ * There, process.kill is TerminateProcess: the daemon used to be ended
+ * wherever it was, in the middle of a send or of writing its queue. The
+ * socket stays one-way, so the request is a file in ~/.engram, which only
+ * the user can write: `{"pid": …, "id": …}`, the PID and the id the
+ * daemon's answer gave. The daemon looks for it every STOP_POLL_MS and
+ * stops as it does for SIGTERM. A daemon the request doesn't name, by both,
+ * leaves it alone: a file left from an earlier daemon can name a PID that
+ * Windows has given to this one since, but never its id.
+ *
+ * The supervisor that starts the daemon again after a crash reads it too:
+ * a daemon that exits with an error after a request was written was
+ * stopped, and isn't started again (see supervise.ts).
+ */
+export const STOP_FILE = join(ENGRAM_DIR, "daemon.stop");
+
+export interface StopRequest {
+  /** The daemon it is for: null when it names none, as from an `engram stop` that found none running. */
+  pid: number | null;
+  id: string | null;
+  /** Which write of the file this is. Every write is a new file (see writePrivateFileSync), so it differs from the last. */
+  stamp: string;
+}
+
+/**
+ * The stop request in STOP_FILE, or null when there is none. It is opened
+ * without waiting and must be a small regular file before it is read: a
+ * FIFO put there would otherwise hang the daemon on the read. BigInt fstat,
+ * for the reason given at lstatSocketPath.
+ */
+export function readStopFile(file: string = STOP_FILE): StopRequest | null {
+  let fd: number;
+  try {
+    // O_NONBLOCK: undefined on Windows, which has no FIFOs in the file system.
+    fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+  } catch {
+    return null;
+  }
+  try {
+    const st = fstatSync(fd, { bigint: true });
+    if (!st.isFile() || st.size > BigInt(MAX_STOP_BYTES)) return null;
+    const buf = Buffer.alloc(MAX_STOP_BYTES + 1);
+    const read = readSync(fd, buf, 0, buf.length, 0);
+    let value: unknown = null;
+    try {
+      value = JSON.parse(buf.subarray(0, read).toString("utf-8"));
+    } catch {
+      // not a request this version wrote: it still counts as one, for no daemon
+    }
+    const r = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+    return {
+      pid: typeof r.pid === "number" && Number.isSafeInteger(r.pid) && r.pid > 0 ? r.pid : null,
+      id: typeof r.id === "string" && /^[0-9a-f]{32}$/.test(r.id) ? r.id : null,
+      stamp: `${st.dev}:${st.ino}:${st.mtimeNs}:${st.size}`,
+    };
+  } catch {
+    return null;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Remove STOP_FILE when the request in it is one `matches` takes. */
+export function removeStopFileIf(matches: (request: StopRequest) => boolean, file: string = STOP_FILE): void {
+  const request = readStopFile(file);
+  if (request === null || !matches(request)) return;
+  try {
+    unlinkSync(file);
+  } catch {
+    // gone already
+  }
+}
+
 // ── The daemon's claim ──
 
 export type Claim =
@@ -602,6 +699,11 @@ let released = false;
 let checkTimer: NodeJS.Timeout | null = null;
 let checking = false;
 let warnedSocket = false;
+/** Whether this daemon looks for stop requests: set when it claims the lock. */
+let watchStopFile = false;
+let stopTimer: NodeJS.Timeout | null = null;
+/** The stamp of the last stop request looked at, so each is read once. */
+let stopSeen: string | null = null;
 
 let stopHandler: () => void = () => {
   releaseDaemonLock();
@@ -614,7 +716,10 @@ let displacedHandler: () => void = () => {
   process.exit(0);
 };
 
-/** What SIGTERM and SIGINT do: the worker sets its shutdown here once it has one. */
+/**
+ * What SIGTERM, SIGINT and SIGHUP do (and SIGBREAK, and a stop request, on
+ * Windows): the worker sets its shutdown here once it has one.
+ */
 export function setStopHandler(fn: () => void): void {
   stopHandler = fn;
 }
@@ -718,22 +823,47 @@ async function bindAgain(old: Held): Promise<void> {
 }
 
 /**
+ * Stop when STOP_FILE asks this daemon to, by its PID and its id. Every
+ * STOP_POLL_MS while it holds the lock, on Windows. Exported for the tests.
+ */
+export function checkStopRequest(): void {
+  if (released || self.stopping || held === null) return;
+  const request = readStopFile();
+  if (request === null || request.stamp === stopSeen) return;
+  stopSeen = request.stamp;
+  if (request.pid !== process.pid || request.id !== held.id) return;
+  log("stop requested ('engram stop')");
+  stopHandler();
+}
+
+/**
  * Become the daemon, or find that one already runs: worker.ts calls this
  * before the preflight, so two starts never run `npm rebuild` at once, and
  * worker-main.ts again for a plist from before 0.4.2 that starts it
  * directly (engram#469). Only the first call does anything. Logs what it
  * found; the caller exits on "taken".
  *
- * Held, the PID file is written, SIGTERM and SIGINT stop the daemon through
- * setStopHandler, and any exit releases both.
+ * Held, the PID file is written, SIGTERM, SIGINT and SIGHUP stop the
+ * daemon through setStopHandler, and any exit releases both. On Windows a
+ * stop request does too (STOP_FILE), and so does SIGBREAK.
  */
-export function claimDaemonLock(options: { log: (msg: string) => void; endpoint?: EndpointOrReason; settleMs?: number }): Promise<Claim> {
+export function claimDaemonLock(options: ClaimOptions): Promise<Claim> {
   claim ??= claimOnce(options);
   return claim;
 }
 
-async function claimOnce(options: { log: (msg: string) => void; endpoint?: EndpointOrReason; settleMs?: number }): Promise<Claim> {
+export interface ClaimOptions {
+  log: (msg: string) => void;
+  endpoint?: EndpointOrReason;
+  settleMs?: number;
+  /** Look for stop requests in STOP_FILE: on Windows unless set. The tests set it elsewhere. */
+  stopFile?: boolean;
+}
+
+async function claimOnce(options: ClaimOptions): Promise<Claim> {
   log = options.log;
+  // Before the socket answers: the answer says whether it does.
+  watchStopFile = options.stopFile ?? process.platform === "win32";
   const endpoint = options.endpoint ?? daemonEndpoint();
   const result: LockResult =
     "unavailable" in endpoint
@@ -764,9 +894,26 @@ async function claimOnce(options: { log: (msg: string) => void; endpoint?: Endpo
   writePidFile();
   process.on("SIGTERM", () => stopHandler());
   process.on("SIGINT", () => stopHandler());
+  // The terminal or console a daemon runs in the foreground in was closed.
+  // Windows ends the process about ten seconds later.
+  process.on("SIGHUP", () => stopHandler());
+  // Ctrl-Break, in a console on Windows.
+  if (process.platform === "win32") process.on("SIGBREAK", () => stopHandler());
   process.on("exit", releaseDaemonLock);
   checkTimer = setInterval(() => void checkDaemonLock(), SELF_CHECK_MS);
   checkTimer.unref();
+  if (result.state === "held" && watchStopFile) {
+    stopTimer = setInterval(checkStopRequest, STOP_POLL_MS);
+    stopTimer.unref();
+    // A request this daemon stopped for is removed once it has, cleanly.
+    // After an error exit it stays, for the supervisor: that exit came
+    // after `engram stop`, so the daemon isn't started again.
+    process.on("exit", (code) => {
+      if (code === 0) removeStopFileIf((request) => request.pid === process.pid);
+    });
+  } else {
+    watchStopFile = false;
+  }
   return result.state === "held" ? { state: "held" } : { state: "unavailable", reason: result.reason };
 }
 
@@ -780,6 +927,7 @@ export function releaseDaemonLock(): void {
   if (released) return;
   released = true;
   if (checkTimer) clearInterval(checkTimer);
+  if (stopTimer) clearInterval(stopTimer);
   if (claim === null) return;
   removePidFileIf(process.pid);
   if (held) unlockEndpoint(held);

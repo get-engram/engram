@@ -4,10 +4,11 @@
  *
  * node.exe is a console program, so whatever it runs at sign-in gets a
  * console window, and closing that window would end the daemon. So this
- * starts the worker detached and hidden, as `engram start` does, and exits:
- * the window only flashes.
+ * starts the supervisor detached and hidden, as `engram start` does, and
+ * exits: the window only flashes. The supervisor starts the worker, and
+ * starts it again if it exits with an error (engram#613; see supervise.ts).
  *
- * It starts the worker without checking for one. The worker does that
+ * It starts them without checking for a daemon. The worker does that
  * itself (engram#612): if a daemon already answers on its named pipe, it
  * exits at once. The PID file is never taken as a sign of one here.
  * Signing out ends every program the user was running, so a file left from
@@ -19,6 +20,6 @@
  *
  * Import-light, like worker.ts: see launch.ts.
  */
-import { spawnWorker } from "./launch.js";
+import { spawnSupervisor } from "./launch.js";
 
-spawnWorker();
+spawnSupervisor();

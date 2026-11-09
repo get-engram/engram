@@ -922,8 +922,9 @@ describe("daemon.db schema version 1 (engram#594)", () => {
 
     new DaemonDb(path).close();
     const after = inspect();
-    expect(after.version).toBe(2); // version 1, then 2 (engram#598)
+    expect(after.version).toBe(3); // version 1, then 2 (engram#598), then 3 (engram#593)
     expect(after.tables).toContain("remote_deletes");
+    expect(after.tables).toContain("gone_conversations");
     expect(after.queueColumns).toContain("key_fp");
     expect(after.sessionKey).toEqual(["conversation_id"]);
     expect(after.rows).toEqual(before.rows);
@@ -940,7 +941,7 @@ describe("daemon.db schema version 1 (engram#594)", () => {
     const before = hash();
 
     const ro = new DaemonDb(path, { readonly: true });
-    const stats = { trackedFiles: 1, pendingMessages: 2, heldMessages: 0, sessionsMapped: 1 };
+    const stats = { trackedFiles: 1, pendingMessages: 2, heldMessages: 0, notSentMessages: 0, sessionsMapped: 1 };
     expect(ro.getStats(fp("key-a1"))).toEqual(stats);
     expect(ro.getStats(null)).toEqual(stats);
     expect(ro.getHeldCount(fp("key-a1"))).toBe(0);

@@ -456,6 +456,26 @@ export function isNotFound(err: unknown): boolean {
   return NOT_FOUND.test(bodyCode(message) ?? message);
 }
 
+/**
+ * True only when Engram's append tool answered that the conversation can't
+ * be written to (engram#593): absent, deleted, or not this account's, which
+ * the server doesn't tell apart. Its refusal carries the code
+ * `conversation_not_found` (engram#592), and the SDK passes that body on as
+ * the message of an error with no HTTP status.
+ *
+ * Narrower than isNotFound on purpose: the daemon stops sending the
+ * conversation's messages on this answer, so anything else must stay an
+ * ordinary failure that is retried. The bare phrase "Conversation not
+ * found" is the delete tool's, not an answer to a send. An error that
+ * carries a status, an HTTP 404 included, came from whatever answered at
+ * that URL, which need not be Engram (a proxy, the wrong host).
+ */
+export function isConversationGone(err: unknown): boolean {
+  const { status, message } = errorParts(err);
+  if (status !== undefined) return false;
+  return bodyCode(message) === "conversation_not_found";
+}
+
 const n = (x: number) => x.toLocaleString("en-US");
 
 /**

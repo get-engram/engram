@@ -129,8 +129,28 @@ CREATE INDEX IF NOT EXISTS idx_pending_sent
   ON pending_messages(sent_at) WHERE sent_at IS NOT NULL;
 `;
 
+/**
+ * Schema version 3 (engram#593): conversations Engram answered it doesn't
+ * have — deleted there, or not this account's, which the server doesn't
+ * tell apart. Their queued messages stay here and aren't sent, and the
+ * conversation is never created again. The daemon asks again a few times
+ * over the next days (GONE_RECHECK_MS in syncer.ts), then stops asking.
+ *
+ * One row per conversation, whichever key its messages were queued under:
+ * a conversation id is one account's, and its messages are only ever sent
+ * with a key of that account.
+ */
+const SCHEMA_V3 = `
+CREATE TABLE IF NOT EXISTS gone_conversations (
+  conversation_id TEXT PRIMARY KEY,
+  gone_at INTEGER NOT NULL,     -- ms since the epoch: the first such answer
+  checked_at INTEGER NOT NULL,  -- ms since the epoch: the latest such answer
+  checks INTEGER NOT NULL       -- how many such answers so far
+);
+`;
+
 /** The schema version this code brings a daemon.db up to (user_version). */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /**
  * Deletes up to `limit` rows sent before a time, oldest first (engram#598).
@@ -156,6 +176,13 @@ function hasColumn(db: Database.Database, table: string, column: string): boolea
   );
 }
 
+function hasTable(db: Database.Database, table: string): boolean {
+  return (
+    db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(table) !==
+    undefined
+  );
+}
+
 /** Bring a daemon.db up to SCHEMA_VERSION in ONE transaction: a crash
  *  part-way leaves it at the version it had, exactly as it was, and the
  *  next start retries. */
@@ -171,6 +198,7 @@ function migrate(db: Database.Database): void {
       db.exec(SCHEMA_V1);
     }
     db.exec(SCHEMA_V2);
+    db.exec(SCHEMA_V3);
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
   }).immediate();
 }
@@ -195,6 +223,9 @@ export class DaemonDb {
    *  still owns (no key_fp yet). That daemon sends every queued row with
    *  its own key, so they all count as pending, none as held. */
   private keyed: boolean;
+  /** False only for a read-only open of a daemon.db that an older daemon
+   *  still owns (before version 3): no conversation is set aside there. */
+  private goneKnown: boolean;
 
   /**
    * `readonly` is for the CLI reading a daemon's database while the daemon
@@ -205,6 +236,7 @@ export class DaemonDb {
     if (options.readonly) {
       this.db = new Database(dbPath, { readonly: true, fileMustExist: true });
       this.keyed = hasColumn(this.db, "pending_messages", "key_fp");
+      this.goneKnown = hasTable(this.db, "gone_conversations");
       return;
     }
     // The queue holds captured transcript text, so its files are the
@@ -233,6 +265,7 @@ export class DaemonDb {
     this.db.exec(SCHEMA);
     migrate(this.db);
     this.keyed = true;
+    this.goneKnown = true;
   }
 
   // ── File offsets ──
@@ -357,6 +390,7 @@ export class DaemonDb {
         .prepare("SELECT COUNT(*) AS c FROM pending_messages WHERE conversation_id = ? AND sent_at IS NULL")
         .get(conversationId) as { c: number };
       this.db.prepare("DELETE FROM pending_messages WHERE conversation_id = ?").run(conversationId);
+      this.db.prepare("DELETE FROM gone_conversations WHERE conversation_id = ?").run(conversationId);
       return unsent;
     })();
   }
@@ -577,14 +611,86 @@ export class DaemonDb {
     insertMany(messages);
   }
 
-  /** Conversation ids with unsent messages queued under `keyFp`. */
+  /** Conversation ids with unsent messages queued under `keyFp`, but for
+   *  those Engram said it doesn't have (engram#593). */
   getPendingConversationIds(keyFp: string | null): string[] {
     const rows = this.db
       .prepare(
-        "SELECT DISTINCT conversation_id FROM pending_messages WHERE sent_at IS NULL AND key_fp IS ?",
+        `SELECT DISTINCT conversation_id FROM pending_messages
+          WHERE sent_at IS NULL AND key_fp IS ?${this.notGone()}`,
       )
       .all(keyFp) as { conversation_id: string }[];
     return rows.map((r) => r.conversation_id);
+  }
+
+  // ── Conversations Engram doesn't have (engram#593) ──
+
+  /**
+   * Record that Engram answered it has no conversation `conversationId`
+   * (deleted, or not this account's), at `at` (ms). Its queued messages
+   * stay here and are no longer sent, until clearGone. Returns how many
+   * times in a row Engram has answered so, this one included.
+   */
+  markGone(conversationId: string, at: number): number {
+    const row = this.db
+      .prepare(
+        `INSERT INTO gone_conversations (conversation_id, gone_at, checked_at, checks)
+         VALUES (?, ?, ?, 1)
+         ON CONFLICT(conversation_id)
+         DO UPDATE SET checked_at = excluded.checked_at, checks = checks + 1
+         RETURNING checks`,
+      )
+      .get(conversationId, at, at) as { checks: number };
+    return row.checks;
+  }
+
+  /** Engram has the conversation after all: its messages are sent again. */
+  clearGone(conversationId: string): void {
+    this.db.prepare("DELETE FROM gone_conversations WHERE conversation_id = ?").run(conversationId);
+  }
+
+  /** The conversations Engram said it doesn't have that have unsent
+   *  messages queued under `keyFp`: when it last said so, and how many
+   *  times. */
+  getGoneConversations(
+    keyFp: string | null,
+  ): Array<{ conversationId: string; checkedAt: number; checks: number }> {
+    if (!this.goneKnown) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT conversation_id, checked_at, checks FROM gone_conversations g
+          WHERE EXISTS (
+            SELECT 1 FROM pending_messages pm
+             WHERE pm.conversation_id = g.conversation_id
+               AND pm.sent_at IS NULL AND pm.key_fp IS ?)
+          ORDER BY gone_at, conversation_id`,
+      )
+      .all(keyFp) as Array<{ conversation_id: string; checked_at: number; checks: number }>;
+    return rows.map((r) => ({
+      conversationId: r.conversation_id,
+      checkedAt: r.checked_at,
+      checks: r.checks,
+    }));
+  }
+
+  /** Unsent messages of one conversation, whichever key queued them. */
+  getUnsentCount(conversationId: string): number {
+    return this.count("conversation_id = ?", conversationId);
+  }
+
+  /** Unsent messages of conversations Engram said it doesn't have,
+   *  whichever key queued them: they're kept here, and not sent. */
+  getNotSentCount(): number {
+    if (!this.goneKnown) return 0;
+    return this.count("conversation_id IN (SELECT conversation_id FROM gone_conversations)");
+  }
+
+  /** The condition that leaves out conversations Engram said it doesn't
+   *  have; none for a daemon.db from before version 3. */
+  private notGone(): string {
+    return this.goneKnown
+      ? " AND conversation_id NOT IN (SELECT conversation_id FROM gone_conversations)"
+      : "";
   }
 
   /** Dequeue up to `limit` unsent messages a conversation has under `keyFp`. */
@@ -678,18 +784,20 @@ export class DaemonDb {
   }
 
   /** Unsent messages queued under `keyFp`; every unsent message when no
-   *  key is given. */
+   *  key is given. Neither counts the messages of a conversation Engram
+   *  said it doesn't have (engram#593): those aren't sent. */
   getPendingCount(keyFp?: string): number {
-    if (keyFp === undefined || !this.keyed) return this.count("1 = 1");
-    return this.count("key_fp IS ?", keyFp);
+    if (keyFp === undefined || !this.keyed) return this.count(`1 = 1${this.notGone()}`);
+    return this.count(`key_fp IS ?${this.notGone()}`, keyFp);
   }
 
   /** Unsent messages waiting for an account other than `keyFp` (`null`:
-   *  every unsent message — nobody is signed in to send them). */
+   *  every unsent message — nobody is signed in to send them), but for
+   *  those of a conversation Engram said it doesn't have. */
   getHeldCount(keyFp: string | null): number {
     if (!this.keyed) return 0;
-    if (keyFp === null) return this.count("1 = 1");
-    return this.count("key_fp IS NOT ?", keyFp);
+    if (keyFp === null) return this.count(`1 = 1${this.notGone()}`);
+    return this.count(`key_fp IS NOT ?${this.notGone()}`, keyFp);
   }
 
   private count(where: string, ...params: Array<string | null>): number {
@@ -781,12 +889,15 @@ export class DaemonDb {
    * `pendingMessages` are the unsent messages `keyFp` will send, and
    * `heldMessages` the ones waiting for another account. No `keyFp`: every
    * unsent message is pending. `null`: nobody is signed in, so every unsent
-   * message is held.
+   * message is held. `notSentMessages` are those of conversations Engram
+   * said it doesn't have (engram#593), whoever is signed in: they're in
+   * neither of the other two.
    */
   getStats(keyFp?: string | null): {
     trackedFiles: number;
     pendingMessages: number;
     heldMessages: number;
+    notSentMessages: number;
     sessionsMapped: number;
   } {
     const files = (
@@ -815,6 +926,7 @@ export class DaemonDb {
       trackedFiles: files,
       pendingMessages: pending,
       heldMessages: held,
+      notSentMessages: this.getNotSentCount(),
       sessionsMapped: sessions,
     };
   }

@@ -216,7 +216,9 @@ export async function daemonStop(): Promise<void> {
  *
  * "Pending" counts what the configured key will send. What another
  * account's key queued is "held" (engram#594): it stays on this machine
- * and is sent only when that account signs in again.
+ * and is sent only when that account signs in again. What was queued for a
+ * conversation Engram no longer has is "not sent" (engram#593): it stays on
+ * this machine, and the conversation isn't created again.
  */
 async function printDbStats(): Promise<void> {
   if (!existsSync(DB_FILE)) return;
@@ -238,6 +240,13 @@ async function printDbStats(): Promise<void> {
       console.log(
         `${dim("Held:")}              ${plural(stats.heldMessages, "message")} ` +
           dim(key ? "(another account's — sent when it signs in again)" : "(sent when their account signs in)"),
+      );
+    }
+    // engram#593: Engram doesn't have their conversation any more.
+    if (stats.notSentMessages > 0) {
+      console.log(
+        `${dim("Not sent:")}          ${plural(stats.notSentMessages, "message")} ` +
+          dim("(their conversation is no longer on Engram — kept on this machine; nothing to do if you deleted it)"),
       );
     }
     console.log(`${dim("Files tracked:")}     ${stats.trackedFiles}`);

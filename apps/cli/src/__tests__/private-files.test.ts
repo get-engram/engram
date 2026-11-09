@@ -653,6 +653,8 @@ describe("launchd's log (engram#627)", () => {
         if (!loaded) throw failed();
         return "{\n};\n";
       }
+      // Never switched off (engram#654).
+      if (command === `print-disabled ${domain}`) return "\n\tdisabled services = {\n\t}\n";
       if (command === `bootstrap ${domain} ${plist}`) {
         logModes.push(existsSync(LOG_FILE) ? mode(LOG_FILE) : null);
         loaded = true;
@@ -664,7 +666,7 @@ describe("launchd's log (engram#627)", () => {
 
     try {
       await daemonInstall();
-      expect(calls).toEqual(["bootout", "unload", "list", "bootstrap"]);
+      expect(calls).toEqual(["print-disabled", "bootout", "unload", "list", "bootstrap"]);
       expect(logModes).toEqual([0o600]);
       expect(mode(ENGRAM)).toBe(0o700);
 
@@ -675,7 +677,7 @@ describe("launchd's log (engram#627)", () => {
       calls.length = 0;
       logModes.length = 0;
       expect(repairLaunchdIfStale()).toBe(true);
-      expect(calls).toEqual(["bootout", "list", "bootstrap"]);
+      expect(calls).toEqual(["print-disabled", "bootout", "list", "bootstrap"]);
       expect(logModes).toEqual([0o600]);
     } finally {
       for (const made of ["Library", "bin", "cli"]) rmSync(join(home.dir, made), { recursive: true, force: true });

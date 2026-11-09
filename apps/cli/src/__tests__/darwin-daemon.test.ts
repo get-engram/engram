@@ -56,6 +56,18 @@ const { home, daemon, launchd, spawn, execSync, execFileSync } = vi.hoisted(() =
     /** How many `list` calls after a bootout still find the job, while launchd lets go of it. */
     stillLoadedFor: 0,
     lingering: 0,
+    /**
+     * launchd's switch for the job, which it keeps with the plist gone
+     * (engram#654): `launchctl disable` (or `unload -w`) switches it off,
+     * `enable` (or `load -w`) on. null: neither ever, so print-disabled
+     * doesn't list it. A job switched off stays loaded until it is unloaded,
+     * but launchd loads it no more.
+     */
+    switchedOff: null as boolean | null,
+    /** What `print-disabled` prints instead, when set. */
+    disabledOutput: null as string | null,
+    printDisabledFails: false,
+    enableFails: false,
     /** Calls the fake didn't expect; each fails the test. */
     unexpected: [] as string[],
   },
@@ -140,7 +152,9 @@ const {
 } = await import("../daemon/commands.js");
 const {
   PLIST_VERSION,
+  agentDisabled,
   agentPid,
+  disabledIn,
   generatePlist,
   launchctlPath,
   pathsIn,
@@ -230,6 +244,17 @@ function listing(): string {
   );
 }
 
+/**
+ * What `launchctl print-disabled gui/<uid>` prints: each job launchd has a
+ * switch for. Another job's, and one whose label starts with ours, which
+ * isn't ours.
+ */
+function disabledListing(): string {
+  const ours =
+    launchd.switchedOff === null ? "" : `\t\t"${LABEL}" => ${launchd.switchedOff ? "disabled" : "enabled"}\n`;
+  return `\n\tdisabled services = {\n\t\t"com.example.agent" => disabled\n${ours}\t\t"${LABEL}.helper" => disabled\n\t}\n`;
+}
+
 function load(plist: string): void {
   launchd.loaded = true;
   launchd.loadedText = readFileSync(plist, "utf-8");
@@ -262,17 +287,30 @@ function fakeLaunchctl(file: string, args: string[]): string {
     throw failed(command, `Could not find service "${LABEL}" in domain for port\n`);
   }
   if (is("bootstrap", DOMAIN, plist)) {
+    if (launchd.switchedOff) throw failed(command, "Bootstrap failed: 119: Service is disabled\n");
     if (launchd.bootstrapFails || launchd.loaded || launchd.lingering > 0 || !existsSync(plist)) {
       throw failed(command, "Bootstrap failed: 5: Input/output error\n");
     }
     load(plist);
     return "";
   }
-  if (is("load", "-w", plist)) {
+  if (is("load", "-w", plist) || is("load", plist)) {
+    // -w switches the job on first, whether or not it then loads.
+    if (args[1] === "-w") launchd.switchedOff = false;
+    if (launchd.switchedOff) throw failed(command, "Load failed: 119: Service is disabled\n");
     if (launchd.loadFails || launchd.loaded || launchd.lingering > 0 || !existsSync(plist)) {
       throw failed(command, "Load failed: 5: Input/output error\nTry running `launchctl bootstrap` as root for richer errors.\n");
     }
     load(plist);
+    return "";
+  }
+  if (is("print-disabled", DOMAIN)) {
+    if (launchd.printDisabledFails) throw failed(command, "Could not find domain for port\n");
+    return launchd.disabledOutput ?? disabledListing();
+  }
+  if (is("enable", `${DOMAIN}/${LABEL}`)) {
+    if (launchd.enableFails) throw failed(command, "Could not enable service: 1: Operation not permitted\n");
+    launchd.switchedOff = false;
     return "";
   }
   if (is("bootout", `${DOMAIN}/${LABEL}`)) {
@@ -292,6 +330,13 @@ function fakeLaunchctl(file: string, args: string[]): string {
 /** The fake launchctl's calls, by their first word. */
 function launchctlCalls(): string[] {
   return execFileSync.mock.calls.map(([, args]) => (args as string[])[0]);
+}
+
+/** The fake launchctl's loads, as their arguments: never -w but for `engram install` (engram#654). */
+function loads(): string[] {
+  return execFileSync.mock.calls
+    .map(([, args]) => (args as string[]).join(" "))
+    .filter((command) => command.startsWith("load "));
 }
 
 /** A spawned worker, as far as the CLI looks at one. */
@@ -346,6 +391,28 @@ function said(): string {
   return text;
 }
 
+/**
+ * Auto-capture runs, in the describe this is called in: signed in, at a
+ * terminal, without what the test run itself sets to keep auto-capture out
+ * of other tests.
+ */
+function signedInAtATerminal(): void {
+  const realIsTTY = process.stdin.isTTY;
+  const config = vi.mocked(loadConfig);
+
+  beforeEach(() => {
+    vi.stubEnv("ENGRAM_NO_AUTOCAPTURE", "");
+    vi.stubEnv("ENGRAM_API_KEY", undefined);
+    Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+    config.mockResolvedValue({ apiKey: "eng_test_616" } as never);
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process.stdin, "isTTY", { value: realIsTTY, configurable: true });
+    config.mockReset().mockImplementation(async () => ({}) as never);
+  });
+}
+
 beforeEach(() => {
   Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
   Object.assign(launchd, {
@@ -359,6 +426,10 @@ beforeEach(() => {
     bootoutFails: false,
     stillLoadedFor: 0,
     lingering: 0,
+    switchedOff: null,
+    disabledOutput: null,
+    printDisabledFails: false,
+    enableFails: false,
     unexpected: [],
   });
   daemon.answering = null;
@@ -665,7 +736,7 @@ describe("engram install on macOS (engram#616)", () => {
     expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
     expect(readdirSync(AGENTS)).toEqual(["app.getengram.daemon.plist"]);
     // Any job of ours unloaded first, and gone, then the new one loaded.
-    expect(launchctlCalls()).toEqual(["bootout", "unload", "list", "bootstrap"]);
+    expect(launchctlCalls()).toEqual(["print-disabled", "bootout", "unload", "list", "bootstrap"]);
     expect(launchd.loadedText).toBe(plistWith());
     // launchd starts it (RunAtLoad), not the CLI.
     expect(spawn).not.toHaveBeenCalled();
@@ -710,14 +781,14 @@ describe("engram install on macOS (engram#616)", () => {
     daemonRunning();
     await daemonInstall();
     // Not unloaded: that would stop the daemon.
-    expect(launchctlCalls()).toEqual(["list"]);
+    expect(launchctlCalls()).toEqual(["print-disabled", "list"]);
     expect(output()).toContain("Auto-start enabled — daemon will start on login");
   });
 
   it("loads one that is there but not loaded", async () => {
     writePlist(plistWith());
     await daemonInstall();
-    expect(launchctlCalls()).toEqual(["list", "list", "bootout", "unload", "list", "bootstrap"]);
+    expect(launchctlCalls()).toEqual(["list", "print-disabled", "list", "bootout", "unload", "list", "bootstrap"]);
     expect(launchd.loaded).toBe(true);
     expect(output()).toContain("Auto-start enabled");
   });
@@ -728,14 +799,15 @@ describe("engram install on macOS (engram#616)", () => {
     launchd.loadedText = v1Plist();
     await daemonInstall();
     expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
-    expect(launchctlCalls()).toEqual(["list", "bootout", "list", "bootstrap"]);
+    expect(launchctlCalls()).toEqual(["list", "print-disabled", "bootout", "list", "bootstrap"]);
     expect(launchd.loadedText).toBe(plistWith());
   });
 
   it("loads it with load -w where bootstrap fails: older macOS, or a job switched off", async () => {
     launchd.bootstrapFails = true;
     await daemonInstall();
-    expect(launchctlCalls()).toEqual(["bootout", "unload", "list", "bootstrap", "load"]);
+    expect(launchctlCalls()).toEqual(["print-disabled", "bootout", "unload", "list", "bootstrap", "load"]);
+    expect(loads()).toEqual([`load -w ${PLIST}`]);
     expect(launchd.loaded).toBe(true);
     expect(output()).toContain("Auto-start enabled — daemon will start on login");
   });
@@ -779,7 +851,7 @@ describe("engram install on macOS (engram#616)", () => {
       expect(lstatSync(PLIST).isFile()).toBe(true);
       expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
       expect(readFileSync(target, "utf-8")).toBe(v1Plist());
-      expect(launchctlCalls()).toEqual(["list", "bootout", "unload", "list", "bootstrap"]);
+      expect(launchctlCalls()).toEqual(["list", "print-disabled", "bootout", "unload", "list", "bootstrap"]);
     } finally {
       rmSync(target, { force: true });
     }
@@ -833,7 +905,7 @@ describe("engram install on macOS (engram#616)", () => {
     await daemonStart([], { install: "" });
     expect(spawn).not.toHaveBeenCalled();
     expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
-    expect(launchctlCalls()).toEqual(["bootout", "unload", "list", "bootstrap"]);
+    expect(launchctlCalls()).toEqual(["print-disabled", "bootout", "unload", "list", "bootstrap"]);
     const text = output();
     expect(text).toContain("Daemon already running");
     expect(text).toContain("Auto-start enabled — daemon will start on login");
@@ -848,7 +920,7 @@ describe("engram start on macOS (engram#616)", () => {
     await daemonStart([], {});
     expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
     expect(launchd.loadedText).toBe(plistWith());
-    expect(launchctlCalls()).toEqual(["list", "bootout", "list", "bootstrap"]);
+    expect(launchctlCalls()).toEqual(["list", "print-disabled", "bootout", "list", "bootstrap"]);
     expect(output()).toContain(`Updated auto-start configuration (plist v${PLIST_VERSION})`);
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(process.exitCode).toBeUndefined();
@@ -914,7 +986,7 @@ describe("engram start on macOS (engram#616)", () => {
     }
     expect(readFileSync(PLIST, "utf-8")).toBe(v1Plist());
     expect(readdirSync(AGENTS)).toEqual(["app.getengram.daemon.plist"]);
-    expect(launchctlCalls()).toEqual(["list"]);
+    expect(launchctlCalls()).toEqual(["list", "print-disabled"]);
     expect(output()).not.toContain("Updated auto-start configuration");
     expect(spawn).toHaveBeenCalledTimes(1);
   });
@@ -951,17 +1023,19 @@ describe("engram start on macOS (engram#616)", () => {
     launchd.loaded = true;
     launchd.stillLoadedFor = 3;
     await daemonStart([], {});
-    expect(launchctlCalls()).toEqual(["list", "bootout", "list", "list", "list", "list", "bootstrap"]);
+    expect(launchctlCalls()).toEqual(["list", "print-disabled", "bootout", "list", "list", "list", "list", "bootstrap"]);
     expect(launchd.loadedText).toBe(plistWith());
   });
 
-  it("unloads and loads with unload and load -w on older macOS", async () => {
+  it("unloads and loads with unload and load on older macOS", async () => {
     writePlist(v1Plist());
     launchd.loaded = true;
     launchd.bootoutFails = true;
     launchd.bootstrapFails = true;
     await daemonStart([], {});
-    expect(launchctlCalls()).toEqual(["list", "bootout", "unload", "list", "bootstrap", "load"]);
+    expect(launchctlCalls()).toEqual(["list", "print-disabled", "bootout", "unload", "list", "bootstrap", "load"]);
+    // Not -w: that would switch back on a job the user switched off (engram#654).
+    expect(loads()).toEqual([`load ${PLIST}`]);
     expect(launchd.loadedText).toBe(plistWith());
   });
 
@@ -977,6 +1051,7 @@ describe("engram start on macOS (engram#616)", () => {
       clock.mockRestore();
     }
     expect(launchctlCalls()).toEqual(["bootout", "list", "list", "list", "list", "list", "bootstrap", "load"]);
+    expect(loads()).toEqual([`load ${PLIST}`]);
   });
 });
 
@@ -989,7 +1064,7 @@ describe("engram status on macOS (engram#616)", () => {
     expect(text).toContain("Auto-start: enabled (launchd)");
     expect(text).not.toContain("outdated");
     expect(text).not.toContain("broken");
-    expect(execFileSync).not.toHaveBeenCalled();
+    expect(launchctlCalls()).toEqual(["print-disabled"]);
   });
 
   it("says a plist launchd can't start the daemon from is broken", async () => {
@@ -1040,7 +1115,7 @@ describe("engram status on macOS (engram#616)", () => {
     const text = output();
     expect(text).toContain("Status: running (pid 4242)");
     expect(text).toContain("It's from an older version of Engram");
-    expect(launchctlCalls()).toEqual(["list"]);
+    expect(launchctlCalls()).toEqual(["list", "print-disabled"]);
   });
 
   it("names the daemon launchd runs when something holds the socket and doesn't answer", async () => {
@@ -1050,7 +1125,7 @@ describe("engram status on macOS (engram#616)", () => {
     daemon.silent = true;
     await daemonStatus();
     expect(output()).toContain("Status: running (pid 4242) — not answering right now");
-    expect(launchctlCalls()).toEqual(["list"]);
+    expect(launchctlCalls()).toEqual(["list", "print-disabled"]);
   });
 
   it("off macOS, never takes a plist older CLIs wrote for launchd's, or asks launchctl about it", async () => {
@@ -1121,21 +1196,7 @@ describe("engram uninstall on macOS (engram#616)", () => {
 });
 
 describe("auto-capture on macOS (engram#616)", () => {
-  const realIsTTY = process.stdin.isTTY;
-  const config = vi.mocked(loadConfig);
-
-  beforeEach(() => {
-    // What the test run itself sets to keep auto-capture out of other tests.
-    vi.stubEnv("ENGRAM_NO_AUTOCAPTURE", "");
-    vi.stubEnv("ENGRAM_API_KEY", undefined);
-    Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-    config.mockResolvedValue({ apiKey: "eng_test_616" } as never);
-  });
-
-  afterEach(() => {
-    Object.defineProperty(process.stdin, "isTTY", { value: realIsTTY, configurable: true });
-    config.mockReset().mockImplementation(async () => ({}) as never);
-  });
+  signedInAtATerminal();
 
   it("starts the daemon and turns on start at login after sign-in, then says nothing more", async () => {
     await autoEnableCapture({ after: "login" });
@@ -1144,7 +1205,7 @@ describe("auto-capture on macOS (engram#616)", () => {
     expect(text).toContain("Auto-start enabled — daemon will start on login");
     expect(text).toContain("Auto-capture is on");
     expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
-    expect(launchctlCalls()).toEqual(["bootstrap"]);
+    expect(launchctlCalls()).toEqual(["print-disabled", "bootstrap"]);
     expect(launchd.loadedText).toBe(plistWith());
 
     execFileSync.mockClear();
@@ -1210,7 +1271,7 @@ describe("auto-capture on macOS (engram#616)", () => {
     expect(said()).toBe("");
     expect(readFileSync(PLIST, "utf-8")).toBe(v1Plist());
     expect(readdirSync(AGENTS)).toEqual([`${LABEL}.plist`]);
-    expect(execFileSync).not.toHaveBeenCalled();
+    expect(launchctlCalls()).toEqual(["print-disabled"]);
   });
 
   it("repairs a broken plist of its own", async () => {
@@ -1275,10 +1336,294 @@ describe("auto-capture on macOS (engram#616)", () => {
     daemonRunning();
     await autoEnableCapture({ after: "login" });
     expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
-    expect(launchctlCalls()).toEqual(["bootstrap", "load"]);
+    expect(launchctlCalls()).toEqual(["print-disabled", "bootstrap", "load"]);
+    expect(loads()).toEqual([`load ${PLIST}`]);
     const text = said();
     expect(text).toContain("Auto-start enabled");
     expect(text).toContain("Auto-capture is on");
+  });
+});
+
+describe("launchd's switch for the job (engram#654)", () => {
+  /** What print-disabled prints with these entries in its list. */
+  const listed = (...entries: string[]) =>
+    `\n\tdisabled services = {\n${entries.map((entry) => `\t\t${entry}\n`).join("")}\t}\n`;
+
+  it("is read from launchctl print-disabled: switched off, switched on, or never switched", () => {
+    expect(disabledIn(listed(`"${LABEL}" => disabled`))).toBe(true);
+    expect(disabledIn(listed(`"${LABEL}" => enabled`))).toBe(false);
+    // Older macOS: true for switched off, false for on.
+    expect(disabledIn(listed(`"${LABEL}" => true`))).toBe(true);
+    expect(disabledIn(listed(`"${LABEL}" => false`))).toBe(false);
+    // Never switched: launchd loads it.
+    expect(disabledIn(listed(`"com.example.agent" => disabled`))).toBe(false);
+    expect(disabledIn(listed())).toBe(false);
+    expect(disabledIn(listed(`"com.example.agent" => disabled`, `"${LABEL}" => disabled`))).toBe(true);
+  });
+
+  it("is the job's own, never another's whose label starts or ends with it", () => {
+    for (const other of [`${LABEL}.helper`, `x.${LABEL}`, LABEL.toUpperCase(), ` ${LABEL}`, `${LABEL} `]) {
+      expect(disabledIn(listed(`"${other}" => disabled`))).toBe(false);
+    }
+    // Nor in another list, or after the list.
+    const elsewhere = `\tother services = {\n\t\t"${LABEL}" => disabled\n\t}\n`;
+    expect(disabledIn(elsewhere)).toBeNull();
+    expect(disabledIn(elsewhere + listed())).toBe(false);
+    expect(disabledIn(listed() + elsewhere)).toBe(false);
+    expect(disabledIn(`${listed()}"${LABEL}" => disabled\n`)).toBe(false);
+  });
+
+  it("is unknown from output it doesn't know", () => {
+    for (const output of ["", "\n", `"${LABEL}" => disabled\n`, "disabled services = {\n"]) {
+      // The last: a list it never saw the end of, which doesn't name the job.
+      expect(disabledIn(output)).toBe(output.startsWith("disabled") ? false : null);
+    }
+    for (const value of ["off", "", "disabled!", "Disabled"]) {
+      expect(disabledIn(listed(`"${LABEL}" => ${value}`))).toBeNull();
+    }
+  });
+
+  it("is asked of the user's own launchd session, and is unknown when launchctl can't say", () => {
+    expect(agentDisabled()).toBe(false);
+    launchd.switchedOff = true;
+    expect(agentDisabled()).toBe(true);
+    launchd.switchedOff = false;
+    expect(agentDisabled()).toBe(false);
+    launchd.printDisabledFails = true;
+    expect(agentDisabled()).toBeNull();
+    launchd.printDisabledFails = false;
+    launchd.disabledOutput = "something a later macOS prints\n";
+    expect(agentDisabled()).toBeNull();
+    vi.stubEnv("PATH", NO_BIN);
+    expect(agentDisabled()).toBeNull();
+    const asked = execFileSync.mock.calls.map(([, args]) => (args as string[]).join(" "));
+    expect(asked).toEqual(Array(5).fill(`print-disabled ${DOMAIN}`));
+  });
+});
+
+describe("a job switched off in launchd (engram#654)", () => {
+  beforeEach(() => {
+    // As `launchctl disable`, or System Settings' Login Items, would leave it.
+    launchd.switchedOff = true;
+  });
+
+  it("engram start leaves its older or broken plist as it is, and the job launchd has", async () => {
+    for (const text of [v1Plist(), plistWith({ node: join(home.dir, "gone", "node") }), "<plist/>"]) {
+      writePlist(text);
+      // Loaded before it was switched off: launchd keeps it until it is unloaded.
+      launchd.loaded = true;
+      launchd.loadedText = text;
+      daemonGone();
+      execFileSync.mockClear();
+      await daemonStart([], {});
+      expect(readFileSync(PLIST, "utf-8")).toBe(text);
+      expect(launchctlCalls()).toEqual(["list", "print-disabled"]);
+      expect(launchd.loadedText).toBe(text);
+      expect(said()).not.toContain("Updated auto-start configuration");
+    }
+    expect(launchd.switchedOff).toBe(true);
+    expect(spawn).toHaveBeenCalledTimes(3);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("engram status says start at login is off, before whether the plist is broken or outdated", async () => {
+    for (const text of [plistWith(), v1Plist(), plistWith({ node: join(home.dir, "gone", "node") })]) {
+      writePlist(text);
+      daemonRunning();
+      execFileSync.mockClear();
+      await daemonStatus();
+      const status = said();
+      expect(status).toContain("Auto-start: off — disabled in launchd  ('engram install' turns it back on)");
+      expect(status).not.toContain("enabled (launchd)");
+      expect(launchctlCalls()).toEqual(["print-disabled"]);
+    }
+    // Stopped, it isn't something that should be running.
+    daemonGone();
+    writePlist(plistWith());
+    await daemonStatus();
+    const text = said();
+    expect(text).toContain("Status: stopped");
+    expect(text).toContain("Auto-start: off — disabled in launchd");
+    expect(text).not.toContain("It should be running");
+  });
+
+  it("engram status says start at login is on when launchctl can't say it's off", async () => {
+    writePlist(plistWith());
+    daemonRunning();
+    for (const fails of [{ printDisabledFails: true }, { disabledOutput: "something a later macOS prints\n" }]) {
+      Object.assign(launchd, fails);
+      await daemonStatus();
+      expect(said()).toContain("Auto-start: enabled (launchd)");
+    }
+  });
+
+  it("engram install switches it back on, then loads it", async () => {
+    await daemonInstall();
+    expect(launchctlCalls()).toEqual(["print-disabled", "enable", "bootout", "unload", "list", "bootstrap"]);
+    expect(execFileSync.mock.calls[1][1]).toEqual(["enable", `${DOMAIN}/${LABEL}`]);
+    expect(loads()).toEqual([]);
+    expect(launchd.switchedOff).toBe(false);
+    expect(launchd.loadedText).toBe(plistWith());
+    expect(output()).toContain("Auto-start enabled — daemon will start on login");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("engram install switches one launchd has loaded back on, and leaves the daemon it runs", async () => {
+    writePlist(plistWith());
+    launchd.loaded = true;
+    launchd.loadedText = plistWith();
+    daemonRunning();
+    await daemonInstall();
+    expect(launchctlCalls()).toEqual(["print-disabled", "enable", "list"]);
+    expect(launchd.switchedOff).toBe(false);
+    expect(launchd.loaded).toBe(true);
+    expect(output()).toContain("Auto-start enabled — daemon will start on login");
+  });
+
+  it("engram install switches it on with load -w where launchctl enable fails", async () => {
+    launchd.enableFails = true;
+    await daemonInstall();
+    expect(launchctlCalls()).toEqual(["print-disabled", "enable", "bootout", "unload", "list", "bootstrap", "load"]);
+    expect(loads()).toEqual([`load -w ${PLIST}`]);
+    expect(launchd.switchedOff).toBe(false);
+    expect(launchd.loaded).toBe(true);
+    expect(output()).toContain("Auto-start enabled — daemon will start on login");
+
+    // One launchd has loaded is loaded again, to switch it on.
+    launchd.switchedOff = true;
+    daemonRunning();
+    execFileSync.mockClear();
+    await daemonInstall();
+    expect(launchctlCalls()).toEqual(["print-disabled", "enable", "bootout", "list", "bootstrap", "load"]);
+    expect(launchd.switchedOff).toBe(false);
+    expect(launchd.loaded).toBe(true);
+  });
+
+  it("engram install switches it on when launchctl can't say whether it's off", async () => {
+    launchd.printDisabledFails = true;
+    await daemonInstall();
+    expect(launchctlCalls()).toEqual(["print-disabled", "enable", "bootout", "unload", "list", "bootstrap"]);
+    expect(launchd.switchedOff).toBe(false);
+    expect(launchd.loaded).toBe(true);
+  });
+
+  it("engram install doesn't switch on one that is on", async () => {
+    launchd.switchedOff = false;
+    await daemonInstall();
+    expect(launchctlCalls()).toEqual(["print-disabled", "bootout", "unload", "list", "bootstrap"]);
+    launchd.switchedOff = null;
+    rmSync(join(home.dir, "Library"), { recursive: true, force: true });
+    launchd.loaded = false;
+    execFileSync.mockClear();
+    await daemonInstall();
+    expect(launchctlCalls()).toEqual(["print-disabled", "bootout", "unload", "list", "bootstrap"]);
+  });
+
+  it("engram start --install switches it back on too", async () => {
+    daemonRunning();
+    await daemonStart([], { install: "" });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(launchctlCalls()).toEqual(["print-disabled", "enable", "bootout", "unload", "list", "bootstrap"]);
+    expect(launchd.switchedOff).toBe(false);
+    expect(launchd.loaded).toBe(true);
+  });
+
+  it("a repair when launchctl can't say leaves it off all the same: it loads without -w", async () => {
+    launchd.printDisabledFails = true;
+    writePlist(v1Plist());
+    await daemonStart([], {});
+    // Written, as for any older plist, and loaded at no login while it is off.
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+    expect(loads()).toEqual([`load ${PLIST}`]);
+    expect(launchd.switchedOff).toBe(true);
+    expect(launchd.loaded).toBe(false);
+    expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("engram uninstall leaves the switch as it is", async () => {
+    for (const switchedOff of [true, false]) {
+      launchd.switchedOff = switchedOff;
+      writePlist(plistWith());
+      execFileSync.mockClear();
+      await daemonUninstall();
+      expect(existsSync(PLIST)).toBe(false);
+      expect(launchctlCalls()).toEqual(["bootout", "unload"]);
+      expect(launchd.switchedOff).toBe(switchedOff);
+      expect(said()).toContain("Auto-start disabled");
+    }
+  });
+
+  describe("auto-capture", () => {
+    signedInAtATerminal();
+
+    it("leaves its older plist as it is after a command, and says nothing", async () => {
+      writePlist(v1Plist());
+      daemonRunning();
+      await autoEnableCapture({ after: "command" });
+      expect(said()).toBe("");
+      expect(readFileSync(PLIST, "utf-8")).toBe(v1Plist());
+      expect(launchctlCalls()).toEqual(["print-disabled"]);
+      expect(launchd.switchedOff).toBe(true);
+    });
+
+    it("writes a plist where there is none, leaves it off, and says so once", async () => {
+      // launchd keeps the switch after the plist is gone, as after `engram uninstall`.
+      await autoEnableCapture({ after: "login" });
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+      expect(launchctlCalls()).toEqual(["print-disabled"]);
+      expect(launchd.loaded).toBe(false);
+      expect(launchd.switchedOff).toBe(true);
+      const text = said();
+      expect(text).toContain("Start at login is switched off in launchd");
+      expect(text).toContain("Run 'engram install' to start the daemon when you log in.");
+      expect(text).toContain("Auto-capture is on");
+      expect(text).not.toContain("Auto-start enabled");
+
+      // Then nothing more: the plist is current, and launchctl isn't asked.
+      execFileSync.mockClear();
+      for (let command = 0; command < 3; command++) {
+        await autoEnableCapture({ after: "command" });
+        expect(said()).toBe("");
+      }
+      expect(execFileSync).not.toHaveBeenCalled();
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it("says so after any other command too, then nothing more", async () => {
+      daemonRunning();
+      await autoEnableCapture({ after: "command" });
+      expect(spawn).not.toHaveBeenCalled();
+      const text = said();
+      expect(text).toContain("Start at login is switched off in launchd");
+      expect(text).toContain("Auto-capture is on");
+      expect(launchd.loaded).toBe(false);
+      await autoEnableCapture({ after: "command" });
+      expect(said()).toBe("");
+    });
+
+    it("loads it without -w when launchctl can't say whether it's off: one that is on loads, one that is off stays off", async () => {
+      launchd.printDisabledFails = true;
+      for (const switchedOff of [null, true]) {
+        Object.assign(launchd, { switchedOff, loaded: false, loadedText: null });
+        rmSync(join(home.dir, "Library"), { recursive: true, force: true });
+        daemonRunning();
+        execFileSync.mockClear();
+        await autoEnableCapture({ after: "command" });
+        expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+        expect(said()).toContain("Auto-start enabled");
+        if (switchedOff === null) {
+          expect(launchctlCalls()).toEqual(["print-disabled", "bootstrap"]);
+          expect(launchd.loaded).toBe(true);
+        } else {
+          expect(launchctlCalls()).toEqual(["print-disabled", "bootstrap", "load"]);
+          expect(loads()).toEqual([`load ${PLIST}`]);
+          expect(launchd.switchedOff).toBe(true);
+          expect(launchd.loaded).toBe(false);
+        }
+      }
+    });
   });
 });
 

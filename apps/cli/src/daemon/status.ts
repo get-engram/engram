@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, win32 } from "node:path";
+import { join } from "node:path";
 import { writePrivateFileSync } from "../private-files.js";
 import { plural } from "../output.js";
+import { powerShellArgs, windowsPowerShellPath } from "./powershell.js";
 
 const STATUS_FILE = join(homedir(), ".engram", "status.json");
 
@@ -647,8 +648,8 @@ export function notifyCommand(
       // Windows PowerShell by its full path, never a powershell.exe found on
       // PATH or in the working directory. It ships with Windows, and it can
       // load the Windows notification API, which PowerShell 7 cannot.
-      file: win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
-      args: ["-NoProfile", "-NonInteractive", "-Command", TOAST_STATEMENTS.join("; ")],
+      file: windowsPowerShellPath(systemRoot),
+      args: powerShellArgs(TOAST_STATEMENTS),
       env: { ENGRAM_NOTIFY_TITLE: title, ENGRAM_NOTIFY_BODY: body },
     };
   }

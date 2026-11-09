@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import {
   existsSync,
@@ -80,6 +80,27 @@ let dir = "";
 const holders: Array<{ stop: () => Promise<void> }> = [];
 const lockServers: Server[] = [];
 const children: ChildProcess[] = [];
+
+// On a fresh Windows machine, the first PowerShells to ask WMI about a
+// process can take longer than identifyProcess waits, while WMI starts
+// (engram#649). It is warmed up once here, given all the time it needs, so
+// that the tests below test identification, not how long WMI takes to start.
+beforeAll(() => {
+  if (process.platform !== "win32") return;
+  const { file, args, env } = windowsIdentifyCommand(process.pid);
+  const started = Date.now();
+  try {
+    execFileSync(file, args, {
+      env: { ...process.env, ...env },
+      stdio: "ignore",
+      timeout: 110_000,
+      windowsHide: true,
+    });
+  } catch {
+    // the tests say what is wrong
+  }
+  console.log(`PowerShell and WMI warmed up in ${Date.now() - started} ms`);
+}, 120_000);
 
 beforeEach(() => {
   dir = mkdtempSync(join(home.dir, "t"));

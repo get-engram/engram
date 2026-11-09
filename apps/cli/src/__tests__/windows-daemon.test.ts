@@ -103,6 +103,7 @@ const { workerPathFor, loginStartPathFor, supervisorPathFor, supervisorPath, STA
 const { VERSION } = await import("../daemon/instance.js");
 const { loadConfig } = await import("../config.js");
 const {
+  autoEnableCapture,
   daemonInstall,
   daemonStart,
   daemonStatus,
@@ -1054,6 +1055,149 @@ describe("stopping the daemon on Windows through the stop file (engram#613)", ()
     registry.approved = null;
     await daemonStatus();
     expect(output()).not.toContain("It should be running");
+  });
+});
+
+describe("auto-capture after sign-in to Engram, on Windows (engram#614)", () => {
+  const realIsTTY = process.stdin.isTTY;
+  const config = vi.mocked(loadConfig);
+
+  beforeEach(() => {
+    // What the test run itself sets to keep auto-capture out of other tests.
+    vi.stubEnv("ENGRAM_NO_AUTOCAPTURE", "");
+    vi.stubEnv("ENGRAM_API_KEY", undefined);
+    Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+    config.mockResolvedValue({ apiKey: "eng_test_614" } as never);
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process.stdin, "isTTY", { value: realIsTTY, configurable: true });
+    config.mockReset().mockImplementation(async () => ({}) as never);
+  });
+
+  it("starts the daemon through the supervisor and turns on start at login", async () => {
+    onWindows();
+    await autoEnableCapture();
+
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const [file, args, opts] = spawn.mock.calls[0];
+    expect(file).toBe(process.execPath);
+    // As at sign-in: started again after an error (engram#613), and with no
+    // --report-until, since nothing here waits on it to report.
+    expect(args).toEqual([supervisorPath()]);
+    expect(opts).toMatchObject({ detached: true, windowsHide: true });
+
+    expect(registry.value).toBe(ENTRY);
+    expect(regCalls("add")).toHaveLength(1);
+    expect(regCalls("delete")).toHaveLength(0);
+    for (const [regFile, , regOpts] of execFileSync.mock.calls) {
+      expect(regFile).toBe(REG_EXE);
+      expect(regOpts).toMatchObject({ windowsHide: true, timeout: 15_000 });
+    }
+    expect(existsSync(join(home.dir, "Library"))).toBe(false);
+    expect(execSync).not.toHaveBeenCalled();
+
+    const said = output();
+    expect(said).toContain("Auto-capture is on");
+    expect(said).toContain("Auto-start enabled — daemon will start when you sign in to Windows");
+    expect(said).toContain("Turn off anytime");
+    expect(said).not.toContain("isn't available");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("adds the entry but leaves it switched off when the user switched it off in Startup apps", async () => {
+    onWindows();
+    daemonRunning();
+    registry.approved = SWITCHED_OFF;
+    await autoEnableCapture();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(registry.value).toBe(ENTRY);
+    expect(registry.approved).toBe(SWITCHED_OFF);
+    expect(regCalls("delete")).toHaveLength(0);
+    const said = output();
+    expect(said).toContain("Start at login is switched off");
+    expect(said).toContain("engram install");
+    expect(said).not.toContain("Auto-start enabled");
+  });
+
+  it("points an entry whose programs are gone at this CLI, and leaves a working one alone", async () => {
+    onWindows();
+    daemonRunning();
+    registry.value = BROKEN_ENTRY;
+    registry.approved = SWITCHED_OFF;
+    await autoEnableCapture();
+    expect(registry.value).toBe(ENTRY);
+    expect(registry.approved).toBe(SWITCHED_OFF);
+    expect(output()).toContain("Updated the start-at-login entry");
+
+    vi.mocked(console.log).mockClear();
+    execFileSync.mockClear();
+    await autoEnableCapture();
+    expect(regCalls("add")).toHaveLength(0);
+    expect(regCalls("delete")).toHaveLength(0);
+    expect(registry.approved).toBe(SWITCHED_OFF);
+    expect(output()).toContain("Auto-capture is on");
+    expect(output()).not.toContain("Auto-start enabled");
+    expect(output()).not.toContain("Updated the start-at-login entry");
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("says how to try again when it can't add the entry, and the command still succeeds", async () => {
+    onWindows();
+    daemonRunning();
+    execFileSync.mockImplementation((file: string, args: string[]) => {
+      if (args[0] === "add") throw Object.assign(new Error("ERROR: Access is denied."), { status: 1 });
+      return fakeReg(file, args);
+    });
+    await autoEnableCapture();
+    expect(registry.value).toBeNull();
+    const said = output();
+    expect(said).toContain("Couldn't turn on start at login. Run 'engram install' to try again.");
+    expect(said).toContain("Auto-capture is on");
+    expect(said).not.toContain("Auto-start enabled");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("leaves start at login alone when there is no sign-in script to point it at", async () => {
+    // Only a source checkout run through tsx has no login-start.js.
+    onWindows();
+    daemonRunning();
+    rmSync(LOGIN_START);
+    try {
+      await autoEnableCapture();
+    } finally {
+      writeFileSync(LOGIN_START, "");
+    }
+    expect(regCalls("add")).toHaveLength(0);
+    expect(registry.value).toBeNull();
+    const said = output();
+    expect(said).toContain("Auto-capture is on");
+    expect(said).not.toContain("Auto-start enabled");
+    expect(said).not.toContain("Couldn't turn on start at login");
+  });
+
+  it("does nothing after 'engram stop', without a key, or outside a terminal", async () => {
+    onWindows();
+    for (const setup of [
+      () => config.mockResolvedValue({ apiKey: "eng_test_614", autocapture: "off" } as never),
+      () => config.mockResolvedValue({} as never),
+      () => Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true }),
+    ]) {
+      setup();
+      await autoEnableCapture();
+    }
+    expect(spawn).not.toHaveBeenCalled();
+    expect(execFileSync).not.toHaveBeenCalled();
+    expect(registry.value).toBeNull();
+    expect(output()).toBe("");
+  });
+
+  it("still says start at login isn't there yet on Linux", async () => {
+    onPlatform("linux");
+    daemonRunning();
+    await autoEnableCapture();
+    expect(execFileSync).not.toHaveBeenCalled();
+    expect(output()).toContain("Start at login isn't available on Linux yet");
   });
 });
 

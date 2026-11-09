@@ -74,6 +74,7 @@ describe("capture errors in status.json (engram#584)", () => {
         `New messages can't be queued (${FULL}). Free up disk space, or check ~/.engram/daemon.db. ` +
           "Capture resumes where it stopped.",
       ],
+      expect.objectContaining({ windowsHide: true, timeout: 30_000 }),
       expect.any(Function),
     );
 

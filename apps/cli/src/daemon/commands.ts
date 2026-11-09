@@ -975,11 +975,19 @@ function exportedData(exported: string): string | null {
   return null;
 }
 
+/**
+ * How long a reg.exe call may take. Auto-capture reads the Run entry after
+ * interactive commands (engram#614), so a reg.exe that hung would otherwise
+ * hang each of them; one that times out counts as one that failed.
+ */
+const REG_TIMEOUT_MS = 15_000;
+
 function runReg(args: string[]): string {
   return execFileSync(regExe(), args, {
     encoding: "utf-8",
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
+    timeout: REG_TIMEOUT_MS,
   });
 }
 
@@ -1059,8 +1067,7 @@ function deleteRunEntry(): boolean {
  * an entry naming a Node or a CLI that has since moved fails at every
  * sign-in without a word. A working entry is left as it is.
  */
-export function repairRunEntryIfBroken(): boolean {
-  const entry = readRunEntry();
+export function repairRunEntryIfBroken(entry: string | null = readRunEntry()): boolean {
   if (entry === null || !runEntryBroken(entry)) return false;
   if (!existsSync(loginStartPath()) || !writeRunEntry()) return false;
   console.log(bold("Updated the start-at-login entry"));
@@ -1142,6 +1149,35 @@ async function enableWindowsStartAtLogin(running: boolean): Promise<void> {
   }
 }
 
+/**
+ * Start at login when auto-capture turns capture on (engram#614), the
+ * Windows counterpart of the launchd agent it installs on macOS: add the
+ * entry when there is none, and point a broken one at this CLI. Unlike
+ * `engram install`, it leaves the Startup apps switch where the user put it,
+ * as macOS leaves a login item switched off under Login Items, and it never
+ * fails the command it runs after.
+ */
+function autoEnableWindowsStartAtLogin(): void {
+  const entry = readRunEntry();
+  if (entry !== null) {
+    repairRunEntryIfBroken(entry);
+    return;
+  }
+  // Only a source checkout run through tsx has no login-start.js: the build ships it.
+  if (!existsSync(loginStartPath())) return;
+  if (!writeRunEntry()) {
+    console.log(dim("  Couldn't turn on start at login. Run 'engram install' to try again."));
+    return;
+  }
+  if (switchedOffInStartupApps()) {
+    console.log(`${bold("Start at login is switched off")} in Windows Startup apps`);
+    console.log(dim("  Switch Engram on there, or run 'engram install', to start the daemon when you sign in."));
+    return;
+  }
+  console.log(`${bold("Auto-start enabled")} — daemon will start when you sign in to Windows`);
+  console.log(dim("  A console window flashes briefly at sign-in while it starts."));
+}
+
 async function disableStartAtLogin(): Promise<void> {
   if (process.platform === "darwin") {
     uninstallLaunchd();
@@ -1185,25 +1221,32 @@ export async function daemonInstall(): Promise<void> {
 export async function autoEnableCapture(): Promise<void> {
   if (process.env.ENGRAM_NO_AUTOCAPTURE) return;
   if (!process.stdin.isTTY) return;
-  if (process.platform !== "darwin" && process.platform !== "linux") return;
+  const platform = process.platform;
+  if (platform !== "darwin" && platform !== "linux" && platform !== "win32") return;
   try {
     const config = await loadConfig();
     if (config.autocapture === "off") return; // user said stop; respect it
     if (!(process.env.ENGRAM_API_KEY ?? config.apiKey)) return; // nothing to capture into
     const found = await findDaemon(500);
     if (found.state === "stopped" || found.state === "stopping") {
-      spawnWorker();
+      // On Windows through the supervisor, as at sign-in, so a worker that
+      // exits with an error is started again (engram#613). Nothing waits on
+      // it here, so it is never asked to report a failed start.
+      if (platform === "win32") spawnSupervisor();
+      else spawnWorker();
       await sleep(500);
     }
-    if (process.platform === "darwin" && !isLaunchdInstalled()) {
+    if (platform === "darwin" && !isLaunchdInstalled()) {
       installLaunchd();
+    } else if (platform === "win32") {
+      autoEnableWindowsStartAtLogin();
     } else {
       migrateLaunchdIfStale();
     }
     console.log(
       `${bold("Auto-capture is on")} — conversations from supported agents on this machine save to your Engram.`,
     );
-    if (process.platform !== "darwin") {
+    if (platform === "linux") {
       console.log(
         dim(`  Start at login isn't available on ${platformLabel()} yet: run 'engram start' after a restart.`),
       );

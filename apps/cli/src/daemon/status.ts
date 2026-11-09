@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import { writePrivateFileSync } from "../private-files.js";
 import { plural } from "../output.js";
 
@@ -601,10 +601,65 @@ function logWarning(
   console.error(`[engram] Run 'engram status' for details.`);
 }
 
+/** A notifier that hangs (a PowerShell that never finishes loading, a stuck
+ *  notification service) is ended, not left running beside the daemon. */
+const NOTIFY_TIMEOUT_MS = 30_000;
+
 /**
- * Best-effort desktop notification. The daemon runs headless under launchd,
- * so stderr goes to daemon.log where nobody reads it — for states that need
- * a human decision, this is the only channel that actually reaches them.
+ * The Windows toast (engram#614), one PowerShell statement each. The title
+ * and body never become script: they arrive in environment variables and go
+ * into the toast as XML text nodes, so quotes, `$(...)`, backticks, `<b>` or
+ * `%PATH%` in them are shown as written, never run or parsed. There are no
+ * double quotes, which the Windows command line would have to escape.
+ *
+ * The toast goes out under Windows PowerShell's app ID, which every Windows
+ * 10 and 11 has registered, so Windows shows it as from Windows PowerShell.
+ */
+export const TOAST_STATEMENTS: readonly string[] = [
+  "$ErrorActionPreference = 'Stop'",
+  "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null",
+  "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null",
+  "$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)",
+  "$text = $template.GetElementsByTagName('text')",
+  "$null = $text.Item(0).AppendChild($template.CreateTextNode($env:ENGRAM_NOTIFY_TITLE))",
+  "$null = $text.Item(1).AppendChild($template.CreateTextNode($env:ENGRAM_NOTIFY_BODY))",
+  "$toast = [Windows.UI.Notifications.ToastNotification]::new($template)",
+  "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show($toast)",
+];
+
+/** How to show a desktop notification here, or null where there is no way. */
+export function notifyCommand(
+  title: string,
+  body: string,
+  platform: NodeJS.Platform = process.platform,
+  systemRoot: string = process.env.SystemRoot || "C:\\Windows",
+): { file: string; args: string[]; env?: Record<string, string> } | null {
+  if (platform === "darwin") {
+    const esc = (s: string) => s.replace(/["\\]/g, "\\$&");
+    return {
+      file: "osascript",
+      args: ["-e", `display notification "${esc(body)}" with title "${esc(title)}"`],
+    };
+  }
+  if (platform === "linux") return { file: "notify-send", args: [title, body] };
+  if (platform === "win32") {
+    return {
+      // Windows PowerShell by its full path, never a powershell.exe found on
+      // PATH or in the working directory. It ships with Windows, and it can
+      // load the Windows notification API, which PowerShell 7 cannot.
+      file: win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+      args: ["-NoProfile", "-NonInteractive", "-Command", TOAST_STATEMENTS.join("; ")],
+      env: { ENGRAM_NOTIFY_TITLE: title, ENGRAM_NOTIFY_BODY: body },
+    };
+  }
+  return null;
+}
+
+/**
+ * Best-effort desktop notification. The daemon runs headless (under launchd
+ * on macOS, started at sign-in on Windows), so stderr goes to daemon.log
+ * where nobody reads it — for states that need a human decision, this is
+ * the only channel that actually reaches them.
  *
  * Deliberately fire-and-forget and fully swallowed: notification tooling is
  * absent on plenty of systems (headless Linux, minimal containers) and a
@@ -615,17 +670,19 @@ function notifyDesktop(title: string, body: string): void {
     // A static import (engram#581): this used to be a lazy `require`, which
     // does not exist in this ES-module build. It threw, the catch below
     // swallowed it, and no notification was ever shown.
-    const done = () => {};
-    if (process.platform === "darwin") {
-      const esc = (s: string) => s.replace(/["\\]/g, "\\$&");
-      execFile(
-        "osascript",
-        ["-e", `display notification "${esc(body)}" with title "${esc(title)}"`],
-        done,
-      );
-    } else if (process.platform === "linux") {
-      execFile("notify-send", [title, body], done);
-    }
+    const command = notifyCommand(title, body);
+    if (!command) return;
+    execFile(
+      command.file,
+      command.args,
+      {
+        // The daemon's own environment, plus the title and body on Windows.
+        env: command.env && { ...process.env, ...command.env },
+        windowsHide: true,
+        timeout: NOTIFY_TIMEOUT_MS,
+      },
+      () => {},
+    );
   } catch {
     // no notification tooling — the log line and the CLI banner still stand
   }

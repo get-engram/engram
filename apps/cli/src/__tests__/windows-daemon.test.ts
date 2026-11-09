@@ -11,6 +11,7 @@ import {
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import type { Probe } from "../daemon/instance.js";
 
 /**
  * engram#602 — the daemon on Windows. `engram start` built the worker's path
@@ -20,15 +21,28 @@ import { basename, dirname, join } from "node:path";
  * These run the Windows code paths on any OS: process.platform is switched to
  * win32, reg.exe is a fake registry, the home directory is a temp dir, and
  * nothing reaches the real registry, launchd or ~/.engram.
+ *
+ * engram#612 — the daemon is what answers on its named pipe, never a PID
+ * file alone. Here `daemon.answering` is what answers, and process.kill is
+ * fake: a signal reaches only a made-up process, never a real one.
  */
 
-const { home, registry, spawn, execSync, execFileSync } = vi.hoisted(() => {
+const { home, registry, daemon, spawn, execSync, execFileSync } = vi.hoisted(() => {
   // vi.hoisted runs before imports: use require-free globals only.
   return {
     home: { dir: "" },
     // HKCU\…\Run and StartupApproved\Run, as far as our one value goes:
     // the Run entry's command line, and the switch's data as reg exports it.
     registry: { value: null as string | null, approved: null as string | null },
+    // What answers on the daemon's named pipe: a daemon, something that
+    // holds it and doesn't answer, no pipe to be had at all, or nothing.
+    daemon: {
+      answering: null as
+        | { pid: number; ready?: boolean; stopping?: boolean; version?: string }
+        | "silent"
+        | "unavailable"
+        | null,
+    },
     spawn: vi.fn(),
     execSync: vi.fn(),
     execFileSync: vi.fn(),
@@ -61,6 +75,18 @@ vi.mock("../daemon/launch.js", async (importOriginal) => {
     loginStartPath: () => path.join(home.dir, "login-start.js"),
   };
 });
+// The probe answers from `daemon.answering`; the rest is the real module.
+vi.mock("../daemon/instance.js", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../daemon/instance.js")>();
+  const probeDaemon = async (): Promise<Probe> => {
+    const a = daemon.answering;
+    if (a === null) return { state: "none", stale: false };
+    if (a === "silent") return { state: "silent" };
+    if (a === "unavailable") return { state: "unavailable", reason: "no pipe in this test" };
+    return { state: "answered", info: { ready: true, stopping: false, version: real.VERSION, ...a } };
+  };
+  return { ...real, probeDaemon };
+});
 
 home.dir = mkdtempSync(join(tmpdir(), "engram-602-"));
 const ENGRAM_DIR = join(home.dir, ".engram");
@@ -70,10 +96,12 @@ const LOGIN_START = join(home.dir, "login-start.js");
 writeFileSync(LOGIN_START, "");
 
 const { workerPathFor, loginStartPathFor, workerPath } = await import("../daemon/launch.js");
+const { VERSION } = await import("../daemon/instance.js");
 const {
   daemonInstall,
   daemonStart,
   daemonStatus,
+  daemonStop,
   daemonUninstall,
   parseApprovedExport,
   parseRunExport,
@@ -167,16 +195,61 @@ function fakeChild(pid: number | undefined = process.pid) {
   return Object.assign(new EventEmitter(), { pid, unref: vi.fn() });
 }
 
-/** A worker whose first act is writing its PID file (worker-main.ts). */
+/** A worker that starts and answers on the pipe, ready. */
 function fakeSpawn() {
   daemonRunning();
   return fakeChild();
 }
 
-/** A PID file naming a live process: this one. */
-function daemonRunning(): void {
+/** A daemon: it answers on the pipe and wrote its PID file. This process stands in for it unless `pid` is made up. */
+function daemonRunning(pid = process.pid): void {
+  pidFile(pid);
+  daemon.answering = { pid };
+}
+
+/** A PID file naming `pid`, and nothing more. */
+function pidFile(pid: number): void {
   mkdirSync(ENGRAM_DIR, { recursive: true });
-  writeFileSync(PID_FILE, String(process.pid));
+  writeFileSync(PID_FILE, String(pid));
+}
+
+/**
+ * Made-up processes for `engram stop`, by PID: the fake kill finds these
+ * (and this process) alive, and sends a signal to these alone. A signal for
+ * any other PID fails the test before it reaches a process.
+ */
+const processes = new Map<number, { onTerm?: () => void }>();
+/** The signals the fake kill took, in order. */
+const signalled: Array<[number, string]> = [];
+const timers: NodeJS.Timeout[] = [];
+
+function fakeKill(pid: number, signal: string | number = "SIGTERM"): true {
+  if (signal === 0) {
+    if (pid === process.pid || processes.has(pid)) return true;
+    throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+  }
+  const proc = processes.get(pid);
+  if (!proc) throw new Error(`a test sent ${String(signal)} to pid ${pid}, which no test made up`);
+  signalled.push([pid, String(signal)]);
+  if (signal === "SIGTERM") proc.onTerm?.();
+  return true;
+}
+
+/**
+ * A made-up process. It exits `exitsIn` ms from now, or `onTermExitsIn` ms
+ * after SIGTERM, or never; its pipe goes with it.
+ */
+function madeUp(pid: number, when: { exitsIn?: number; onTermExitsIn?: number } = {}): void {
+  const exit = () => {
+    processes.delete(pid);
+    const a = daemon.answering;
+    if (a !== null && typeof a === "object" && a.pid === pid) daemon.answering = null;
+  };
+  const { exitsIn, onTermExitsIn } = when;
+  processes.set(pid, {
+    onTerm: onTermExitsIn === undefined ? undefined : () => void timers.push(setTimeout(exit, onTermExitsIn)),
+  });
+  if (exitsIn !== undefined) timers.push(setTimeout(exit, exitsIn));
 }
 
 function strayPlist(): void {
@@ -202,6 +275,10 @@ function onWindows(): void {
 beforeEach(() => {
   registry.value = null;
   registry.approved = null;
+  daemon.answering = null;
+  processes.clear();
+  signalled.length = 0;
+  vi.spyOn(process, "kill").mockImplementation(fakeKill);
   rmSync(PID_FILE, { force: true });
   rmSync(join(home.dir, "Library"), { recursive: true, force: true });
   spawn.mockReset().mockImplementation(fakeSpawn);
@@ -213,6 +290,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const t of timers.splice(0)) clearTimeout(t);
   Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
   process.exitCode = undefined;
   vi.unstubAllEnvs();
@@ -251,7 +329,7 @@ describe("the worker's path (engram#602)", () => {
   });
 
   it("is never built from URL#pathname", () => {
-    for (const file of ["launch.ts", "login-start.ts", "commands.ts"]) {
+    for (const file of ["launch.ts", "login-start.ts", "commands.ts", "instance.ts"]) {
       const src = readFileSync(join(__dirname, "..", "daemon", file), "utf-8");
       expect(src).not.toMatch(/\.pathname\b/);
     }
@@ -559,39 +637,202 @@ describe("start at login on Windows (engram#602)", () => {
   });
 });
 
-describe("waiting for the worker to start (engram#602)", () => {
-  it("is running once it writes its PID file", async () => {
+describe("waiting for the worker to start (engram#602, engram#612)", () => {
+  it("is running once it answers on the pipe as itself, ready", async () => {
     const child = fakeChild(4242);
-    setTimeout(daemonRunning, 250);
-    expect(await waitForWorker(child as never, 5_000)).toEqual({ state: "running", pid: process.pid });
+    timers.push(setTimeout(() => (daemon.answering = { pid: 4242 }), 250));
+    expect(await waitForWorker(child as never, 5_000)).toEqual({ state: "running", pid: 4242 });
   });
 
-  it("is still starting when alive without a PID file yet", async () => {
+  it("is still starting while it answers as not ready yet", async () => {
+    daemon.answering = { pid: 4242, ready: false };
     expect(await waitForWorker(fakeChild(4242) as never, 300)).toEqual({ state: "starting", pid: 4242 });
+  });
+
+  it("is still starting while alive and not answering, whatever the PID file says", async () => {
+    // A PID file isn't an answer: one left by an earlier daemon can name
+    // this PID as well.
+    pidFile(4242);
+    expect(await waitForWorker(fakeChild(4242) as never, 300)).toEqual({ state: "starting", pid: 4242 });
+  });
+
+  it("isn't running while another daemon answers and it hasn't exited", async () => {
+    daemon.answering = { pid: 777 };
+    expect(await waitForWorker(fakeChild(4242) as never, 300)).toEqual({ state: "starting", pid: 4242 });
+  });
+
+  it("is running once its PID file names it, where there is no pipe or socket", async () => {
+    // A home folder too long for a socket path (see daemonEndpoint).
+    daemon.answering = "unavailable";
+    timers.push(setTimeout(() => pidFile(4242), 250));
+    expect(await waitForWorker(fakeChild(4242) as never, 5_000)).toEqual({ state: "running", pid: 4242 });
   });
 
   it("has failed once it exits, without waiting out the limit", async () => {
     const child = fakeChild(4242);
-    setTimeout(() => child.emit("exit", 1, null), 50);
+    timers.push(setTimeout(() => child.emit("exit", 1, null), 50));
     const before = Date.now();
     expect(await waitForWorker(child as never, 5_000)).toEqual({ state: "failed" });
     expect(Date.now() - before).toBeLessThan(2_000);
   });
 
-  it("has failed when it wrote its PID file and then died", async () => {
-    // worker-main exits on a missing API key after writing the file.
-    mkdirSync(ENGRAM_DIR, { recursive: true });
-    writeFileSync(PID_FILE, "999999999");
+  it("is the daemon already running when it exits 0, having found that one", async () => {
+    // launchd started one as the plist loaded, or two starts raced: the
+    // worker found a daemon answering and left the capture to it.
+    daemon.answering = { pid: 777 };
     const child = fakeChild(4242);
-    setTimeout(() => child.emit("exit", 1, null), 50);
+    timers.push(setTimeout(() => child.emit("exit", 0, null), 50));
+    expect(await waitForWorker(child as never, 5_000)).toEqual({ state: "running", pid: 777 });
+  });
+
+  it("waits for that daemon to be ready", async () => {
+    daemon.answering = { pid: 777, ready: false };
+    const child = fakeChild(4242);
+    timers.push(setTimeout(() => child.emit("exit", 0, null), 50));
+    timers.push(setTimeout(() => (daemon.answering = { pid: 777 }), 400));
+    expect(await waitForWorker(child as never, 5_000)).toEqual({ state: "running", pid: 777 });
+  });
+
+  it("has failed when it exits 0 and no daemon answers", async () => {
+    const child = fakeChild(4242);
+    timers.push(setTimeout(() => child.emit("exit", 0, null), 50));
     expect(await waitForWorker(child as never, 5_000)).toEqual({ state: "failed" });
-    expect(existsSync(PID_FILE)).toBe(false);
   });
 
   it("has failed when it could not be started at all", async () => {
     const child = fakeChild(undefined);
-    setTimeout(() => child.emit("error", new Error("spawn EAGAIN")), 50);
+    timers.push(setTimeout(() => child.emit("error", new Error("spawn EAGAIN")), 50));
     expect(await waitForWorker(child as never, 5_000)).toEqual({ state: "failed" });
+  });
+});
+
+describe("one daemon, found by its pipe, on Windows (engram#612)", () => {
+  it("engram stop signals the daemon, waits for it to exit, and removes its PID file", async () => {
+    onWindows();
+    daemonRunning(4242);
+    madeUp(4242, { onTermExitsIn: 300 });
+    await daemonStop();
+    expect(signalled).toEqual([[4242, "SIGTERM"]]);
+    expect(output()).toContain("Daemon stopped (pid 4242)");
+    // On Windows SIGTERM ends the process outright: it removes nothing itself.
+    expect(existsSync(PID_FILE)).toBe(false);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("engram stop waits for a daemon that is stopping already, and doesn't signal it again", async () => {
+    onWindows();
+    daemonRunning(4242);
+    daemon.answering = { pid: 4242, stopping: true };
+    madeUp(4242, { exitsIn: 300 });
+    await daemonStop();
+    expect(signalled).toEqual([]);
+    expect(output()).toContain("Daemon stopped (pid 4242)");
+  });
+
+  it("engram stop signals nothing that only a PID file names", async () => {
+    // Signing out ends the daemon without a chance to clean up, and Windows
+    // reuses PIDs: the one in the file can be another program's by now.
+    onWindows();
+    pidFile(4242);
+    madeUp(4242);
+    await daemonStop();
+    expect(signalled).toEqual([]);
+    expect(output()).toContain("Daemon is not running.");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("engram stop signals nothing when the pipe's answer and the PID file disagree", async () => {
+    // A pipe's name is one namespace for the whole machine.
+    onWindows();
+    pidFile(5151);
+    madeUp(5151);
+    daemon.answering = { pid: 4242 };
+    madeUp(4242);
+    await daemonStop();
+    expect(signalled).toEqual([]);
+    expect(output()).toContain("doesn't name it, so nothing was stopped");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("engram stop signals nothing when something holds the pipe and doesn't answer", async () => {
+    onWindows();
+    pidFile(4242);
+    madeUp(4242);
+    daemon.answering = "silent";
+    await daemonStop();
+    expect(signalled).toEqual([]);
+    expect(output()).toContain("isn't answering, and no process could be confirmed as it");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("engram status reports a daemon only when one answers", async () => {
+    onWindows();
+    pidFile(4242);
+    madeUp(4242);
+    await daemonStatus();
+    expect(output()).toContain("Status: stopped");
+    expect(output()).not.toContain("4242");
+  });
+
+  it("engram status says when the daemon is busy, still starting, or stopping", async () => {
+    onWindows();
+    daemon.answering = "silent";
+    await daemonStatus();
+    expect(output()).toContain("Status: not answering — the daemon's named pipe is held, but nothing replies");
+
+    (console.log as Mock).mockClear();
+    daemon.answering = { pid: 4242, ready: false };
+    await daemonStatus();
+    expect(output()).toContain("Status: running (pid 4242)");
+    expect(output()).toContain("Still starting up.");
+
+    (console.log as Mock).mockClear();
+    daemon.answering = { pid: 4242, stopping: true };
+    await daemonStatus();
+    expect(output()).toContain("Status: stopping (pid 4242)");
+  });
+
+  it("engram status says when the daemon runs another version, and how to switch", async () => {
+    onWindows();
+    daemon.answering = { pid: 4242, version: "0.6.9" };
+    await daemonStatus();
+    expect(output()).toContain(
+      `It runs version 0.6.9, and this CLI is ${VERSION}: run 'engram stop' and then 'engram start' to switch.`,
+    );
+
+    (console.log as Mock).mockClear();
+    daemon.answering = { pid: 4242 };
+    await daemonStatus();
+    expect(output()).not.toContain("It runs version");
+  });
+
+  it("engram start starts a daemon when only a PID file names a process", async () => {
+    onWindows();
+    pidFile(4242);
+    madeUp(4242);
+    await daemonStart([], {});
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(output()).toContain("Engram daemon started");
+    expect(signalled).toEqual([]);
+  });
+
+  it("engram start waits for a daemon that is stopping, then starts one", async () => {
+    // `engram stop` and then `engram start`, with a send still finishing.
+    onWindows();
+    daemon.answering = { pid: 4242, stopping: true };
+    madeUp(4242, { exitsIn: 300 });
+    await daemonStart([], {});
+    expect(output()).toContain("Waiting for the daemon that is stopping (pid 4242) to finish...");
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(output()).toContain("Engram daemon started");
+  });
+
+  it("engram start starts no second daemon beside one that isn't answering", async () => {
+    onWindows();
+    daemon.answering = "silent";
+    await daemonStart([], {});
+    expect(spawn).not.toHaveBeenCalled();
+    expect(output()).toContain("Daemon already running, but it isn't answering right now");
   });
 });
 
@@ -600,22 +841,27 @@ describe("the Windows sign-in launcher (engram#602)", () => {
   it("starts the worker hidden, without trusting the last session's PID file", async () => {
     // Signing out ended the old daemon; its PID may belong to another program
     // now, as this test's PID file (naming a live process) stands in for.
-    daemonRunning();
+    // The worker finds out for itself whether a daemon runs (engram#612).
+    pidFile(process.pid);
     vi.resetModules();
     await import("../daemon/login-start.js");
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(spawn.mock.calls[0][2]).toMatchObject({ detached: true, windowsHide: true });
   });
 
-  it("imports nothing but Node built-ins: it runs before the ABI preflight", () => {
-    // launch.ts, login-start.ts, and every module of ours they import, all
-    // the way down: launch.ts imports private-files.ts (engram#627).
+  /**
+   * The modules of ours that `entries` (in src/daemon) load, all the way
+   * down, failing on any import that is neither a Node built-in nor ours.
+   * `dynamic`: import() too, not only the imports that load first.
+   */
+  function modulesLoaded(entries: string[], dynamic: boolean): string[] {
+    const imports = dynamic ? /\b(?:from|import)\s*\(?\s*["']([^"']+)["']/g : /\b(?:from|import)\s+["']([^"']+)["']/g;
     const seen = new Set<string>();
     const visit = (file: string): void => {
       if (seen.has(file)) return;
       seen.add(file);
       const src = readFileSync(file, "utf-8");
-      const specifiers = [...src.matchAll(/\b(?:from|import)\s*\(?\s*["']([^"']+)["']/g)].map((m) => m[1]);
+      const specifiers = [...src.matchAll(imports)].map((m) => m[1]);
       expect(specifiers.length).toBeGreaterThan(0);
       for (const s of specifiers) {
         if (s.startsWith("node:")) continue;
@@ -623,8 +869,33 @@ describe("the Windows sign-in launcher (engram#602)", () => {
         visit(join(dirname(file), s.replace(/\.js$/, ".ts")));
       }
     };
-    for (const file of ["launch.ts", "login-start.ts"]) visit(join(__dirname, "..", "daemon", file));
+    for (const file of entries) visit(join(__dirname, "..", "daemon", file));
+    return [...seen].map((f) => basename(f)).sort();
+  }
+
+  it("imports nothing but Node built-ins: it runs before the ABI preflight", () => {
+    // launch.ts, login-start.ts, and every module of ours they import, all
+    // the way down: launch.ts imports private-files.ts (engram#627).
     // A new import here is a new module to check for the same rule.
-    expect([...seen].map((f) => basename(f)).sort()).toEqual(["launch.ts", "login-start.ts", "private-files.ts"]);
+    expect(modulesLoaded(["launch.ts", "login-start.ts"], true)).toEqual([
+      "launch.ts",
+      "login-start.ts",
+      "private-files.ts",
+    ]);
+  });
+
+  it("the worker claims its lock with Node built-ins only, before the ABI preflight", () => {
+    // worker.ts takes the single-daemon lock (instance.ts, engram#612) and
+    // then preflights better-sqlite3: neither may load it. The daemon's
+    // body comes after, through import().
+    expect(modulesLoaded(["worker.ts"], false)).toEqual([
+      "instance.ts",
+      "launch.ts",
+      "preflight.ts",
+      "private-files.ts",
+      "worker.ts",
+    ]);
+    const worker = readFileSync(join(__dirname, "..", "daemon", "worker.ts"), "utf-8");
+    expect(worker).toContain('await import("./worker-main.js")');
   });
 });

@@ -22,6 +22,7 @@ vi.mock("../daemon/status.js", async (importOriginal) => ({
   recordSignedIn: vi.fn(),
   updatePending: vi.fn(),
   recordNextRetry: vi.fn(),
+  recordDeletesRefused: vi.fn(),
 }));
 vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/exclusions.js")>()),

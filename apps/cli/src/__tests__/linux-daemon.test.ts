@@ -742,7 +742,7 @@ describe("engram status on Linux (engram#615)", () => {
       writeUnit(unitWith(gone));
       daemonRunning();
       await daemonStatus();
-      expect(said()).toContain("Auto-start: enabled (systemd)  — broken, run 'engram start' to repair");
+      expect(said()).toContain("Auto-start: enabled (systemd)  — broken, run 'engram install' to repair");
     }
   });
 
@@ -758,7 +758,7 @@ describe("engram status on Linux (engram#615)", () => {
       writeUnit(unitWith().replace(/^ExecStart=.*$/m, () => `ExecStart=${other}`));
       daemonRunning();
       await daemonStatus();
-      expect(said()).toContain("broken, run 'engram start' to repair");
+      expect(said()).toContain("broken, run 'engram install' to repair");
     }
   });
 
@@ -766,7 +766,28 @@ describe("engram status on Linux (engram#615)", () => {
     writeUnit(unitWith({}, 0));
     daemonRunning();
     await daemonStatus();
-    expect(output()).toContain("Auto-start: enabled (systemd)  — outdated config, run 'engram start' to update");
+    expect(output()).toContain("Auto-start: enabled (systemd)  — outdated config, run 'engram install' to update");
+  });
+
+  it("points at what repairs or updates it while the daemon runs: engram install (engram#651)", async () => {
+    for (const unit of [unitWith({}, 0), unitWith({ node: join(home.dir, "gone", "node") })]) {
+      writeUnit(unit);
+      daemonRunning();
+      await daemonStatus();
+      expect(said()).toMatch(/^Auto-start: enabled \(systemd\) {2}— (broken|outdated config), run 'engram install' to (repair|update)$/m);
+      // engram start finds the daemon running, and repairs nothing.
+      await daemonStart([], {});
+      expect(readFileSync(UNIT, "utf-8")).toBe(unit);
+      expect(said()).toContain("Daemon already running");
+      await daemonInstall();
+      expect(readFileSync(UNIT, "utf-8")).toBe(unitWith());
+      expect(spawn).not.toHaveBeenCalled();
+      expect(said()).toContain("Auto-start enabled — daemon will start when you log in (systemd)");
+      await daemonStatus();
+      const after = said();
+      expect(after).toContain("Auto-start: enabled (systemd)");
+      expect(after).not.toMatch(/broken|outdated|engram start/);
+    }
   });
 
   it("says nothing of a unit it didn't write, or of none", async () => {

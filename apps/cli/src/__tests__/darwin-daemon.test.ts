@@ -1076,7 +1076,7 @@ describe("engram status on macOS (engram#616)", () => {
       writePlist(text);
       daemonRunning();
       await daemonStatus();
-      expect(said()).toContain("Auto-start: enabled (launchd)  — broken, run 'engram start' to repair");
+      expect(said()).toContain("Auto-start: enabled (launchd)  — broken, run 'engram install' to repair");
     }
   });
 
@@ -1084,7 +1084,30 @@ describe("engram status on macOS (engram#616)", () => {
     writePlist(v1Plist());
     daemonRunning();
     await daemonStatus();
-    expect(output()).toContain("Auto-start: enabled (launchd)  — outdated config, run 'engram start' to update");
+    expect(output()).toContain("Auto-start: enabled (launchd)  — outdated config, run 'engram install' to update");
+  });
+
+  it("points at what repairs or updates it while the daemon runs: engram install (engram#651)", async () => {
+    for (const text of [v1Plist(), plistWith({ node: join(home.dir, "gone", "node") })]) {
+      writePlist(text);
+      launchd.loaded = true;
+      launchd.loadedText = text;
+      daemonRunning();
+      await daemonStatus();
+      expect(said()).toMatch(/^Auto-start: enabled \(launchd\) {2}— (broken|outdated config), run 'engram install' to (repair|update)$/m);
+      // engram start finds the daemon running, and repairs nothing.
+      await daemonStart([], {});
+      expect(readFileSync(PLIST, "utf-8")).toBe(text);
+      expect(said()).toContain("Daemon already running");
+      await daemonInstall();
+      expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+      expect(launchd.loadedText).toBe(plistWith());
+      expect(said()).toContain("Auto-start enabled — daemon will start on login");
+      await daemonStatus();
+      const after = said();
+      expect(after).toContain("Auto-start: enabled (launchd)");
+      expect(after).not.toMatch(/broken|outdated|engram start/);
+    }
   });
 
   it("says nothing of start at login without a plist", async () => {

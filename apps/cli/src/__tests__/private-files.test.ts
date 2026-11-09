@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import {
   chmodSync,
   chownSync,
@@ -22,7 +22,7 @@ import {
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
 
 // engram#627: ~/.engram holds the API key, the vault key and the daemon's
@@ -33,7 +33,13 @@ import Database from "better-sqlite3";
 // and config.json is replaced in one step, so a save cut short never leaves
 // it truncated, without the key.
 
-const { home, launchctl } = vi.hoisted(() => ({ home: { dir: "" }, launchctl: vi.fn() }));
+const { home, run } = vi.hoisted(() => ({
+  home: { dir: "" },
+  // execFileSync: a test that runs something gives it a fake to run.
+  run: vi.fn<(file: string, args: string[]) => unknown>(() => {
+    throw new Error("not run in these tests");
+  }),
+}));
 
 // Each wraps the real call, so a test can make one of them fail.
 vi.mock("node:fs", async (importOriginal) => {
@@ -58,15 +64,25 @@ vi.mock("node:os", async (importOriginal) => ({
 // a launchd job under a real install's label.
 vi.mock("node:child_process", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:child_process")>()),
-  execSync: launchctl,
-  execFile: vi.fn(),
-  execFileSync: vi.fn(() => {
+  execSync: vi.fn(() => {
     throw new Error("not run in these tests");
   }),
+  execFile: vi.fn(),
+  execFileSync: run,
   spawn: vi.fn(() => {
     throw new Error("not run in these tests");
   }),
 }));
+
+// An install has dist/daemon/worker.js beside launch.js; under vitest the
+// module beside launch.ts is worker.ts. A test that needs one makes this one.
+vi.mock("../daemon/launch.js", async (importOriginal) => {
+  const path = await import("node:path");
+  return {
+    ...(await importOriginal<typeof import("../daemon/launch.js")>()),
+    workerPath: () => path.join(home.dir, "cli", "dist", "daemon", "worker.js"),
+  };
+});
 
 home.dir = mkdtempSync(join(tmpdir(), "engram-627-home-"));
 const ENGRAM = join(home.dir, ".engram");
@@ -84,7 +100,7 @@ const { loadConfig, saveConfig } = await import("../config.js");
 const { vaultKeygen } = await import("../commands/vault.js");
 const { LOG_FILE, prepareLogSync } = await import("../daemon/launch.js");
 const { DaemonDb } = await import("../daemon/db.js");
-const { daemonInstall, migrateLaunchdIfStale } = await import("../daemon/commands.js");
+const { daemonInstall, repairLaunchdIfStale } = await import("../daemon/commands.js");
 
 process.on("exit", () => rmSync(home.dir, { recursive: true, force: true }));
 
@@ -153,8 +169,9 @@ afterEach(() => {
   Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
   if (umask !== undefined) process.umask(umask);
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   for (const fn of [renameSync, writeFileSync, fsyncSync, fchownSync, chownSync]) vi.mocked(fn).mockReset();
-  launchctl.mockReset();
+  run.mockReset();
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -604,29 +621,64 @@ describe("launchd's log (engram#627)", () => {
   // launchd opens the log for the job before the worker runs, and creates a
   // missing one with the default 0644.
   posixIt("is there, 0600, when launchctl loads the job: engram install, and a plist update", async () => {
-    expect(vi.isMockFunction(execSync)).toBe(true);
+    expect(vi.isMockFunction(execFileSync)).toBe(true);
     onMac();
+    // launchctl, found on PATH: a stub never run, which the fake below answers for.
+    const bin = join(home.dir, "bin");
+    const launchctl = join(bin, "launchctl");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(launchctl, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    vi.stubEnv("PATH", bin);
+    const worker = join(home.dir, "cli", "dist", "daemon", "worker.js");
+    mkdirSync(dirname(worker), { recursive: true });
+    writeFileSync(worker, "");
+    const plist = join(home.dir, "Library", "LaunchAgents", "app.getengram.daemon.plist");
+    const domain = `gui/${process.getuid?.() ?? 0}`;
+
+    let loaded = false;
+    const calls: string[] = [];
     const logModes: Array<number | null> = [];
-    launchctl.mockImplementation(() => {
-      logModes.push(existsSync(LOG_FILE) ? mode(LOG_FILE) : null);
-      return Buffer.alloc(0);
+    run.mockImplementation((file: string, args: string[]) => {
+      const command = args.join(" ");
+      // What it asked for, or what it shouldn't have: the CLI catches what this throws.
+      calls.push(file !== launchctl ? `${file} ${command}` : args[0]);
+      const failed = () => Object.assign(new Error(`Command failed: launchctl ${command}`), { status: 1, stderr: "" });
+      if (file !== launchctl) throw failed();
+      if (command === `bootout ${domain}/app.getengram.daemon` || command === `unload ${plist}`) {
+        if (!loaded) throw failed();
+        loaded = false;
+        return "";
+      }
+      if (command === "list app.getengram.daemon") {
+        if (!loaded) throw failed();
+        return "{\n};\n";
+      }
+      if (command === `bootstrap ${domain} ${plist}`) {
+        logModes.push(existsSync(LOG_FILE) ? mode(LOG_FILE) : null);
+        loaded = true;
+        return "";
+      }
+      calls.push(`unexpected: ${command}`);
+      throw failed();
     });
 
-    await daemonInstall();
-    expect(launchctl.mock.calls.map(([cmd]) => String(cmd).split(" ").slice(0, 2).join(" "))).toEqual([
-      "launchctl load",
-    ]);
-    expect(logModes).toEqual([0o600]);
-    expect(mode(ENGRAM)).toBe(0o700);
+    try {
+      await daemonInstall();
+      expect(calls).toEqual(["bootout", "unload", "list", "bootstrap"]);
+      expect(logModes).toEqual([0o600]);
+      expect(mode(ENGRAM)).toBe(0o700);
 
-    // A plist from before the version stamp, and no log: it is rewritten
-    // and loaded again.
-    rmSync(LOG_FILE);
-    writeFileSync(join(home.dir, "Library", "LaunchAgents", "app.getengram.daemon.plist"), "<plist></plist>");
-    launchctl.mockClear();
-    logModes.length = 0;
-    expect(migrateLaunchdIfStale()).toBe(true);
-    expect(logModes.length).toBeGreaterThan(0);
-    expect(logModes.every((m) => m === 0o600)).toBe(true);
+      // A plist from before the version stamp, and no log: it is rewritten
+      // and loaded again.
+      rmSync(LOG_FILE);
+      writeFileSync(plist, "<plist></plist>");
+      calls.length = 0;
+      logModes.length = 0;
+      expect(repairLaunchdIfStale()).toBe(true);
+      expect(calls).toEqual(["bootout", "list", "bootstrap"]);
+      expect(logModes).toEqual([0o600]);
+    } finally {
+      for (const made of ["Library", "bin", "cli"]) rmSync(join(home.dir, made), { recursive: true, force: true });
+    }
   });
 });

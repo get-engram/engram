@@ -973,12 +973,16 @@ export async function daemonStatus(): Promise<void> {
     problem ? "config.json, see below" : syncStatus.signed_out_at ? "signed out" : undefined,
   );
 
+  // The daemon has no vault key, and the vault holds secrets (engram#698):
+  // said with what to do, which is what the warning below would say.
+  const keyMissing = await vaultKeyMissing(syncStatus, key);
+
   // Show sync health warnings
-  printSyncWarnings(syncStatus, problem, key);
+  printSyncWarnings(syncStatus, problem, key, keyMissing);
 
   console.log(`${dim("Log:")} ${LOG_FILE}`);
 
-  if (printAutoStart(found)) await printLoginVaultKeyWarning();
+  if (printAutoStart(found) && !keyMissing) await printLoginVaultKeyWarning();
 }
 
 /**
@@ -1172,6 +1176,46 @@ async function printLoginVaultKeyWarning(startsAtLogin: () => boolean = () => tr
 }
 
 /**
+ * engram#698: the daemon has no vault key, and the account's vault holds
+ * secrets: how many, and whether ENGRAM_VAULT_KEY holds a key to save. Not
+ * while ~/.engram/vault-key is there: the daemon reads it before its next
+ * send, or holds sends while it can't (printVaultKeyWarning). Not while
+ * signed out: nothing is captured then.
+ */
+interface KeyMissing {
+  secrets: number;
+  envKey: boolean;
+}
+
+async function vaultKeyMissing(status: SyncStatus, key: KeyFile): Promise<KeyMissing | null> {
+  const secrets: unknown = status.vault_key_missing?.secrets;
+  if (typeof secrets !== "number" || !Number.isSafeInteger(secrets) || secrets <= 0) return null;
+  const keyHeld = status.error_type === "vault_key" && status.health !== "healthy";
+  if (status.vault_key !== null || key !== "none" || keyHeld || status.signed_out_at) return null;
+  return { secrets, envKey: (await envVaultKeyState()) === "none" };
+}
+
+/**
+ * engram#698, in `engram status`. A key saved now is read before the next
+ * send: no restart.
+ */
+function printVaultKeyMissingWarning({ secrets, envKey }: KeyMissing): void {
+  const one = secrets === 1;
+  console.log("");
+  console.log(red(`  WARNING: The daemon has no vault key, and your vault has ${plural(secrets, "secret")}.`));
+  console.log(dim(`  Without the key, it can't remove ${one ? "its value" : "their values"} from what it captures before`));
+  console.log(dim("  sending it."));
+  if (envKey) {
+    console.log(dim("  To save ENGRAM_VAULT_KEY's key for it: engram vault save-key"));
+  } else {
+    console.log(dim("  Put your vault key in ~/.engram/vault-key, or run 'engram vault save-key'"));
+    console.log(dim("  from a shell where ENGRAM_VAULT_KEY holds it."));
+  }
+  console.log(dim("  The daemon reads it before its next send: no restart needed."));
+  console.log("");
+}
+
+/**
  * engram#694, in `engram status`: the daemon holds sends for secrets its
  * vault key doesn't decrypt, until each decrypts, or is gone. It decrypts
  * none of the vault's secrets, or did when the hold began and some now:
@@ -1257,9 +1301,15 @@ function printVaultUndecryptableWarning(found: { secrets: number; unscrubbed: nu
 
 /**
  * `problem`: config.json can't be read (engram#673), said above. `key`:
- * what ~/.engram/vault-key holds now (engram#677).
+ * what ~/.engram/vault-key holds now (engram#677). `keyMissing`: the daemon
+ * has no vault key for the vault's secrets (engram#698).
  */
-function printSyncWarnings(status: SyncStatus, problem: ConfigUnreadable | null, key: KeyFile): void {
+function printSyncWarnings(
+  status: SyncStatus,
+  problem: ConfigUnreadable | null,
+  key: KeyFile,
+  keyMissing: KeyMissing | null = null,
+): void {
   if (problem) printConfigWarning(problem);
 
   // Sends wait while the daemon can't read the vault key, and go on waiting
@@ -1323,6 +1373,8 @@ function printSyncWarnings(status: SyncStatus, problem: ConfigUnreadable | null,
     console.log(dim(`  Since: ${status.delete_refused.since}`));
     console.log("");
   }
+
+  if (keyMissing) printVaultKeyMissingWarning(keyMissing);
 
   // Sends wait for secrets the daemon's vault key doesn't decrypt: said
   // below, or here while nothing waits yet. Some of them, with no hold:

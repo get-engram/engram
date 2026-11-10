@@ -127,6 +127,10 @@ async function fakeFetch(input: unknown, init: RequestInit = {}): Promise<Respon
       content: [{ type: "text", text: JSON.stringify({ appended: contents.length, message_ids: ids }) }],
     });
   }
+  if (tool === "vault_list") {
+    // A daemon with no vault key counts the vault's secrets (engram#698).
+    return rpc(body.id, { content: [{ type: "text", text: JSON.stringify({ secrets: [], total: 0 }) }] });
+  }
   net.violations.push(`${name}: ${tool}`);
   return rpc(body.id, { isError: true, content: [{ type: "text", text: "unexpected tool" }] });
 }
@@ -340,6 +344,9 @@ describe("the worker reads the key and its server together (engram#685)", () => 
     const after = net.events.slice(switched).filter((e): e is Sent => e.kind === "request");
     expect(after.length).toBeGreaterThan(0);
     expect(after.every((r) => r.server === "other" && r.key === KEY_B)).toBe(true);
+    // With no vault key, the new account's vault is counted, on its server
+    // with its key (engram#698). Nothing went to it before the switch.
+    expect(to("other").filter((r) => r.tool === "vault_list").map((r) => r.key)).toEqual([KEY_B]);
     // The new server isn't asked about the old key's rows: they are another server's.
     expect(to("other").filter((r) => r.hashes !== undefined)).toEqual([]);
 

@@ -15,6 +15,11 @@ import { join } from "node:path";
  * there is one even with no key yet: a key saved later is read through the
  * account in use. status.json says where the key in use came from.
  *
+ * engram#698 — with no key, the daemon counts the account's vault's
+ * secrets, through a client with no key: at start, after a switch, and when
+ * told the vault changed. How many goes to status.json and the log, never a
+ * name. Its socket says it has no key, until one is found.
+ *
  * In a temp home, with the lock, the scrubber, the syncer and the SDK's
  * client faked: the worker stops where the syncer would start. Nothing here
  * takes the real daemon's lock, changes the umask of this process, touches
@@ -40,8 +45,11 @@ interface MadeScrubber {
   report: unknown;
   /** What the daemon before held sends for, as handed on, and whether it had started then (engram#694). */
   continued: Array<{ found: unknown; started: boolean }>;
-  /** Where it looks for notices that the vault changed, and whether it had started then (engram#701). */
-  follows: Array<{ changes: () => string | null; started: boolean }>;
+  /**
+   * Where it looks for notices that the vault changed, and whether it had
+   * started then (engram#701); what it tells of each (engram#698).
+   */
+  follows: Array<{ changes: () => string | null; onChange: (() => void) | undefined; started: boolean }>;
 }
 
 /** What a fake client's vault is: what the client was made with. */
@@ -59,6 +67,14 @@ interface Keys {
 const { home, made } = vi.hoisted(() => ({
   home: { dir: "" },
   made: {
+    /** Each vault list, by the client it was made with (engram#698). */
+    lists: [] as Array<{ apiKey: string; baseUrl: string | undefined; vaultKey: string | undefined }>,
+    /** How many secrets each list finds. */
+    secrets: 0,
+    /** Each list fails, as one the server refuses or can't be reached for does. */
+    listFails: false,
+    /** What the socket was told of the key, in order (markVaultKey). */
+    marks: [] as boolean[],
     scrubbers: [] as MadeScrubber[],
     /** The scrubber each syncer was given: what it waits on before sending. */
     syncers: [] as unknown[],
@@ -88,6 +104,23 @@ const OTHER_API_KEY = "engram_sk_live_test_677_worker_2468024680";
 const SERVER = "http://127.0.0.1:8788";
 const posix = process.platform !== "win32";
 const root = process.getuid?.() === 0;
+/** The names of the vault's secrets: never in a log or status.json. */
+const SECRET_NAMES = ["DOOR_CODE_698", "GATE_PHRASE_698", "BACKUP_PIN_698"];
+
+/** A fake client's vault: what the client was made with, and the secrets made.secrets says. */
+class FakeVault implements MadeVault {
+  constructor(
+    readonly apiKey: string,
+    readonly baseUrl: string | undefined,
+    readonly vaultKey: string | undefined,
+  ) {}
+
+  async list(): Promise<Array<{ name: string }>> {
+    made.lists.push({ apiKey: this.apiKey, baseUrl: this.baseUrl, vaultKey: this.vaultKey });
+    if (made.listFails) throw new Error(`vault_list refused for ${this.apiKey} at ${this.baseUrl}`);
+    return SECRET_NAMES.slice(0, made.secrets).map((name) => ({ name }));
+  }
+}
 
 /** Where status.json says the daemon's key came from (engram#693). */
 function keyOrigin(): unknown {
@@ -110,6 +143,7 @@ async function runWorker(): Promise<{ log: () => string }> {
   vi.doMock("../daemon/instance.js", async (importOriginal) => ({
     ...(await importOriginal<typeof import("../daemon/instance.js")>()),
     claimDaemonLock: vi.fn(async () => ({ state: "held" })),
+    markVaultKey: vi.fn((has: boolean) => void made.marks.push(has)),
   }));
   // Everything in ~/.engram is the user's (engram#659 has the rest).
   vi.doMock("../daemon/ownership.js", async (importOriginal) => ({
@@ -161,8 +195,8 @@ async function runWorker(): Promise<{ log: () => string }> {
       continueMismatchHold(found: unknown) {
         this.made.continued.push({ found, started: this.made.started });
       }
-      followChanges(changes: () => string | null) {
-        this.made.follows.push({ changes, started: this.made.started });
+      followChanges(changes: () => string | null, onChange?: () => void) {
+        this.made.follows.push({ changes, onChange, started: this.made.started });
       }
       reconnect(vault: unknown) {
         this.made.reconnects.push(vault);
@@ -187,7 +221,7 @@ async function runWorker(): Promise<{ log: () => string }> {
     Engram: class {
       readonly vault: MadeVault;
       constructor(config: { apiKey: string; baseUrl?: string; vault?: { encryptionKey: string } }) {
-        this.vault = { apiKey: config.apiKey, baseUrl: config.baseUrl, vaultKey: config.vault?.encryptionKey };
+        this.vault = new FakeVault(config.apiKey, config.baseUrl, config.vault?.encryptionKey);
       }
     },
   }));
@@ -203,6 +237,10 @@ async function runWorker(): Promise<{ log: () => string }> {
 }
 
 beforeEach(() => {
+  made.lists.length = 0;
+  made.secrets = 0;
+  made.listFails = false;
+  made.marks.length = 0;
   made.scrubbers.length = 0;
   made.syncers.length = 0;
   made.keys.length = 0;
@@ -515,5 +553,212 @@ describe("a daemon told when the vault changes (engram#701)", () => {
     expect(changes()).toBe(first);
     expect(noteVaultChanged(join(ENGRAM_DIR, "vault-changed"))).toBe(true);
     expect(changes()).not.toBe(first);
+  });
+});
+
+describe("a daemon with no vault key counts the account's vault's secrets (engram#698)", () => {
+  const STATUS_FILE = join(ENGRAM_DIR, "status.json");
+  const statusText = (): string => readFileSync(STATUS_FILE, "utf-8");
+  const missingIn = (): unknown => (JSON.parse(statusText()) as { vault_key_missing?: unknown }).vault_key_missing;
+  const TWO =
+    "vault scrubber: off, and this account's vault has 2 secrets — with no vault key, their values " +
+    "aren't removed from what is captured. Put the key in ~/.engram/vault-key (engram vault save-key): " +
+    "it is read before the next send.\n";
+  const signedIn = () =>
+    writeFileSync(join(ENGRAM_DIR, "config.json"), JSON.stringify({ apiKey: API_KEY, baseUrl: SERVER }), {
+      mode: 0o600,
+    });
+  /** A turn of the event loop: a check begun has answered by then. */
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  /** Never a secret's name, and no key, in the log or status.json. */
+  const nothingNamed = (log: string) => {
+    for (const text of [log, statusText()]) {
+      for (const name of SECRET_NAMES) expect(text).not.toContain(name);
+      for (const secret of [API_KEY, OTHER_API_KEY, VAULT_KEY]) expect(text).not.toContain(secret);
+    }
+  };
+
+  it("signed in: counts them through a client with no key, and says how many, never a name", async () => {
+    signedIn();
+    made.secrets = 2;
+    const { log } = await runWorker();
+    await vi.waitFor(() => expect(missingIn()).toEqual({ secrets: 2 }));
+    // Once, through the account in use, with no key: listing needs none.
+    expect(made.lists).toEqual([{ apiKey: API_KEY, baseUrl: SERVER, vaultKey: "" }]);
+    expect(log()).toContain(TWO);
+    // The scrubber still has no vault to read.
+    expect(made.scrubbers[0]).toMatchObject({ vault: null, key: undefined, started: true });
+    // Its socket says it has no key: `engram vault set` warns.
+    expect(made.marks).toEqual([false]);
+    nothingNamed(log());
+  });
+
+  it("a vault with none: nothing said, and status.json says nothing of it", async () => {
+    signedIn();
+    const { log } = await runWorker();
+    expect(made.lists).toHaveLength(1);
+    await settle();
+    expect(missingIn()).toBeNull();
+    expect(log()).not.toContain("this account's vault has");
+  });
+
+  it.each([
+    ["a key file that reads", () => writeFileSync(KEY_FILE, `${VAULT_KEY}\n`)],
+    ["ENGRAM_VAULT_KEY", () => vi.stubEnv("ENGRAM_VAULT_KEY", ENV_VAULT_KEY)],
+    ["a key file it can't read", () => mkdirSync(KEY_FILE)],
+  ])("%s: never lists, and its socket says it has a key", async (_with, keyed) => {
+    signedIn();
+    keyed();
+    made.secrets = 2;
+    const { log } = await runWorker();
+    const [scrubber] = made.scrubbers;
+    // Told the vault changed, or switched: still nothing listed.
+    scrubber.follows[0].onChange?.();
+    (made.keys[0] as Keys).connect({ key: OTHER_API_KEY, server: SERVER });
+    await settle();
+    expect(made.lists).toEqual([]);
+    expect(missingIn()).toBeNull();
+    expect(log()).not.toContain("this account's vault has");
+    expect(made.marks).toEqual([true]);
+  });
+
+  it("told the vault changed: counts it again, through the account in use", async () => {
+    signedIn();
+    const { log } = await runWorker();
+    const [scrubber] = made.scrubbers;
+    expect(made.lists).toHaveLength(1);
+    await settle();
+    expect(missingIn()).toBeNull();
+    // `engram vault set`, from a shell with the key: some now.
+    made.secrets = 3;
+    scrubber.follows[0].onChange?.();
+    await vi.waitFor(() => expect(missingIn()).toEqual({ secrets: 3 }));
+    expect(log()).toContain("this account's vault has 3 secrets — with no vault key, their values aren't removed");
+    // `engram vault delete`: one left.
+    made.secrets = 1;
+    scrubber.follows[0].onChange?.();
+    await vi.waitFor(() => expect(missingIn()).toEqual({ secrets: 1 }));
+    expect(log()).toContain("this account's vault has 1 secret — with no vault key, its value isn't removed");
+    // And none.
+    made.secrets = 0;
+    scrubber.follows[0].onChange?.();
+    await vi.waitFor(() => expect(missingIn()).toBeNull());
+    expect(made.lists).toEqual(Array(4).fill({ apiKey: API_KEY, baseUrl: SERVER, vaultKey: "" }));
+    nothingNamed(log());
+  });
+
+  it("a key found later: the count goes at once, nothing is listed after, and its socket says it has one", async () => {
+    signedIn();
+    made.secrets = 2;
+    const { log } = await runWorker();
+    await vi.waitFor(() => expect(missingIn()).toEqual({ secrets: 2 }));
+    const [scrubber] = made.scrubbers;
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    const key = await scrubber.keyFile?.source.read();
+    expect(key).toBe(VAULT_KEY);
+    scrubber.keyFile?.source.vaultWith(key as string);
+    expect(missingIn()).toBeNull();
+    expect(made.marks).toEqual([false, true]);
+    // Changes and switches list nothing more.
+    scrubber.follows[0].onChange?.();
+    (made.keys[0] as Keys).connect({ key: OTHER_API_KEY, server: SERVER });
+    await settle();
+    expect(made.lists).toHaveLength(1);
+    expect(missingIn()).toBeNull();
+    nothingNamed(log());
+  });
+
+  it("a key file that can't be read, found later: sends are held for it, so the count goes too", async () => {
+    signedIn();
+    made.secrets = 2;
+    await runWorker();
+    await vi.waitFor(() => expect(missingIn()).toEqual({ secrets: 2 }));
+    const [scrubber] = made.scrubbers;
+    mkdirSync(KEY_FILE);
+    await expect(scrubber.keyFile?.source.read()).rejects.toMatchObject({ kind: "folder" });
+    expect(missingIn()).toBeNull();
+    expect(made.marks).toEqual([false, true]);
+    scrubber.follows[0].onChange?.();
+    await settle();
+    expect(made.lists).toHaveLength(1);
+    expect(missingIn()).toBeNull();
+  });
+
+  it("another account: the last one's count goes at once, and the new one's is counted; signed out: none", async () => {
+    signedIn();
+    made.secrets = 2;
+    const { log } = await runWorker();
+    await vi.waitFor(() => expect(missingIn()).toEqual({ secrets: 2 }));
+    const [scrubber] = made.scrubbers;
+    const keys = made.keys[0] as Keys & { disconnect(): void };
+    made.secrets = 1;
+    keys.connect({ key: OTHER_API_KEY, server: SERVER });
+    // Gone before the new account's answer: it was the other account's.
+    expect(missingIn()).toBeNull();
+    await vi.waitFor(() => expect(missingIn()).toEqual({ secrets: 1 }));
+    expect(made.lists.at(-1)).toEqual({ apiKey: OTHER_API_KEY, baseUrl: SERVER, vaultKey: "" });
+    // Told the vault changed: the account in use now is the one counted.
+    made.secrets = 3;
+    scrubber.follows[0].onChange?.();
+    await vi.waitFor(() => expect(missingIn()).toEqual({ secrets: 3 }));
+    expect(made.lists).toHaveLength(3);
+    expect(made.lists.at(-1)).toMatchObject({ apiKey: OTHER_API_KEY });
+    // Signed out: nothing to say, and nothing listed then.
+    keys.disconnect();
+    expect(missingIn()).toBeNull();
+    scrubber.follows[0].onChange?.();
+    await settle();
+    expect(made.lists).toHaveLength(3);
+    expect(missingIn()).toBeNull();
+    nothingNamed(log());
+  });
+
+  it("signed out at start: nothing listed until it signs in", async () => {
+    made.secrets = 2;
+    await runWorker();
+    const [scrubber] = made.scrubbers;
+    scrubber.follows[0].onChange?.();
+    await settle();
+    expect(made.lists).toEqual([]);
+    expect(missingIn()).toBeNull();
+    expect(made.marks).toEqual([false]);
+    (made.keys[0] as Keys).connect({ key: API_KEY, server: SERVER });
+    await vi.waitFor(() => expect(missingIn()).toEqual({ secrets: 2 }));
+    expect(made.lists).toEqual([{ apiKey: API_KEY, baseUrl: SERVER, vaultKey: "" }]);
+  });
+
+  it("a list that fails: nothing said, and never why", async () => {
+    signedIn();
+    made.secrets = 2;
+    made.listFails = true;
+    const { log } = await runWorker();
+    expect(made.lists).toHaveLength(1);
+    await settle();
+    expect(missingIn()).toBeNull();
+    expect(log()).not.toContain("this account's vault has");
+    expect(log()).not.toContain("refused");
+    expect(log()).not.toContain("127.0.0.1");
+    nothingNamed(log());
+  });
+
+  it("a count the daemon before left: gone from its first write, without a key or with one", async () => {
+    const stale = () =>
+      writeFileSync(STATUS_FILE, JSON.stringify({ health: "healthy", vault_key: null, vault_key_missing: { secrets: 5 } }));
+    // No key, signed out: nothing else is written at start.
+    stale();
+    await runWorker();
+    expect(missingIn()).toBeNull();
+    expect(made.lists).toEqual([]);
+
+    for (const db of made.dbs.splice(0)) db.close();
+    vi.resetModules();
+    made.scrubbers.length = 0;
+    made.keys.length = 0;
+    made.syncers.length = 0;
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    stale();
+    await runWorker();
+    expect(missingIn()).toBeNull();
+    expect(made.lists).toEqual([]);
   });
 });

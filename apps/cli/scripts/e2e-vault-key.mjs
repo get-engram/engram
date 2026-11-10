@@ -25,6 +25,12 @@
  *   - A key that isn't there any more, after one that couldn't be read:
  *     still held, and `engram status` says how to go on without one. A
  *     start with no key sends what was held. Nothing said is lost.
+ *   - No key at all, and secrets in the account's vault (engram#698): the
+ *     daemon counts them, and names none, and daemon.log, status.json,
+ *     `engram status` and `engram vault set` say it can't remove their
+ *     values. A secret saved meanwhile is counted too. The key saved with
+ *     `engram vault save-key` is read before the next send, with no
+ *     restart, and what is said next is scrubbed.
  *
  * Usage, after `pnpm build`:  node scripts/e2e-vault-key.mjs
  *
@@ -72,6 +78,11 @@ const TOKEN = `[VAULT:${SECRET_NAME}]`;
 const NEW_NAME = "GATE_PHRASE";
 const NEW_SECRET = `fern-quarry-${randomBytes(4).toString("hex")}-kettle`;
 const NEW_TOKEN = `[VAULT:${NEW_NAME}]`;
+// Saved from a shell with the key in ENGRAM_VAULT_KEY, while the daemon runs
+// with none (engram#698).
+const THIRD_NAME = "BACKUP_PIN";
+const THIRD_SECRET = `moss-ladder-${randomBytes(4).toString("hex")}-candle`;
+const THIRD_TOKEN = `[VAULT:${THIRD_NAME}]`;
 const KEY_TOKEN = "[VAULT:vault-key]";
 const fp = (k) => createHash("sha256").update(k).digest("hex");
 
@@ -241,7 +252,9 @@ function redact(s) {
     .split(SECRET)
     .join("<the secret>")
     .split(NEW_SECRET)
-    .join("<the new secret>");
+    .join("<the new secret>")
+    .split(THIRD_SECRET)
+    .join("<the third secret>");
   const vk = knownVaultKey();
   // The key's first 8 characters too: keygen and status showed them before
   // engram#699, and step 1 checks that nothing does now.
@@ -295,8 +308,12 @@ let lastOut = "";
  * process. `out` is redacted and printed; `raw` is what it said, unprinted.
  */
 function engram(...args) {
+  return engramWith({}, ...args);
+}
+/** engram(), with `extra` in its environment as well. */
+function engramWith(extra, ...args) {
   return new Promise((resolve) => {
-    const child = spawn(node, [CLI, ...args], { env, cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(node, [CLI, ...args], { env: { ...env, ...extra }, cwd: root, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (out += d));
@@ -306,7 +323,8 @@ function engram(...args) {
       const raw = out.replace(/\x1b\[[0-9;]*m/g, "");
       out = redact(raw);
       lastOut = out;
-      console.log(`\n$ engram ${redact(args.join(" "))}  (exit ${status})`);
+      const set = Object.keys(extra).map((name) => `${name}=<set> `).join("");
+      console.log(`\n$ ${set}engram ${redact(args.join(" "))}  (exit ${status})`);
       for (const line of out.trimEnd().split("\n")) console.log(`  │ ${line}`);
       resolve({ status, out, raw });
     });
@@ -413,6 +431,16 @@ const NOTICE =
 const WAITS = "Meanwhile, messages wait here rather than be sent with your vault's secrets";
 /** Said before a command while the daemon holds messages for the key. */
 const BANNER = `engram: ${NOTICE}`;
+// engram#698: no key, and secrets in the account's vault.
+const NO_KEY_COUNT = (n) =>
+  `vault scrubber: off, and this account's vault has ${n} secrets — with no vault key, their values aren't ` +
+  "removed from what is captured. Put the key in ~/.engram/vault-key (engram vault save-key): it is read " +
+  "before the next send.";
+const NO_KEY_WARNING = (n) => `WARNING: The daemon has no vault key, and your vault has ${n} secrets.`;
+const NO_KEY_FIX = "Put your vault key in ~/.engram/vault-key, or run 'engram vault save-key'";
+const NO_KEY_ENV_FIX = "To save ENGRAM_VAULT_KEY's key for it: engram vault save-key";
+const NO_KEY_HINT = "The daemon running now has no vault key, so it can't remove this secret from what it captures.";
+const KEY_SAVED = "vault scrubber: on — a vault key was saved; reading the vault with it before sending";
 const statusIs = (health, errorType, pending) => () => {
   const s = syncStatus();
   return s.health === health && s.error_type === errorType && (pending === undefined || s.pending_messages === pending);
@@ -570,15 +598,72 @@ try {
   check(since("append", t6).length === 0 && unsent() === 1, "w1 isn't sent; it waits in daemon.db");
   await stopWorker(pid);
   check(lastOut.includes(`${BANNER} 1 message waiting locally.`), "stop: the daemon held w1, and says so");
+  const t7 = Date.now();
   pid = await startWorker(pid);
   check(!lastOut.includes(BANNER), "start: no word of a hold, as the daemon it starts has no key to wait for");
   await waitFor("daemon.log: the scrubber is off", () => logCount(SCRUB_OFF) === 1, 10_000);
   await waitFor("w1 arrives", () => arrived("w1").length === 1);
   await waitFor("daemon.db: nothing waits", () => unsent() === 0, 10_000);
   await waitFor("status.json: healthy", statusIs("healthy", null, 0), 10_000);
+
+  // ── 7. no key, and secrets in the vault (engram#698): counted, never named, and said; a key saved is read before the next send ──
+  await waitFor("status.json: no key, and the vault's 2 secrets", () => syncStatus().vault_key_missing?.secrets === 2, 10_000);
+  check(syncStatus().vault_key === null, "status.json: no key in use");
+  // Said before it is recorded; waited for all the same, as a log write can land a moment late.
+  await waitFor("daemon.log: no key, and the vault has 2 secrets", () => logCount(NO_KEY_COUNT(2)) > 0, 10_000);
+  check(logCount(NO_KEY_COUNT(2)) === 1, "daemon.log: no key, and the vault has 2 secrets, said once");
+  check(
+    since("vault_list", t7).length === 1 && since("vault_get", t7).length === 0,
+    `the vault listed once, and no secret read (${since("vault_list", t7).length}, ${since("vault_get", t7).length})`,
+  );
+  r = await engram("status");
+  check(r.out.includes(NO_KEY_WARNING(2)) && r.out.includes(NO_KEY_FIX), "engram status: no key, 2 secrets, and where the key goes");
+  check(!r.out.includes(NO_KEY_ENV_FIX), "engram status: nothing of ENGRAM_VAULT_KEY, which isn't set");
+  check(![SECRET_NAME, NEW_NAME].some((n) => r.raw.includes(n)), "engram status names neither secret");
+  // A shell with the key in ENGRAM_VAULT_KEY, which the daemon never got.
+  const withKey = { ENGRAM_VAULT_KEY: knownVaultKey() ?? "" };
+  r = await engramWith(withKey, "vault", "set", THIRD_NAME, "--value", THIRD_SECRET);
+  check(r.status === 0, "vault set, with the key in ENGRAM_VAULT_KEY, exits 0");
+  check(
+    r.out.includes(NO_KEY_HINT) && r.out.includes("To save this key where it reads it: engram vault save-key"),
+    "vault set: the daemon has no key to remove it with, and how to save the key",
+  );
+  check(!r.raw.includes(RESTART_HINT), "vault set: nothing of the 10-minute read");
+  const t7b = Date.now();
+  const s4 = session();
+  s4.say(`${said("x0")} nothing secret yet`);
+  await waitFor("x0 arrives", () => arrived("x0").length === 1);
+  await waitFor("status.json: 3 secrets now", () => syncStatus().vault_key_missing?.secrets === 3, 10_000);
+  await waitFor("daemon.log: told the vault changed, it counts 3", () => logCount(NO_KEY_COUNT(3)) > 0, 10_000);
+  check(logCount(NO_KEY_COUNT(3)) === 1, "daemon.log: 3 secrets, said once");
+  check(
+    since("vault_list", t7b).length === 1 && since("vault_get", t7b).length === 0,
+    `listed once more, and no secret read (${since("vault_list", t7b).length}, ${since("vault_get", t7b).length})`,
+  );
+  r = await engramWith(withKey, "status");
+  check(
+    r.out.includes(NO_KEY_WARNING(3)) && r.out.includes(NO_KEY_ENV_FIX),
+    "engram status, with the key in ENGRAM_VAULT_KEY: 3 secrets, and save-key saves its key",
+  );
+  r = await engramWith(withKey, "vault", "save-key");
+  check(r.status === 0 && r.out.includes("Vault key saved to:"), "vault save-key saves ENGRAM_VAULT_KEY's key");
+  check(r.out.includes("The daemon running now reads it before its next send: no restart needed."), "vault save-key: no restart needed");
+  s4.say(`${said("x1")} the door code ${SECRET}, the pin ${THIRD_SECRET}`);
+  await waitFor("x1 arrives", () => arrived("x1").length === 1);
+  check(arrived("x1")[0]?.includes(`the door code ${TOKEN}, the pin ${THIRD_TOKEN}`), `x1 arrives with ${TOKEN} and ${THIRD_TOKEN}`);
+  check(logCount(KEY_SAVED) === 1, "daemon.log: a key was saved, and the vault read with it before sending");
+  check(daemonPid() === pid && alive(pid), "the same worker: no restart");
+  await waitFor(
+    "status.json: the file's key in use, and nothing missing",
+    () => syncStatus().vault_key === "file" && syncStatus().vault_key_missing === null,
+    10_000,
+  );
+  r = await engram("status");
+  check(r.status === 0 && !r.out.includes("The daemon has no vault key"), "engram status: nothing of a missing key");
+  await waitFor("daemon.db: no copy of the secrets", () => kept(SECRET) === 0 && kept(THIRD_SECRET) === 0, 10_000);
   await stopWorker(pid);
 
-  const all = ["u1", "u2", "u3", "u4", "u5", ...(asRoot ? [] : ["v1"]), "w1"];
+  const all = ["u1", "u2", "u3", "u4", "u5", ...(asRoot ? [] : ["v1"]), "w1", "x0", "x1"];
   const counts = all.map((n) => `${n}×${arrived(n).length}`).join(" ");
   check(all.every((n) => arrived(n).length === 1), `everything said arrived, once: nothing lost (${counts})`);
   check(arrived("stored").length === 0, "and nothing from the refused store");
@@ -598,12 +683,15 @@ try {
   check(!stubLines().some((l) => l.startsWith("launchctl")), "launchctl was never run");
   check(reached(SECRET) === 0, `the secret never reached the server (${reached(SECRET)} requests)`);
   check(reached(NEW_SECRET) === 0, `the new secret never reached the server (${reached(NEW_SECRET)} requests)`);
+  check(reached(THIRD_SECRET) === 0, `the third secret never reached the server (${reached(THIRD_SECRET)} requests)`);
   check(vaultKey !== null && reached(vaultKey) === 0, `the vault key never reached the server (${vaultKey ? reached(vaultKey) : "?"} requests)`);
   const files = logText() + (existsSync(STATUS_FILE) ? readFileSync(STATUS_FILE, "utf-8") : "");
   check(
-    !files.includes(SECRET) && !files.includes(NEW_SECRET) && !(vaultKey && files.includes(vaultKey)),
+    !files.includes(SECRET) && !files.includes(NEW_SECRET) && !files.includes(THIRD_SECRET) &&
+      !(vaultKey && files.includes(vaultKey)),
     "daemon.log and status.json never hold the secrets or the key",
   );
+  check(![SECRET_NAME, NEW_NAME, THIRD_NAME].some((n) => files.includes(n)), "daemon.log and status.json never name a secret");
   const ops = {};
   for (const x of server.log) ops[`${x.op} [${x.key}]`] = (ops[`${x.op} [${x.key}]`] ?? 0) + 1;
   console.log("\nrequests the server saw:", JSON.stringify(ops, null, 1));

@@ -351,6 +351,17 @@ describe("reading the daemon's answer", () => {
     }
   });
 
+  it("reads whether it has a vault key, when it says (engram#698)", () => {
+    expect(parseAnswer(answerLine({ vault_key: false }).trim())?.vaultKey).toBe(false);
+    expect(parseAnswer(answerLine({ vault_key: true }).trim())?.vaultKey).toBe(true);
+    // One from before, or one that hasn't read it yet, says nothing of it:
+    // `engram vault set` then never says it has none. Only true or false is
+    // an answer.
+    for (const value of [undefined, "false", 0, null, "true", 1]) {
+      expect(parseAnswer(answerLine({ vault_key: value }).trim())?.vaultKey, String(value)).toBeUndefined();
+    }
+  });
+
   it("reads whether it takes a request to stop from the stop file (engram#613)", () => {
     expect(parseAnswer(answerLine({ stop_file: true }).trim())?.stopFile).toBe(true);
     // A daemon from before then says nothing of it; only true is taken for yes.
@@ -1047,5 +1058,28 @@ describe("the daemon's answer as it starts and stops", () => {
     const other = endpointIn(mkdtempSync(join(dir, "o")));
     heldOf(await lock(other));
     expect(await probeDaemon({ endpoint: other })).toMatchObject({ info: { ready: false, stopping: false } });
+  });
+
+  it("says whether it has a vault key once it has read it, and not before (engram#698)", async () => {
+    vi.resetModules();
+    const fresh = await import("../daemon/instance.js");
+    const endpoint = endpointIn(dir);
+    const result = await fresh.lockEndpoint(endpoint, { settleMs: 20 });
+    if (result.state === "held") lockServers.push(result.held.server);
+    heldOf(result);
+    const said = async (): Promise<Record<string, unknown>> => JSON.parse((await exchange(endpoint)).trim());
+    // Not read yet: nothing said, as by one from before.
+    expect(await said()).not.toHaveProperty("vault_key");
+    fresh.markVaultKey(false);
+    expect((await said()).vault_key).toBe(false);
+    expect(await probeDaemon({ endpoint })).toMatchObject({ info: { vaultKey: false } });
+    fresh.markVaultKey(true);
+    expect((await said()).vault_key).toBe(true);
+    expect(await probeDaemon({ endpoint })).toMatchObject({ info: { vaultKey: true } });
+
+    // The copy the other tests use was never marked.
+    const other = endpointIn(mkdtempSync(join(dir, "o")));
+    heldOf(await lock(other));
+    expect(JSON.parse((await exchange(other)).trim())).not.toHaveProperty("vault_key");
   });
 });

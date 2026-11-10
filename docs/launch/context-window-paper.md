@@ -212,20 +212,11 @@ engram search "when did we deploy"
 
 That's it. Every Claude Code session is captured automatically from that point forward.
 
-For MCP integration (so the agent searches automatically), add to `~/.claude/settings.json`:
+For MCP integration (so the agent searches automatically), add Engram as an MCP server for all your projects:
 
-```json
-{
-  "mcpServers": {
-    "engram": {
-      "type": "url",
-      "url": "https://mcp.getengram.app/mcp",
-      "headers": {
-        "Authorization": "Bearer YOUR_API_KEY"
-      }
-    }
-  }
-}
+```bash
+claude mcp add --transport http --scope user engram https://mcp.getengram.app/mcp \
+  --header "Authorization: Bearer YOUR_API_KEY"
 ```
 
 ## 7. Conclusion

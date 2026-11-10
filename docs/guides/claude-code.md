@@ -10,21 +10,14 @@ Sign up at [getengram.app](https://getengram.app) or [self-host](../self-hosting
 
 ### 2. Add the MCP Server
 
-**Global (all projects)** — add to `~/.claude/settings.json`:
+**Global (all projects)** — run:
 
-```json
-{
-  "mcpServers": {
-    "engram": {
-      "type": "url",
-      "url": "https://mcp.getengram.app/mcp",
-      "headers": {
-        "Authorization": "Bearer engram_sk_live_your_key_here"
-      }
-    }
-  }
-}
+```bash
+claude mcp add --transport http --scope user engram https://mcp.getengram.app/mcp \
+  --header "Authorization: Bearer engram_sk_live_your_key_here"
 ```
+
+Claude Code keeps servers for all your projects in `~/.claude.json`. It doesn't load MCP servers from `~/.claude/settings.json`.
 
 **Per-project** — add `.mcp.json` to the project root:
 
@@ -32,7 +25,7 @@ Sign up at [getengram.app](https://getengram.app) or [self-host](../self-hosting
 {
   "mcpServers": {
     "engram": {
-      "type": "url",
+      "type": "http",
       "url": "https://mcp.getengram.app/mcp",
       "headers": {
         "Authorization": "Bearer engram_sk_live_your_key_here"

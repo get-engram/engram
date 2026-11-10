@@ -408,7 +408,7 @@ Back up your vault key in a secure location.
 
 ### Claude Code
 
-In `~/.claude/settings.json`:
+In your project's `.mcp.json`:
 
 ```json
 {

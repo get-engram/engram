@@ -26,13 +26,13 @@ Restart Claude Desktop. Engram's 6 tools will appear in Claude's tool list.
 
 ## Claude Code (CLI)
 
-Add to your project's `.mcp.json` or global config:
+Add to your project's `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "engram": {
-      "type": "url",
+      "type": "http",
       "url": "https://mcp.getengram.app/mcp",
       "headers": {
         "Authorization": "Bearer engram_sk_live_your_key_here"
@@ -40,6 +40,13 @@ Add to your project's `.mcp.json` or global config:
     }
   }
 }
+```
+
+Or add it to all your projects:
+
+```bash
+claude mcp add --transport http --scope user engram https://mcp.getengram.app/mcp \
+  --header "Authorization: Bearer engram_sk_live_your_key_here"
 ```
 
 ## Cursor

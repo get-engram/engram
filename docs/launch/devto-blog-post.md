@@ -38,7 +38,7 @@ Try asking: *"What did we discuss about [topic] last week?"*
 
 ## Setup: Claude Code (one config line + auto-capture)
 
-Add to your MCP config (`~/.claude/settings.json`):
+Add to `.mcp.json` in your project root:
 
 ```json
 {

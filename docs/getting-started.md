@@ -22,19 +22,12 @@ Add Engram to your MCP client. See [Integrations](./integrations.md) for all sup
 
 **Claude Code:**
 
-Add to `~/.claude/settings.json` under `mcpServers`:
-
-```json
-{
-  "engram": {
-    "type": "http",
-    "url": "https://mcp.getengram.app/mcp",
-    "headers": {
-      "Authorization": "Bearer engram_sk_live_your_api_key_here"
-    }
-  }
-}
+```bash
+claude mcp add --transport http --scope user engram https://mcp.getengram.app/mcp \
+  --header "Authorization: Bearer engram_sk_live_your_api_key_here"
 ```
+
+That adds Engram to all your projects. For a per-project `.mcp.json`, see the [Claude Code guide](./guides/claude-code.md).
 
 **Claude Desktop:**
 

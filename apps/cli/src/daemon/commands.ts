@@ -16,6 +16,7 @@ import { formatWait } from "./backoff.js";
 import { ALL_ADAPTERS } from "./adapters.js";
 import { rootForAnotherUser } from "./as-root.js";
 import { commandFailure } from "./command-path.js";
+import { throughOptLink } from "./homebrew.js";
 import {
   ENGRAM_DIR,
   LOG_FILE,
@@ -693,10 +694,9 @@ function printLaunchdAutoStart(plist: PlistState): boolean {
     console.log(`${dim("Auto-start:")} enabled (launchd)` + red("  — broken, run 'engram install' to repair"));
     return false;
   }
-  const stale = plist.version < PLIST_VERSION;
   console.log(
     `${dim("Auto-start:")} enabled (launchd)` +
-      (stale ? red("  — outdated config, run 'engram install' to update") : ""),
+      (plist.outdated ? red("  — outdated config, run 'engram install' to update") : ""),
   );
   return true;
 }
@@ -716,7 +716,7 @@ function printSystemdAutoStart(unit: UnitState): boolean {
   }
   console.log(
     `${dim("Auto-start:")} enabled (systemd)` +
-      (unit.version < UNIT_VERSION ? red("  — outdated config, run 'engram install' to update") : ""),
+      (unit.outdated ? red("  — outdated config, run 'engram install' to update") : ""),
   );
   return true;
 }
@@ -800,7 +800,8 @@ function plistForThisCli(): { text: string } | { error: string } {
     return {
       text: generatePlist({
         node,
-        worker: workerPath(),
+        // A CLI installed with brew runs from a versioned keg too (engram#652).
+        worker: throughOptLink(workerPath()),
         log: LOG_FILE,
         home: homedir(),
         // launchd hands a job a bare PATH (/usr/bin:/bin:/usr/sbin:/sbin) —
@@ -841,7 +842,8 @@ function prepareLaunchdLog(): void {
 /**
  * Rewrite and reload a plist of ours that an older CLI wrote (engram#469),
  * or that can't start the daemon (engram#616): one launchd can't read, or
- * one naming a Node or a CLI that has since moved.
+ * one naming a Node or a CLI that has since moved. Or one naming them in a
+ * Homebrew version that the next upgrade removes (engram#652).
  *
  * Without this, a plist defect is permanent: `brew upgrade` / `npm i -g`
  * replaces the code but leaves the plist, so the machine keeps launching the
@@ -855,7 +857,7 @@ export function repairLaunchdIfStale(plist?: PlistState): boolean {
   if (process.platform !== "darwin") return false;
   const state = plist ?? readPlist();
   if (state.kind !== "ours") return false;
-  if (!state.broken && state.version >= PLIST_VERSION) return false;
+  if (!state.broken && !state.outdated) return false;
   // Only a source checkout run through tsx has no worker.js: the build ships it.
   if (!existsSync(workerPath())) return false;
   // Never fails the command it runs in: a plist that can't be made or
@@ -1021,10 +1023,12 @@ export function runEntryCommand(nodePath: string, entryPath: string): string {
  * Node's own path, through any links. A version manager can start Node
  * through a link made for one shell session (fnm's multishell directories),
  * which may be gone by the next sign-in; the program it links to stays.
+ * Homebrew's Node goes by its opt link, which outlasts the version the next
+ * `brew upgrade` removes (engram#652).
  */
 function nodePathForEntry(): string {
   try {
-    return realpathSync.native(process.execPath);
+    return throughOptLink(realpathSync.native(process.execPath));
   } catch {
     return process.execPath;
   }
@@ -1197,7 +1201,7 @@ function unitForThisCli(): { text: string } | { error: string } {
     return {
       text: generateUnit({
         node,
-        worker: workerPath(),
+        worker: throughOptLink(workerPath()),
         log: LOG_FILE,
         engramDir: ENGRAM_DIR,
         home: homedir(),
@@ -1211,13 +1215,14 @@ function unitForThisCli(): { text: string } | { error: string } {
 
 /**
  * Rewrite an enabled unit of ours that names a Node or a CLI that has since
- * moved, or that an older CLI wrote: the counterpart of repairLaunchdIfStale
- * and repairRunEntryIfBroken. One the user disabled is left as it is.
+ * moved, or that an older CLI wrote, or that names them in a Homebrew version
+ * (engram#652): the counterpart of repairLaunchdIfStale and
+ * repairRunEntryIfBroken. One the user disabled is left as it is.
  */
 export function repairSystemdUnitIfStale(unit: UnitState = readUnit()): boolean {
   if (process.platform !== "linux") return false;
   if (unit.kind !== "ours" || !unit.enabled) return false;
-  if (!unit.broken && unit.version >= UNIT_VERSION) return false;
+  if (!unit.broken && !unit.outdated) return false;
   // Only a source checkout run through tsx has no worker.js: the build ships it.
   if (!existsSync(workerPath())) return false;
   // Never fails the command it runs in: a unit that can't be made or written

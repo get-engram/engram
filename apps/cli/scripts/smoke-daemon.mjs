@@ -11,6 +11,10 @@
  * needs one and writes no unit (engram#615); scripts/e2e-systemd.mjs runs
  * the real systemd.
  *
+ * With a config.json it can't write, `engram stop` still stops the daemon,
+ * says it couldn't record that capture is off, why, and what fixes it, and
+ * exits 1; once it's fixed, a stop records it (engram#681).
+ *
  * On Windows it also checks the supervisor (engram#613): every way of
  * starting the daemon runs the worker under one, `engram stop` asks the
  * worker to stop through ~/.engram/daemon.stop and it shuts down as it does
@@ -279,7 +283,8 @@ async function started(what, not = null) {
   return pid;
 }
 
-async function stopped(pid) {
+/** `engram stop`, with the daemon running as `pid`: exits `exit`, and the daemon is gone. */
+async function stopped(pid, exit = 0) {
   const running = pid !== null && alive(pid);
   const supervisor = running ? supervisorFor.get(pid) : undefined;
   if (WINDOWS && supervisor) {
@@ -289,7 +294,7 @@ async function stopped(pid) {
   }
   const logFrom = readLog().length;
   const r = engram("stop");
-  check(r.status === 0, "stop exits 0");
+  check(r.status === exit, `stop exits ${exit}`);
   if (pid) await waitFor("the worker exits", () => !alive(pid));
   check(daemonPid() === null, "stop removes the PID file");
   if (WINDOWS && supervisor) {
@@ -303,6 +308,7 @@ async function stopped(pid) {
     check(!/supervisor: /.test(readLog().slice(logFrom)), "and doesn't start it again");
     check(!existsSync(STOP_FILE), "the worker removes the request once it has stopped");
   }
+  return r;
 }
 
 /** Permission bits, in octal. */
@@ -562,6 +568,38 @@ try {
       `the CLI's and the daemon's writes leave no temp file behind (${temps.join(", ")})`,
     );
   }
+
+  // ── engram stop with a config.json it can't write (engram#681) ──
+  // It stops the daemon all the same. Until "off" is recorded, the next
+  // engram command starts the daemon again, so it says so, and exits 1.
+  r = engram("start");
+  check(r.status === 0, "start exits 0");
+  pid = await started("the worker starts again");
+  const CONFIG = join(ENGRAM_DIR, "config.json");
+  const config = readFileSync(CONFIG, "utf-8");
+  check(JSON.parse(config).autocapture === "on", "start records that capture is on");
+  chmodSync(CONFIG, 0o400);
+  r = await stopped(pid, 1);
+  const said = [
+    "Couldn't record that capture is off: ~/.engram/config.json can't be written: permission denied.",
+    // chmod is no fix on Windows, where a read-only file is one by an attribute.
+    ...(WINDOWS
+      ? ["  Once it's fixed, run 'engram stop' again, or the next engram command turns capture back on."]
+      : [
+          "  To fix it, run: chmod u+w ~/.engram/config.json",
+          "  Then run 'engram stop' again, or the next engram command turns capture back on.",
+        ]),
+  ].join("\n");
+  check(r.out.includes(said), "stop says it couldn't record that capture is off, why, and what fixes it");
+  check(readFileSync(CONFIG, "utf-8") === config, "config.json is as it was");
+  check(
+    readdirSync(ENGRAM_DIR).every((name) => !name.endsWith(".tmp") || join(ENGRAM_DIR, name) === freshTemp),
+    "the failed write leaves no temp file",
+  );
+  chmodSync(CONFIG, 0o600);
+  r = engram("stop");
+  check(r.status === 0 && /Daemon is not running/.test(r.out), "once it's fixed, stop exits 0");
+  check(JSON.parse(readFileSync(CONFIG, "utf-8")).autocapture === "off", "and records that capture is off");
 } catch (err) {
   check(false, `smoke test crashed: ${err instanceof Error ? err.stack : err}`);
 } finally {

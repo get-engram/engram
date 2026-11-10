@@ -3,7 +3,7 @@ import { readFileSync, existsSync, mkdtempSync, realpathSync, rmSync } from "nod
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, win32 } from "node:path";
 import { bold, dim, plural, red } from "../output.js";
-import { loadConfigStrict, saveConfig, type Config } from "../config.js";
+import { loadConfigStrict, saveConfig, saveFailure, type Config } from "../config.js";
 import { ConfigUnreadable } from "../config-file.js";
 import { inspectConfig, printEmptyConfigNote } from "../config-guard.js";
 import { writePrivateFileSync } from "../private-files.js";
@@ -748,6 +748,13 @@ async function waitForOther(deadline: number): Promise<WorkerStart> {
  * was, `engram stop` replaced it with only `autocapture`. Nothing is lost
  * by not recording "on": nothing turns capture off meanwhile, and the
  * banner before the command said what is wrong with the file.
+ *
+ * A save that fails never stops the command: the daemon is stopped or
+ * started all the same. But it is said, with what fixes it (engram#681).
+ * Not recording "off" means the next command starts the daemon again, so
+ * the exit says that too. Not recording "on" over an "off" means no other
+ * command starts it again after it stops; over anything else, nothing
+ * changes, so nothing is said.
  */
 async function recordCaptureIntent(v: "on" | "off", command: string): Promise<void> {
   let config: Config;
@@ -772,11 +779,32 @@ async function recordCaptureIntent(v: "on" | "off", command: string): Promise<vo
       return;
     }
   }
+  const was = config.autocapture;
   try {
     config.autocapture = v;
     await saveConfig(config);
-  } catch {
-    // config write failures never block daemon management
+  } catch (err: unknown) {
+    const { problem, fix } = saveFailure(err);
+    if (v === "off") {
+      process.exitCode = 1;
+      console.error(red(`Couldn't record that capture is off: ${problem}.`));
+      const again = `run 'engram ${command}' again, or the next engram command turns capture back on.`;
+      if (fix) {
+        console.error(dim(`  To fix it, run: ${fix}`));
+        console.error(dim(`  Then ${again}`));
+      } else {
+        console.error(dim(`  Once it's fixed, ${again}`));
+      }
+    } else if (was === "off") {
+      console.error(dim(`Note: couldn't record that capture is on: ${problem}.`));
+      console.error(dim("  Until it is, other engram commands won't start the daemon again if it stops."));
+      if (fix) {
+        console.error(dim(`  To fix it, run: ${fix}`));
+        console.error(dim(`  Then run 'engram ${command}' again.`));
+      } else {
+        console.error(dim(`  Once it's fixed, run 'engram ${command}' again.`));
+      }
+    }
   }
 }
 

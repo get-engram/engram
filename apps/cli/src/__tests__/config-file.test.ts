@@ -11,6 +11,7 @@ import {
   readFailure,
   readProblem,
   unreadable,
+  writeProblem,
 } from "../config-file.js";
 
 // engram#673: ~/.engram/config.json holds the API key and the folders kept
@@ -188,6 +189,27 @@ describe("why a read failed", () => {
     expect(readProblem(errno("EIO"))).toBe("can't be read (EIO)");
     expect(readProblem(new Error(`open '/Users/someone/${TAIL}'`))).toBe("can't be read");
     expect(readProblem(errno(`bad ${TAIL}`))).toBe("can't be read");
+  });
+});
+
+describe("why a write failed (engram#681)", () => {
+  it.each([
+    ["EACCES", "can't be written: permission denied"],
+    ["EPERM", "can't be written: permission denied"],
+    ["EROFS", "can't be written: the disk it's on is read-only"],
+    ["ENOSPC", "can't be written: the disk it's on is full"],
+    ["EDQUOT", "can't be written: the disk quota is used up"],
+    ["EIO", "can't be written (EIO)"],
+    ["EBUSY", "can't be written (EBUSY)"],
+  ])("names %s from its code", (code, problem) => {
+    expect(writeProblem(errno(code))).toBe(problem);
+  });
+
+  it("takes nothing from an error's message, or from a code that isn't one", () => {
+    const secret = `open '/Users/someone/${TAIL}'`;
+    for (const err of [new Error(secret), errno(`bad ${TAIL}`, secret), errno("eacces", secret), null, undefined, secret]) {
+      expect(writeProblem(err)).toBe("can't be written");
+    }
   });
 });
 

@@ -88,6 +88,20 @@ export function readFailure(err: unknown): ConfigUnreadable {
 }
 
 /**
+ * What is wrong with a file a write of it failed on (engram#681), worded
+ * to follow the file's name: from the error's code, never its message.
+ */
+export function writeProblem(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  if (code === "EACCES" || code === "EPERM") return "can't be written: permission denied";
+  if (code === "EROFS") return "can't be written: the disk it's on is read-only";
+  if (code === "ENOSPC") return "can't be written: the disk it's on is full";
+  if (code === "EDQUOT") return "can't be written: the disk quota is used up";
+  if (typeof code === "string" && /^[A-Z0-9_]+$/.test(code)) return `can't be written (${code})`;
+  return "can't be written";
+}
+
+/**
  * config.json's text as settings: a JSON object. Throws ConfigUnreadable
  * for anything else. A leading byte-order mark, which some Windows editors
  * add, is skipped.

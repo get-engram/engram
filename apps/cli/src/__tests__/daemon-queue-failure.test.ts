@@ -268,7 +268,7 @@ describe("the watcher holds a file at a line that couldn't be queued", () => {
     append(A, cUser("s1", "hello"));
     failQueueOnce(db);
     read(A);
-    expect(recordCaptureStall).toHaveBeenCalledWith(A, FULL);
+    expect(recordCaptureStall).toHaveBeenCalledWith(A, FULL, "queue");
     expect(recordCaptureResumed).not.toHaveBeenCalled();
 
     retry(A);

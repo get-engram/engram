@@ -95,7 +95,7 @@ engram search "deploy" --json | jq '.results[0].score'
 
 ## Configuration
 
-Credentials are stored in `~/.engram/config.json`.
+Credentials are stored in `~/.engram/config.json`, with the folders excluded from capture. If the file is there but can't be read, capture waits and commands that would save it stop, rather than lose your key and exclusions; `engram status` says why.
 
 ### Environment Variables
 

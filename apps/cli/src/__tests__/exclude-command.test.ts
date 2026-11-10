@@ -15,7 +15,7 @@ describe("engram exclude add/remove (engram#619)", () => {
     vi.resetModules();
     const store: { excludePaths?: string[] } = { excludePaths: [...excludePaths] };
     vi.doMock("../config.js", () => ({
-      loadConfig: async () => ({ excludePaths: [...(store.excludePaths ?? [])] }),
+      loadConfigStrict: async () => ({ excludePaths: [...(store.excludePaths ?? [])] }),
       saveConfig: async (c: { excludePaths?: string[] }) => {
         store.excludePaths = c.excludePaths;
       },

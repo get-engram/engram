@@ -24,8 +24,14 @@ vi.mock("node:child_process", async (importOriginal) => ({
 home.dir = mkdtempSync(join(tmpdir(), "engram-584-status-"));
 mkdirSync(join(home.dir, ".engram"));
 
-const { recordCaptureStall, recordCaptureResumed, recordSuccess, readStatus, captureErrorSummary } =
-  await import("../daemon/status.js");
+const {
+  recordCaptureStall,
+  recordCaptureResumed,
+  recordSuccess,
+  readStatus,
+  captureErrorSummary,
+  configProblemSummary,
+} = await import("../daemon/status.js");
 
 const FULL = "database or disk is full";
 const HOUR = 60 * 60_000;
@@ -155,7 +161,85 @@ describe("capture errors in status.json (engram#584)", () => {
   });
 });
 
+// engram#673: transcripts held because config.json can't say which folders
+// are excluded are the same episode in status.json, marked "config", in
+// words of their own: freeing disk space wouldn't help.
+describe("capture held for config.json (engram#673)", () => {
+  const BAD = "~/.engram/config.json isn't valid JSON";
+
+  it("records the stall as config's, warns once and notifies once", () => {
+    recordCaptureStall("/t/a.jsonl", BAD, "config");
+    expect(readStatus().capture_error).toEqual({
+      message: BAD,
+      since: new Date(clock).toISOString(),
+      files: 1,
+      kind: "config",
+    });
+    expect(logged()).toContain(
+      `[engram] WARNING: Engram can't read the folders you excluded from capture (${BAD}), so 1 ` +
+        "transcript is waiting. Fix the file, and capture picks up where it stopped: nothing is " +
+        "skipped, and nothing from an excluded folder is captured.",
+    );
+    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(execFile).toHaveBeenCalledWith(
+      "notify-send",
+      [
+        "Engram paused capture",
+        `${BAD}, so Engram can't tell which folders you excluded. Fix it, and capture resumes ` +
+          "where it stopped.",
+      ],
+      expect.objectContaining({ windowsHide: true, timeout: 30_000 }),
+      expect.any(Function),
+    );
+
+    recordCaptureStall("/t/b.jsonl", BAD, "config");
+    expect(readStatus().capture_error).toMatchObject({ files: 2, kind: "config" });
+    expect(logged().filter((l) => l.includes("WARNING"))).toHaveLength(1);
+    expect(execFile).toHaveBeenCalledTimes(1);
+
+    recordCaptureResumed("/t/a.jsonl");
+    expect(readStatus().capture_error).toMatchObject({ files: 1, kind: "config" });
+    recordCaptureResumed("/t/b.jsonl");
+  });
+
+  it("says what the latest stall was about, when files wait for both", () => {
+    recordCaptureStall("/t/a.jsonl", BAD, "config");
+    recordCaptureStall("/t/b.jsonl", FULL);
+    expect(readStatus().capture_error).toEqual({
+      message: FULL,
+      since: new Date(clock).toISOString(),
+      files: 2,
+    });
+    recordCaptureStall("/t/a.jsonl", BAD, "config");
+    expect(readStatus().capture_error).toMatchObject({ message: BAD, files: 2, kind: "config" });
+    recordCaptureResumed("/t/a.jsonl");
+    recordCaptureResumed("/t/b.jsonl");
+  });
+});
+
 describe("captureErrorSummary", () => {
+  it("says when config.json is what is wrong, not the disk", () => {
+    expect(
+      captureErrorSummary({
+        message: "~/.engram/config.json is empty",
+        since: "",
+        files: 2,
+        kind: "config",
+      }),
+    ).toBe(
+      "Engram can't read the folders you excluded from capture (~/.engram/config.json is empty), " +
+        "so 2 transcripts are waiting. Fix the file, and capture picks up where it stopped: " +
+        "nothing is skipped, and nothing from an excluded folder is captured.",
+    );
+  });
+
+  it("says the same of config.json itself, before anything waits", () => {
+    expect(configProblemSummary("~/.engram/config.json isn't valid JSON")).toBe(
+      "~/.engram/config.json isn't valid JSON, so Engram can't tell which folders you excluded " +
+        "from capture. New messages wait until it's fixed; nothing is skipped.",
+    );
+  });
+
   it("says what's wrong, what to do and that nothing is skipped", () => {
     const one = captureErrorSummary({ message: FULL, since: "", files: 1 });
     expect(one).toContain(`(${FULL})`);

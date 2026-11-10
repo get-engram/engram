@@ -2,15 +2,16 @@ import { watch, type FSWatcher } from "chokidar";
 import { openSync, readSync, closeSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { DaemonDb } from "./db.js";
-import { QueueWriteError } from "./queue-error.js";
+import { isCaptureHold } from "./queue-error.js";
 import { recordCaptureStall, recordCaptureResumed } from "./status.js";
 import type { OnMessages, LineParser, HostAdapter } from "./types.js";
 
 /**
  * How long a file waits to be read again after daemon.db couldn't queue its
- * messages (engram#584): 5 s, 30 s, 2 min, then every 5 min. A locked
- * daemon.db has usually cleared by the first; a full disk waits for a
- * person.
+ * messages (engram#584), or config.json couldn't say which folders are
+ * excluded (engram#673): 5 s, 30 s, 2 min, then every 5 min. A locked
+ * daemon.db, or a config.json caught mid-save, has usually cleared by the
+ * first; a full disk or a damaged file waits for a person.
  */
 export const RETRY_DELAYS_MS = [5_000, 30_000, 2 * 60_000, 5 * 60_000];
 
@@ -28,10 +29,13 @@ export interface FileLine {
   offset: number;
 }
 
-/** A file held at a line whose messages couldn't be queued (engram#584). */
+/** A file held at a line whose messages couldn't be queued (engram#584),
+ *  or whose folder couldn't be told excluded or not (engram#673). */
 interface Hold {
   /** Failed attempts so far. */
   attempts: number;
+  /** Why the last attempt failed: daemon.db, or config.json. */
+  kind: "queue" | "config";
   /** When the file is due to be read again, in ms since the epoch. */
   retryAt: number;
   timer: ReturnType<typeof setTimeout>;
@@ -225,7 +229,7 @@ export class Watcher {
           try {
             this.guard(filePath, () => this.parser.processLine(line.text, filePath, line.offset));
           } catch (err: unknown) {
-            // guard() lets only a failure to queue through.
+            // guard() lets only a reason to hold the file through.
             this.hold(filePath, cursor, reading.safe, err);
             return;
           } finally {
@@ -256,10 +260,11 @@ export class Watcher {
   }
 
   /**
-   * daemon.db couldn't queue a line's messages (engram#584). Holds the file
-   * at `at`, where what wasn't queued begins, and reads it again from there
-   * after a backoff, instead of moving on past messages that were never
-   * queued.
+   * daemon.db couldn't queue a line's messages (engram#584), or config.json
+   * couldn't say whether the session's folder is excluded (engram#673).
+   * Holds the file at `at`, where what wasn't queued begins, and reads it
+   * again from there after a backoff, instead of moving on past messages
+   * that were never queued.
    */
   private hold(filePath: string, cursor: FileCursor, at: number, err: unknown): void {
     // Whatever the parser buffered of the file starts at or after `at`, so
@@ -268,37 +273,45 @@ export class Watcher {
     cursor.read = at;
     // Everything before `at` is queued: a restart needn't read it again.
     this.save(filePath, cursor, at);
-    this.backoff(filePath, reasonOf(err));
+    this.backoff(filePath, reasonOf(err), isCaptureHold(err) ? err.kind : "queue");
   }
 
   /** Schedules the next attempt at a held file, each one later than the last. */
-  private backoff(filePath: string, reason: string): void {
+  private backoff(filePath: string, reason: string, kind: "queue" | "config" = "queue"): void {
     const prev = this.held.get(filePath);
     if (prev) clearTimeout(prev.timer);
     const attempts = (prev?.attempts ?? 0) + 1;
     const delay = RETRY_DELAYS_MS[Math.min(attempts, RETRY_DELAYS_MS.length) - 1];
     const timer = setTimeout(() => this.processFile(filePath, true), delay);
     timer.unref?.();
-    this.held.set(filePath, { attempts, retryAt: Date.now() + delay, timer });
+    this.held.set(filePath, { attempts, kind, retryAt: Date.now() + delay, timer });
 
     const at = this.cursors.get(filePath)?.read ?? 0;
+    const what =
+      kind === "config"
+        ? `capture from ${filePath}: which folders are excluded can't be told`
+        : `queue messages from ${filePath}`;
     console.error(
-      `[engram] ${attempts === 1 ? "couldn't" : "still can't"} queue messages from ${filePath} ` +
+      `[engram] ${attempts === 1 ? "couldn't" : "still can't"} ${what} ` +
         `(${reason}); holding at byte ${at}, trying again in ${delay / 1000}s`,
     );
-    recordCaptureStall(filePath, reason);
+    recordCaptureStall(filePath, reason, kind);
   }
 
-  /** Ends a file's hold: its lines were queued after all, or there is
-   *  nothing left to retry. */
+  /** Ends a file's hold: its lines were queued (or dropped as excluded)
+   *  after all, or there is nothing left to retry. */
   private release(filePath: string, why?: string): void {
     const hold = this.held.get(filePath);
     if (!hold) return;
     clearTimeout(hold.timer);
     this.held.delete(filePath);
-    console.error(
-      `[engram] ${why ?? `queued messages from ${filePath} again, after ${hold.attempts} failed attempt(s)`}`,
-    );
+    // After a config.json hold the lines may have been dropped, the folder
+    // being excluded after all: not "queued".
+    const again =
+      hold.kind === "config"
+        ? `capturing from ${filePath} again, after ${hold.attempts} attempt(s) while config.json couldn't be read`
+        : `queued messages from ${filePath} again, after ${hold.attempts} failed attempt(s)`;
+    console.error(`[engram] ${why ?? again}`);
     recordCaptureResumed(filePath);
   }
 
@@ -330,24 +343,26 @@ export class Watcher {
 
   /**
    * One line the parser can't handle must not wedge the file: every line
-   * after it would never be read. A failure to queue is different. It says
-   * nothing about the line, and skipping the line would lose it, so it
-   * passes through, and processFile holds the file there (engram#584).
+   * after it would never be read. A failure to queue is different, as is a
+   * config.json that can't say which folders are excluded. Neither says
+   * anything about the line, and skipping the line would lose it, so they
+   * pass through, and processFile holds the file there (engram#584,
+   * engram#673).
    */
   private guard(filePath: string, fn: () => void): void {
     try {
       fn();
     } catch (err: unknown) {
-      if (err instanceof QueueWriteError) throw err;
+      if (isCaptureHold(err)) throw err;
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[engram] skipped a line of ${filePath}: ${msg}`);
     }
   }
 }
 
-/** What daemon.db said, without the wrapping. */
+/** What daemon.db, or what is wrong with config.json, said, without the wrapping. */
 function reasonOf(err: unknown): string {
-  if (err instanceof QueueWriteError) return err.reason;
+  if (isCaptureHold(err)) return err.reason;
   return err instanceof Error ? err.message : String(err);
 }
 

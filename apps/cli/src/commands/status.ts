@@ -39,6 +39,11 @@ export async function status(
     case "failed":
       console.log(dim(`\nPlan and usage: unavailable right now (${result.status}).`));
       return;
+    case "config":
+      // What is wrong with it is said above, with the daemon (engram#673).
+      console.log(dim("\nPlan and usage: can't be shown until ~/.engram/config.json can be read."));
+      process.exitCode = 1;
+      return;
     default:
       console.error("");
       printUsageError(result);

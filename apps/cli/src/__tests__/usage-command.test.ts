@@ -18,7 +18,7 @@ describe("engram usage with a rejected key (engram#587)", () => {
   async function runUsage(status: number): Promise<string> {
     vi.resetModules();
     vi.doMock("../config.js", () => ({
-      loadConfig: async () => ({ apiKey: "eng_test_saved_key" }),
+      loadConfigStrict: async () => ({ apiKey: "eng_test_saved_key" }),
       getBaseUrl: () => "http://127.0.0.1:9",
       resolveBaseUrl: () => "http://127.0.0.1:9",
     }));

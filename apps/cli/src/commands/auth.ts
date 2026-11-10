@@ -1,4 +1,5 @@
-import { saveConfig, loadConfig, resolveBaseUrl } from "../config.js";
+import { saveConfig, resolveBaseUrl } from "../config.js";
+import { loadConfigForUpdate, loadConfigForUse } from "../config-guard.js";
 import { green, red } from "../output.js";
 import { Engram } from "@getengram/sdk";
 import { autoEnableCapture } from "../daemon/commands.js";
@@ -18,7 +19,10 @@ export async function authLogin(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const config = await loadConfig();
+  // Strict, before the key is sent anywhere (engram#673): read leniently,
+  // a file that couldn't be read named no server, so the key went to the
+  // default one, and was then saved over the file and what was in it.
+  const config = await loadConfigForUpdate();
 
   // Check the key against the server it will be used with, the one every
   // other command and the daemon use (engram#625). This used the SDK's
@@ -42,7 +46,10 @@ export async function authLogin(args: string[]): Promise<void> {
 }
 
 export async function authLogout(): Promise<void> {
-  const config = await loadConfig();
+  const config = await loadConfigForUpdate([
+    "To sign out anyway: run 'engram stop', then remove the file. The folders you",
+    "excluded from capture go with it.",
+  ]);
   delete config.apiKey;
   await saveConfig(config);
   console.log(green("✓ Logged out"));
@@ -60,7 +67,8 @@ export async function authLogout(): Promise<void> {
 }
 
 export async function authStatus(): Promise<void> {
-  const config = await loadConfig();
+  // Strict (engram#673): one that can't be read isn't "not authenticated".
+  const config = await loadConfigForUse();
   const key = process.env.ENGRAM_API_KEY ?? config.apiKey;
 
   if (!key) {

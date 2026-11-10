@@ -32,7 +32,7 @@ describe("engram status (engram#609)", () => {
     vi.resetModules();
     delete process.env.ENGRAM_API_KEY;
     vi.doMock("../config.js", () => ({
-      loadConfig: async () => (apiKey ? { apiKey } : {}),
+      loadConfigStrict: async () => (apiKey ? { apiKey } : {}),
       getBaseUrl: () => "http://127.0.0.1:9",
       resolveBaseUrl: () => "http://127.0.0.1:9",
     }));

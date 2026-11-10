@@ -269,6 +269,10 @@ Credentials are stored in `~/.engram/config.json`:
 }
 ```
 
+It also holds the folders excluded from capture (`engram exclude`) and whether you stopped capture (`engram stop`). If the file is there but can't be read (it isn't valid JSON after a hand edit, say), Engram doesn't guess: capture waits, so nothing from an excluded folder is sent and nothing is skipped, and commands that would save the file stop instead of replacing your key and exclusions. `engram status` says what is wrong. Once the file reads again, capture picks up where it stopped within 5 minutes. No file at all means no settings.
+
+With both `ENGRAM_API_KEY` and `ENGRAM_BASE_URL` set, commands that only use the key and server run without the file.
+
 ## Scripting Examples
 
 ### Create and populate a session

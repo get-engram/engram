@@ -1,4 +1,6 @@
-import { loadConfig, resolveBaseUrl } from "../config.js";
+import { resolveBaseUrl } from "../config.js";
+import type { ConfigUnreadable } from "../config-file.js";
+import { configForUse, printConfigProblemForUse } from "../config-guard.js";
 import { bold, dim, red, plural, json as printJson } from "../output.js";
 import { readStatus } from "../daemon/status.js";
 
@@ -30,13 +32,20 @@ export interface UsageResponse {
 export type UsageResult =
   | { kind: "ok"; data: UsageResponse }
   | { kind: "signed-out" }
+  /** ~/.engram/config.json can't be read (engram#673). */
+  | { kind: "config"; problem: ConfigUnreadable }
   | { kind: "rejected" }
   | { kind: "failed"; status: number }
   | { kind: "unreachable"; url: string };
 
 /** Fetch the account's plan and usage. Never throws. */
 export async function fetchUsage(): Promise<UsageResult> {
-  const config = await loadConfig();
+  // Strict (engram#673): one that can't be read isn't "not authenticated",
+  // and ENGRAM_API_KEY isn't sent to the default server in place of the
+  // one it names.
+  const read = await configForUse();
+  if ("problem" in read) return { kind: "config", problem: read.problem };
+  const config = read.config;
   const baseUrl = resolveBaseUrl(config);
   const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
   if (!apiKey) return { kind: "signed-out" };
@@ -65,6 +74,9 @@ export function printUsageError(result: Exclude<UsageResult, { kind: "ok" }>): v
   switch (result.kind) {
     case "signed-out":
       console.error(red("Not authenticated. Run 'engram signup' first."));
+      break;
+    case "config":
+      printConfigProblemForUse(result.problem);
       break;
     case "rejected":
       // Every rejected-key notice the daemon gives says to run `engram

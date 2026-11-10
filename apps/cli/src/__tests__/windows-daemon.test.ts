@@ -61,12 +61,15 @@ vi.mock("node:child_process", async (importOriginal) => ({
   execFileSync,
   execFile: vi.fn(),
 }));
-vi.mock("../config.js", () => ({
-  loadConfig: vi.fn(async () => ({})),
-  saveConfig: vi.fn(async () => {}),
-  getBaseUrl: () => "https://engram.invalid",
-  resolveBaseUrl: () => "https://engram.invalid",
-}));
+vi.mock("../config.js", () => {
+  const loadConfigStrict = vi.fn(async () => ({}));
+  return {
+    loadConfigStrict,
+    saveConfig: vi.fn(async () => {}),
+    getBaseUrl: () => "https://engram.invalid",
+    resolveBaseUrl: () => "https://engram.invalid",
+  };
+});
 // An install has dist/daemon/login-start.js beside launch.js; under vitest the
 // module beside launch.ts is login-start.ts. Point at a file that exists.
 vi.mock("../daemon/launch.js", async (importOriginal) => {
@@ -101,7 +104,7 @@ const { workerPathFor, loginStartPathFor, supervisorPathFor, supervisorPath, STA
   "../daemon/launch.js"
 );
 const { IDENTIFY_STATEMENTS, VERSION } = await import("../daemon/instance.js");
-const { loadConfig } = await import("../config.js");
+const { loadConfigStrict } = await import("../config.js");
 const {
   autoEnableCapture,
   daemonInstall,
@@ -1326,7 +1329,7 @@ describe("stopping the daemon on Windows through the stop file (engram#613)", ()
 
     // Not once 'engram stop' has recorded that capture is off.
     (console.log as Mock).mockClear();
-    vi.mocked(loadConfig).mockResolvedValueOnce({ autocapture: "off" } as never);
+    vi.mocked(loadConfigStrict).mockResolvedValueOnce({ autocapture: "off" } as never);
     await daemonStatus();
     expect(output()).toContain("Status: stopped");
     expect(output()).not.toContain("It should be running");
@@ -1351,7 +1354,7 @@ describe("stopping the daemon on Windows through the stop file (engram#613)", ()
  */
 function signedInAtATerminal(): void {
   const realIsTTY = process.stdin.isTTY;
-  const config = vi.mocked(loadConfig);
+  const config = vi.mocked(loadConfigStrict);
 
   beforeEach(() => {
     // What the test run itself sets to keep auto-capture out of other tests.
@@ -1368,7 +1371,7 @@ function signedInAtATerminal(): void {
 }
 
 describe("auto-capture after sign-in to Engram, on Windows (engram#614)", () => {
-  const config = vi.mocked(loadConfig);
+  const config = vi.mocked(loadConfigStrict);
   signedInAtATerminal();
 
   it("starts the daemon through the supervisor and turns on start at login", async () => {

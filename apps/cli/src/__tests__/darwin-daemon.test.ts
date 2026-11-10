@@ -3111,6 +3111,30 @@ describe("a daemon left running as root (engram#680)", () => {
     expect(existsSync(PID_FILE)).toBe(false);
   });
 
+  rootIt("stop stops theirs, then says the one the PID file names and the job's, each once", async () => {
+    // The PID file names one started with sudo, the job in launchd's system
+    // domain runs another, and the user's own answers on the socket.
+    inSystemDomain(OTHER_ROOT);
+    ownRunning();
+    startedWithSudo();
+    vi.mocked(process.kill).mockImplementation((pid: number, signal?: string | number) => {
+      if (pid === OWN && signal === "SIGTERM") {
+        madeUp.delete(OWN);
+        daemon.answering = null;
+        return true;
+      }
+      return fakeKill(pid, signal);
+    });
+    await daemonStop();
+    // Neither is said again as one that nothing ties to the user.
+    expect(said()).toBe(
+      [`Daemon stopped (pid ${OWN})`, `${PROBLEM} 'engram stop' can't stop it.`, `  ${KILL}`, `  ${ALSO_UNLOAD}`].join("\n"),
+    );
+    expect(process.exitCode).toBe(1);
+    expect(signalsSent()).toEqual([[OWN, "SIGTERM"]]);
+    expect(readFileSync(PID_FILE, "utf-8")).toBe(String(ROOT));
+  });
+
   rootIt("says one running as root that nothing ties to the user, and starts theirs all the same", async () => {
     launchd.rootWorkers = [ROOT];
     const untied = `A daemon is running as root (pid ${ROOT}), most likely started with sudo. Stop it with: sudo kill ${ROOT}`;

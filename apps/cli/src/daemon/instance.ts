@@ -484,7 +484,11 @@ export async function lockEndpoint(endpoint: Endpoint, options: LockOptions = {}
       server.unref();
       continue;
     }
-    if (err.code !== "EADDRINUSE") {
+    // The path is taken. macOS says EEXIST, not EADDRINUSE, when another
+    // start binds it at the same moment: bind looks the name up, then makes
+    // it, and the other made it in between. Taken for a socket that can't be
+    // used here, it left a daemon running without the lock (engram#708).
+    if (err.code !== "EADDRINUSE" && err.code !== "EEXIST") {
       return { state: "unavailable", reason: `couldn't listen on ${where(endpoint)} (${err.code ?? err.message})` };
     }
     const probe = await probeDaemon({ endpoint });

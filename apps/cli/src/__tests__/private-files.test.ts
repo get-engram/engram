@@ -661,13 +661,16 @@ describe("launchd's log (engram#627)", () => {
         loaded = true;
         return "";
       }
+      // The look for a job `sudo engram install` loaded into launchd's
+      // system domain (engram#680): none there.
+      if (command === "print system/app.getengram.daemon") throw Object.assign(failed(), { status: 113 });
       calls.push(`unexpected: ${command}`);
       throw failed();
     });
 
     try {
       await daemonInstall();
-      expect(calls).toEqual(["print-disabled", "bootout", "unload", "list", "bootstrap"]);
+      expect(calls).toEqual(["print", "print-disabled", "bootout", "unload", "list", "bootstrap"]);
       expect(logModes).toEqual([0o600]);
       expect(mode(ENGRAM)).toBe(0o700);
 

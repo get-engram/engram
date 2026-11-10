@@ -27,6 +27,7 @@ import { excludeAdd, excludeRemove, excludeList } from "./commands/exclude.js";
 import { bold, dim, red } from "./output.js";
 import { readStatus, syncErrorSummary, captureErrorSummary, configProblemSummary } from "./daemon/status.js";
 import { foreignFiles, foreignFilesFix, foreignFilesProblem } from "./daemon/ownership.js";
+import { findRootDaemon, rootDaemonLines } from "./daemon/root-daemon.js";
 import { alive, pidInFile } from "./daemon/instance.js";
 
 // Read from package.json rather than duplicated here. The previous hardcoded
@@ -321,12 +322,22 @@ function daemonRuns(): boolean {
  * outlast the fix. Once they are the user's, the capture check after the
  * next command starts the daemon again.
  */
-function printForeignFilesBanner(): void {
+function printForeignFilesBanner(commandSaysRoot: boolean): void {
   try {
     const foreign = foreignFiles();
     if (!foreign) return;
+    // The daemon that made them may still run as root (engram#680), and
+    // makes more until it is stopped: that comes first. `engram stop` says
+    // both itself, as it can't stop that daemon.
+    const root = foreign.root ? findRootDaemon() : null;
+    if (root && commandSaysRoot) return;
+    if (root) {
+      const { problem, fixes } = rootDaemonLines(root);
+      console.error(red(bold("engram:")) + ` ${problem}`);
+      for (const fix of fixes) console.error(dim(`  ${fix}`));
+    }
     console.error(red(bold("engram:")) + ` ${foreignFilesProblem(foreign)}`);
-    console.error(dim(`  ${foreignFilesFix(foreign)}`));
+    console.error(dim(`  ${foreignFilesFix(foreign, root !== null)}`));
     console.error("");
   } catch {
     // Never let this block the command the user asked for.
@@ -403,9 +414,11 @@ async function main(): Promise<void> {
   if (cmd !== "status" && cmd !== "daemon status" && cmd !== "usage") {
     await printSyncBanner();
   }
-  // start, install and status say it themselves.
+  // start, install and status say it themselves. So does stop, with a
+  // daemon running as root that made them (engram#680).
   const SAYS_FOREIGN_FILES = new Set(["start", "daemon start", "install", "daemon install", "status", "daemon status"]);
-  if (!SAYS_FOREIGN_FILES.has(cmd)) printForeignFilesBanner();
+  const SAYS_ROOT_DAEMON = new Set(["stop", "daemon stop"]);
+  if (!SAYS_FOREIGN_FILES.has(cmd)) printForeignFilesBanner(SAYS_ROOT_DAEMON.has(cmd));
 
   try {
     switch (cmd) {

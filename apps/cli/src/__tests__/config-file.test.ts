@@ -9,6 +9,7 @@ import {
   parseConfigText,
   readConfigFileSync,
   readFailure,
+  readProblem,
   unreadable,
 } from "../config-file.js";
 
@@ -178,6 +179,15 @@ describe("why a read failed", () => {
   it("takes ENOENT on a file that is there for a link to nothing", () => {
     expect(readFailure(errno("ENOENT")).message).toBe("~/.engram/config.json is a link to a file that isn't there");
     expect(readFailure(errno("EACCES")).message).toBe("~/.engram/config.json can't be read: permission denied");
+  });
+
+  it("readProblem: the same words, for any file's name to go before (engram#677)", () => {
+    expect(readProblem(errno("ENOENT"))).toBe("is a link to a file that isn't there");
+    expect(readProblem(errno("EACCES"))).toBe("can't be read: permission denied");
+    expect(readProblem(errno("EISDIR"))).toBe("is a folder, not a file");
+    expect(readProblem(errno("EIO"))).toBe("can't be read (EIO)");
+    expect(readProblem(new Error(`open '/Users/someone/${TAIL}'`))).toBe("can't be read");
+    expect(readProblem(errno(`bad ${TAIL}`))).toBe("can't be read");
   });
 });
 

@@ -13,7 +13,7 @@ import { Pruner } from "./prune.js";
 import { Watcher } from "./watcher.js";
 import { Syncer, type Account, type CaptureControl, type KeySource } from "./syncer.js";
 import { SecretScrubber, type VaultLike } from "./scrubber.js";
-import { loadVaultKey } from "../commands/vault.js";
+import { asVaultKeyProblem, readVaultKey, vaultKeyFix, type VaultKeyUnreadable } from "../vault-key.js";
 import { availableAdapters } from "./adapters.js";
 import { configuredAccount, ownedKeysOf } from "./key-source.js";
 import { makeDirPrivateSync, type PrivateDirReport } from "../private-files.js";
@@ -208,19 +208,48 @@ async function main(): Promise<void> {
   // every captured message (client.store → processContent), which is a
   // behaviour change in its own right. This one exists only to read the
   // vault so the scrubber can match exact values.
-  const vaultKey = await loadVaultKey();
-  let vaultFor: ((account: Account) => VaultLike | null) | null = null;
+  //
+  // Only a key file that isn't there means no key (engram#677). One that
+  // can't be read holds sends until it can be: the scrubber reads it again,
+  // and captures keep queueing meanwhile. Never the key in a log line.
+  let vaultKey: string | undefined;
+  let keyProblem: VaultKeyUnreadable | undefined;
+  try {
+    vaultKey = await readVaultKey();
+  } catch (err: unknown) {
+    keyProblem = asVaultKeyProblem(err);
+  }
+  // The account in use, for the vault read with a key found later.
+  let account: Account | undefined = current;
+  const vaultFor = (a: Account | undefined): VaultLike | null =>
+    a && vaultKey
+      ? new Engram({
+          apiKey: a.key,
+          baseUrl: a.server,
+          vault: { encryptionKey: vaultKey },
+          timeout: 30_000,
+        }).vault
+      : null;
   if (vaultKey) {
-    vaultFor = (account) =>
-      new Engram({
-        apiKey: account.key,
-        baseUrl: account.server,
-        vault: { encryptionKey: vaultKey },
-        timeout: 30_000,
-      }).vault;
-    scrubber = new SecretScrubber(current ? vaultFor(current) : null, vaultKey, log);
+    scrubber = new SecretScrubber(vaultFor(current), vaultKey, log);
     scrubber.start();
     log("vault scrubber: on (exact-match redaction of named secrets and the vault key)");
+  } else if (keyProblem) {
+    scrubber = new SecretScrubber(null, undefined, log, {
+      problem: keyProblem,
+      source: {
+        read: readVaultKey,
+        vaultWith: (key) => {
+          vaultKey = key;
+          return vaultFor(account);
+        },
+      },
+    });
+    scrubber.start();
+    log(
+      `vault scrubber: holding sends — ${keyProblem.message}. Capture goes on, and what it ` +
+        `captures is sent once the key can be read. ${vaultKeyFix(keyProblem)}`,
+    );
   } else {
     log("vault scrubber: off (no vault key configured — only pattern redaction applies)");
   }
@@ -236,18 +265,20 @@ async function main(): Promise<void> {
     current,
     unread,
     read: configuredAccount,
-    connect: (account) => {
-      if (vaultScrubber && vaultFor) {
-        vaultScrubber.reconnect(vaultFor(account)).catch((err: unknown) => {
+    connect: (next) => {
+      account = next;
+      if (vaultScrubber) {
+        vaultScrubber.reconnect(vaultFor(next)).catch((err: unknown) => {
           log(`vault scrubber: reconnect failed (${errorText(err)})`);
         });
       }
-      return connect(account);
+      return connect(next);
     },
     // Signed out: nothing is captured or sent, so the vault read through
     // the last key isn't kept in memory. The next key's is read when it
     // signs in, and nothing is sent before that read.
     disconnect: () => {
+      account = undefined;
       vaultScrubber?.reconnect(null).catch(() => {});
     },
     // Only key fingerprints go to the server, and only to the account's

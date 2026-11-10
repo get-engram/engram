@@ -1,7 +1,8 @@
 /**
  * Reading ~/.engram/config.json without trusting it (engram#673). Shared by
  * the CLI and the daemon, and free of the file's location: callers pass the
- * path, or read the text themselves.
+ * path, or read the text themselves. vault-key.ts reads ~/.engram/vault-key
+ * the same way (engram#677).
  *
  * IMPORTANT: Node built-ins only. The daemon's exclusions use this module.
  */
@@ -37,15 +38,18 @@ export class ConfigUnreadable extends Error {
   }
 }
 
+/** What a read that failed says is wrong: from its error code, not its message. */
+function codeProblem(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  if (code === "EACCES" || code === "EPERM") return "can't be read: permission denied";
+  if (code === "EISDIR") return "is a folder, not a file";
+  if (typeof code === "string" && /^[A-Z0-9_]+$/.test(code)) return `can't be read (${code})`;
+  return "can't be read";
+}
+
 /** The ConfigUnreadable for a read that failed: from its error code, not its message. */
 export function unreadable(err: unknown): ConfigUnreadable {
-  const code = (err as NodeJS.ErrnoException | null)?.code;
-  if (code === "EACCES" || code === "EPERM") return new ConfigUnreadable("can't be read: permission denied");
-  if (code === "EISDIR") return new ConfigUnreadable("is a folder, not a file");
-  if (typeof code === "string" && /^[A-Z0-9_]+$/.test(code)) {
-    return new ConfigUnreadable(`can't be read (${code})`);
-  }
-  return new ConfigUnreadable("can't be read");
+  return new ConfigUnreadable(codeProblem(err));
 }
 
 /**
@@ -65,13 +69,22 @@ export function isMissing(err: unknown, file: string): boolean {
 }
 
 /**
+ * What is wrong with a file a read of it failed on, given it isn't missing
+ * (isMissing): ENOENT then means a link to nothing. Worded to follow the
+ * file's name, and from the error's code, never its message.
+ */
+export function readProblem(err: unknown): string {
+  return (err as NodeJS.ErrnoException | null)?.code === "ENOENT"
+    ? "is a link to a file that isn't there"
+    : codeProblem(err);
+}
+
+/**
  * The ConfigUnreadable for a read of config.json that failed, given the
- * file isn't missing (isMissing): ENOENT then means a link to nothing.
+ * file isn't missing (isMissing).
  */
 export function readFailure(err: unknown): ConfigUnreadable {
-  return (err as NodeJS.ErrnoException | null)?.code === "ENOENT"
-    ? new ConfigUnreadable("is a link to a file that isn't there")
-    : unreadable(err);
+  return new ConfigUnreadable(readProblem(err));
 }
 
 /**

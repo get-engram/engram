@@ -74,6 +74,32 @@ describe("desktop notifications (engram#581)", () => {
     expect(execFile.mock.calls[0][2].env).toBeUndefined();
   });
 
+  it("says sends wait on a vault key that can't be read, as an error from the first (engram#677)", () => {
+    onPlatform("linux");
+    recordFailure(
+      "holding messages until the vault key can be read: ~/.engram/vault-key is a folder, not a file",
+      "vault_key",
+      2,
+    );
+    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(execFile.mock.calls[0].slice(0, 2)).toEqual([
+      "notify-send",
+      [
+        "Engram needs attention",
+        "Your vault key (~/.engram/vault-key) can't be read, so messages wait here rather than " +
+          "be sent with your vault's secrets in them. Nothing is lost.",
+      ],
+    ]);
+    // Something for the user to fix: not a warning that clears on its own.
+    const status = JSON.parse(readFileSync(join(home.dir, ".engram", "status.json"), "utf-8"));
+    expect(status).toMatchObject({
+      health: "error",
+      error_type: "vault_key",
+      consecutive_failures: 1,
+      pending_messages: 2,
+    });
+  });
+
   it("shows a Windows toast, with the title and body kept out of the script (engram#614)", () => {
     onPlatform("win32");
     vi.stubEnv("SystemRoot", "C:\\Windows");

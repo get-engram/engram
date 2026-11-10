@@ -36,6 +36,10 @@ interface MadeScrubber {
   reconnects: unknown[];
   /** The scrubber itself, as the syncer gets it. */
   instance: unknown;
+  /** Where what each complete read finds goes (engram#694). */
+  report: unknown;
+  /** What the daemon before held sends for, as handed on, and whether it had started then (engram#694). */
+  continued: Array<{ found: unknown; started: boolean }>;
 }
 
 /** What a fake client's vault is: what the client was made with. */
@@ -129,12 +133,21 @@ async function runWorker(): Promise<{ log: () => string }> {
     ...(await importOriginal<typeof import("../daemon/scrubber.js")>()),
     SecretScrubber: class {
       private readonly made: MadeScrubber;
-      constructor(vault: unknown, key: string | undefined, _log: unknown, keyFile?: MadeScrubber["keyFile"]) {
-        this.made = { vault, key, keyFile, started: false, reconnects: [], instance: this };
+      constructor(
+        vault: unknown,
+        key: string | undefined,
+        _log: unknown,
+        keyFile?: MadeScrubber["keyFile"],
+        report?: unknown,
+      ) {
+        this.made = { vault, key, keyFile, started: false, reconnects: [], instance: this, report, continued: [] };
         made.scrubbers.push(this.made);
       }
       start() {
         this.made.started = true;
+      }
+      continueMismatchHold(found: unknown) {
+        this.made.continued.push({ found, started: this.made.started });
       }
       reconnect(vault: unknown) {
         this.made.reconnects.push(vault);
@@ -388,5 +401,83 @@ describe("a daemon started with a vault key it can't read (engram#677)", () => {
     expect(keyOrigin()).toBe("env");
     // And what it reads again is the variable, whatever the file is.
     await expect(scrubber.keyFile?.source.read()).resolves.toBe(ENV_VAULT_KEY);
+  });
+});
+
+describe("a daemon started after one that held sends for secrets its vault key didn't decrypt (engram#694)", () => {
+  const STATUS_FILE = join(ENGRAM_DIR, "status.json");
+  const HELD = { secrets: 2, unscrubbed: 2, decrypted: 1, held: true };
+  /** status.json as the daemon before left it: holding sends for them. */
+  const heldBefore = (found: unknown = HELD) =>
+    writeFileSync(
+      STATUS_FILE,
+      JSON.stringify({
+        health: "error",
+        error_type: "vault_mismatch",
+        pending_messages: 3,
+        vault_key: "file",
+        vault_undecryptable: found,
+      }),
+    );
+  const undecryptable = (): unknown =>
+    (JSON.parse(readFileSync(STATUS_FILE, "utf-8")) as { vault_undecryptable?: unknown }).vault_undecryptable;
+
+  it("a key that reads: it goes on holding them from the start, and status.json says so from its first write", async () => {
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    heldBefore();
+    await runWorker();
+    const [scrubber] = made.scrubbers;
+    // Handed on before it starts: its first read finds the hold in place,
+    // so a secret that decrypts now doesn't release the others.
+    expect(scrubber.continued).toEqual([{ found: { secrets: 2, unscrubbed: 2, decrypted: 1 }, started: false }]);
+    expect(scrubber.started).toBe(true);
+    // Its first write didn't drop it: `engram status` says sends wait.
+    expect(undecryptable()).toEqual(HELD);
+    expect(keyOrigin()).toBe("file");
+    // What its reads find goes to status.json: once none can't be scrubbed,
+    // nothing more is said of a hold.
+    (scrubber.report as (found: unknown) => void)({ secrets: 0, unscrubbed: 0, decrypted: 3, held: false });
+    expect(undecryptable()).toBeNull();
+  });
+
+  it("the key from ENGRAM_VAULT_KEY, or a key file it can't read: held still", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_VAULT_KEY);
+    heldBefore();
+    await runWorker();
+    expect(made.scrubbers[0]?.continued).toEqual([{ found: { secrets: 2, unscrubbed: 2, decrypted: 1 }, started: false }]);
+    expect(undecryptable()).toEqual(HELD);
+    expect(keyOrigin()).toBe("env");
+
+    for (const db of made.dbs.splice(0)) db.close();
+    vi.unstubAllEnvs();
+    vi.stubEnv("ENGRAM_VAULT_KEY", undefined);
+    vi.resetModules();
+    made.scrubbers.length = 0;
+    mkdirSync(KEY_FILE);
+    heldBefore();
+    await runWorker();
+    expect(made.scrubbers[0]?.keyFile?.problem).toMatchObject({ kind: "folder" });
+    expect(made.scrubbers[0]?.continued).toEqual([{ found: { secrets: 2, unscrubbed: 2, decrypted: 1 }, started: false }]);
+    expect(undecryptable()).toEqual(HELD);
+  });
+
+  it("no key at all: it starts without the hold, as with no key", async () => {
+    heldBefore();
+    await runWorker();
+    expect(made.scrubbers[0]?.continued).toEqual([]);
+    expect(made.scrubbers[0]).toMatchObject({ key: undefined, started: true });
+  });
+
+  it("nothing held before, or a status.json from before engram#694: nothing handed on", async () => {
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    for (const found of [null, { secrets: 2, unscrubbed: 2 }, { ...HELD, held: false }, { ...HELD, held: "true" }]) {
+      for (const db of made.dbs.splice(0)) db.close();
+      vi.resetModules();
+      made.scrubbers.length = 0;
+      heldBefore(found);
+      await runWorker();
+      expect(made.scrubbers[0]?.continued).toEqual([]);
+      expect(made.scrubbers[0]?.started).toBe(true);
+    }
   });
 });

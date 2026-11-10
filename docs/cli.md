@@ -158,9 +158,12 @@ engram vault keygen
 engram vault keygen --save
 ```
 
+With no key saved, `--save` first checks your vault. If it already holds secrets, they were saved with another key, which a new one can't decrypt, and the daemon would hold what it captures (see [the vault guide](./vault.md#a-key-that-doesnt-match-your-vault)). Then it saves nothing, and says how to put that key back, unless you add `--force`.
+
 | Flag | Description |
 |------|-------------|
 | `--save` | Save key to `~/.engram/vault-key` |
+| `--force` | Replace a key in the file (backed up first), or save a new key over a vault that holds secrets |
 
 ### engram vault save-key
 
@@ -232,11 +235,15 @@ engram vault list
 # OPENAI_KEY      api_key              2026-05-25
 
 engram vault list --json
+
+# Which secrets decrypt with your vault key (values are never shown)
+engram vault list --check
 ```
 
 | Flag | Description |
 |------|-------------|
 | `--json` | Output as JSON |
+| `--check` | Read each secret and say which don't decrypt with your vault key: saved with another. With `--json`, each has `decrypts`: `true`, `false`, or `null` when it couldn't be checked |
 
 ### engram vault delete
 

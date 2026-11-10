@@ -1092,6 +1092,90 @@ async function printLoginVaultKeyWarning(startsAtLogin: () => boolean = () => tr
 }
 
 /**
+ * engram#694, in `engram status`: the daemon holds sends for secrets its
+ * vault key doesn't decrypt, until each decrypts, or is gone. It decrypts
+ * none of the vault's secrets, or did when the hold began and some now:
+ * saved again one at a time, they hold until the last. Then the key they
+ * were saved with isn't the fix: the others don't decrypt with it. Its key
+ * is the file's, or ENGRAM_VAULT_KEY's, which it read when it started:
+ * then setting the variable again takes a restart.
+ */
+function printVaultMismatchWarning(status: SyncStatus): void {
+  const secrets = status.vault_undecryptable?.secrets ?? 0;
+  const decrypted = status.vault_undecryptable?.decrypted ?? 0;
+  const one = secrets === 1;
+  const they = one ? "it was" : "they were";
+  console.log("");
+  console.log(
+    red(
+      decrypted > 0
+        ? `  WARNING: ${secrets} of your vault's ${secrets + decrypted} secrets ${one ? "doesn't" : "don't"} decrypt with your vault key.`
+        : one
+          ? "  WARNING: Your vault key doesn't decrypt your vault's secret."
+          : `  WARNING: Your vault key doesn't decrypt any of your vault's ${secrets > 1 ? `${secrets} ` : ""}secrets.`,
+    ),
+  );
+  console.log(dim(`  ${one ? "It was" : "They were"} saved with another key, so the daemon can't remove ${one ? "it" : "them"} from`));
+  console.log(dim("  what it captures. Meanwhile, messages wait here rather than be sent with your"));
+  console.log(dim("  vault's secrets in them. Nothing is lost. To send what waits, do one of these:"));
+  if (decrypted > 0) {
+    // The others decrypt with this key, and wouldn't with that one.
+  } else if (status.vault_key === "env") {
+    console.log(dim(`    Set ENGRAM_VAULT_KEY to the key ${they} saved with, then run`));
+    console.log(dim("    'engram stop' and 'engram start' from that shell."));
+  } else {
+    console.log(dim(`    Put the key ${they} saved with in ~/.engram/vault-key.`));
+  }
+  console.log(dim(`    Save ${one ? "it" : "each"} again with this key: engram vault set <NAME>`));
+  // Not "whose key is lost": one still in use, deleted, is no longer
+  // removed from what the daemon captures. Saved again, it is.
+  console.log(dim(`    Delete ${one ? "it, if you no longer use it" : "each you no longer use"}: engram vault delete <NAME>`));
+  if (decrypted > 0) {
+    console.log(dim("  'engram vault list --check' shows which. Then the daemon sends what it held"));
+    console.log(dim("  within 5 minutes."));
+  } else {
+    console.log(dim(`  'engram vault list' lists ${one ? "it" : "them"}. Then the daemon sends what it held within`));
+    console.log(dim("  5 minutes."));
+  }
+  if (status.pending_messages > 0) {
+    console.log(red(`  ${plural(status.pending_messages, "message")} waiting to sync`));
+  }
+  // Held with nothing waiting yet, the last error is another's.
+  if (status.last_error_at && status.health !== "healthy") {
+    console.log(dim(`  Last error: ${status.last_error_at}`));
+  }
+  console.log("");
+}
+
+/**
+ * engram#694, in `engram status`: some of the vault's secrets don't decrypt
+ * with the daemon's vault key, and the others do. Sends go on: the key
+ * these were saved with would leave the others out instead. Those it read
+ * before, with a key it had then, it still removes, until it restarts.
+ * Putting that key back isn't the fix: the others don't decrypt with it.
+ */
+function printVaultUndecryptableWarning(found: { secrets: number; unscrubbed: number }): void {
+  const { secrets, unscrubbed } = found;
+  const one = secrets === 1;
+  console.log("");
+  console.log(red(`  WARNING: ${plural(secrets, "secret")} in your vault ${one ? "doesn't" : "don't"} decrypt with your vault key.`));
+  if (unscrubbed >= secrets) {
+    console.log(dim(`  ${one ? "It was" : "They were"} saved with another key, so the daemon can't remove ${one ? "it" : "them"} from`));
+    console.log(dim("  what it captures before sending it."));
+  } else if (unscrubbed === 0) {
+    console.log(dim(`  ${one ? "It was" : "They were"} saved with another key. The daemon still removes ${one ? "it" : "them"} from what`));
+    console.log(dim(`  it captures, with what it read before, but can't once it restarts.`));
+  } else {
+    console.log(dim(`  They were saved with another key. The daemon can't remove ${unscrubbed} of them from`));
+    console.log(dim("  what it captures before sending it, and the others only until it restarts."));
+  }
+  console.log(dim(`  Save ${one ? "it" : "each"} again with this key (engram vault set <NAME>), or delete ${one ? "it if you" : "each you"}`));
+  console.log(dim(`  no longer use${one ? " it" : ""} (engram vault delete <NAME>). 'engram vault list --check'`));
+  console.log(dim("  shows which don't decrypt."));
+  console.log("");
+}
+
+/**
  * `problem`: config.json can't be read (engram#673), said above. `key`:
  * what ~/.engram/vault-key holds now (engram#677).
  */
@@ -1160,7 +1244,17 @@ function printSyncWarnings(status: SyncStatus, problem: ConfigUnreadable | null,
     console.log("");
   }
 
+  // Sends wait for secrets the daemon's vault key doesn't decrypt: said
+  // below, or here while nothing waits yet. Some of them, with no hold:
+  // sending goes on, said here (engram#694).
+  const mismatchHeld = status.error_type === "vault_mismatch" && status.health !== "healthy";
+  const held = status.vault_undecryptable?.held === true;
+  if (status.vault_undecryptable && !mismatchHeld && !held) {
+    printVaultUndecryptableWarning(status.vault_undecryptable);
+  }
+
   if (status.health === "healthy") {
+    if (held) printVaultMismatchWarning(status);
     if (status.last_sync_at) {
       console.log(`${dim("Last sync:")}        ${status.last_sync_at}`);
     }
@@ -1178,6 +1272,10 @@ function printSyncWarnings(status: SyncStatus, problem: ConfigUnreadable | null,
       console.log(dim(`  ${plural(status.pending_messages, "message")} waiting to sync`));
     }
     console.log("");
+    return;
+  }
+  if (mismatchHeld) {
+    printVaultMismatchWarning(status);
     return;
   }
 

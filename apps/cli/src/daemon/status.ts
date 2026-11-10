@@ -25,7 +25,13 @@ export type SyncErrorType =
   /** ~/.engram/vault-key is there but can't be read (engram#677): sends
    *  wait for it rather than go out without the vault's values scrubbed.
    *  The user must fix the file; nothing queued is lost meanwhile. */
-  | "vault_key";
+  | "vault_key"
+  /** The vault key reads, but decrypts none of the vault's secrets
+   *  (engram#694): they were saved with another key, and can't be scrubbed
+   *  from what is captured. Sends wait until the right key is back, or the
+   *  secrets are saved again with this one, or deleted. Nothing queued is
+   *  lost meanwhile. */
+  | "vault_mismatch";
 
 /**
  * Transcripts that can't be queued in daemon.db (engram#584): a full disk,
@@ -105,7 +111,26 @@ export interface SyncStatus {
    * it had in use: `engram status` says a restart starts without one.
    */
   vault_key: "file" | "env" | null;
+  /**
+   * The vault's secrets the daemon's vault key doesn't decrypt (engram#694):
+   * how many, how many of those it has no value for from before, so can't
+   * scrub from what it captures, and how many it does decrypt. Counts only,
+   * never a name. Null when each decrypts, or the vault hasn't been read.
+   * `held`: sends wait for them (error_type "vault_mismatch" once one
+   * would go). They do when the key decrypts none of the vault's secrets,
+   * and from then until none is left that can't be scrubbed: a daemon
+   * started meanwhile reads it here, and goes on holding. When some decrypt
+   * and nothing was held, they don't.
+   */
+  vault_undecryptable: VaultUndecryptable | null;
   updated_at: string;
+}
+
+export interface VaultUndecryptable {
+  secrets: number;
+  unscrubbed: number;
+  decrypted: number;
+  held: boolean;
 }
 
 const DEFAULT_STATUS: SyncStatus = {
@@ -122,6 +147,7 @@ const DEFAULT_STATUS: SyncStatus = {
   next_retry_at: null,
   delete_refused: null,
   vault_key: null,
+  vault_undecryptable: null,
   updated_at: new Date().toISOString(),
 };
 
@@ -189,7 +215,7 @@ export interface FailureDetails {
 
 /**
  * Record a sync failure. Logs once per error type and, for the states the
- * user must act on (auth, storage_full, vault_key), raises a desktop
+ * user must act on (auth, storage_full, vault_key, vault_mismatch), raises a desktop
  * notification on first occurrence — the daemon is headless, so a line in
  * daemon.log is not "telling" anyone.
  */
@@ -219,7 +245,8 @@ export function recordFailure(
     errorType === "auth" ||
     errorType === "billing" ||
     errorType === "storage_full" ||
-    errorType === "vault_key"
+    errorType === "vault_key" ||
+    errorType === "vault_mismatch"
   ) {
     currentStatus.health = "error";
   } else if (currentStatus.consecutive_failures >= 5) {
@@ -234,7 +261,12 @@ export function recordFailure(
   if (errorType !== lastNotifiedError) {
     lastNotifiedError = errorType;
     logWarning(errorType, currentStatus.storage);
-    if (errorType === "auth" || errorType === "storage_full" || errorType === "vault_key") {
+    if (
+      errorType === "auth" ||
+      errorType === "storage_full" ||
+      errorType === "vault_key" ||
+      errorType === "vault_mismatch"
+    ) {
       const storage = currentStatus.storage;
       notifyDesktop(
         errorType === "storage_full" ? "Engram memory is full" : "Engram needs attention",
@@ -263,6 +295,49 @@ export function recordVaultKey(source: "file" | "env" | null): void {
   if (currentStatus.vault_key === source) return;
   currentStatus.vault_key = source;
   writeStatus();
+}
+
+/**
+ * What the last complete read of the vault found of secrets the key
+ * doesn't decrypt (engram#694); null when each decrypts. Written only when
+ * it changes.
+ */
+export function recordVaultUndecryptable(found: VaultUndecryptable | null): void {
+  const prev = currentStatus.vault_undecryptable;
+  const next =
+    found === null || found.secrets <= 0
+      ? null
+      : { secrets: found.secrets, unscrubbed: found.unscrubbed, decrypted: found.decrypted, held: found.held };
+  if (
+    prev === next ||
+    (prev &&
+      next &&
+      prev.secrets === next.secrets &&
+      prev.unscrubbed === next.unscrubbed &&
+      prev.decrypted === next.decrypted &&
+      prev.held === next.held)
+  ) {
+    return;
+  }
+  currentStatus.vault_undecryptable = next;
+  writeStatus();
+}
+
+/**
+ * What the daemon before this one held sends for (engram#694), as its
+ * status.json says: the secrets its vault key didn't decrypt, while they
+ * wait. Null when nothing waited for them. Read before this daemon's first
+ * write replaces it.
+ */
+export function heldVaultMismatch(): Omit<VaultUndecryptable, "held"> | null {
+  const found: unknown = readStatus().vault_undecryptable;
+  if (typeof found !== "object" || found === null) return null;
+  const { secrets, unscrubbed, decrypted, held } = found as Partial<Record<keyof VaultUndecryptable, unknown>>;
+  if (held !== true) return null;
+  const count = (n: unknown): number => (typeof n === "number" && Number.isSafeInteger(n) && n > 0 ? n : 0);
+  // Held, at least one couldn't be scrubbed, whatever else it says.
+  const atLeastOne = Math.max(1, count(unscrubbed));
+  return { secrets: Math.max(atLeastOne, count(secrets)), unscrubbed: atLeastOne, decrypted: count(decrypted) };
 }
 
 /**
@@ -611,6 +686,11 @@ export function syncErrorSummary(
       return (
         "Your vault key (~/.engram/vault-key) can't be read, so messages wait here " +
         "rather than be sent with your vault's secrets in them. Nothing is lost."
+      );
+    case "vault_mismatch":
+      return (
+        "Your vault holds secrets your vault key doesn't decrypt, so messages wait here " +
+        "rather than be sent with those secrets in them. Nothing is lost."
       );
     default:
       return "Can't reach Engram — messages queued, will retry.";

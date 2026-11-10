@@ -84,6 +84,17 @@
  * not others, with no hold before, doesn't hold; `engram status` says how
  * many it can't scrub.
  *
+ * A secret saved with `engram vault set` while the daemon runs
+ * (engram#701) used to go out as it was until the interval read the vault
+ * again, up to 10 minutes later. Now `engram vault set` and `engram vault
+ * delete` leave a notice in ~/.engram (vault-changed.ts), which is looked
+ * for before each send and on the interval. A new one makes the next send
+ * wait for a read of the vault begun after it, as the first send waits
+ * for the first read. A read already under way when it came may have
+ * listed the vault before the change, so it doesn't count, and another
+ * follows it. A secret saved anywhere else, such as on another machine,
+ * is read on the interval still.
+ *
  * What it never does: write a value to disk, include one in a log line, or
  * send one anywhere. Values are refreshed from the vault on an interval and
  * dropped on stop. The daemon already runs as the user who owns the 0600
@@ -205,8 +216,16 @@ function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * The notice that the vault changed there now (engram#701), as a value
+ * that differs from the last for each new one; null when there is none.
+ */
+export type VaultChanges = () => string | null;
+
 interface Read {
   vault: VaultLike | null;
+  /** The notices seen when it began: a read begun before the last isn't a read of the vault as it is now. */
+  count: number;
   done: Promise<void>;
 }
 
@@ -274,6 +293,13 @@ export class SecretScrubber {
   /** The key file went while its key was in use: said once (engram#693). */
   private keyGone = false;
 
+  /** Where to look for notices that the vault changed (engram#701). */
+  private changes: VaultChanges | undefined = undefined;
+  /** The notice last seen. */
+  private changeSeen: string | null = null;
+  /** How many new notices have been seen. */
+  private changeCount = 0;
+
   /**
    * `key.source`: where the key is read again, before each send and on the
    * interval (engram#693). Without one, `vaultKey` is the key for as long
@@ -332,15 +358,19 @@ export class SecretScrubber {
     if (this.stopped) return Promise.resolve();
     const vault = this.vault;
     if (this.reading && this.reading.vault === vault) return this.reading.done;
-    const read: Read = { vault, done: Promise.resolve() };
-    read.done = this.read(vault)
+    const read: Read = { vault, count: this.changeCount, done: Promise.resolve() };
+    read.done = this.read(vault, read.count)
       .catch((err: unknown) => {
         this.fellShort(vault, err, "server");
         this.log(`vault scrubber: read failed (${errorText(err)})`);
       })
       .catch(() => {}) // a log that throws: ready() mustn't
       .finally(() => {
-        if (this.reading === read) this.reading = null;
+        if (this.reading !== read) return;
+        this.reading = null;
+        // The vault changed while it was under way (engram#701): read it
+        // again, and a ready() waiting on this read waits for that one.
+        if (read.count !== this.changeCount) void this.refresh();
       });
     this.reading = read;
     return read.done;
@@ -367,9 +397,14 @@ export class SecretScrubber {
    * A key that decrypts none of the vault's secrets (engram#694) holds the
    * same way: no bound releases it. The vault is listed again when its
    * retry is due, on MISMATCH_RETRY_MS.
+   *
+   * First of all, a new notice that the vault changed (engram#701) means
+   * the set no longer covers it: ready() waits for a read begun after the
+   * notice, at once, and as for the first read.
    */
   async ready(): Promise<boolean> {
     if (this.stopped) return false;
+    this.checkChanges();
     if (this.keySource !== undefined && (this.keyProblem === undefined || Date.now() >= this.keyRetryAt)) {
       await this.checkKey();
       if (this.stopped) return false;
@@ -447,6 +482,47 @@ export class SecretScrubber {
     );
   }
 
+  /**
+   * Look for notices that the vault changed (engram#701), before each send
+   * and on the interval: `engram vault set` and `engram vault delete` leave
+   * one. The notice there now changes nothing: start() reads the vault
+   * anyway. Call before start().
+   */
+  followChanges(changes: VaultChanges): void {
+    this.changes = changes;
+    this.changeSeen = this.noticeNow();
+  }
+
+  /** The notice there now. A reader that throws finds none. */
+  private noticeNow(): string | null {
+    try {
+      return this.changes?.() ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * A new notice that the vault changed (engram#701): the set may not cover
+   * the vault now. The next send waits for a read begun after it, which
+   * ready() starts at once. A hold released at the bound tries once more
+   * before it lets sends go, and one for secrets the key doesn't decrypt
+   * reads each secret, though the list is the same. A notice removed, or
+   * one that can't be read, changes nothing, nor does the same one read
+   * again after: each notice says something of its own.
+   */
+  private checkChanges(): void {
+    const notice = this.noticeNow();
+    if (notice === null || notice === this.changeSeen) return;
+    this.changeSeen = notice;
+    this.changeCount++;
+    this.settledFor = undefined;
+    this.retryAt = 0;
+    this.released = false;
+    this.mismatchPrint = undefined;
+    this.log("vault scrubber: the vault changed — reading it again before sending");
+  }
+
   /** Read now and on an interval: the key too, on the interval. */
   start(intervalMs = 10 * 60_000): void {
     this.stopped = false;
@@ -459,6 +535,8 @@ export class SecretScrubber {
 
   /** The interval's read: the key, then the vault (engram#693). */
   private async tick(): Promise<void> {
+    // Seen now, the notice needs no read but this one (engram#701).
+    this.checkChanges();
     const vault = this.vault;
     if (this.keySource !== undefined) await this.checkKey();
     // Read through another client since, which a new key reads through.
@@ -695,7 +773,7 @@ export class SecretScrubber {
     );
   }
 
-  private async read(vault: VaultLike | null): Promise<void> {
+  private async read(vault: VaultLike | null, count: number): Promise<void> {
     const next = new Map<string, string>();
 
     // The key itself is the most damaging thing to leak, and `engram vault
@@ -818,6 +896,11 @@ export class SecretScrubber {
     if (next.size !== before) {
       this.log(`vault scrubber: protecting ${next.size} secret(s)`);
     }
+
+    // The vault changed while this read was under way (engram#701): it may
+    // have listed the vault before the change. What it read is in force,
+    // but the read that follows it decides the rest.
+    if (count !== this.changeCount) return;
 
     if (short) {
       this.fellShort(vault, short.err, short.failure);

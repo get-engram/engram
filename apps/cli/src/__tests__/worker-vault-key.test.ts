@@ -40,6 +40,8 @@ interface MadeScrubber {
   report: unknown;
   /** What the daemon before held sends for, as handed on, and whether it had started then (engram#694). */
   continued: Array<{ found: unknown; started: boolean }>;
+  /** Where it looks for notices that the vault changed, and whether it had started then (engram#701). */
+  follows: Array<{ changes: () => string | null; started: boolean }>;
 }
 
 /** What a fake client's vault is: what the client was made with. */
@@ -140,7 +142,17 @@ async function runWorker(): Promise<{ log: () => string }> {
         keyFile?: MadeScrubber["keyFile"],
         report?: unknown,
       ) {
-        this.made = { vault, key, keyFile, started: false, reconnects: [], instance: this, report, continued: [] };
+        this.made = {
+          vault,
+          key,
+          keyFile,
+          started: false,
+          reconnects: [],
+          instance: this,
+          report,
+          continued: [],
+          follows: [],
+        };
         made.scrubbers.push(this.made);
       }
       start() {
@@ -148,6 +160,9 @@ async function runWorker(): Promise<{ log: () => string }> {
       }
       continueMismatchHold(found: unknown) {
         this.made.continued.push({ found, started: this.made.started });
+      }
+      followChanges(changes: () => string | null) {
+        this.made.follows.push({ changes, started: this.made.started });
       }
       reconnect(vault: unknown) {
         this.made.reconnects.push(vault);
@@ -479,5 +494,26 @@ describe("a daemon started after one that held sends for secrets its vault key d
       expect(made.scrubbers[0]?.continued).toEqual([]);
       expect(made.scrubbers[0]?.started).toBe(true);
     }
+  });
+});
+
+describe("a daemon told when the vault changes (engram#701)", () => {
+  it("looks for ~/.engram/vault-changed from before it starts reading the vault", async () => {
+    await runWorker();
+    const [scrubber] = made.scrubbers;
+    expect(scrubber.follows).toHaveLength(1);
+    expect(scrubber.follows[0].started).toBe(false);
+    expect(scrubber.started).toBe(true);
+
+    const changes = scrubber.follows[0].changes;
+    expect(changes()).toBeNull();
+    // What `engram vault set` writes, in this home's ~/.engram.
+    const { noteVaultChanged } = await import("../daemon/vault-changed.js");
+    expect(noteVaultChanged(join(ENGRAM_DIR, "vault-changed"))).toBe(true);
+    const first = changes();
+    expect(first).not.toBeNull();
+    expect(changes()).toBe(first);
+    expect(noteVaultChanged(join(ENGRAM_DIR, "vault-changed"))).toBe(true);
+    expect(changes()).not.toBe(first);
   });
 });

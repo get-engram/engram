@@ -16,6 +16,10 @@
  *   - The key put back, with no restart: the daemon reads it, then the
  *     vault, then sends all it held, with the vault's secret and the key
  *     itself scrubbed out. daemon.db keeps no copy of either.
+ *   - A secret saved with `engram vault set` while the daemon runs
+ *     (engram#701): the CLI tells it, and it reads the vault again before
+ *     it sends what is said next, scrubbed. The CLI says nothing of a
+ *     restart.
  *   - A key the user can't read (mode 000; skipped as root): held over a
  *     restart, then sent scrubbed.
  *   - A key that isn't there any more, after one that couldn't be read:
@@ -64,6 +68,10 @@ const KEY = `engram_sk_live_e2e_vault_${randomBytes(12).toString("hex")}`;
 const SECRET_NAME = "DOOR_CODE";
 const SECRET = `plum-harbor-${randomBytes(4).toString("hex")}-lantern`;
 const TOKEN = `[VAULT:${SECRET_NAME}]`;
+// Saved while the daemon runs (engram#701).
+const NEW_NAME = "GATE_PHRASE";
+const NEW_SECRET = `fern-quarry-${randomBytes(4).toString("hex")}-kettle`;
+const NEW_TOKEN = `[VAULT:${NEW_NAME}]`;
 const KEY_TOKEN = "[VAULT:vault-key]";
 const fp = (k) => createHash("sha256").update(k).digest("hex");
 
@@ -228,7 +236,12 @@ function knownVaultKey() {
   return vaultKey;
 }
 function redact(s) {
-  let out = s.replace(/engram_sk_live_e2e_\w*/g, "<test key>").split(SECRET).join("<the secret>");
+  let out = s
+    .replace(/engram_sk_live_e2e_\w*/g, "<test key>")
+    .split(SECRET)
+    .join("<the secret>")
+    .split(NEW_SECRET)
+    .join("<the new secret>");
   const vk = knownVaultKey();
   // The key's first 8 characters too: keygen and status showed them before
   // engram#699, and step 1 checks that nothing does now.
@@ -391,6 +404,8 @@ const HELD = (problem) =>
 const READ_NOW = "vault scrubber: the vault key can be read now — reading the vault before sending what was held";
 const SENDING = "[engram] vault read — sending the messages held for it";
 const SCRUB_ON = "vault scrubber: on (";
+const CHANGED = "vault scrubber: the vault changed — reading it again before sending";
+const RESTART_HINT = "The daemon running now reads the vault every 10 minutes";
 const SCRUB_OFF = "vault scrubber: off until a vault key is saved (";
 const NOTICE =
   "Your vault key (~/.engram/vault-key) can't be read, so messages wait here rather than be sent with your " +
@@ -493,6 +508,22 @@ try {
   check(arrived("u4")[0]?.includes(`once more, ${TOKEN}`), `u4 arrives with ${TOKEN}`);
   check(kept(SECRET) === 0, "daemon.db never held u4's secret");
 
+  // ── 4b. a secret saved while the daemon runs (engram#701): told, it reads the vault before it sends again ──
+  const t4b = Date.now();
+  r = await engram("vault", "set", NEW_NAME, "--value", NEW_SECRET);
+  check(r.status === 0, "vault set exits 0, the daemon running");
+  check(!r.raw.includes(RESTART_HINT) && !r.raw.includes("engram stop"), "vault set: no word of a restart, as the daemon is told");
+  check(existsSync(join(ENGRAM_DIR, "vault-changed")), "~/.engram/vault-changed: the notice is there");
+  s1.say(`${said("u5")} the gate phrase is ${NEW_SECRET}`);
+  await waitFor("u5 arrives", () => arrived("u5").length === 1);
+  check(arrived("u5")[0]?.includes(`the gate phrase is ${NEW_TOKEN}`), `u5 arrives with ${NEW_TOKEN}, 10 minutes before the interval would read the vault`);
+  check(logCount(CHANGED) === 1, "daemon.log: the vault changed, read again before sending");
+  const reread = server.log.findIndex((x) => x.op === "vault_get" && x.name === NEW_NAME && x.t >= t4b);
+  const u5Sent = server.log.findIndex((x) => x.op === "append" && x.contents.some((c) => c.includes(said("u5"))));
+  check(reread !== -1 && reread < u5Sent, "the vault was read again before u5 was sent");
+  check(daemonPid() === pid && alive(pid), "the same worker: no restart");
+  await waitFor("daemon.db: no copy of the new secret", () => kept(NEW_SECRET) === 0, 10_000);
+
   // ── 5. a key the user can't read: held over a restart, then sent scrubbed ──
   if (asRoot) {
     console.log("\nskipped: mode 000 doesn't stop root reading the key");
@@ -547,7 +578,7 @@ try {
   await waitFor("status.json: healthy", statusIs("healthy", null, 0), 10_000);
   await stopWorker(pid);
 
-  const all = ["u1", "u2", "u3", "u4", ...(asRoot ? [] : ["v1"]), "w1"];
+  const all = ["u1", "u2", "u3", "u4", "u5", ...(asRoot ? [] : ["v1"]), "w1"];
   const counts = all.map((n) => `${n}×${arrived(n).length}`).join(" ");
   check(all.every((n) => arrived(n).length === 1), `everything said arrived, once: nothing lost (${counts})`);
   check(arrived("stored").length === 0, "and nothing from the refused store");
@@ -566,9 +597,13 @@ try {
   check(keyless === 0, `no request came without a valid key (${keyless})`);
   check(!stubLines().some((l) => l.startsWith("launchctl")), "launchctl was never run");
   check(reached(SECRET) === 0, `the secret never reached the server (${reached(SECRET)} requests)`);
+  check(reached(NEW_SECRET) === 0, `the new secret never reached the server (${reached(NEW_SECRET)} requests)`);
   check(vaultKey !== null && reached(vaultKey) === 0, `the vault key never reached the server (${vaultKey ? reached(vaultKey) : "?"} requests)`);
   const files = logText() + (existsSync(STATUS_FILE) ? readFileSync(STATUS_FILE, "utf-8") : "");
-  check(!files.includes(SECRET) && !(vaultKey && files.includes(vaultKey)), "daemon.log and status.json never hold either");
+  check(
+    !files.includes(SECRET) && !files.includes(NEW_SECRET) && !(vaultKey && files.includes(vaultKey)),
+    "daemon.log and status.json never hold the secrets or the key",
+  );
   const ops = {};
   for (const x of server.log) ops[`${x.op} [${x.key}]`] = (ops[`${x.op} [${x.key}]`] ?? 0) + 1;
   console.log("\nrequests the server saw:", JSON.stringify(ops, null, 1));

@@ -1,0 +1,293 @@
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+/**
+ * engram#677 — the daemon, started while ~/.engram/vault-key is there but
+ * can't be read, starts with sends held: its scrubber waits for the key and
+ * reads the file again, and the syncer sends nothing until the scrubber is
+ * ready (scrub-before-send.test.ts has that part). It used to take the file
+ * for no key, and send the vault's secrets as they were. A file that isn't
+ * there is still no key, and ENGRAM_VAULT_KEY still wins over the file.
+ *
+ * In a temp home, with the lock, the scrubber, the syncer and the SDK's
+ * client faked: the worker stops where the syncer would start. Nothing here
+ * takes the real daemon's lock, changes the umask of this process, touches
+ * the real ~/.engram, or sends anything anywhere.
+ */
+
+interface MadeScrubber {
+  vault: unknown;
+  key: string | undefined;
+  pending:
+    | {
+        problem: { name: string; kind: string; message: string };
+        source: { read(): Promise<string | undefined>; vaultWith(key: string): unknown };
+      }
+    | undefined;
+  started: boolean;
+  /** The vault each reconnect was given: after an account switch. */
+  reconnects: unknown[];
+  /** The scrubber itself, as the syncer gets it. */
+  instance: unknown;
+}
+
+/** What a fake client's vault is: what the client was made with. */
+interface MadeVault {
+  apiKey: string;
+  baseUrl: string | undefined;
+  vaultKey: string | undefined;
+}
+
+/** The syncer's way to switch accounts (KeySource.connect). */
+interface Keys {
+  connect(account: { key: string; server: string }): unknown;
+}
+
+const { home, made } = vi.hoisted(() => ({
+  home: { dir: "" },
+  made: {
+    scrubbers: [] as MadeScrubber[],
+    /** The scrubber each syncer was given: what it waits on before sending. */
+    syncers: [] as unknown[],
+    /** The key source each syncer was given. */
+    keys: [] as unknown[],
+  },
+}));
+
+vi.mock("node:os", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:os")>()),
+  homedir: () => home.dir,
+}));
+
+home.dir = mkdtempSync(join(tmpdir(), "engram-677w-"));
+const ENGRAM_DIR = join(home.dir, ".engram");
+const KEY_FILE = join(ENGRAM_DIR, "vault-key");
+
+const { START_FAILED_EXIT } = await import("../daemon/supervise.js");
+
+const VAULT_KEY = Buffer.alloc(32, 7).toString("base64");
+const ENV_VAULT_KEY = Buffer.alloc(32, 9).toString("base64");
+const API_KEY = "engram_sk_live_test_677_worker_1357913579";
+const OTHER_API_KEY = "engram_sk_live_test_677_worker_2468024680";
+/** Local: no test key is ever named with a server that isn't. */
+const SERVER = "http://127.0.0.1:8788";
+const posix = process.platform !== "win32";
+const root = process.getuid?.() === 0;
+
+/** What the worker logs, in place of stderr. */
+function captureLog(): string[] {
+  const written: string[] = [];
+  vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+    written.push(String(chunk));
+    return true;
+  }) as never);
+  return written;
+}
+
+/** The worker, from its lock (held) to where the syncer would start. */
+async function runWorker(): Promise<{ log: () => string }> {
+  vi.doMock("../daemon/instance.js", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../daemon/instance.js")>()),
+    claimDaemonLock: vi.fn(async () => ({ state: "held" })),
+  }));
+  // Everything in ~/.engram is the user's (engram#659 has the rest).
+  vi.doMock("../daemon/ownership.js", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../daemon/ownership.js")>()),
+    foreignFiles: vi.fn(() => null),
+  }));
+  vi.doMock("../daemon/scrubber.js", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../daemon/scrubber.js")>()),
+    SecretScrubber: class {
+      private readonly made: MadeScrubber;
+      constructor(vault: unknown, key: string | undefined, _log: unknown, pending?: MadeScrubber["pending"]) {
+        this.made = { vault, key, pending, started: false, reconnects: [], instance: this };
+        made.scrubbers.push(this.made);
+      }
+      start() {
+        this.made.started = true;
+      }
+      reconnect(vault: unknown) {
+        this.made.reconnects.push(vault);
+        return Promise.resolve();
+      }
+      stop() {}
+    },
+  }));
+  vi.doMock("../daemon/syncer.js", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../daemon/syncer.js")>()),
+    Syncer: class {
+      constructor(_queue: unknown, _client: unknown, scrubber: unknown, keys: unknown) {
+        made.syncers.push(scrubber);
+        made.keys.push(keys);
+        throw new Error("no syncer in this test");
+      }
+    },
+  }));
+  // A client is never made for real: its vault says what it was made with.
+  vi.doMock("@getengram/sdk", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("@getengram/sdk")>()),
+    Engram: class {
+      readonly vault: MadeVault;
+      constructor(config: { apiKey: string; baseUrl?: string; vault?: { encryptionKey: string } }) {
+        this.vault = { apiKey: config.apiKey, baseUrl: config.baseUrl, vaultKey: config.vault?.encryptionKey };
+      }
+    },
+  }));
+  // The worker's catch exits with START_FAILED_EXIT: let be.
+  vi.spyOn(process, "exit").mockImplementation((() => {}) as never);
+  const written = captureLog();
+  await import("../daemon/worker-main.js");
+  await vi.waitFor(() => expect(written.join("")).toContain("fatal: "));
+  expect(process.exit).toHaveBeenCalledWith(START_FAILED_EXIT);
+  return { log: () => written.join("") };
+}
+
+beforeEach(() => {
+  made.scrubbers.length = 0;
+  made.syncers.length = 0;
+  made.keys.length = 0;
+  mkdirSync(ENGRAM_DIR, { recursive: true, mode: 0o700 });
+  // Signed out: no account, so nothing could be sent here anyway.
+  vi.stubEnv("ENGRAM_API_KEY", undefined);
+  vi.stubEnv("ENGRAM_BASE_URL", undefined);
+  vi.stubEnv("ENGRAM_VAULT_KEY", undefined);
+  // The worker sets a umask of 0o077: not on this process.
+  vi.spyOn(process, "umask").mockReturnValue(0o022);
+});
+
+afterEach(() => {
+  try {
+    if (lstatSync(KEY_FILE).isFile()) chmodSync(KEY_FILE, 0o600);
+  } catch {
+    // not there
+  }
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+  for (const path of ["instance", "ownership", "scrubber", "syncer"]) vi.doUnmock(`../daemon/${path}.js`);
+  vi.doUnmock("@getengram/sdk");
+  vi.resetModules();
+  rmSync(ENGRAM_DIR, { recursive: true, force: true });
+});
+
+afterAll(() => rmSync(home.dir, { recursive: true, force: true }));
+
+describe("a daemon started with a vault key it can't read (engram#677)", () => {
+  it("starts with sends held, the scrubber reading the file again, and says why and the fix", async () => {
+    mkdirSync(KEY_FILE);
+    const { log } = await runWorker();
+    expect(made.scrubbers).toHaveLength(1);
+    const [scrubber] = made.scrubbers;
+    expect(scrubber.vault).toBeNull();
+    expect(scrubber.key).toBeUndefined();
+    expect(scrubber.started).toBe(true);
+    expect(scrubber.pending?.problem).toMatchObject({
+      name: "VaultKeyUnreadable",
+      kind: "folder",
+      message: "~/.engram/vault-key is a folder, not a file",
+    });
+    // The syncer waits on it.
+    expect(made.syncers).toEqual([scrubber.instance]);
+    // The queue is the temp home's: the worker ran there.
+    expect(existsSync(join(ENGRAM_DIR, "daemon.db"))).toBe(true);
+    expect(log()).toContain(
+      "vault scrubber: holding sends — ~/.engram/vault-key is a folder, not a file. Capture goes on, " +
+        "and what it captures is sent once the key can be read. " +
+        "Move the folder aside, and put your vault key back in ~/.engram/vault-key.\n",
+    );
+    expect(log()).not.toContain("vault scrubber: off");
+
+    // What it reads again is the file: still a folder, then a key.
+    await expect(scrubber.pending?.source.read()).rejects.toMatchObject({ kind: "folder" });
+    rmSync(KEY_FILE, { recursive: true });
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    await expect(scrubber.pending?.source.read()).resolves.toBe(VAULT_KEY);
+    // Signed out: no account to read the vault through yet.
+    expect(scrubber.pending?.source.vaultWith(VAULT_KEY)).toBeNull();
+    expect(log()).not.toContain(VAULT_KEY);
+  });
+
+  it("signed in: the key, once it reads, is the one the vault is read with, then and after a switch", async () => {
+    mkdirSync(KEY_FILE);
+    writeFileSync(join(ENGRAM_DIR, "config.json"), JSON.stringify({ apiKey: API_KEY, baseUrl: SERVER }), {
+      mode: 0o600,
+    });
+    const { log } = await runWorker();
+    const [scrubber] = made.scrubbers;
+    expect(scrubber).toMatchObject({ vault: null, key: undefined, started: true });
+    expect(scrubber.pending?.problem).toMatchObject({ kind: "folder" });
+    const [keys] = made.keys as Keys[];
+
+    // A switch while there is no key: no vault to read yet, and still held.
+    keys.connect({ key: OTHER_API_KEY, server: SERVER });
+    expect(scrubber.reconnects).toEqual([null]);
+
+    rmSync(KEY_FILE, { recursive: true });
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    const key = await scrubber.pending?.source.read();
+    expect(key).toBe(VAULT_KEY);
+    // Through the account in use now: the one switched to.
+    expect(scrubber.pending?.source.vaultWith(VAULT_KEY)).toEqual({
+      apiKey: OTHER_API_KEY,
+      baseUrl: SERVER,
+      vaultKey: VAULT_KEY,
+    } satisfies MadeVault);
+
+    // And the next switch reads that account's vault with it too.
+    keys.connect({ key: API_KEY, server: SERVER });
+    expect(scrubber.reconnects).toEqual([
+      null,
+      { apiKey: API_KEY, baseUrl: SERVER, vaultKey: VAULT_KEY } satisfies MadeVault,
+    ]);
+    for (const secret of [VAULT_KEY, API_KEY, OTHER_API_KEY]) expect(log()).not.toContain(secret);
+  });
+
+  it.skipIf(!posix || root)("a key file it can't read (mode 000): held, with how to make it readable", async () => {
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    chmodSync(KEY_FILE, 0o000);
+    const { log } = await runWorker();
+    expect(made.scrubbers[0]?.pending?.problem).toMatchObject({ kind: "permission" });
+    expect(log()).toContain(
+      "vault scrubber: holding sends — ~/.engram/vault-key can't be read: permission denied. Capture goes on, " +
+        "and what it captures is sent once the key can be read. " +
+        "Make it readable with: chmod 600 ~/.engram/vault-key\n",
+    );
+  });
+
+  it("an empty key file: held, not taken for no key", async () => {
+    writeFileSync(KEY_FILE, "\n");
+    const { log } = await runWorker();
+    expect(made.scrubbers[0]?.pending?.problem).toMatchObject({ kind: "empty" });
+    expect(log()).toContain("vault scrubber: holding sends — ~/.engram/vault-key is empty.");
+  });
+
+  it("no key file: no vault, and nothing held", async () => {
+    const { log } = await runWorker();
+    expect(made.scrubbers).toEqual([]);
+    expect(made.syncers).toEqual([null]);
+    expect(log()).toContain("vault scrubber: off (no vault key configured — only pattern redaction applies)\n");
+    expect(log()).not.toContain("holding sends");
+  });
+
+  it("a key that reads: on, with the key", async () => {
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    const { log } = await runWorker();
+    expect(made.scrubbers).toHaveLength(1);
+    expect(made.scrubbers[0]).toMatchObject({ key: VAULT_KEY, pending: undefined, started: true });
+    expect(made.syncers).toEqual([made.scrubbers[0].instance]);
+    expect(log()).toContain("vault scrubber: on (exact-match redaction of named secrets and the vault key)\n");
+    expect(log()).not.toContain(VAULT_KEY);
+  });
+
+  it("ENGRAM_VAULT_KEY set for the daemon still wins over a file it can't read", async () => {
+    mkdirSync(KEY_FILE);
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_VAULT_KEY);
+    const { log } = await runWorker();
+    expect(made.scrubbers).toHaveLength(1);
+    expect(made.scrubbers[0]).toMatchObject({ key: ENV_VAULT_KEY, pending: undefined });
+    expect(log()).toContain("vault scrubber: on");
+    expect(log()).not.toContain("holding sends");
+    expect(log()).not.toContain(ENV_VAULT_KEY);
+  });
+});

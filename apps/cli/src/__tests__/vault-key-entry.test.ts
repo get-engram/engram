@@ -293,6 +293,36 @@ describe("commands that use the vault key, with a key file that can't be read (e
     expect([...out, ...errs].join("\n")).not.toContain(VAULT_KEY);
   });
 
+  it("engram vault save-key saves ENGRAM_VAULT_KEY in the file, for the daemon started at login (engram#690)", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_VAULT_KEY);
+    await engram("vault", "save-key");
+    expect(exits).toEqual([]);
+    expect(readFileSync(KEY_FILE, "utf-8")).toBe(`${ENV_VAULT_KEY}\n`);
+    expect(out).toEqual([
+      `Vault key saved to: ${KEY_FILE}`,
+      "Permissions set to owner-only (600). The daemon started at login reads it there.",
+    ]);
+    expect(errs).toEqual([]);
+    expect(clients).toEqual([]);
+    expect(requests).toEqual([]);
+  });
+
+  it("engram vault save-key doesn't replace a key file it can't read, --force or not (engram#690)", async () => {
+    keyFolder();
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_VAULT_KEY);
+    await engram("vault", "save-key", "--force");
+    expect(exits[0]?.code).toBe(1);
+    expect(saidBeforeExiting()).toEqual([
+      "Error: ~/.engram/vault-key is a folder, not a file, so it can't be backed up, and isn't replaced.",
+      "  Move the folder aside, and put your vault key back in ~/.engram/vault-key.",
+      "  Then run this again. Or move it aside yourself:",
+      "    mv ~/.engram/vault-key ~/.engram/vault-key.old",
+    ]);
+    expect(readdirSync(KEY_FILE)).toEqual(["kept"]);
+    expect(out).toEqual([]);
+    expect([...out, ...errs].join("\n")).not.toContain(ENV_VAULT_KEY.slice(0, 8));
+  });
+
   describe("the banner, while the daemon holds messages for the key", () => {
     beforeEach(() => {
       writeFileSync(STATUS_FILE, JSON.stringify({ error_type: "vault_key", pending_messages: 3 }));

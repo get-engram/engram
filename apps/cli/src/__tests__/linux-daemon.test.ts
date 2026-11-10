@@ -1118,6 +1118,225 @@ describe("auto-capture on Linux (engram#615)", () => {
   });
 });
 
+describe("the vault key a daemon started at login reads (engram#690)", () => {
+  signedInAtATerminal();
+
+  const VAULT_KEY = join(ENGRAM_DIR, "vault-key");
+  /** The key in ENGRAM_VAULT_KEY here, and another. */
+  const KEY = Buffer.alloc(32, 7).toString("base64");
+  const OTHER = Buffer.alloc(32, 9).toString("base64");
+  /** What is said when the file isn't there. */
+  const NONE = [
+    "  WARNING: ENGRAM_VAULT_KEY is set here, but ~/.engram/vault-key isn't there.",
+    "  A daemon started at login may not get this shell's variables. Then it has no",
+    "  vault key, and your vault's secrets aren't removed from what it captures.",
+    "  To save the key there, readable only by you: engram vault save-key",
+  ];
+  /** What is said when it holds another key. */
+  const DIFFERENT = [
+    "  WARNING: ~/.engram/vault-key holds a different vault key from ENGRAM_VAULT_KEY.",
+    "  A daemon started at login may not get this shell's variables. Then it uses the",
+    "  file's key, and secrets encrypted with ENGRAM_VAULT_KEY's aren't removed from",
+    "  what it captures. If ENGRAM_VAULT_KEY's key is the right one:",
+    "  engram vault save-key --force (the file's key is backed up first).",
+    "  If the file's is, unset ENGRAM_VAULT_KEY.",
+  ];
+
+  beforeEach(() => {
+    vi.stubEnv("NO_COLOR", "1");
+    vi.stubEnv("ENGRAM_VAULT_KEY", KEY);
+    rmSync(VAULT_KEY, { force: true });
+  });
+
+  afterEach(() => rmSync(VAULT_KEY, { force: true }));
+
+  function saveKey(text: string): void {
+    mkdirSync(ENGRAM_DIR, { recursive: true });
+    writeFileSync(VAULT_KEY, text, { mode: 0o600 });
+  }
+
+  /**
+   * Where `warning` was said in `text`, a line on its own between blank
+   * ones; -1 when it wasn't. Fails when it was said more than once.
+   */
+  function warnedAt(text: string, warning: string[]): number {
+    const lines = text.split("\n");
+    const at = lines.indexOf(warning[0]);
+    if (at === -1) return -1;
+    expect(lines.slice(at - 1, at + warning.length + 1)).toEqual(["", ...warning, ""]);
+    expect(lines.indexOf(warning[0], at + 1)).toBe(-1);
+    return at;
+  }
+
+  /** Neither warning was said. */
+  function noWarning(text: string): void {
+    expect(text).not.toContain("ENGRAM_VAULT_KEY");
+    expect(text).not.toContain("save-key");
+  }
+
+  describe("engram install", () => {
+    it("warns, after the unit, when ~/.engram/vault-key isn't there", async () => {
+      await daemonInstall();
+      const text = output();
+      const lines = text.split("\n");
+      const at = warnedAt(text, NONE);
+      expect(at).toBeGreaterThan(lines.indexOf(`Unit: ${UNIT}`));
+      expect(at).toBeLessThan(lines.findIndex((line) => line.includes("Engram daemon started")));
+      expect(linked()).toBe(true);
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it("warns when it holds another key", async () => {
+      saveKey(`${OTHER}\n`);
+      await daemonInstall();
+      const text = output();
+      expect(warnedAt(text, DIFFERENT)).toBeGreaterThan(-1);
+      expect(warnedAt(text, NONE)).toBe(-1);
+      // Neither key is ever printed.
+      expect(text).not.toContain(KEY.slice(0, 12));
+      expect(text).not.toContain(OTHER.slice(0, 12));
+    });
+
+    it("says nothing when it holds this key, however written", async () => {
+      for (const saved of [`${KEY}\n`, `  ${KEY}\n\n`, KEY.replace(/=+$/, "")]) {
+        saveKey(saved);
+        await daemonInstall();
+        noWarning(said());
+      }
+    });
+
+    it("says nothing without a key here, or with one that isn't a vault key", async () => {
+      for (const env of [undefined, "", "not-a-vault-key", Buffer.alloc(16, 7).toString("base64")]) {
+        vi.stubEnv("ENGRAM_VAULT_KEY", env);
+        await daemonInstall();
+        noWarning(said());
+      }
+    });
+
+    it("says nothing when start at login isn't available, or wasn't turned on", async () => {
+      vi.stubEnv("PATH", NO_BIN);
+      await daemonInstall();
+      noWarning(said());
+
+      vi.stubEnv("PATH", BIN);
+      systemd.enableFails = true;
+      await daemonInstall();
+      const text = said();
+      expect(text).toContain("Couldn't turn on start at login.");
+      noWarning(text);
+    });
+  });
+
+  describe("engram status", () => {
+    it("warns while the daemon runs, after the line on start at login", async () => {
+      writeUnit(unitWith());
+      daemonRunning();
+      await daemonStatus();
+      const text = output();
+      const lines = text.split("\n");
+      expect(warnedAt(text, NONE)).toBeGreaterThan(lines.indexOf("Auto-start: enabled (systemd)"));
+      expect(execFileSync).not.toHaveBeenCalled();
+    });
+
+    it("warns while it is stopped, and when the file holds another key", async () => {
+      writeUnit(unitWith());
+      saveKey(OTHER);
+      await daemonStatus();
+      const text = output();
+      expect(text).toContain("Status: stopped");
+      expect(warnedAt(text, DIFFERENT)).toBeGreaterThan(-1);
+    });
+
+    it("says nothing when start at login is off, broken, or not ours, running or stopped", async () => {
+      for (const unit of [
+        () => writeUnit(unitWith(), false),
+        () => writeUnit(unitWith({ node: join(home.dir, "gone", "node") })),
+        () => writeUnit("[Service]\nExecStart=/usr/bin/true\n"),
+        () => rmSync(CONFIG, { recursive: true, force: true }),
+      ]) {
+        for (const running of [true, false]) {
+          if (running) daemonRunning();
+          else daemonGone();
+          unit();
+          await daemonStatus();
+          const text = said();
+          expect(text).toContain(running ? "Status: running" : "Status: stopped");
+          noWarning(text);
+        }
+      }
+    });
+
+    it("says nothing when the file holds this key", async () => {
+      writeUnit(unitWith());
+      saveKey(`${KEY}\n`);
+      daemonRunning();
+      await daemonStatus();
+      const text = output();
+      expect(text).toContain("Auto-start: enabled (systemd)");
+      noWarning(text);
+    });
+  });
+
+  describe("auto-capture", () => {
+    it("warns after sign-in, when it turns on start at login, then says nothing more", async () => {
+      await autoEnableCapture({ after: "login" });
+      const text = said();
+      expect(warnedAt(text, NONE)).toBeGreaterThan(text.split("\n").indexOf("  Turn off anytime: engram stop && engram uninstall"));
+      expect(linked()).toBe(true);
+
+      await autoEnableCapture({ after: "command" });
+      expect(said()).toBe("");
+    });
+
+    it("warns when start at login was on already", async () => {
+      writeUnit(unitWith());
+      daemonRunning();
+      saveKey(OTHER);
+      await autoEnableCapture({ after: "login" });
+      expect(warnedAt(said(), DIFFERENT)).toBeGreaterThan(-1);
+    });
+
+    it("says nothing when start at login is off: switched off, not ours, unavailable, failed, or no worker.js", async () => {
+      daemonRunning();
+      const cases: Array<() => void> = [
+        () => writeUnit(unitWith(), false),
+        () => writeUnit("[Service]\nExecStart=/usr/bin/true\n", false),
+        () => vi.stubEnv("PATH", NO_BIN),
+        () => {
+          systemd.reachable = false;
+        },
+        () => {
+          systemd.enableFails = true;
+          daemonGone();
+        },
+        () => rmSync(WORKER),
+      ];
+      for (const setUp of cases) {
+        rmSync(CONFIG, { recursive: true, force: true });
+        vi.stubEnv("PATH", BIN);
+        systemd.reachable = true;
+        systemd.enableFails = false;
+        writeFileSync(WORKER, "");
+        daemonRunning();
+        setUp();
+        await autoEnableCapture({ after: "login" });
+        const text = said();
+        expect(text).toContain("Auto-capture is on");
+        noWarning(text);
+      }
+    });
+
+    it("says nothing when the file holds this key", async () => {
+      saveKey(`${KEY}\n`);
+      await autoEnableCapture({ after: "login" });
+      const text = said();
+      expect(text).toContain("Auto-capture is on");
+      expect(linked()).toBe(true);
+      noWarning(text);
+    });
+  });
+});
+
 describe("a CLI and a Node installed with brew (engram#652)", () => {
   // Homebrew on Linux keeps the layout it has on a Mac, under its own prefix:
   // each version in its keg under Cellar/, and opt/<formula> a link to the

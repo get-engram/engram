@@ -27,7 +27,7 @@ import {
   OWNERSHIP_FIX,
   type ForeignFiles,
 } from "./ownership.js";
-import { vaultKeyFileState, vaultKeyFix, VaultKeyUnreadable } from "../vault-key.js";
+import { envVaultKeySaved, envVaultKeyState, vaultKeyFileState, vaultKeyFix, VaultKeyUnreadable } from "../vault-key.js";
 import {
   ENGRAM_DIR,
   LOG_FILE,
@@ -394,12 +394,15 @@ function startInBackground(): Promise<WorkerStart> {
  * Settings in this command's environment that a daemon spawned from it
  * inherits, and one launchd starts doesn't have: launchd gives its job only
  * the plist's environment (engram#641). A key or a server set here, or the
- * vault key, which the daemon scrubs vault values with. With one of them
- * set, the daemon is spawned, as before.
+ * vault key, which the daemon scrubs vault values with, unless
+ * ~/.engram/vault-key holds it, which launchd's daemon reads (engram#690).
+ * With one of them set, the daemon is spawned, as before.
  */
 function daemonEnvOverrides(): boolean {
   return Boolean(
-    process.env.ENGRAM_API_KEY || process.env.ENGRAM_BASE_URL?.trim() || process.env.ENGRAM_VAULT_KEY,
+    process.env.ENGRAM_API_KEY ||
+      process.env.ENGRAM_BASE_URL?.trim() ||
+      (process.env.ENGRAM_VAULT_KEY && !envVaultKeySaved()),
   );
 }
 
@@ -861,13 +864,15 @@ export async function daemonStatus(): Promise<void> {
     // aren't the user's, said above, are why, when they stop it. With
     // config.json unreadable, whether 'engram stop' recorded capture off
     // can't be told.
-    if (printAutoStart() && !stopsCapture(foreign) && config !== null && config.autocapture !== "off") {
+    const startsAtLogin = printAutoStart();
+    if (startsAtLogin && !stopsCapture(foreign) && config !== null && config.autocapture !== "off") {
       // Not stopped by 'engram stop', which records autocapture "off", and
       // started at sign-in, so it stopped by itself (engram#613).
       console.log(dim("  It should be running: start at login is on. It may have stopped after an error."));
       console.log(dim(`  The end of its log says why: ${LOG_FILE}`));
       console.log(dim("  Run 'engram start' to start it again."));
     }
+    if (startsAtLogin) await printLoginVaultKeyWarning();
     return;
   }
 
@@ -900,7 +905,7 @@ export async function daemonStatus(): Promise<void> {
 
   console.log(`${dim("Log:")} ${LOG_FILE}`);
 
-  printAutoStart();
+  if (printAutoStart()) await printLoginVaultKeyWarning();
 }
 
 /**
@@ -910,65 +915,90 @@ export async function daemonStatus(): Promise<void> {
  * read while it runs (engram#651).
  */
 function printAutoStart(): boolean {
-  if (process.platform === "darwin") return printLaunchdAutoStart(readPlist());
-  if (process.platform === "linux") return printSystemdAutoStart(readUnit());
+  const { on, line } = autoStart();
+  if (line !== null) console.log(line);
+  return on;
+}
+
+/** How the daemon starts at login, as `engram status` says it. */
+interface AutoStart {
+  /** It is set to, and should work. */
+  on: boolean;
+  /** What status says of it: null when Engram has nothing there. */
+  line: string | null;
+}
+
+function autoStart(): AutoStart {
+  if (process.platform === "darwin") return launchdAutoStart(readPlist());
+  if (process.platform === "linux") return systemdAutoStart(readUnit());
 
   const entry = readRunEntry();
-  if (entry === null) return false;
+  if (entry === null) return { on: false, line: null };
   // Said before broken, as on macOS and Linux: one switched off doesn't
   // start at sign-in either way, and 'engram install' switches it back on.
   if (switchedOffInStartupApps()) {
-    console.log(
-      `${dim("Auto-start:")} off — switched off in Windows Startup apps` +
+    return {
+      on: false,
+      line:
+        `${dim("Auto-start:")} off — switched off in Windows Startup apps` +
         dim("  ('engram install' turns it back on)"),
-    );
-  } else if (runEntryBroken(entry)) {
-    console.log(`${dim("Auto-start:")} enabled (Windows sign-in)` + red("  — broken, run 'engram install' to repair"));
-  } else {
-    console.log(`${dim("Auto-start:")} enabled (Windows sign-in)`);
-    return true;
+    };
   }
-  return false;
+  if (runEntryBroken(entry)) {
+    return {
+      on: false,
+      line: `${dim("Auto-start:")} enabled (Windows sign-in)` + red("  — broken, run 'engram install' to repair"),
+    };
+  }
+  return { on: true, line: `${dim("Auto-start:")} enabled (Windows sign-in)` };
 }
 
-/** printAutoStart for the launchd agent: nothing when there is none. */
-function printLaunchdAutoStart(plist: PlistState): boolean {
-  if (plist.kind === "none") return false;
+/** autoStart for the launchd agent: nothing when there is none. */
+function launchdAutoStart(plist: PlistState): AutoStart {
+  if (plist.kind === "none") return { on: false, line: null };
   // Said before broken or outdated: 'engram start' won't repair a job the
   // user switched off (engram#654).
   if (agentDisabled() === true) {
-    console.log(`${dim("Auto-start:")} off — disabled in launchd` + dim("  ('engram install' turns it back on)"));
-    return false;
+    return {
+      on: false,
+      line: `${dim("Auto-start:")} off — disabled in launchd` + dim("  ('engram install' turns it back on)"),
+    };
   }
   if (plist.broken) {
-    console.log(`${dim("Auto-start:")} enabled (launchd)` + red("  — broken, run 'engram install' to repair"));
-    return false;
+    return {
+      on: false,
+      line: `${dim("Auto-start:")} enabled (launchd)` + red("  — broken, run 'engram install' to repair"),
+    };
   }
-  console.log(
-    `${dim("Auto-start:")} enabled (launchd)` +
+  return {
+    on: true,
+    line:
+      `${dim("Auto-start:")} enabled (launchd)` +
       (plist.outdated ? red("  — outdated config, run 'engram install' to update") : ""),
-  );
-  return true;
+  };
 }
 
-/** printAutoStart for the systemd unit: nothing when there is none of ours. */
-function printSystemdAutoStart(unit: UnitState): boolean {
-  if (unit.kind !== "ours") return false;
+/** autoStart for the systemd unit: nothing when there is none of ours. */
+function systemdAutoStart(unit: UnitState): AutoStart {
+  if (unit.kind !== "ours") return { on: false, line: null };
   if (!unit.enabled) {
-    console.log(
-      `${dim("Auto-start:")} off — disabled with systemctl` + dim("  ('engram install' turns it back on)"),
-    );
-    return false;
+    return {
+      on: false,
+      line: `${dim("Auto-start:")} off — disabled with systemctl` + dim("  ('engram install' turns it back on)"),
+    };
   }
   if (unit.broken) {
-    console.log(`${dim("Auto-start:")} enabled (systemd)` + red("  — broken, run 'engram install' to repair"));
-    return false;
+    return {
+      on: false,
+      line: `${dim("Auto-start:")} enabled (systemd)` + red("  — broken, run 'engram install' to repair"),
+    };
   }
-  console.log(
-    `${dim("Auto-start:")} enabled (systemd)` +
+  return {
+    on: true,
+    line:
+      `${dim("Auto-start:")} enabled (systemd)` +
       (unit.outdated ? red("  — outdated config, run 'engram install' to update") : ""),
-  );
-  return true;
+  };
 }
 
 /**
@@ -1026,6 +1056,38 @@ function printVaultKeyWarning(problem: VaultKeyUnreadable, held: SyncStatus | nu
     console.log(dim("  Meanwhile, commands that need the key won't run."));
   }
   if (envKey) console.log(dim("  Commands run here use ENGRAM_VAULT_KEY instead, which wins over the file."));
+  console.log("");
+}
+
+/**
+ * engram#690: ENGRAM_VAULT_KEY is set here, and ~/.engram/vault-key doesn't
+ * hold its key. A daemon started at login reads the file: launchd never
+ * gives it a shell's variables, and systemd and Windows may not. Without
+ * the key, it captures without the vault's values removed (scrubber.ts);
+ * with another key, without those encrypted with this one. Nothing said for
+ * a variable that holds no key, or a file that can't be read, which
+ * printVaultKeyWarning says (engram#677). `startsAtLogin`: whether the
+ * daemon starts at login, asked only when there is something to say, as on
+ * macOS that asks launchd.
+ */
+async function printLoginVaultKeyWarning(startsAtLogin: () => boolean = () => true): Promise<void> {
+  const state = await envVaultKeyState();
+  if (state !== "none" && state !== "different") return;
+  if (!startsAtLogin()) return;
+  console.log("");
+  if (state === "none") {
+    console.log(red("  WARNING: ENGRAM_VAULT_KEY is set here, but ~/.engram/vault-key isn't there."));
+    console.log(dim("  A daemon started at login may not get this shell's variables. Then it has no"));
+    console.log(dim("  vault key, and your vault's secrets aren't removed from what it captures."));
+    console.log(dim("  To save the key there, readable only by you: engram vault save-key"));
+  } else {
+    console.log(red("  WARNING: ~/.engram/vault-key holds a different vault key from ENGRAM_VAULT_KEY."));
+    console.log(dim("  A daemon started at login may not get this shell's variables. Then it uses the"));
+    console.log(dim("  file's key, and secrets encrypted with ENGRAM_VAULT_KEY's aren't removed from"));
+    console.log(dim("  what it captures. If ENGRAM_VAULT_KEY's key is the right one:"));
+    console.log(dim("  engram vault save-key --force (the file's key is backed up first)."));
+    console.log(dim("  If the file's is, unset ENGRAM_VAULT_KEY."));
+  }
   console.log("");
 }
 
@@ -1293,6 +1355,7 @@ async function enableLaunchdStartAtLogin(start = false): Promise<void> {
   }
   console.log(`${bold("Auto-start enabled")} — daemon will start on login`);
   console.log(`${dim("Plist:")} ${plistPath()}`);
+  await printLoginVaultKeyWarning();
   // A job launchd had loaded already starts no daemon now: after `engram
   // stop`, its daemon exited 0, which KeepAlive doesn't start again
   // (engram#691). It is started as `engram start` starts it: through
@@ -1633,6 +1696,7 @@ async function enableSystemdStartAtLogin(running: boolean): Promise<void> {
   }
   console.log(`${bold("Auto-start enabled")} — daemon will start when you log in (systemd)`);
   console.log(`${dim("Unit:")} ${unitPath()}`);
+  await printLoginVaultKeyWarning();
   // Enabled, not started: systemd starts it from the next login on. The
   // daemon now is started as 'engram start' starts it, with this shell's
   // environment, and never beside a running one.
@@ -1733,6 +1797,7 @@ async function enableWindowsStartAtLogin(running: boolean): Promise<void> {
   console.log(`${bold("Auto-start enabled")} — daemon will start when you sign in to Windows`);
   console.log(dim("  A console window flashes briefly at sign-in while it starts."));
   console.log(`${dim("Startup entry:")} ${RUN_KEY}\\${RUN_VALUE}`);
+  await printLoginVaultKeyWarning();
   // launchctl load starts the agent right away on macOS; match that, but
   // never start a second worker beside a running one. Through the
   // supervisor, as at sign-in, so it is started again after an error too.
@@ -1942,6 +2007,9 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
       );
     }
     console.log(dim("  Turn off anytime: engram stop && engram uninstall"));
+    // When start at login is on: the daemon it starts reads the file
+    // (engram#690). Not one the user switched off, or never there.
+    await printLoginVaultKeyWarning(() => autoStart().on);
   } catch {
     // Non-fatal by design: capture is a convenience, login is the job.
   }

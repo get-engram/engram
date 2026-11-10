@@ -15,7 +15,7 @@
  * daemon/ownership.js, which are too. The daemon reads the key with this.
  */
 
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -111,6 +111,76 @@ export async function vaultKeyFileState(): Promise<"key" | "none" | VaultKeyUnre
   } catch (err: unknown) {
     return asVaultKeyProblem(err);
   }
+}
+
+/**
+ * The key's bytes as the SDK reads a key, with atob: base64, blanks
+ * skipped. Null when it isn't base64.
+ */
+function keyBytes(key: string): string | null {
+  try {
+    return atob(key);
+  } catch {
+    return null;
+  }
+}
+
+/** `key` is a vault key: 32 bytes, base64-encoded, as the SDK takes one. */
+export function isVaultKey(key: string): boolean {
+  return keyBytes(key)?.length === 32;
+}
+
+/**
+ * The same key: the same bytes, however written (a line's end, padding).
+ * Two that aren't base64 are the same when their text is.
+ */
+export function sameVaultKey(a: string, b: string): boolean {
+  const x = keyBytes(a);
+  const y = keyBytes(b);
+  return x !== null && y !== null ? x === y : a.trim() === b.trim();
+}
+
+/**
+ * ENGRAM_VAULT_KEY, which commands run in a shell use, against
+ * ~/.engram/vault-key, which a daemon started at login reads: it may not
+ * get a shell's variables (engram#690). "unset": ENGRAM_VAULT_KEY isn't
+ * set. "invalid": it doesn't hold a vault key. "same": the file holds its
+ * key. "none": there is no file. "different": the file holds another key.
+ * Or why no key can be read from the file.
+ */
+export type EnvVaultKeyState = "unset" | "invalid" | "same" | "none" | "different" | VaultKeyUnreadable;
+
+export async function envVaultKeyState(): Promise<EnvVaultKeyState> {
+  const envKey = process.env.ENGRAM_VAULT_KEY;
+  if (!envKey) return "unset";
+  if (!isVaultKey(envKey)) return "invalid";
+  let fileKey: string | undefined;
+  try {
+    fileKey = await readVaultKeyFile();
+  } catch (err: unknown) {
+    return asVaultKeyProblem(err);
+  }
+  if (fileKey === undefined) return "none";
+  return sameVaultKey(envKey, fileKey) ? "same" : "different";
+}
+
+/**
+ * ENGRAM_VAULT_KEY is set, and ~/.engram/vault-key holds it: a daemon
+ * started without the variable, as launchd starts one, has the key too
+ * (engram#690). Written the same, not only the same key: the daemon also
+ * scrubs the key's own text from what it captures, and should scrub the
+ * text set here. Read synchronously, to choose how to start the daemon.
+ */
+export function envVaultKeySaved(): boolean {
+  const envKey = process.env.ENGRAM_VAULT_KEY?.trim();
+  if (!envKey) return false;
+  let text: string;
+  try {
+    text = readFileSync(VAULT_KEY_FILE, "utf-8");
+  } catch {
+    return false;
+  }
+  return text.trim() === envKey;
 }
 
 /** How to fix it, in a line. */

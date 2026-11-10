@@ -2338,6 +2338,158 @@ describe("a job switched off in launchd (engram#654)", () => {
   });
 });
 
+describe("the vault key a daemon started at login reads, on macOS (engram#690)", () => {
+  const VAULT_KEY = join(ENGRAM_DIR, "vault-key");
+  /** The key in ENGRAM_VAULT_KEY here, and another. */
+  const KEY = Buffer.alloc(32, 7).toString("base64");
+  const OTHER = Buffer.alloc(32, 9).toString("base64");
+  /** The first line of what is said when the file isn't there, and when it holds another key. */
+  const NONE = "  WARNING: ENGRAM_VAULT_KEY is set here, but ~/.engram/vault-key isn't there.";
+  const DIFFERENT = "  WARNING: ~/.engram/vault-key holds a different vault key from ENGRAM_VAULT_KEY.";
+
+  beforeEach(() => {
+    vi.stubEnv("NO_COLOR", "1");
+    vi.stubEnv("ENGRAM_VAULT_KEY", KEY);
+    rmSync(VAULT_KEY, { recursive: true, force: true });
+  });
+
+  afterEach(() => rmSync(VAULT_KEY, { recursive: true, force: true }));
+
+  function saveKey(text: string): void {
+    mkdirSync(ENGRAM_DIR, { recursive: true });
+    writeFileSync(VAULT_KEY, text, { mode: 0o600 });
+  }
+
+  /** The lines said. */
+  function lines(): string[] {
+    return output().split("\n");
+  }
+
+  it("engram start has launchd start the daemon when ~/.engram/vault-key holds the key set here, as it is written here", async () => {
+    jobLoaded();
+    for (const saved of [`${KEY}\n`, `  ${KEY}\n\n`, KEY]) {
+      saveKey(saved);
+      daemonGone();
+      execFileSync.mockClear();
+      await daemonStart([], {});
+      expect(launchctlCalls()).toEqual(["list", "list", "print-disabled", "kickstart", "list"]);
+      expect(spawn).not.toHaveBeenCalled();
+      const text = said();
+      expect(text).toContain(`Engram daemon started (pid ${process.pid})`);
+      expect(text).not.toContain("ENGRAM_VAULT_KEY");
+    }
+  });
+
+  it("engram start starts the daemon itself otherwise: launchd's would have no key, another, or this one written another way", async () => {
+    jobLoaded();
+    for (const saved of [null, `${OTHER}\n`, `${KEY.replace(/=+$/, "")}\n`, "", "folder"]) {
+      rmSync(VAULT_KEY, { recursive: true, force: true });
+      if (saved === "folder") mkdirSync(VAULT_KEY, { recursive: true });
+      else if (saved !== null) saveKey(saved);
+      daemonGone();
+      execFileSync.mockClear();
+      spawn.mockClear();
+      await daemonStart([], {});
+      // Only the look for a daemon launchd runs.
+      expect(launchctlCalls()).toEqual(["list"]);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      said();
+    }
+  });
+
+  it("engram install warns, after the plist, when the file isn't there or holds another key", async () => {
+    for (const saved of [null, `${OTHER}\n`]) {
+      rmSync(join(home.dir, "Library"), { recursive: true, force: true });
+      Object.assign(launchd, { loaded: false, loadedText: null });
+      rmSync(VAULT_KEY, { force: true });
+      if (saved !== null) saveKey(saved);
+      await daemonInstall();
+      const shown = lines();
+      const at = shown.indexOf(saved === null ? NONE : DIFFERENT);
+      expect(at).toBeGreaterThan(shown.indexOf(`Plist: ${PLIST}`));
+      expect(shown[at - 1]).toBe("");
+      expect(shown.indexOf(saved === null ? DIFFERENT : NONE)).toBe(-1);
+      expect(said()).not.toContain(OTHER.slice(0, 12));
+    }
+    expect(spawn).not.toHaveBeenCalled();
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("engram install says nothing of the key when the file holds it", async () => {
+    saveKey(`${KEY}\n`);
+    await daemonInstall();
+    expect(launchctlCalls()).toEqual(["print-disabled", "bootout", "unload", "list", "bootstrap"]);
+    expect(output()).toContain(`Plist: ${PLIST}`);
+    expect(output()).not.toContain("ENGRAM_VAULT_KEY");
+  });
+
+  it("engram status warns when start at login is on, and not when it is switched off in launchd", async () => {
+    writePlist(plistWith());
+    daemonRunning();
+    await daemonStatus();
+    expect(lines()).toContain(NONE);
+    // Whether it is on is asked of launchd once, as before.
+    expect(launchctlCalls()).toEqual(["print-disabled"]);
+
+    said();
+    launchd.switchedOff = true;
+    await daemonStatus();
+    const text = said();
+    expect(text).toContain("Auto-start: off — disabled in launchd");
+    expect(text).not.toContain("ENGRAM_VAULT_KEY");
+  });
+
+  it("engram status says nothing of the key without a plist, or with a broken one, running or stopped", async () => {
+    for (const plist of [null, plistWith({ node: join(home.dir, "gone", "node") })]) {
+      for (const running of [true, false]) {
+        rmSync(PLIST, { force: true });
+        if (plist !== null) writePlist(plist);
+        if (running) daemonRunning();
+        else daemonGone();
+        await daemonStatus();
+        const text = said();
+        expect(text).toContain(running ? "Status: running" : "Status: stopped");
+        expect(text).not.toContain("It should be running");
+        expect(text).not.toContain("ENGRAM_VAULT_KEY");
+      }
+    }
+  });
+
+  describe("auto-capture", () => {
+    signedInAtATerminal();
+
+    it("has launchd start the daemon when the file holds the key set here", async () => {
+      saveKey(`${KEY}\n`);
+      await autoEnableCapture({ after: "login" });
+      expect(launchctlCalls()).toEqual(["print-disabled", "bootstrap", "list", "print-disabled", "kickstart"]);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(launchd.pid).toBe(process.pid);
+      const text = said();
+      expect(text).toContain("Auto-capture is on");
+      expect(text).not.toContain("ENGRAM_VAULT_KEY");
+    });
+
+    it("else starts it itself, turns on start at login, and warns", async () => {
+      await autoEnableCapture({ after: "login" });
+      expect(spawn).toHaveBeenCalledTimes(1);
+      // And whether start at login is on, asked once there is something to say.
+      expect(launchctlCalls()).toEqual(["print-disabled", "bootstrap", "print-disabled"]);
+      const shown = lines();
+      expect(shown.indexOf(NONE)).toBeGreaterThan(shown.indexOf("  Turn off anytime: engram stop && engram uninstall"));
+    });
+
+    it("says nothing of the key when start at login is switched off in launchd", async () => {
+      launchd.switchedOff = true;
+      daemonRunning();
+      await autoEnableCapture({ after: "login" });
+      const text = said();
+      expect(text).toContain("Start at login is switched off in launchd");
+      expect(text).toContain("Auto-capture is on");
+      expect(text).not.toContain("ENGRAM_VAULT_KEY");
+    });
+  });
+});
+
 describe("a CLI and a Node installed with brew (engram#652)", () => {
   // A Homebrew prefix as `brew install node engram` leaves one: each version
   // in its keg under Cellar/, and opt/<formula> a link to the current one.

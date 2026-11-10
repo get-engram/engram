@@ -11,6 +11,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -33,6 +34,16 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   const fs = await importOriginal<typeof import("node:fs/promises")>();
   return { ...fs, readFile: vi.fn(fs.readFile) };
 });
+// A daemon from before engram#612 has no socket: its PID file names it,
+// and only `ps` tells it from another process. A test says there is one.
+const { pidFileDaemon } = vi.hoisted(() => ({ pidFileDaemon: { pid: null as number | null } }));
+vi.mock("../daemon/instance.js", async (importOriginal) => {
+  const instance = await importOriginal<typeof import("../daemon/instance.js")>();
+  return {
+    ...instance,
+    confirmedDaemonInPidFile: () => pidFileDaemon.pid ?? instance.confirmedDaemonInPidFile(),
+  };
+});
 
 home.dir = mkdtempSync(join(tmpdir(), "engram-677-home-"));
 const ENGRAM = join(home.dir, ".engram");
@@ -42,14 +53,19 @@ const KEY_FILE = join(ENGRAM, "vault-key");
 const { readFile } = await import("node:fs/promises");
 const {
   asVaultKeyProblem,
+  envVaultKeySaved,
+  envVaultKeyState,
+  isVaultKey,
   readVaultKey,
   readVaultKeyFile,
+  sameVaultKey,
   VAULT_KEY_FILE,
   vaultKeyFileState,
   VaultKeyUnreadable,
   vaultKeyFix,
 } = await import("../vault-key.js");
-const { vaultKeygen, vaultStatus } = await import("../commands/vault.js");
+const { vaultKeygen, vaultSaveKey, vaultStatus } = await import("../commands/vault.js");
+const { daemonEndpoint } = await import("../daemon/instance.js");
 
 process.on("exit", () => rmSync(home.dir, { recursive: true, force: true }));
 
@@ -107,6 +123,7 @@ afterEach(() => {
   vi.mocked(readFile).mockClear();
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
+  pidFileDaemon.pid = null;
 });
 
 describe("reading the vault key: only a file that isn't there is no key (engram#677)", () => {
@@ -280,16 +297,17 @@ describe("vaultKeyFix: what fixes it", () => {
   });
 });
 
-describe("vault keygen --save over a key that can't be read (engram#677)", () => {
-  /** What is in ~/.engram, so a backup or a new key would show. */
-  const files = () => readdirSync(ENGRAM).sort();
-  const REFUSED = (problem: string, fix: string) => [
-    `Error: ~/.engram/vault-key ${problem}, so it can't be backed up, and isn't replaced.`,
-    `  ${fix}`,
-    "  Then run this again. Or move it aside yourself:",
-    "    mv ~/.engram/vault-key ~/.engram/vault-key.old",
-  ];
+/** What is in ~/.engram, so a backup or a new key would show. */
+const files = () => readdirSync(ENGRAM).sort();
+/** A key in the file that can't be read isn't replaced: it can't be backed up. */
+const REFUSED = (problem: string, fix: string) => [
+  `Error: ~/.engram/vault-key ${problem}, so it can't be backed up, and isn't replaced.`,
+  `  ${fix}`,
+  "  Then run this again. Or move it aside yourself:",
+  "    mv ~/.engram/vault-key ~/.engram/vault-key.old",
+];
 
+describe("vault keygen --save over a key that can't be read (engram#677)", () => {
   it("a folder in its place: refused, with --force too, and nothing in it touched", async () => {
     mkdirSync(KEY_FILE);
     writeFileSync(join(KEY_FILE, "keep"), "kept");
@@ -378,10 +396,40 @@ describe("vault status (engram#677)", () => {
     ]);
   });
 
-  it("ENGRAM_VAULT_KEY, and no file: the key in it", async () => {
+  it("ENGRAM_VAULT_KEY, and no file: the key in it, and that a daemon started at login may not have it (engram#690)", async () => {
     vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
     await vaultStatus();
+    expect(out).toEqual([
+      "Vault: configured (key in ENGRAM_VAULT_KEY)",
+      "  ~/.engram/vault-key isn't there: a daemon started at login may not have this key.",
+      "  To save it there, readable only by you: engram vault save-key",
+    ]);
+  });
+
+  it("ENGRAM_VAULT_KEY, saved in the file: nothing more (engram#690)", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    writeFileSync(KEY_FILE, `${ENV_KEY}\n`, { mode: 0o600 });
+    await vaultStatus();
     expect(out).toEqual(["Vault: configured (key in ENGRAM_VAULT_KEY)"]);
+  });
+
+  it("ENGRAM_VAULT_KEY, and another key in the file: which a daemon started at login may use (engram#690)", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    writeFileSync(KEY_FILE, `${KEY}\n`, { mode: 0o600 });
+    await vaultStatus();
+    expect(out).toEqual([
+      "Vault: configured (key in ENGRAM_VAULT_KEY)",
+      "  ~/.engram/vault-key holds a different key: a daemon started at login may use that one.",
+      "  If this one is right: engram vault save-key --force (the file's key is backed up first)",
+    ]);
+    expect(out.join("\n")).not.toContain(KEY.slice(0, 8));
+    expect(out.join("\n")).not.toContain(ENV_KEY.slice(0, 8));
+  });
+
+  it("ENGRAM_VAULT_KEY that isn't a key: nothing said about saving it (engram#690)", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", Buffer.alloc(16, 9).toString("base64"));
+    await vaultStatus();
+    expect(out).toEqual(["Vault: invalid key in ENGRAM_VAULT_KEY (expected 32 bytes, got 16)"]);
   });
 
   it("no file: not configured, and how to make a key", async () => {
@@ -393,5 +441,358 @@ describe("vault status (engram#677)", () => {
     writeFileSync(KEY_FILE, `${KEY}\n`, { mode: 0o600 });
     await vaultStatus();
     expect(out).toEqual([`Vault: configured (key at ${VAULT_KEY_FILE})`, `Key prefix: ${KEY.slice(0, 8)}...`]);
+  });
+});
+
+describe("a vault key as the SDK reads one (engram#690)", () => {
+  it("32 bytes, base64: its padding, a line's end and blanks aside", () => {
+    expect(isVaultKey(KEY)).toBe(true);
+    expect(isVaultKey(KEY.replace(/=+$/, ""))).toBe(true);
+    expect(isVaultKey(`  ${KEY}\n`)).toBe(true);
+    expect(isVaultKey(Buffer.alloc(16, 7).toString("base64"))).toBe(false);
+    expect(isVaultKey(Buffer.alloc(33, 7).toString("base64"))).toBe(false);
+    // The SDK reads a key with atob, which doesn't take base64url.
+    expect(isVaultKey(Buffer.alloc(32, 0xff).toString("base64url"))).toBe(false);
+    expect(isVaultKey(LEAK)).toBe(false);
+    expect(isVaultKey("")).toBe(false);
+  });
+
+  it("the same key, however written; text that isn't a key, by its text", () => {
+    expect(sameVaultKey(KEY, `${KEY.replace(/=+$/, "")}\n`)).toBe(true);
+    expect(sameVaultKey(KEY, ENV_KEY)).toBe(false);
+    expect(sameVaultKey(LEAK, ` ${LEAK}\n`)).toBe(true);
+    expect(sameVaultKey(LEAK, KEY)).toBe(false);
+  });
+});
+
+describe("ENGRAM_VAULT_KEY against ~/.engram/vault-key, which the daemon at login reads (engram#690)", () => {
+  type Unreadable = InstanceType<typeof VaultKeyUnreadable>;
+
+  it("ENGRAM_VAULT_KEY unset, or empty: unset, and nothing saved", async () => {
+    writeFileSync(KEY_FILE, `${KEY}\n`, { mode: 0o600 });
+    expect(await envVaultKeyState()).toBe("unset");
+    expect(envVaultKeySaved()).toBe(false);
+    vi.stubEnv("ENGRAM_VAULT_KEY", "");
+    expect(await envVaultKeyState()).toBe("unset");
+    expect(envVaultKeySaved()).toBe(false);
+  });
+
+  it("ENGRAM_VAULT_KEY that isn't a key: invalid, whatever the file holds", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", LEAK);
+    expect(await envVaultKeyState()).toBe("invalid");
+    mkdirSync(KEY_FILE);
+    expect(await envVaultKeyState()).toBe("invalid");
+  });
+
+  it("no file: none", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    expect(await envVaultKeyState()).toBe("none");
+    expect(envVaultKeySaved()).toBe(false);
+  });
+
+  it("the file holds it: the same, and saved, blanks and a line's end in either aside", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    writeFileSync(KEY_FILE, `${ENV_KEY}\n`, { mode: 0o600 });
+    expect(await envVaultKeyState()).toBe("same");
+    expect(envVaultKeySaved()).toBe(true);
+
+    vi.stubEnv("ENGRAM_VAULT_KEY", `${ENV_KEY}\n`);
+    writeFileSync(KEY_FILE, `  ${ENV_KEY}  \n\n`, { mode: 0o600 });
+    expect(await envVaultKeyState()).toBe("same");
+    expect(envVaultKeySaved()).toBe(true);
+  });
+
+  it("the same key, written another way: the same key, but not saved as written here", async () => {
+    // The daemon scrubs the key's own text too: started from the file, it
+    // would scrub the file's.
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    writeFileSync(KEY_FILE, `${ENV_KEY.replace(/=+$/, "")}\n`, { mode: 0o600 });
+    expect(await envVaultKeyState()).toBe("same");
+    expect(envVaultKeySaved()).toBe(false);
+  });
+
+  it("another key: different, and not saved", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    writeFileSync(KEY_FILE, `${KEY}\n`, { mode: 0o600 });
+    expect(await envVaultKeyState()).toBe("different");
+    expect(envVaultKeySaved()).toBe(false);
+  });
+
+  it("a file that can't be read, or is empty: why, and not saved", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    mkdirSync(KEY_FILE);
+    const folder = await envVaultKeyState();
+    expect(folder).toBeInstanceOf(VaultKeyUnreadable);
+    expect((folder as Unreadable).kind).toBe("folder");
+    expect(envVaultKeySaved()).toBe(false);
+
+    rmSync(KEY_FILE, { recursive: true });
+    writeFileSync(KEY_FILE, " \n", { mode: 0o600 });
+    expect(((await envVaultKeyState()) as Unreadable).kind).toBe("empty");
+    expect(envVaultKeySaved()).toBe(false);
+  });
+
+  unreadableIt("mode 000: why, and not saved", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    writeFileSync(KEY_FILE, `${ENV_KEY}\n`, { mode: 0o600 });
+    chmodSync(KEY_FILE, 0o000);
+    expect(((await envVaultKeyState()) as Unreadable).kind).toBe("permission");
+    expect(envVaultKeySaved()).toBe(false);
+  });
+});
+
+describe("engram vault save-key (engram#690)", () => {
+  const SAVED = [
+    `Vault key saved to: ${VAULT_KEY_FILE}`,
+    "Permissions set to owner-only (600). The daemon started at login reads it there.",
+  ];
+  const RESTART = [
+    "The daemon running now read its key when it started. If that was without this one,",
+    "as at login, run 'engram stop', then 'engram start'.",
+  ];
+
+  /** Nothing of either key is ever printed. */
+  function neverPrinted(): void {
+    const said = [...out, ...errs].join("\n");
+    for (const key of [KEY, ENV_KEY]) expect(said).not.toContain(key.slice(0, 8));
+    expect(said).not.toContain(LEAK);
+  }
+
+  /** `server` listening where the daemon does. Returns how to stop it, and close what it holds open. */
+  async function onDaemonEndpoint(server: Server): Promise<() => Promise<void>> {
+    const endpoint = daemonEndpoint();
+    if ("unavailable" in endpoint) throw new Error(endpoint.unavailable);
+    const open = new Set<Socket>();
+    server.on("connection", (socket) => {
+      socket.on("error", () => {});
+      open.add(socket);
+      socket.on("close", () => open.delete(socket));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(endpoint.path, () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+    return () =>
+      new Promise<void>((resolve) => {
+        for (const socket of open) socket.destroy();
+        server.close(() => resolve());
+      });
+  }
+
+  /** A daemon answering on its socket, as `engram status` finds one. Returns how to stop it. */
+  function daemonAnswering(stopping = false): Promise<() => Promise<void>> {
+    const line = `${JSON.stringify({ engram: "daemon", protocol: 1, pid: 4242, ready: true, stopping, stop_file: true })}\n`;
+    return onDaemonEndpoint(createServer((socket) => socket.end(line)));
+  }
+
+  /**
+   * A daemon too busy to answer, as in its first start after an update: it
+   * takes the connection, and says nothing. Returns how to stop it.
+   */
+  function daemonBusy(): Promise<() => Promise<void>> {
+    return onDaemonEndpoint(createServer(() => {}));
+  }
+
+  it("ENGRAM_VAULT_KEY unset, or empty: refused, and nothing written", async () => {
+    for (const value of [undefined, ""]) {
+      vi.stubEnv("ENGRAM_VAULT_KEY", value);
+      errs = [];
+      await expect(vaultSaveKey({})).rejects.toThrow("exit 1");
+      expect(errs).toEqual([
+        "Error: ENGRAM_VAULT_KEY isn't set, so there is no key to save.",
+        "  To make a new vault key and save it instead: engram vault keygen --save",
+      ]);
+    }
+    expect(exits).toEqual([1, 1]);
+    expect(files()).toEqual([]);
+  });
+
+  it("ENGRAM_VAULT_KEY that isn't a key: refused, nothing written, and what it holds never said", async () => {
+    for (const value of [LEAK, Buffer.alloc(16, 9).toString("base64")]) {
+      vi.stubEnv("ENGRAM_VAULT_KEY", value);
+      errs = [];
+      await expect(vaultSaveKey({ force: "" })).rejects.toThrow("exit 1");
+      expect(errs).toEqual([
+        "Error: ENGRAM_VAULT_KEY doesn't hold a vault key, so it isn't saved.",
+        "  A vault key is 32 bytes, base64-encoded, as 'engram vault keygen' makes one.",
+      ]);
+    }
+    expect(files()).toEqual([]);
+    neverPrinted();
+  });
+
+  it("no file: saved as ENGRAM_VAULT_KEY has it, less blanks, readable only by the user", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", `  ${ENV_KEY}\n`);
+    await vaultSaveKey({});
+    expect(exits).toEqual([]);
+    expect(out).toEqual(SAVED);
+    expect(readFileSync(KEY_FILE, "utf-8")).toBe(`${ENV_KEY}\n`);
+    expect(files()).toEqual(["vault-key"]);
+    if (posix) expect(lstatSync(KEY_FILE).mode & 0o777).toBe(0o600);
+    expect(envVaultKeySaved()).toBe(true);
+    neverPrinted();
+  });
+
+  it("no ~/.engram: made, the user's alone, and the key saved in it", async () => {
+    rmSync(ENGRAM, { recursive: true, force: true });
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    await vaultSaveKey({});
+    expect(out).toEqual(SAVED);
+    expect(readFileSync(KEY_FILE, "utf-8")).toBe(`${ENV_KEY}\n`);
+    if (posix) expect(lstatSync(ENGRAM).mode & 0o777).toBe(0o700);
+  });
+
+  it("the key already saved: said, and the file left as it is", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    writeFileSync(KEY_FILE, ` ${ENV_KEY}\n\n`, { mode: 0o600 });
+    await vaultSaveKey({});
+    expect(exits).toEqual([]);
+    expect(out).toEqual([`Already saved: ${VAULT_KEY_FILE} holds the key in ENGRAM_VAULT_KEY.`]);
+    expect(readFileSync(KEY_FILE, "utf-8")).toBe(` ${ENV_KEY}\n\n`);
+    expect(files()).toEqual(["vault-key"]);
+    neverPrinted();
+  });
+
+  it("the same key, written another way: written as ENGRAM_VAULT_KEY has it, without --force or a backup", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    writeFileSync(KEY_FILE, `${ENV_KEY.replace(/=+$/, "")}\n`, { mode: 0o600 });
+    await vaultSaveKey({});
+    expect(exits).toEqual([]);
+    expect(out).toEqual(SAVED);
+    expect(readFileSync(KEY_FILE, "utf-8")).toBe(`${ENV_KEY}\n`);
+    expect(files()).toEqual(["vault-key"]);
+    expect(envVaultKeySaved()).toBe(true);
+  });
+
+  it("another key: refused without --force; with it, backed up, then replaced", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    writeFileSync(KEY_FILE, `${KEY}\n`, { mode: 0o600 });
+    await expect(vaultSaveKey({})).rejects.toThrow("exit 1");
+    expect(errs).toEqual([
+      "~/.engram/vault-key holds a different vault key.",
+      "Secrets encrypted with it can only be read with it. To replace it all the same,",
+      "run this again with --force: the key in the file is backed up first.",
+    ]);
+    expect(out).toEqual([]);
+    expect(readFileSync(KEY_FILE, "utf-8")).toBe(`${KEY}\n`);
+    expect(files()).toEqual(["vault-key"]);
+
+    exits = [];
+    await vaultSaveKey({ force: "" });
+    expect(exits).toEqual([]);
+    const backups = files().filter((name) => name.startsWith("vault-key.bak-"));
+    expect(backups).toHaveLength(1);
+    const backup = join(ENGRAM, backups[0]);
+    expect(readFileSync(backup, "utf-8")).toBe(`${KEY}\n`);
+    if (posix) expect(lstatSync(backup).mode & 0o777).toBe(0o600);
+    expect(readFileSync(KEY_FILE, "utf-8")).toBe(`${ENV_KEY}\n`);
+    expect(out).toEqual([`Previous key backed up to ${backup}`, ...SAVED]);
+    neverPrinted();
+  });
+
+  it("a folder in its place: refused, with --force too, and nothing in it touched", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    mkdirSync(KEY_FILE);
+    writeFileSync(join(KEY_FILE, "keep"), "kept");
+    for (const flags of [{}, { force: "" }] as Array<Record<string, string>>) {
+      errs = [];
+      await expect(vaultSaveKey(flags)).rejects.toThrow("exit 1");
+      expect(errs).toEqual(
+        REFUSED(
+          "is a folder, not a file",
+          "Move the folder aside, and put your vault key back in ~/.engram/vault-key.",
+        ),
+      );
+    }
+    expect(files()).toEqual(["vault-key"]);
+    expect(readdirSync(KEY_FILE)).toEqual(["keep"]);
+    expect(out).toEqual([]);
+  });
+
+  unreadableIt("mode 000: refused, with --force too, and the key in it kept", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    writeFileSync(KEY_FILE, `${KEY}\n`, { mode: 0o600 });
+    chmodSync(KEY_FILE, 0o000);
+    await expect(vaultSaveKey({ force: "" })).rejects.toThrow("exit 1");
+    expect(errs).toEqual(
+      REFUSED("can't be read: permission denied", "Make it readable with: chmod 600 ~/.engram/vault-key"),
+    );
+    expect(files()).toEqual(["vault-key"]);
+    chmodSync(KEY_FILE, 0o600);
+    expect(readFileSync(KEY_FILE, "utf-8")).toBe(`${KEY}\n`);
+  });
+
+  it("an empty file: replaced, with nothing in it to back up", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    writeFileSync(KEY_FILE, "\n", { mode: 0o600 });
+    await vaultSaveKey({});
+    expect(exits).toEqual([]);
+    expect(out).toEqual(SAVED);
+    expect(files()).toEqual(["vault-key"]);
+    expect(readFileSync(KEY_FILE, "utf-8")).toBe(`${ENV_KEY}\n`);
+  });
+
+  it("a daemon running: it read its key when it started, and how to start it again with this one", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    const stop = await daemonAnswering();
+    try {
+      await vaultSaveKey({});
+    } finally {
+      await stop();
+    }
+    expect(out).toEqual([...SAVED, ...RESTART]);
+  });
+
+  it("a daemon too busy to answer, or one only its PID file names: running all the same", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    const stop = await daemonBusy();
+    try {
+      await vaultSaveKey({});
+    } finally {
+      await stop();
+    }
+    expect(out).toEqual([...SAVED, ...RESTART]);
+
+    // One from before engram#612, which has no socket.
+    out = [];
+    rmSync(KEY_FILE);
+    pidFileDaemon.pid = 4242;
+    await vaultSaveKey({});
+    expect(out).toEqual([...SAVED, ...RESTART]);
+  });
+
+  it("a daemon stopping, or none: nothing about starting it again", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    const stop = await daemonAnswering(true);
+    try {
+      await vaultSaveKey({});
+    } finally {
+      await stop();
+    }
+    expect(out).toEqual(SAVED);
+
+    out = [];
+    rmSync(KEY_FILE);
+    await vaultSaveKey({});
+    expect(out).toEqual(SAVED);
+  });
+});
+
+describe("vault keygen: saving the key for the daemon at login (engram#690)", () => {
+  it("not saved: how to save it, after how to set ENGRAM_VAULT_KEY", async () => {
+    await vaultKeygen([], {});
+    expect(out.slice(-3)).toEqual([
+      "Usage with environment variable:",
+      expect.stringMatching(/^ {2}export ENGRAM_VAULT_KEY=.{8}\.\.\.$/),
+      "  Then 'engram vault save-key' saves it for the daemon started at login.",
+    ]);
+  });
+
+  it("saved: nothing about save-key", async () => {
+    await vaultKeygen([], { save: "" });
+    expect(out.join("\n")).not.toContain("save-key");
   });
 });

@@ -237,6 +237,14 @@ export ENGRAM_VAULT_KEY="your-base64-key-here"
 
 The CLI and SDK check `ENGRAM_VAULT_KEY` first, then fall back to `~/.engram/vault-key`.
 
+The capture daemon that `engram install` starts at login may not get your shell's variables (launchd never passes them on macOS), so it reads `~/.engram/vault-key`. To save the key you set in `ENGRAM_VAULT_KEY` there, readable only by you:
+
+```bash
+engram vault save-key
+```
+
+`engram install`, `engram status` and `engram vault status` warn when the file doesn't hold the key in `ENGRAM_VAULT_KEY`. Until it does, a daemon started at login doesn't remove your vault's secrets from what it captures.
+
 ### Automatic protection with CLI
 
 When a vault key is configured, `engram store` automatically encrypts detected secrets:

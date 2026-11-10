@@ -53,6 +53,8 @@ const { home, made } = vi.hoisted(() => ({
     syncers: [] as unknown[],
     /** The key source each syncer was given. */
     keys: [] as unknown[],
+    /** daemon.db, each time the worker opened it. */
+    dbs: [] as { close(): void }[],
   },
 }));
 
@@ -97,6 +99,21 @@ async function runWorker(): Promise<{ log: () => string }> {
     ...(await importOriginal<typeof import("../daemon/ownership.js")>()),
     foreignFiles: vi.fn(() => null),
   }));
+  // The worker opens daemon.db, and its fatal path exits without closing it:
+  // here it can't exit, so the test closes it. Windows can't delete a file
+  // that is open.
+  vi.doMock("../daemon/db.js", async (importOriginal) => {
+    const real = await importOriginal<typeof import("../daemon/db.js")>();
+    return {
+      ...real,
+      DaemonDb: class extends real.DaemonDb {
+        constructor(...args: ConstructorParameters<typeof real.DaemonDb>) {
+          super(...args);
+          made.dbs.push(this);
+        }
+      },
+    };
+  });
   vi.doMock("../daemon/scrubber.js", async (importOriginal) => ({
     ...(await importOriginal<typeof import("../daemon/scrubber.js")>()),
     SecretScrubber: class {
@@ -141,6 +158,8 @@ async function runWorker(): Promise<{ log: () => string }> {
   await import("../daemon/worker-main.js");
   await vi.waitFor(() => expect(written.join("")).toContain("fatal: "));
   expect(process.exit).toHaveBeenCalledWith(START_FAILED_EXIT);
+  // It opened daemon.db once, which afterEach closes.
+  expect(made.dbs).toHaveLength(1);
   return { log: () => written.join("") };
 }
 
@@ -148,6 +167,7 @@ beforeEach(() => {
   made.scrubbers.length = 0;
   made.syncers.length = 0;
   made.keys.length = 0;
+  made.dbs.length = 0;
   mkdirSync(ENGRAM_DIR, { recursive: true, mode: 0o700 });
   // Signed out: no account, so nothing could be sent here anyway.
   vi.stubEnv("ENGRAM_API_KEY", undefined);
@@ -158,6 +178,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const db of made.dbs.splice(0)) db.close();
   try {
     if (lstatSync(KEY_FILE).isFile()) chmodSync(KEY_FILE, 0o600);
   } catch {
@@ -165,7 +186,7 @@ afterEach(() => {
   }
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
-  for (const path of ["instance", "ownership", "scrubber", "syncer"]) vi.doUnmock(`../daemon/${path}.js`);
+  for (const path of ["instance", "ownership", "db", "scrubber", "syncer"]) vi.doUnmock(`../daemon/${path}.js`);
   vi.doUnmock("@getengram/sdk");
   vi.resetModules();
   rmSync(ENGRAM_DIR, { recursive: true, force: true });

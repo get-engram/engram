@@ -30,6 +30,7 @@ const {
   heldVaultMismatch,
   recordFailure,
   recordSuccess,
+  recordVaultKeyMissing,
   recordVaultUndecryptable,
   notifyCommand,
   notifyDesktopBeforeExit,
@@ -399,5 +400,59 @@ describe("what the vault's last read found the key can't decrypt (engram#694)", 
     expect(heldVaultMismatch()).toEqual({ secrets: 3, unscrubbed: 3, decrypted: 2 });
     writeFileSync(file, "{ not json");
     expect(heldVaultMismatch()).toBeNull();
+  });
+});
+
+describe("how many secrets a daemon with no vault key can't remove (engram#698)", () => {
+  const file = join(home.dir, ".engram", "status.json");
+  const written = () => JSON.parse(readFileSync(file, "utf-8"));
+
+  afterEach(() => recordVaultKeyMissing(null));
+
+  it("is written when it changes, and only then", () => {
+    recordVaultKeyMissing(2);
+    expect(written().vault_key_missing).toEqual({ secrets: 2 });
+    rmSync(file);
+    recordVaultKeyMissing(2);
+    expect(existsSync(file)).toBe(false);
+    recordVaultKeyMissing(3);
+    expect(written().vault_key_missing).toEqual({ secrets: 3 });
+    rmSync(file);
+    recordVaultKeyMissing(null);
+    expect(written().vault_key_missing).toBeNull();
+    rmSync(file);
+    recordVaultKeyMissing(null);
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it("is null for a count that isn't one, and isn't written again for that", () => {
+    recordVaultKeyMissing(1);
+    recordVaultKeyMissing(0);
+    expect(written().vault_key_missing).toBeNull();
+    rmSync(file);
+    for (const secrets of [0, -2, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) recordVaultKeyMissing(secrets);
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it("a daemon's first is written even when it is none: a count the one before left is gone", async () => {
+    writeFileSync(file, JSON.stringify({ health: "healthy", vault_key: null, vault_key_missing: { secrets: 2 } }));
+    vi.resetModules();
+    const fresh = await import("../daemon/status.js");
+    fresh.recordVaultKeyMissing(null);
+    expect(written().vault_key_missing).toBeNull();
+    // From then on, only when it changes.
+    rmSync(file);
+    fresh.recordVaultKeyMissing(null);
+    fresh.recordVaultKeyMissing(Number.NaN);
+    expect(existsSync(file)).toBe(false);
+    fresh.recordVaultKeyMissing(2);
+    expect(written().vault_key_missing).toEqual({ secrets: 2 });
+  });
+
+  it("outlasts sends that go and fail: nothing waits for it", () => {
+    recordVaultKeyMissing(2);
+    recordSuccess(0);
+    recordFailure("fetch failed", "network", 1);
+    expect(written()).toMatchObject({ error_type: "network", vault_key_missing: { secrets: 2 } });
   });
 });

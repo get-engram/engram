@@ -394,10 +394,19 @@ export async function vaultSet(
  * changed does, once `told`: the notice was written. One from before, or
  * one that doesn't say which it is, reads the vault every 10 minutes, and
  * until then sends the secret as it is: a restart reads it now.
+ *
+ * One with no vault key can't scrub it at all (engram#698). The key used
+ * here is then ENGRAM_VAULT_KEY's, which that daemon never got: saved to
+ * ~/.engram/vault-key, it is read before the next send.
  */
 async function printDaemonVaultHint(told: boolean): Promise<void> {
   const daemon = await runningDaemon();
   if (daemon === null) return;
+  if (daemon !== "unknown" && daemon.vaultKey === false && (await vaultKeyFileState()) === "none") {
+    console.log(dim("The daemon running now has no vault key, so it can't remove this secret from what it captures."));
+    console.log(dim("To save this key where it reads it: engram vault save-key"));
+    return;
+  }
   const notices = daemon !== "unknown" && daemon.vaultChangeNotice;
   if (notices && told) return;
   if (notices) console.log(dim("Couldn't write ~/.engram/vault-changed to tell the daemon running now."));

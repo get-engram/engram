@@ -14,17 +14,25 @@ import { Watcher } from "./watcher.js";
 import { Syncer, type Account, type CaptureControl, type KeySource } from "./syncer.js";
 import { SecretScrubber, type VaultKeySource, type VaultLike } from "./scrubber.js";
 import { readVaultChanged } from "./vault-changed.js";
+import { MissingVaultKey } from "./vault-key-missing.js";
 import { asVaultKeyProblem, readVaultKey, vaultKeyFix, type VaultKeyUnreadable } from "../vault-key.js";
 import { availableAdapters } from "./adapters.js";
 import { configuredAccount, ownedKeysOf } from "./key-source.js";
 import { makeDirPrivateSync, type PrivateDirReport } from "../private-files.js";
 import { START_FAILED_EXIT } from "./supervise.js";
 import { foreignFiles, foreignFilesFix, foreignFilesProblem, OWNERSHIP_FIX } from "./ownership.js";
-import { heldVaultMismatch, notifyDesktopBeforeExit, recordVaultKey, recordVaultUndecryptable } from "./status.js";
+import {
+  heldVaultMismatch,
+  notifyDesktopBeforeExit,
+  recordVaultKey,
+  recordVaultKeyMissing,
+  recordVaultUndecryptable,
+} from "./status.js";
 import {
   claimDaemonLock,
   markReady,
   markStopping,
+  markVaultKey,
   releaseDaemonLock,
   setDisplacedHandler,
   setStopHandler,
@@ -237,6 +245,13 @@ async function main(): Promise<void> {
   const heldBefore = vaultKey !== undefined || keyProblem !== undefined ? heldVaultMismatch() : null;
   if (heldBefore) recordVaultUndecryptable({ ...heldBefore, held: true });
   recordVaultKey(vaultKey ? keyOrigin() : null);
+  // Nothing counted yet: a count of secrets the daemon before had no key
+  // for is gone from status.json now (engram#698).
+  recordVaultKeyMissing(null);
+  // With none, `engram vault set` says this one can't remove the secret
+  // (engram#698).
+  const keyless = vaultKey === undefined && keyProblem === undefined;
+  markVaultKey(!keyless);
   // The account in use, for the vault read with a key found later.
   let account: Account | undefined = current;
   const vaultFor = (a: Account | undefined, key = vaultKey): VaultLike | null =>
@@ -248,11 +263,43 @@ async function main(): Promise<void> {
           timeout: 30_000,
         }).vault
       : null;
+  // With no key, whether the account's vault holds secrets it can't remove
+  // the values of (engram#698): counted, never named. Listing needs no key;
+  // the SDK only hands out the vault of a client made with one, and this
+  // one's is never used for anything else.
+  const missing = new MissingVaultKey(
+    async (a) =>
+      (
+        await new Engram({
+          apiKey: a.key,
+          baseUrl: a.server,
+          vault: { encryptionKey: "" },
+          timeout: 30_000,
+        }).vault.list()
+      ).length,
+    recordVaultKeyMissing,
+    log,
+    keyless,
+  );
+  // A key, or one that can't be read: never no key again (scrubber.ts).
+  const keyFound = (): void => {
+    missing.keyFound();
+    markVaultKey(true);
+  };
   const keySource: VaultKeySource = {
-    read: readVaultKey,
+    // A key that can't be read holds sends.
+    read: async () => {
+      try {
+        return await readVaultKey();
+      } catch (err: unknown) {
+        keyFound();
+        throw err;
+      }
+    },
     // The key the vault is read with from now on, after an account switch
     // too.
     vaultWith: (key) => {
+      keyFound();
       const vault = vaultFor(account, key);
       vaultKey = key;
       recordVaultKey(keyOrigin());
@@ -271,7 +318,12 @@ async function main(): Promise<void> {
   if (heldBefore) vaultScrubber.continueMismatchHold(heldBefore);
   // `engram vault set` and `engram vault delete` say when the vault
   // changed: the next send waits for a read of it (engram#701).
-  vaultScrubber.followChanges(() => readVaultChanged());
+  // With no key, the vault may hold secrets now, or none any more
+  // (engram#698).
+  vaultScrubber.followChanges(
+    () => readVaultChanged(),
+    () => void missing.check(account),
+  );
   scrubber = vaultScrubber;
   vaultScrubber.start();
   if (vaultKey) {
@@ -286,6 +338,7 @@ async function main(): Promise<void> {
       "vault scrubber: off until a vault key is saved (no vault key configured — only pattern " +
         "redaction applies)",
     );
+    void missing.check(current);
   }
 
   // The syncer reads the configured account every few seconds (engram#587,
@@ -303,6 +356,7 @@ async function main(): Promise<void> {
       vaultScrubber.reconnect(vaultFor(next)).catch((err: unknown) => {
         log(`vault scrubber: reconnect failed (${errorText(err)})`);
       });
+      void missing.check(next);
       return connect(next);
     },
     // Signed out: nothing is captured or sent, so the vault read through
@@ -311,6 +365,7 @@ async function main(): Promise<void> {
     disconnect: () => {
       account = undefined;
       vaultScrubber.reconnect(null).catch(() => {});
+      void missing.check(undefined);
     },
     // Only key fingerprints go to the server, and only to the account's
     // own (see ownedKeysAt).

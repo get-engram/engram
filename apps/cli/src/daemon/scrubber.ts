@@ -299,6 +299,8 @@ export class SecretScrubber {
   private changeSeen: string | null = null;
   /** How many new notices have been seen. */
   private changeCount = 0;
+  /** Told of each new notice (engram#698). */
+  private onChange: (() => void) | undefined = undefined;
 
   /**
    * `key.source`: where the key is read again, before each send and on the
@@ -486,10 +488,12 @@ export class SecretScrubber {
    * Look for notices that the vault changed (engram#701), before each send
    * and on the interval: `engram vault set` and `engram vault delete` leave
    * one. The notice there now changes nothing: start() reads the vault
-   * anyway. Call before start().
+   * anyway. Call before start(). `onChange`: told of each new notice, after
+   * the scrubber has taken it in (engram#698).
    */
-  followChanges(changes: VaultChanges): void {
+  followChanges(changes: VaultChanges, onChange?: () => void): void {
     this.changes = changes;
+    this.onChange = onChange;
     this.changeSeen = this.noticeNow();
   }
 
@@ -521,6 +525,11 @@ export class SecretScrubber {
     this.released = false;
     this.mismatchPrint = undefined;
     this.log("vault scrubber: the vault changed — reading it again before sending");
+    try {
+      this.onChange?.();
+    } catch {
+      // Nothing of it reaches ready(), which mustn't throw.
+    }
   }
 
   /** Read now and on an interval: the key too, on the interval. */

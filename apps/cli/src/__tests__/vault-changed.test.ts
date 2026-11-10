@@ -40,7 +40,7 @@ const ENGRAM = join(home.dir, ".engram");
 // After the temp home is set: these take their paths from it when imported.
 const { noteVaultChanged, readVaultChanged, VAULT_CHANGED_FILE } = await import("../daemon/vault-changed.js");
 const { SecretScrubber, MAX_SERVER_HOLD_MS, READ_RETRY_MS } = await import("../daemon/scrubber.js");
-const { VaultKeyUnreadable } = await import("../vault-key.js");
+const { VaultKeyUnreadable, VAULT_KEY_FILE } = await import("../vault-key.js");
 const { vaultDelete, vaultSet } = await import("../commands/vault.js");
 const { daemonEndpoint } = await import("../daemon/instance.js");
 
@@ -488,6 +488,63 @@ describe("a secret saved while the daemon runs (engram#701)", () => {
     expect(await scrubber.ready()).toBe(false);
     expect(vault.lists).toBe(1);
   });
+
+  it("tells the daemon of each new notice once it has taken it in, with no vault key too (engram#698)", async () => {
+    fakeTime(["setInterval", "clearInterval"]);
+    const notices = new Notices();
+    notices.write();
+    const told: string[] = [];
+    const source: VaultKeySource = { read: async () => undefined, vaultWith: () => null };
+    const scrubber = new SecretScrubber(null, undefined, (msg) => void log.push(msg), { source });
+    // What the scrubber had said when it told: its own line comes first.
+    scrubber.followChanges(notices.read, () => void told.push(log.at(-1) ?? ""));
+    scrubbers.push(scrubber);
+    scrubber.start();
+    // The notice from before it started is no change.
+    expect(await scrubber.ready()).toBe(true);
+    expect(told).toEqual([]);
+
+    notices.write();
+    expect(await Promise.all([scrubber.ready(), scrubber.ready()])).toEqual([true, true]);
+    expect(told).toEqual([CHANGED]);
+    // The same one again, none, or one that can't be read: not told again.
+    expect(await scrubber.ready()).toBe(true);
+    notices.fails = true;
+    expect(await scrubber.ready()).toBe(true);
+    notices.fails = false;
+    notices.now = null;
+    expect(await scrubber.ready()).toBe(true);
+    expect(told).toHaveLength(1);
+
+    // The interval finds a new one too, and the send after isn't told again.
+    notices.write();
+    vi.advanceTimersByTime(10 * 60_000);
+    await settle();
+    expect(told).toEqual([CHANGED, CHANGED]);
+    expect(await scrubber.ready()).toBe(true);
+    expect(told).toHaveLength(2);
+  });
+
+  it("what it tells throwing changes nothing of the send (engram#698)", async () => {
+    const vault = new FakeVault({ A: "alpha-secret-1" });
+    const notices = new Notices();
+    const scrubber = new SecretScrubber(vault, KEY, (msg) => void log.push(msg));
+    let told = 0;
+    scrubber.followChanges(notices.read, () => {
+      told++;
+      throw new Error("EACCES: status.json");
+    });
+    scrubbers.push(scrubber);
+    scrubber.start();
+    expect(await scrubber.ready()).toBe(true);
+
+    vault.secrets.B = "bravo-secret-2";
+    notices.write();
+    expect(await scrubber.ready()).toBe(true);
+    expect(told).toBe(1);
+    expect(vault.lists).toBe(2);
+    expect(scrubber.scrub("bravo-secret-2").text).toBe("[VAULT:B]");
+  });
 });
 
 describe("~/.engram/vault-changed (engram#701)", () => {
@@ -607,10 +664,15 @@ async function onDaemonEndpoint(server: Server): Promise<() => Promise<void>> {
 
 /**
  * A daemon answering on its socket. `notices`: one that reads the vault
- * again when told it changed; without it, one from before. Returns how to
- * stop it.
+ * again when told it changed; without it, one from before. `vaultKey`:
+ * whether it says it has a vault key (engram#698); undefined, it says
+ * nothing of it. Returns how to stop it.
  */
-function daemonAnswering({ stopping = false, notices = false } = {}): Promise<() => Promise<void>> {
+function daemonAnswering({
+  stopping = false,
+  notices = false,
+  vaultKey,
+}: { stopping?: boolean; notices?: boolean; vaultKey?: boolean } = {}): Promise<() => Promise<void>> {
   const answer = {
     engram: "daemon",
     protocol: 1,
@@ -619,8 +681,10 @@ function daemonAnswering({ stopping = false, notices = false } = {}): Promise<()
     stopping,
     stop_file: true,
     vault_key_reread: true,
+    ...(notices ? { vault_change_notice: true } : {}),
+    ...(vaultKey === undefined ? {} : { vault_key: vaultKey }),
   };
-  const line = `${JSON.stringify(notices ? { ...answer, vault_change_notice: true } : answer)}\n`;
+  const line = `${JSON.stringify(answer)}\n`;
   return onDaemonEndpoint(createServer((socket) => socket.end(line)));
 }
 
@@ -743,5 +807,41 @@ describe("engram vault set and delete tell the daemon running now (engram#701)",
     });
     await expect(vaultDelete(failing, ["B"], {})).rejects.toThrow("Network error");
     expect(readVaultChanged()).not.toBeNull();
+  });
+
+  describe("one with no vault key (engram#698)", () => {
+    const KEYLESS = [
+      "The daemon running now has no vault key, so it can't remove this secret from what it captures.",
+      "To save this key where it reads it: engram vault save-key",
+    ];
+
+    it("says it can't remove the secret, and how to save the key where it reads it", async () => {
+      expect(await set(() => daemonAnswering({ notices: true, vaultKey: false }))).toEqual([...STORED, ...KEYLESS]);
+      // Told all the same: it counts the vault's secrets again.
+      expect(readVaultChanged()).not.toBeNull();
+      // The notice couldn't be written: what to do is the same.
+      rmSync(VAULT_CHANGED_FILE);
+      mkdirSync(VAULT_CHANGED_FILE);
+      expect(await set(() => daemonAnswering({ notices: true, vaultKey: false }))).toEqual([...STORED, ...KEYLESS]);
+    });
+
+    it("~/.engram/vault-key is there for it to read before its next send: as any daemon told", async () => {
+      writeFileSync(VAULT_KEY_FILE, `${Buffer.alloc(32, 7).toString("base64")}\n`, { mode: 0o600 });
+      expect(await set(() => daemonAnswering({ notices: true, vaultKey: false }))).toEqual(STORED);
+      // One that can't be read holds its sends, and says so itself.
+      writeFileSync(VAULT_KEY_FILE, "");
+      expect(await set(() => daemonAnswering({ notices: true, vaultKey: false }))).toEqual(STORED);
+    });
+
+    it("one with a key, or one that doesn't say: nothing of it", async () => {
+      expect(await set(() => daemonAnswering({ notices: true, vaultKey: true }))).toEqual(STORED);
+      expect(await set(() => daemonAnswering({ notices: true }))).toEqual(STORED);
+      expect(await set(() => daemonAnswering({ vaultKey: true }))).toEqual([...STORED, ...BEFORE]);
+      expect(await set(daemonBusy)).toEqual([...STORED, ...BEFORE]);
+    });
+
+    it("one stopping: nothing", async () => {
+      expect(await set(() => daemonAnswering({ stopping: true, vaultKey: false }))).toEqual(STORED);
+    });
   });
 });

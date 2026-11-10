@@ -259,6 +259,12 @@ engram vault save-key
 
 A daemon already running reads `~/.engram/vault-key` again before each send, and every 10 minutes, so a key saved there, or a new one in its place, is used without a restart: what it has captured waits until the vault has been read with that key, then goes out with your vault's secrets removed. A daemon started with `ENGRAM_VAULT_KEY` set goes on using that key. If the file can't be read (a folder in its place, say), the daemon holds what it captures until it can; nothing is lost. That includes a file another user owns, as running the CLI with `sudo` can leave it: `engram status` says so, and how to make it yours. If you delete the file, the daemon goes on with the key it read until it restarts, and `engram status` warns that it will start without one.
 
+#### A daemon with no key
+
+A daemon with no vault key can't remove your vault's secrets from what it captures: only the built-in patterns are removed. So when it has no key, it checks whether your account's vault holds any secrets: when it starts, when it signs in to another account, and after `engram vault set` or `engram vault delete` on this machine, at its next send or within 10 minutes. Listing them needs no key. It keeps only how many there are: no secret's name goes in its log or its status. If there are some, the daemon's log and `engram status` say so, and `engram vault set` says so when you save one. That happens when they were saved on another machine, or from a shell whose `ENGRAM_VAULT_KEY` the daemon never got. To fix it, put the key in `~/.engram/vault-key`, or run `engram vault save-key` from a shell where `ENGRAM_VAULT_KEY` holds it. The daemon reads it before its next send, with no restart.
+
+The daemon doesn't hold what it captures meanwhile: that would stop capture on every machine that has your account but not the key. If you no longer have the key, no other decrypts those secrets. Make a new one with `engram vault keygen --save --force`, then save each secret again with it, or delete it: until then, the daemon holds what it captures (below).
+
 #### A key that doesn't match your vault
 
 Each secret decrypts only with the key it was saved with. If the daemon's key decrypts none of your vault's secrets (they were saved with a key you replaced, or on another machine), it can't remove them from what it captures, so it holds what it captures instead of sending it with them in it. Nothing is lost. `engram status`, the daemon's log and a desktop notification say so. To send what it holds, do one of these:

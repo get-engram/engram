@@ -123,7 +123,18 @@ export interface SyncStatus {
    * and nothing was held, they don't.
    */
   vault_undecryptable: VaultUndecryptable | null;
+  /**
+   * The daemon has no vault key, and the account's vault holds secrets
+   * (engram#698): how many. Their values aren't removed from what it
+   * captures. A count only, never a name. Null when it has a key, or holds
+   * sends for one it can't read, or the vault holds none, or it can't tell.
+   */
+  vault_key_missing: VaultKeyMissing | null;
   updated_at: string;
+}
+
+export interface VaultKeyMissing {
+  secrets: number;
 }
 
 export interface VaultUndecryptable {
@@ -148,6 +159,7 @@ const DEFAULT_STATUS: SyncStatus = {
   delete_refused: null,
   vault_key: null,
   vault_undecryptable: null,
+  vault_key_missing: null,
   updated_at: new Date().toISOString(),
 };
 
@@ -294,6 +306,25 @@ export function recordNextRetry(retryAt: number | null): void {
 export function recordVaultKey(source: "file" | "env" | null): void {
   if (currentStatus.vault_key === source) return;
   currentStatus.vault_key = source;
+  writeStatus();
+}
+
+/** This daemon has written vault_key_missing (engram#698). */
+let vaultKeyMissingWritten = false;
+
+/**
+ * How many secrets the account's vault holds, while the daemon has no vault
+ * key to remove their values with (engram#698); null when there is nothing
+ * to say. Written when it changes, and the first time even when it is null:
+ * a count the daemon before left is gone at once.
+ */
+export function recordVaultKeyMissing(secrets: number | null): void {
+  const next = secrets !== null && Number.isSafeInteger(secrets) && secrets > 0 ? { secrets } : null;
+  if (vaultKeyMissingWritten && (currentStatus.vault_key_missing?.secrets ?? null) === (next?.secrets ?? null)) {
+    return;
+  }
+  vaultKeyMissingWritten = true;
+  currentStatus.vault_key_missing = next;
   writeStatus();
 }
 

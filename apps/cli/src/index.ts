@@ -21,11 +21,13 @@ import { autoEnableCapture } from "./daemon/commands.js";
 import { upgrade } from "./commands/upgrade.js";
 import { usage as showUsage } from "./commands/usage.js";
 import { status as showStatus } from "./commands/status.js";
-import { vaultKeygen, vaultStatus, loadVaultKey, vaultSet, vaultGet, vaultList, vaultDelete } from "./commands/vault.js";
+import { vaultKeygen, vaultStatus, vaultSet, vaultGet, vaultList, vaultDelete } from "./commands/vault.js";
+import { readVaultKey, vaultKeyFileState, vaultKeyFix, VaultKeyUnreadable } from "./vault-key.js";
 import { excludeAdd, excludeRemove, excludeList } from "./commands/exclude.js";
 import { bold, dim, red } from "./output.js";
 import { readStatus, syncErrorSummary, captureErrorSummary, configProblemSummary } from "./daemon/status.js";
 import { foreignFiles, foreignFilesFix, foreignFilesProblem } from "./daemon/ownership.js";
+import { alive, pidInFile } from "./daemon/instance.js";
 
 // Read from package.json rather than duplicated here. The previous hardcoded
 // constant had drifted to 0.3.4 while the package shipped 0.5.1, so
@@ -110,7 +112,13 @@ function parseArgs(argv: string[]): {
   return { command, args, flags };
 }
 
-async function getClient(): Promise<Engram> {
+/**
+ * `vault`: the command uses the vault key, to encrypt the secrets in what
+ * it sends or for the vault itself. One that can't be read stops it before
+ * anything is sent, rather than send without it (engram#677). The other
+ * commands don't read the key.
+ */
+async function getClient(options: { vault?: boolean } = {}): Promise<Engram> {
   // Strict (engram#673): a config.json that can't be read isn't "not
   // authenticated", and ENGRAM_API_KEY isn't sent to the default server in
   // place of the one it names.
@@ -126,7 +134,18 @@ async function getClient(): Promise<Engram> {
     process.exit(1);
   }
 
-  const vaultKey = await loadVaultKey();
+  let vaultKey: string | undefined;
+  if (options.vault) {
+    try {
+      vaultKey = await readVaultKey();
+    } catch (err: unknown) {
+      if (!(err instanceof VaultKeyUnreadable)) throw err;
+      console.error(red(`Error: ${err.message}, so Engram can't use your vault key. Nothing was sent.`));
+      console.error(dim(`  ${vaultKeyFix(err)}`));
+      console.error(dim("  Then run this again."));
+      process.exit(1);
+    }
+  }
 
   return new Engram({
     apiKey,
@@ -219,10 +238,11 @@ ${dim(`v${VERSION} — https://getengram.app`)}
  *
  * Only the states a human must act on are surfaced: transcripts that can't
  * be queued on this machine (a full disk, engram#584), a rejected key, a
- * full memory. Transient trouble (network, rate limits, 5xx) resolves
- * itself and would just be noise on every command.
+ * full memory, a vault key that can't be read (engram#677). Transient
+ * trouble (network, rate limits, 5xx) resolves itself and would just be
+ * noise on every command.
  */
-function printSyncBanner(): void {
+async function printSyncBanner(): Promise<void> {
   try {
     const s = readStatus();
     // Waiting on config.json (engram#673): printConfigBanner says why, from
@@ -232,7 +252,16 @@ function printSyncBanner(): void {
       console.error(dim("  (run 'engram status' for details)"));
       console.error("");
     }
-    if (s.error_type !== "storage_full" && s.error_type !== "auth") return;
+    if (s.error_type !== "storage_full" && s.error_type !== "auth" && s.error_type !== "vault_key") return;
+    if (s.error_type === "vault_key") {
+      // A vault key that reads fine now: the daemon reads it again within a
+      // minute, and sends what it held. One that is gone holds them only in
+      // the daemon that held them: the next starts without a key, and sends
+      // them. So with no daemon running, as after 'engram stop' (how to go
+      // on without a key), there is nothing to say.
+      const key = await vaultKeyFileState();
+      if (key === "key" || (key === "none" && !daemonRuns())) return;
+    }
     const queued =
       s.pending_messages > 0
         ? ` ${s.pending_messages.toLocaleString("en-US")} message${s.pending_messages === 1 ? "" : "s"} waiting locally.`
@@ -243,6 +272,16 @@ function printSyncBanner(): void {
   } catch {
     // Never let a status-file problem block the command the user asked for.
   }
+}
+
+/**
+ * Whether a process runs with the PID in daemon.pid. Only to choose what to
+ * say: a PID that another process has since been given makes it say what
+ * the daemon would.
+ */
+function daemonRuns(): boolean {
+  const pid = pidInFile();
+  return pid !== null && alive(pid);
 }
 
 /**
@@ -333,7 +372,7 @@ async function main(): Promise<void> {
   ]);
   if (!SAYS_CONFIG_PROBLEM.has(cmd)) await printConfigBanner();
   if (cmd !== "status" && cmd !== "daemon status" && cmd !== "usage") {
-    printSyncBanner();
+    await printSyncBanner();
   }
   // start, install and status say it themselves.
   const SAYS_FOREIGN_FILES = new Set(["start", "daemon start", "install", "daemon install", "status", "daemon status"]);
@@ -402,7 +441,7 @@ async function main(): Promise<void> {
 
       case "store":
       case "append":
-        await store(await getClient(), args, flags);
+        await store(await getClient({ vault: true }), args, flags);
         break;
 
       case "search":
@@ -415,7 +454,7 @@ async function main(): Promise<void> {
         break;
 
       case "import":
-        await importHistory(await getClient(), args, flags);
+        await importHistory(await getClient({ vault: true }), args, flags);
         break;
 
       case "upgrade":
@@ -438,21 +477,21 @@ async function main(): Promise<void> {
         break;
 
       case "vault set":
-        await vaultSet(await getClient(), args, flags);
+        await vaultSet(await getClient({ vault: true }), args, flags);
         break;
 
       case "vault get":
-        await vaultGet(await getClient(), args, flags);
+        await vaultGet(await getClient({ vault: true }), args, flags);
         break;
 
       case "vault list":
       case "vault ls":
-        await vaultList(await getClient(), args, flags);
+        await vaultList(await getClient({ vault: true }), args, flags);
         break;
 
       case "vault delete":
       case "vault rm":
-        await vaultDelete(await getClient(), args, flags);
+        await vaultDelete(await getClient({ vault: true }), args, flags);
         break;
 
       case "vault status":

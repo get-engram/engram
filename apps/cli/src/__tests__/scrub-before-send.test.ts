@@ -31,8 +31,10 @@ import {
   SecretScrubber,
   READ_RETRY_MS,
   MAX_SERVER_HOLD_MS,
+  type VaultKeySource,
   type VaultLike,
 } from "../daemon/scrubber.js";
+import { VaultKeyUnreadable } from "../vault-key.js";
 import { recordFailure, recordSuccess } from "../daemon/status.js";
 import type { ParsedMessage, SessionMeta } from "../daemon/types.js";
 
@@ -101,6 +103,50 @@ class FakeVault implements VaultLike {
     return this.secrets[name] ?? null;
   }
 }
+
+/** ~/.engram/vault-key, read again by the scrubber: the test says what a read finds. */
+class FakeKeyFile implements VaultKeySource {
+  reads = 0;
+  /** The key each vault was made with. */
+  keys: string[] = [];
+  /** A key, nothing (no file), or a throw (a file that can't be read). */
+  finds: () => string | undefined = () => {
+    throw folder();
+  };
+  vaultError: (() => unknown) | null = null;
+  private gate: Promise<void> | null = null;
+  private open: (() => void) | null = null;
+
+  constructor(public vault: VaultLike | null) {}
+
+  /** Hold every read() until release(). */
+  hold(): void {
+    this.gate = new Promise((r) => (this.open = r));
+  }
+
+  release(): void {
+    this.open?.();
+    this.gate = null;
+  }
+
+  async read(): Promise<string | undefined> {
+    this.reads++;
+    if (this.gate) await this.gate;
+    return this.finds();
+  }
+
+  vaultWith(key: string): VaultLike | null {
+    this.keys.push(key);
+    if (this.vaultError) throw this.vaultError();
+    return this.vault;
+  }
+}
+
+const folder = () => new VaultKeyUnreadable("is a folder, not a file", "folder");
+
+/** A scrubber whose key couldn't be read at start, as worker-main makes it (engram#677). */
+const keyPending = (source: VaultKeySource, log?: (msg: string) => void) =>
+  new SecretScrubber(null, undefined, log, { problem: folder(), source });
 
 const later = (ms: number) => vi.setSystemTime(Date.now() + ms);
 
@@ -541,6 +587,207 @@ describe("the scrubber says when captured messages may be sent (engram#588)", ()
   });
 });
 
+// engram#677: a vault key that was there but couldn't be read counted as no
+// key, and captures went out with the vault's secrets in them. Now sends
+// wait until the key reads, and then for the vault read through it.
+describe("a vault key that can't be read holds sends until it can be (engram#677)", () => {
+  it("holds for as long as it lasts: no bound releases it", async () => {
+    const source = new FakeKeyFile(new FakeVault({ PIN: "4821" }));
+    const s = keyPending(source);
+    await s.refresh(); // as start() does: there is no vault to read yet
+    expect(s.active).toBe(false);
+    expect(await s.ready()).toBe(false);
+    expect(s.failure).toBeInstanceOf(VaultKeyUnreadable);
+    const start = Date.now();
+    for (let i = 0; i < 120; i++) {
+      later(60_000);
+      expect(await s.ready()).toBe(false);
+    }
+    // Eight times the 15 minutes a failing server gets.
+    expect(Date.now() - start).toBe(8 * MAX_SERVER_HOLD_MS);
+    expect(s.failure).toBeInstanceOf(VaultKeyUnreadable);
+    expect(source.reads).toBe(120);
+    expect(source.keys).toEqual([]);
+  });
+
+  it("reads the key again in 10 s, 30 s, then every minute, not on every flush", async () => {
+    const source = new FakeKeyFile(null);
+    const s = keyPending(source);
+    // It was read just now, at start.
+    expect(await s.ready()).toBe(false);
+    expect(source.reads).toBe(0);
+    const readsAfter = async (ms: number) => {
+      later(ms);
+      expect(await s.ready()).toBe(false);
+      return source.reads;
+    };
+    expect(await readsAfter(READ_RETRY_MS[0] - 1)).toBe(0);
+    expect(await readsAfter(1)).toBe(1); // 10 s
+    expect(await readsAfter(2_000)).toBe(1); // the next flush
+    expect(await readsAfter(READ_RETRY_MS[1] - 2_001)).toBe(1);
+    expect(await readsAfter(1)).toBe(2); // 30 s
+    expect(await readsAfter(READ_RETRY_MS[2] - 1)).toBe(2);
+    expect(await readsAfter(1)).toBe(3); // 1 min
+    expect(await readsAfter(READ_RETRY_MS[2])).toBe(4); // still 1 min
+  });
+
+  it("reads the key once at a time", async () => {
+    const source = new FakeKeyFile(null);
+    source.hold();
+    const s = keyPending(source);
+    later(READ_RETRY_MS[0]);
+    const first = s.ready();
+    const second = s.ready();
+    await settle();
+    expect(source.reads).toBe(1);
+    source.release();
+    expect(await first).toBe(false);
+    expect(await second).toBe(false);
+    expect(source.reads).toBe(1);
+  });
+
+  it("once the key reads: scrubbed from then on, the vault read with it, and sends wait for that read", async () => {
+    const vault = new FakeVault({ PIN: "4821" });
+    vault.hold();
+    const source = new FakeKeyFile(vault);
+    const log: string[] = [];
+    const s = keyPending(source, (m) => log.push(m));
+    await s.refresh();
+    source.finds = () => KEY;
+
+    later(READ_RETRY_MS[0]);
+    let ready: boolean | undefined;
+    void s.ready().then((r) => (ready = r));
+    await settle();
+    expect(source.keys).toEqual([KEY]);
+    expect(vault.lists).toBe(1);
+    expect(ready).toBeUndefined(); // the read through the key is in flight
+    expect(s.failure).toBeUndefined();
+    expect(s.scrub(`key=${KEY}`).text).toBe("key=[VAULT:vault-key]");
+    expect(log).toEqual([
+      "vault scrubber: the vault key can be read now — reading the vault before sending what was held",
+    ]);
+
+    vault.release();
+    await settle();
+    expect(ready).toBe(true);
+    expect(s.scrub("the PIN is 4821").text).toBe("the PIN is [VAULT:PIN]");
+    expect(vault.lists).toBe(1);
+    expect(log.join("\n")).not.toContain(KEY);
+  });
+
+  it("then a vault that fails to read holds as any vault read does", async () => {
+    const vault = new FakeVault({ PIN: "4821" });
+    vault.listError = busy;
+    const source = new FakeKeyFile(vault);
+    const s = keyPending(source);
+    await s.refresh();
+    source.finds = () => KEY;
+    later(READ_RETRY_MS[0]);
+    expect(await s.ready()).toBe(false);
+    expect(s.failure).toBeInstanceOf(EngramError);
+    // A server that answers with errors: 15 minutes at most, as with a key
+    // that read at start, and the key itself is scrubbed meanwhile.
+    later(MAX_SERVER_HOLD_MS);
+    expect(await s.ready()).toBe(true);
+    expect(s.names).toEqual(["vault-key"]);
+  });
+
+  it("a key file gone meanwhile holds still: it may be being put back", async () => {
+    const source = new FakeKeyFile(new FakeVault({}));
+    const log: string[] = [];
+    const s = keyPending(source, (m) => log.push(m));
+    source.finds = () => undefined;
+    for (let i = 0; i < 10; i++) {
+      later(READ_RETRY_MS[2]);
+      expect(await s.ready()).toBe(false);
+    }
+    expect(source.reads).toBe(10);
+    const gone = s.failure as InstanceType<typeof VaultKeyUnreadable>;
+    expect(gone).toBeInstanceOf(VaultKeyUnreadable);
+    expect(gone.kind).toBe("gone");
+    expect(gone.message).toBe("~/.engram/vault-key isn't there any more");
+    // Said when it changes, not on every read.
+    expect(log).toEqual(["vault scrubber: still holding sends — ~/.engram/vault-key isn't there any more"]);
+
+    source.finds = () => {
+      throw new VaultKeyUnreadable("can't be read: permission denied", "permission");
+    };
+    later(READ_RETRY_MS[2]);
+    expect(await s.ready()).toBe(false);
+    expect(log.at(-1)).toBe("vault scrubber: still holding sends — ~/.engram/vault-key can't be read: permission denied");
+
+    source.finds = () => KEY;
+    later(READ_RETRY_MS[2]);
+    expect(await s.ready()).toBe(true);
+  });
+
+  it("a key that reads but makes no vault keeps the hold, and is tried again on the schedule", async () => {
+    const source = new FakeKeyFile(new FakeVault({ PIN: "4821" }));
+    source.finds = () => KEY;
+    source.vaultError = () => new Error("no vault");
+    const s = keyPending(source);
+    later(READ_RETRY_MS[0]);
+    expect(await s.ready()).toBe(false);
+    expect(s.failure).toBeInstanceOf(VaultKeyUnreadable);
+    expect(s.names).toEqual([]); // nothing kept from a read that didn't finish
+
+    source.vaultError = null;
+    later(READ_RETRY_MS[1] - 1);
+    expect(await s.ready()).toBe(false);
+    expect(source.reads).toBe(1);
+    later(1);
+    expect(await s.ready()).toBe(true);
+    expect(source.keys).toEqual([KEY, KEY]);
+    expect(s.scrub("4821").text).toBe("[VAULT:PIN]");
+  });
+
+  it("a log that throws as the hold lifts: lifted whole, and ready() doesn't throw", async () => {
+    const source = new FakeKeyFile(new FakeVault({ PIN: "4821" }));
+    source.finds = () => KEY;
+    const s = keyPending(source, (m) => {
+      if (m.includes("can be read now")) throw new Error("log broke");
+    });
+    later(READ_RETRY_MS[0]);
+    expect(await s.ready()).toBe(true);
+    expect(s.failure).toBeUndefined();
+    expect(s.scrub(`4821 ${KEY}`).text).toBe("[VAULT:PIN] [VAULT:vault-key]");
+  });
+
+  it("stopped while the key is read: keeps nothing, and makes no vault", async () => {
+    const source = new FakeKeyFile(new FakeVault({ PIN: "4821" }));
+    source.finds = () => KEY;
+    source.hold();
+    const s = keyPending(source);
+    later(READ_RETRY_MS[0]);
+    const ready = s.ready();
+    await settle();
+    s.stop();
+    source.release();
+    expect(await ready).toBe(false);
+    expect(source.keys).toEqual([]);
+    expect(s.names).toEqual([]);
+    later(READ_RETRY_MS[2]);
+    expect(await s.ready()).toBe(false);
+    expect(source.reads).toBe(1);
+  });
+
+  it("a new API key meanwhile doesn't lift the hold", async () => {
+    const source = new FakeKeyFile(null);
+    const s = keyPending(source);
+    // Even a vault that reads in full: there is no key to scrub its values with.
+    await s.reconnect(new FakeVault({}));
+    expect(await s.ready()).toBe(false);
+    await s.reconnect(null);
+    expect(await s.ready()).toBe(false);
+    expect(s.failure).toBeInstanceOf(VaultKeyUnreadable);
+    // The key is still read on its schedule.
+    later(READ_RETRY_MS[0]);
+    expect(await s.ready()).toBe(false);
+    expect(source.reads).toBe(1);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // The syncer: the hold and the second scrub, against a real daemon.db.
 
@@ -856,5 +1103,89 @@ describe("nothing is sent before the vault has been read (engram#588)", () => {
     await syncer.onMessages("s1", meta("s1"), msgs("hello"));
     await syncer.flush();
     expect(server.received).toEqual(["hello"]);
+  });
+
+  it("a vault key that can't be read: creates go through, and sends wait however long it lasts (engram#677)", async () => {
+    const vault = new FakeVault({ PIN: "4821" });
+    const source = new FakeKeyFile(vault);
+    const scrubber = keyPending(source);
+    await scrubber.refresh(); // as start() does
+    const syncer = new Syncer(db, server.client(), scrubber);
+
+    await syncer.onMessages("s1", meta("s1"), msgs("the PIN is 4821", `key ${KEY}`));
+    await syncer.flush();
+    expect(server.creates).toBe(1);
+    expect(server.sends).toHaveLength(0);
+    const held = "holding messages until the vault key can be read: ~/.engram/vault-key is a folder, not a file";
+    expect(failures().at(-1)).toEqual([held, "vault_key", 2]);
+
+    // Two hours of flushes: still waiting, and said once.
+    for (let i = 0; i < 120; i++) {
+      later(60_000);
+      await syncer.flush();
+    }
+    expect(server.sends).toHaveLength(0);
+    expect(recordSuccess).not.toHaveBeenCalled();
+    expect(errorsLogged("holding queued messages until the vault key can be read")).toBe(1);
+    expect(errorsLogged("holding queued messages until the vault is read")).toBe(0);
+
+    // Capture goes on meanwhile.
+    await syncer.onMessages("s1", meta("s1"), msgs("later: 4821"));
+    later(2_000);
+    await syncer.flush();
+    expect(failures().at(-1)).toEqual([held, "vault_key", 3]);
+
+    // The key put back: read on the next try, and the vault read with it.
+    source.finds = () => KEY;
+    later(READ_RETRY_MS[2]);
+    await syncer.flush();
+    expect(source.keys).toEqual([KEY]);
+    const scrubbed = ["the PIN is [VAULT:PIN]", "key [VAULT:vault-key]", "later: [VAULT:PIN]"];
+    expect(server.received).toEqual(scrubbed);
+    expect(queued()).toEqual(scrubbed);
+    expect(recordSuccess).toHaveBeenCalledTimes(1);
+    const said = vi.mocked(console.log).mock.calls.filter((c) => String(c[0]).includes("vault read"));
+    expect(said).toHaveLength(1);
+  });
+
+  it("a vault key file gone while sends wait for it keeps them waiting (engram#677)", async () => {
+    const source = new FakeKeyFile(new FakeVault({ PIN: "4821" }));
+    const scrubber = keyPending(source);
+    await scrubber.refresh();
+    const syncer = new Syncer(db, server.client(), scrubber);
+    await syncer.onMessages("s1", meta("s1"), msgs("the PIN is 4821"));
+    source.finds = () => undefined;
+    for (let i = 0; i < 30; i++) {
+      later(60_000);
+      await syncer.flush();
+    }
+    expect(server.sends).toHaveLength(0);
+    expect(failures().at(-1)).toEqual([
+      "holding messages until the vault key can be read: ~/.engram/vault-key isn't there any more",
+      "vault_key",
+      1,
+    ]);
+    expect(queued()).toEqual(["the PIN is 4821"]); // kept, to send once it's safe
+  });
+
+  it("once the key reads, a vault that won't read holds as any vault read does (engram#677)", async () => {
+    const vault = new FakeVault({ PIN: "4821" });
+    vault.listError = unavailable;
+    const source = new FakeKeyFile(vault);
+    const scrubber = keyPending(source);
+    await scrubber.refresh();
+    const syncer = new Syncer(db, server.client(), scrubber);
+    await syncer.onMessages("s1", meta("s1"), msgs("the PIN is 4821"));
+    source.finds = () => KEY;
+    later(READ_RETRY_MS[0]);
+    await syncer.flush();
+    expect(server.sends).toHaveLength(0);
+    expect(failures().at(-1)?.[0]).toMatch(/^holding messages until the vault is read/);
+    expect(failures().at(-1)?.[1]).toBe("server");
+
+    vault.listError = null;
+    later(READ_RETRY_MS[0]);
+    await syncer.flush();
+    expect(server.received).toEqual(["the PIN is [VAULT:PIN]"]);
   });
 });

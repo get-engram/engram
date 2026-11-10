@@ -42,6 +42,17 @@
  *    resume with the secrets already known, so a broken vault endpoint
  *    can't stop capture, and the interval keeps reading.
  *
+ * A vault key that is there but can't be read (engram#677) — a file of
+ * mode 000, a folder in its place, a link to nothing, an empty file —
+ * leaves nothing to read the vault with, nor to scrub its secrets with. It
+ * used to count as no key, and every secret went out as it was. Now sends
+ * wait for as long as it lasts: no bound releases them, since nothing
+ * would make them safe to send. Captures keep queueing meanwhile. The key
+ * is read again on READ_RETRY_MS; once it reads, the vault is read through
+ * it, and sends wait for that read like any other. A key file gone by then
+ * holds them still: it is likely being put back, and sending in between
+ * would send what the key protects. A restart starts without a key.
+ *
  * What it never does: write a value to disk, include one in a log line, or
  * send one anywhere. Values are refreshed from the vault on an interval and
  * dropped on stop. The daemon already runs as the user who owns the 0600
@@ -50,10 +61,22 @@
  */
 
 import { isRefusal } from "./status.js";
+import { asVaultKeyProblem, VaultKeyUnreadable } from "../vault-key.js";
 
 export interface VaultLike {
   list(): Promise<Array<{ name: string }>>;
   get(name: string): Promise<string | null>;
+}
+
+/**
+ * Where the key is read again while it can't be (engram#677). read():
+ * the key, undefined when the file isn't there, and throws when it can't
+ * be read. vaultWith(): the vault, read with that key, of the account in
+ * use now; null when signed out.
+ */
+export interface VaultKeySource {
+  read(): Promise<string | undefined>;
+  vaultWith(key: string): VaultLike | null;
 }
 
 export interface ScrubResult {
@@ -130,13 +153,34 @@ export class SecretScrubber {
   private refusalLogged = false;
   private undecryptable = 0;
 
+  /** Why the vault key can't be read, while sends wait for it (engram#677). */
+  private keyProblem: VaultKeyUnreadable | undefined = undefined;
+  private keySource: VaultKeySource | undefined = undefined;
+  private keyRetryAt = 0;
+  private keyRetryStep = 0;
+  /** The read of the key in flight. */
+  private keyRead: Promise<void> | null = null;
+
+  /**
+   * `pendingKey`: the vault key couldn't be read at start, so sends wait
+   * until it can be, from `source` (engram#677). `vault` is null then, and
+   * `vaultKey` undefined.
+   */
   constructor(
     private vault: VaultLike | null,
-    private readonly vaultKey: string | undefined,
+    private vaultKey: string | undefined,
     private readonly log: (msg: string) => void = () => {},
+    pendingKey?: { problem: unknown; source: VaultKeySource },
   ) {
     // Known before any read: scrubbed from the first message queued.
     if (vaultKey && vaultKey.length >= MIN_SCRUB_LENGTH) this.values.set("vault-key", vaultKey);
+    if (pendingKey) {
+      this.keyProblem = asVaultKeyProblem(pendingKey.problem);
+      this.keySource = pendingKey.source;
+      // It was read just now.
+      this.keyRetryAt = Date.now() + READ_RETRY_MS[0];
+      this.keyRetryStep = 1;
+    }
   }
 
   /** True when there is anything to scrub against. */
@@ -150,9 +194,9 @@ export class SecretScrubber {
   }
 
   /** Why the vault couldn't be read through the current client, while
-   *  ready() is false. */
+   *  ready() is false: a VaultKeyUnreadable while the key can't be read. */
   get failure(): unknown {
-    return this.lastFailure;
+    return this.keyProblem ?? this.lastFailure;
   }
 
   /**
@@ -191,9 +235,18 @@ export class SecretScrubber {
    * A set already read in full doesn't wait for the periodic re-read: that
    * only refreshes it. A released hold doesn't retry either: the interval
    * reads, and the flush loop doesn't add a read every few seconds.
+   *
+   * Before any of it, a vault key that can't be read is read again when its
+   * retry is due (engram#677). Until it reads, ready() is false, however
+   * long that takes.
    */
   async ready(): Promise<boolean> {
     if (this.stopped) return false;
+    if (this.keyProblem !== undefined) {
+      if (Date.now() < this.keyRetryAt) return false;
+      await this.retryKey();
+      if (this.stopped || this.keyProblem !== undefined) return false;
+    }
     if (this.settled()) return true;
     await this.inFlight();
     if (this.settled()) return true;
@@ -277,6 +330,59 @@ export class SecretScrubber {
       replaced.push({ name, count });
     }
     return { text: out, replaced };
+  }
+
+  /** Read the key again: one read at a time. */
+  private retryKey(): Promise<void> {
+    this.keyRead ??= this.readKey()
+      // A log that throws: the hold stays until it has been lifted in full,
+      // and ready() mustn't throw.
+      .catch(() => {})
+      .finally(() => {
+        this.keyRead = null;
+      });
+    return this.keyRead;
+  }
+
+  /**
+   * The key still can't be read: try again on READ_RETRY_MS. It isn't
+   * there: still wait, for the key put back or a restart. It reads: scrub
+   * it from now on, and read the vault with it, which sends wait for.
+   */
+  private async readKey(): Promise<void> {
+    const source = this.keySource;
+    if (source === undefined) return;
+    // The next try, should this one fall short in any way.
+    this.keyRetryAt = Date.now() + READ_RETRY_MS[Math.min(this.keyRetryStep, READ_RETRY_MS.length - 1)];
+    this.keyRetryStep++;
+    let read: { key: string } | { problem: VaultKeyUnreadable };
+    try {
+      const key = await source.read();
+      read = key === undefined ? { problem: new VaultKeyUnreadable("isn't there any more", "gone") } : { key };
+    } catch (err: unknown) {
+      read = { problem: asVaultKeyProblem(err) };
+    }
+    if (this.stopped) return;
+
+    if ("problem" in read) {
+      const { problem } = read;
+      const changed = problem.message !== this.keyProblem?.message;
+      this.keyProblem = problem;
+      if (changed) this.log(`vault scrubber: still holding sends — ${problem.message}`);
+      return;
+    }
+
+    const { key } = read;
+    const vault = source.vaultWith(key);
+    this.vaultKey = key;
+    if (key.length >= MIN_SCRUB_LENGTH) this.values.set("vault-key", key);
+    // Lifted, and at once the read through `vault` starts: ready() waits
+    // for that read, as after any new client.
+    this.keyProblem = undefined;
+    this.keySource = undefined;
+    const done = this.reconnect(vault);
+    this.log("vault scrubber: the vault key can be read now — reading the vault before sending what was held");
+    await done;
   }
 
   private settled(): boolean {

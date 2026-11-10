@@ -27,6 +27,7 @@ import {
   OWNERSHIP_FIX,
   type ForeignFiles,
 } from "./ownership.js";
+import { vaultKeyFileState, vaultKeyFix, VaultKeyUnreadable } from "../vault-key.js";
 import {
   ENGRAM_DIR,
   LOG_FILE,
@@ -845,6 +846,8 @@ export async function daemonStatus(): Promise<void> {
   const foreign = foreignFiles();
   // A config.json that can't be read (engram#673): capture waits on it.
   const { config, problem } = await inspectConfig();
+  // A vault key that can't be read (engram#677): sends wait on it.
+  const key = await keyFile(foreign);
 
   if (found.state === "stopped") {
     console.log(`${bold("Status:")} stopped`);
@@ -853,6 +856,7 @@ export async function daemonStatus(): Promise<void> {
     await printDbStats(foreign, config);
     if (foreign) printForeignFilesWarning(foreign, true);
     if (problem) printConfigWarning(problem);
+    if (key instanceof VaultKeyUnreadable) printVaultKeyWarning(key, null);
     // A broken start-at-login entry is often why it's stopped. Files that
     // aren't the user's, said above, are why, when they stop it. With
     // config.json unreadable, whether 'engram stop' recorded capture off
@@ -892,7 +896,7 @@ export async function daemonStatus(): Promise<void> {
   );
 
   // Show sync health warnings
-  printSyncWarnings(syncStatus, problem);
+  printSyncWarnings(syncStatus, problem, key);
 
   console.log(`${dim("Log:")} ${LOG_FILE}`);
 
@@ -985,9 +989,63 @@ function printConfigWarning(problem: ConfigUnreadable): void {
   console.log("");
 }
 
-/** `problem`: config.json can't be read (engram#673), said above. */
-function printSyncWarnings(status: SyncStatus, problem: ConfigUnreadable | null): void {
+/**
+ * What ~/.engram/vault-key holds, read as the daemon reads it (engram#677):
+ * a key, nothing, or why no key can be read from it. "foreign": it can't be
+ * read, and is another user's, which printForeignFilesWarning says.
+ */
+type KeyFile = "key" | "none" | "foreign" | VaultKeyUnreadable;
+
+async function keyFile(foreign: ForeignFiles | null): Promise<KeyFile> {
+  const state = await vaultKeyFileState();
+  return state instanceof VaultKeyUnreadable && foreign?.files.includes("vault-key") ? "foreign" : state;
+}
+
+/**
+ * engram#677, in `engram status`: no key can be read from ~/.engram/vault-key.
+ * `held`: the daemon's status, while it holds sends for the key.
+ */
+function printVaultKeyWarning(problem: VaultKeyUnreadable, held: SyncStatus | null): void {
+  console.log("");
+  console.log(red(`  WARNING: ${problem.message}.`));
+  // A sentence to a line: the one for a key that is gone is long.
+  for (const line of vaultKeyFix(problem).split(/(?<=\.) /)) console.log(dim(`  ${line}`));
+  // ENGRAM_VAULT_KEY wins over the file for commands run in this shell, not
+  // for the daemon, which launchd and systemd start without it. A file that
+  // is gone is no key to commands: they run without one.
+  const envKey = Boolean(process.env.ENGRAM_VAULT_KEY) && problem.kind !== "gone";
+  const refused = !envKey && problem.kind !== "gone";
+  if (held) {
+    console.log(dim("  Meanwhile, messages wait here rather than be sent with your vault's secrets"));
+    console.log(dim(`  in them${refused ? ", and commands that need the key won't run" : ""}. Nothing is lost.`));
+    if (held.pending_messages > 0) {
+      console.log(red(`  ${plural(held.pending_messages, "message")} waiting to sync`));
+    }
+    if (held.last_error_at) console.log(dim(`  Last error: ${held.last_error_at}`));
+  } else if (refused) {
+    console.log(dim("  Meanwhile, commands that need the key won't run."));
+  }
+  if (envKey) console.log(dim("  Commands run here use ENGRAM_VAULT_KEY instead, which wins over the file."));
+  console.log("");
+}
+
+/**
+ * `problem`: config.json can't be read (engram#673), said above. `key`:
+ * what ~/.engram/vault-key holds now (engram#677).
+ */
+function printSyncWarnings(status: SyncStatus, problem: ConfigUnreadable | null, key: KeyFile): void {
   if (problem) printConfigWarning(problem);
+
+  // Sends wait while the daemon can't read the vault key, and go on waiting
+  // once the file is gone (scrubber.ts). Nothing is sent while signed out.
+  const keyHeld = status.error_type === "vault_key" && status.health !== "healthy" && !status.signed_out_at;
+  const keyProblem =
+    key instanceof VaultKeyUnreadable
+      ? key
+      : keyHeld && key === "none"
+        ? new VaultKeyUnreadable("isn't there any more", "gone")
+        : null;
+  if (keyProblem) printVaultKeyWarning(keyProblem, keyHeld ? status : null);
 
   // No key saved (engram#594): the daemon runs, but captures and sends
   // nothing until one is. Nothing queued is lost meanwhile.
@@ -1034,6 +1092,20 @@ function printSyncWarnings(status: SyncStatus, problem: ConfigUnreadable | null)
     if (status.last_sync_at) {
       console.log(`${dim("Last sync:")}        ${status.last_sync_at}`);
     }
+    return;
+  }
+
+  // Waiting on the vault key: said above when it can't be read now. One
+  // that is another user's is said with them, and gets the words below.
+  if (status.error_type === "vault_key" && keyProblem) return;
+  if (status.error_type === "vault_key" && key === "key") {
+    console.log("");
+    console.log(red("  Sending is waiting on ~/.engram/vault-key, which reads fine now."));
+    console.log(dim("  The daemon reads it again within a minute, then sends what it held."));
+    if (status.pending_messages > 0) {
+      console.log(dim(`  ${plural(status.pending_messages, "message")} waiting to sync`));
+    }
+    console.log("");
     return;
   }
 

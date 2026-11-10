@@ -1,11 +1,14 @@
-import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { generateVaultKey, type Engram } from "@getengram/sdk";
-import { bold, dim, plural } from "../output.js";
+import { bold, dim, plural, red } from "../output.js";
 import { ensurePrivateDirSync, writePrivateFileSync } from "../private-files.js";
-
-const VAULT_KEY_FILE = join(homedir(), ".engram", "vault-key");
+import {
+  readVaultKeyFile,
+  VAULT_KEY_FILE,
+  vaultKeyFileState,
+  VaultKeyUnreadable,
+  vaultKeyFix,
+} from "../vault-key.js";
 
 export async function vaultKeygen(
   _args: string[],
@@ -25,9 +28,19 @@ export async function vaultKeygen(
     // so an accidental --force is still recoverable.
     let existing: string | undefined;
     try {
-      existing = (await readFile(VAULT_KEY_FILE, "utf-8")).trim();
-    } catch {
-      existing = undefined;
+      existing = await readVaultKeyFile();
+    } catch (err: unknown) {
+      if (!(err instanceof VaultKeyUnreadable)) throw err;
+      // A key that can't be read can't be backed up, so it isn't replaced,
+      // --force or not: that could orphan every secret encrypted with it
+      // (engram#677). An empty file has nothing in it to lose.
+      if (err.kind !== "empty") {
+        console.error(red(`Error: ${err.message}, so it can't be backed up, and isn't replaced.`));
+        console.error(dim(`  ${vaultKeyFix(err)}`));
+        console.error(dim("  Then run this again. Or move it aside yourself:"));
+        console.error(dim("    mv ~/.engram/vault-key ~/.engram/vault-key.old"));
+        process.exit(1);
+      }
     }
     if (existing && flags.force === undefined) {
       console.error(bold(`A vault key already exists at ${VAULT_KEY_FILE}.`));
@@ -69,37 +82,51 @@ export async function vaultKeygen(
 }
 
 export async function vaultStatus(): Promise<void> {
-  try {
-    const key = await readFile(VAULT_KEY_FILE, "utf-8");
-    const trimmed = key.trim();
-    const bytes = Buffer.from(trimmed, "base64");
-    if (bytes.length === 32) {
-      console.log(
-        `${bold("Vault:")} configured (key at ${VAULT_KEY_FILE})`
-      );
-      console.log(dim(`Key prefix: ${trimmed.slice(0, 8)}...`));
-    } else {
-      console.log(
-        `${bold("Vault:")} invalid key (expected 32 bytes, got ${bytes.length})`
-      );
+  // The key every command uses: ENGRAM_VAULT_KEY wins over the file.
+  const envKey = process.env.ENGRAM_VAULT_KEY;
+  if (envKey) {
+    const bytes = Buffer.from(envKey.trim(), "base64");
+    console.log(
+      bytes.length === 32
+        ? `${bold("Vault:")} configured (key in ENGRAM_VAULT_KEY)`
+        : `${bold("Vault:")} invalid key in ENGRAM_VAULT_KEY (expected 32 bytes, got ${bytes.length})`
+    );
+    // The daemon reads the file when started without it, as at login.
+    const file = await vaultKeyFileState();
+    if (file instanceof VaultKeyUnreadable) {
+      console.log(red(`  ~/.engram/vault-key, which the daemon reads, ${file.problem}. See 'engram status'.`));
     }
-  } catch {
+    return;
+  }
+
+  let key: string | undefined;
+  try {
+    key = await readVaultKeyFile();
+  } catch (err: unknown) {
+    if (!(err instanceof VaultKeyUnreadable)) throw err;
+    // Not "not configured" (engram#677): there is a key, and nothing that
+    // needs it goes ahead without it.
+    console.log(`${bold("Vault:")} ${red(`the key can't be read: ${err.message}`)}`);
+    console.log(dim(`  ${vaultKeyFix(err)}`));
+    console.log(dim("  Until then, commands that need the key won't run, and the daemon holds"));
+    console.log(dim("  messages on this machine rather than send them unscrubbed."));
+    return;
+  }
+  if (key === undefined) {
     console.log(`${bold("Vault:")} not configured`);
     console.log(dim("Run 'engram vault keygen --save' to generate a key."));
+    return;
   }
-}
-
-export async function loadVaultKey(): Promise<string | undefined> {
-  // Environment variable takes precedence
-  const envKey = process.env.ENGRAM_VAULT_KEY;
-  if (envKey) return envKey;
-
-  // Fall back to file
-  try {
-    const key = await readFile(VAULT_KEY_FILE, "utf-8");
-    return key.trim() || undefined;
-  } catch {
-    return undefined;
+  const bytes = Buffer.from(key, "base64");
+  if (bytes.length === 32) {
+    console.log(
+      `${bold("Vault:")} configured (key at ${VAULT_KEY_FILE})`
+    );
+    console.log(dim(`Key prefix: ${key.slice(0, 8)}...`));
+  } else {
+    console.log(
+      `${bold("Vault:")} invalid key (expected 32 bytes, got ${bytes.length})`
+    );
   }
 }
 

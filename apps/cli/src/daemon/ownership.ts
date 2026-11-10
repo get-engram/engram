@@ -48,9 +48,10 @@ const WATCHED: Watched[] = [
   // Even with ENGRAM_API_KEY set: unread, the exclusions would be lost, and
   // the sessions they keep out captured (engram#673).
   { name: "config.json", stops: { mode: R_OK, what: "daemon" }, warns: W_OK },
-  // The vault key. Unread, the scrubber is off, and the values of named
-  // secrets would be captured as they are. Not read at all while
-  // ENGRAM_VAULT_KEY is set.
+  // The vault key. One that can't be read holds sends, rather than let the
+  // values of named secrets go out as they are (engram#677). Another
+  // user's still stops the daemon, which says whose it is and the fix. Not
+  // read at all while ENGRAM_VAULT_KEY is set.
   { name: "vault-key", stops: { mode: R_OK, what: "daemon", unlessEnv: "ENGRAM_VAULT_KEY" }, warns: W_OK },
   // `engram start` and the systemd unit open it for the daemon's output.
   { name: "daemon.log", stops: { mode: W_OK, what: "start" } },

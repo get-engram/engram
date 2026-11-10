@@ -71,6 +71,14 @@ jobs:
         working-directory: apps/cli
         run: node scripts/e2e-delete-scope.mjs
 
+      # A vault key that can't be read, under the real daemon, against a fake
+      # server: commands that would send content refuse, the daemon holds its
+      # sends and says why, and once the key reads again they are sent with
+      # the vault's secrets scrubbed out; nothing is lost (engram#677).
+      - name: Daemon vault-key test
+        working-directory: apps/cli
+        run: node scripts/e2e-vault-key.mjs
+
       # Two starts at once, a launchd-style start beside a running daemon, a
       # daemon killed outright, its socket removed, and one from before the
       # lock: one daemon runs, and each message reaches the server once
@@ -195,6 +203,14 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
         run: node scripts/smoke-daemon.mjs
+
+      # The vault-key test above, here too: its desktop notification goes
+      # through osascript (engram#677).
+      - name: Daemon vault-key test
+        working-directory: apps/cli
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: node scripts/e2e-vault-key.mjs
 
       # Start at login under the user's own launchd: install, as at login, a
       # crash and `engram stop`, an older CLI's plist and a broken one, a job

@@ -20,6 +20,7 @@ import { queueing } from "./queue-error.js";
 import { plural } from "../output.js";
 import { isDefaultServer, normalizeServer, sameServer } from "../server-url.js";
 import type { SecretScrubber } from "./scrubber.js";
+import { VaultKeyUnreadable } from "../vault-key.js";
 import type { ParsedMessage, SessionMeta, PendingRow } from "./types.js";
 
 // Claude Code transcript messages can be enormous (tool output dumps), and
@@ -1499,6 +1500,26 @@ export class Syncer {
   }
 
   private holdForVault(err: unknown): void {
+    // The vault key can't be read (engram#677): there is nothing to scrub
+    // the vault's secrets with, for as long as it lasts. Something for the
+    // user to fix, unlike the waits below: an error, in status.json and on
+    // the desktop.
+    if (err instanceof VaultKeyUnreadable) {
+      if (!this.vaultHeld) {
+        this.vaultHeld = true;
+        console.error(
+          `[engram] holding queued messages until the vault key can be read, so a vault ` +
+            `secret in them can't be sent unredacted: ${err.message}`,
+        );
+      }
+      recordFailure(
+        `holding messages until the vault key can be read: ${err.message}`,
+        "vault_key",
+        this.pendingCount(),
+      );
+      return;
+    }
+
     const reason =
       err === undefined
         ? "the vault hasn't been read yet"

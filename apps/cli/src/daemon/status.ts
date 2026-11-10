@@ -21,7 +21,11 @@ export type SyncErrorType =
   | "server"
   /** Engram paused saving for scheduled maintenance (`writes_paused`). It
    *  passes on its own, and nothing queued here is lost meanwhile. */
-  | "paused";
+  | "paused"
+  /** ~/.engram/vault-key is there but can't be read (engram#677): sends
+   *  wait for it rather than go out without the vault's values scrubbed.
+   *  The user must fix the file; nothing queued is lost meanwhile. */
+  | "vault_key";
 
 /**
  * Transcripts that can't be queued in daemon.db (engram#584): a full disk,
@@ -176,10 +180,10 @@ export interface FailureDetails {
 }
 
 /**
- * Record a sync failure. Logs once per error type and, for the two states
- * the user must act on (auth, storage_full), raises a desktop notification
- * on first occurrence — the daemon is headless, so a line in daemon.log is
- * not "telling" anyone.
+ * Record a sync failure. Logs once per error type and, for the states the
+ * user must act on (auth, storage_full, vault_key), raises a desktop
+ * notification on first occurrence — the daemon is headless, so a line in
+ * daemon.log is not "telling" anyone.
  */
 export function recordFailure(
   error: string,
@@ -203,7 +207,12 @@ export function recordFailure(
   }
 
   // Escalate health based on severity and consecutive failures
-  if (errorType === "auth" || errorType === "billing" || errorType === "storage_full") {
+  if (
+    errorType === "auth" ||
+    errorType === "billing" ||
+    errorType === "storage_full" ||
+    errorType === "vault_key"
+  ) {
     currentStatus.health = "error";
   } else if (currentStatus.consecutive_failures >= 5) {
     currentStatus.health = "error";
@@ -217,7 +226,7 @@ export function recordFailure(
   if (errorType !== lastNotifiedError) {
     lastNotifiedError = errorType;
     logWarning(errorType, currentStatus.storage);
-    if (errorType === "auth" || errorType === "storage_full") {
+    if (errorType === "auth" || errorType === "storage_full" || errorType === "vault_key") {
       const storage = currentStatus.storage;
       notifyDesktop(
         errorType === "storage_full" ? "Engram memory is full" : "Engram needs attention",
@@ -583,6 +592,11 @@ export function syncErrorSummary(
       return "Server error — messages queued, will retry.";
     case "paused":
       return "Engram is paused for scheduled maintenance — messages queued, will retry.";
+    case "vault_key":
+      return (
+        "Your vault key (~/.engram/vault-key) can't be read, so messages wait here " +
+        "rather than be sent with your vault's secrets in them. Nothing is lost."
+      );
     default:
       return "Can't reach Engram — messages queued, will retry.";
   }

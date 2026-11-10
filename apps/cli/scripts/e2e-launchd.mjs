@@ -13,8 +13,10 @@
  *     job has the plist's environment and log, and `engram status` finds it.
  *   - When launchd loads the job, as at login, ~/.engram is made 0700 again,
  *     and the log launchd opens for the daemon, 0600.
- *   - A daemon killed outright is started again; one `engram stop` stops,
- *     isn't.
+ *   - A daemon killed outright is started again; one `engram stop` stops
+ *     exits 0, and isn't, even when the stop comes while it is still starting
+ *     (engram#669: that one was ended by the signal, which launchd takes for
+ *     a crash).
  *   - A plist and a worker marked as downloaded (com.apple.quarantine) load
  *     and run all the same.
  *   - The plist an older CLI wrote, naming worker-main.js, is outdated:
@@ -257,6 +259,8 @@ function job() {
     pid: Number(field("pid")) || 0,
     runs: Number(field("runs")) || 0,
     lastExit: field("last exit code"),
+    // Instead of an exit code, when a signal ended it: `<name>: <number>`.
+    lastSignal: field("last terminating signal"),
     path: field("path"),
     stdout: field("stdout path"),
     stderr: field("stderr path"),
@@ -453,7 +457,11 @@ async function run() {
     stopped !== null && stopped.state !== "running" && stopped.runs === runsStopped && ourWorkers().length === 0,
     `launchd didn't start it again (state ${stopped?.state}, runs ${stopped?.runs}, workers ${ourWorkers().length})`,
   );
-  check(stopped?.lastExit === "0", `it exited 0, so KeepAlive leaves it stopped (last exit code ${stopped?.lastExit})`);
+  check(
+    stopped?.lastExit === "0",
+    `it exited 0, so KeepAlive leaves it stopped (last exit code ${stopped?.lastExit}, ` +
+      `last terminating signal ${stopped?.lastSignal ?? "none"})`,
+  );
 
   // ── Marked as downloaded: launchd loads and runs it all the same ────────────
   bootout();

@@ -7,6 +7,11 @@ import type { LineParser, OnMessages, SessionMeta, ParsedMessage } from "./types
 
 interface RolloutLine {
   type?: string; // session_meta | response_item | event_msg | turn_context | ...
+  /**
+   * A paginated rollout numbers its records from 0, its own session_meta
+   * first. A legacy one doesn't number them.
+   */
+  ordinal?: unknown;
   payload?: {
     type?: string; // for response_item: "message"
     role?: string; // user | assistant | developer | tool
@@ -14,6 +19,8 @@ interface RolloutLine {
     session_id?: string;
     id?: string;
     cwd?: string;
+    /** session_meta: the first record that is the subagent's own. */
+    subagent_history_start_ordinal?: unknown;
   };
 }
 
@@ -24,6 +31,12 @@ const CONTEXT_PREFIX = /^<(environment_context|recommended_plugins|user_instruct
 interface RolloutState {
   sessionId: string | null;
   cwd: string | undefined;
+  /**
+   * The first record that is this subagent's own. The ones before it are its
+   * parent's history, copied in as context (engram#583). null when the file
+   * has no such boundary, or its own session_meta hasn't been read.
+   */
+  ownFrom: number | null;
 }
 
 /**
@@ -41,6 +54,15 @@ interface RolloutState {
  * fork's rollout names its own id in the filename but carries its parent's
  * `session_id`, and its messages have always gone to the parent's
  * conversation.
+ *
+ * A subagent's rollout copies its parent's history in before its own turns.
+ * Those messages are the parent's, captured from the parent's own rollout,
+ * so appending them again would repeat them in the conversation. When the
+ * rollout numbers its records (paginated), the subagent's own session_meta
+ * says where its own records begin, and the messages before that are
+ * skipped (engram#583). A legacy rollout has no numbers and no boundary, so
+ * its copy is still captured: skipping by a guess could drop the
+ * subagent's own turns (engram#671).
  */
 export class CodexParser implements LineParser {
   /**
@@ -67,6 +89,7 @@ export class CodexParser implements LineParser {
 
     const role = p.role;
     if (role !== "user" && role !== "assistant") return; // skip developer/system/tool
+    if (inherited(data, state)) return;
 
     const text = (p.content ?? [])
       .map((c) => c.text ?? c.input_text ?? "")
@@ -106,14 +129,15 @@ export class CodexParser implements LineParser {
   }
 
   discard(_filePath: string): void {
-    // Nothing buffered. The session id and cwd kept per file aren't
-    // buffered content: they are already true of the lines read again.
+    // Nothing buffered. The session id, cwd and boundary kept per file
+    // aren't buffered content: they are already true of the lines read
+    // again.
   }
 
   private stateOf(filePath: string): RolloutState {
     let state = this.files.get(filePath);
     if (!state) {
-      state = { sessionId: null, cwd: undefined };
+      state = { sessionId: null, cwd: undefined, ownFrom: null };
       this.files.set(filePath, state);
     }
     return state;
@@ -129,6 +153,13 @@ export class CodexParser implements LineParser {
       // path exclusion could not apply to them. A subagent's second
       // session_meta is its parent's, so the first one wins.
       if (p.cwd && state.cwd === undefined) state.cwd = p.cwd;
+      // The boundary is this file's own session_meta's: its first record,
+      // numbered 0. A subagent's parent's session_meta comes next. When the
+      // parent is a subagent too, that one has a boundary of its own, which
+      // isn't this file's. Going by the number rather than by which
+      // session_meta came first, a resumed read that couldn't replay the
+      // file's first line never takes the parent's (engram#583).
+      if (data.ordinal === 0) state.ownFrom = startOrdinal(p.subagent_history_start_ordinal);
       return true;
     }
     if (data.type === "turn_context") {
@@ -143,6 +174,16 @@ export class CodexParser implements LineParser {
     const m = filePath.match(/rollout-[\dT-]+-([0-9a-f-]{36})\.jsonl$/i);
     return m ? m[1] : null;
   }
+}
+
+/** A record numbered before this subagent's own: its parent's history. */
+function inherited(data: RolloutLine, state: RolloutState): boolean {
+  return state.ownFrom !== null && typeof data.ordinal === "number" && data.ordinal < state.ownFrom;
+}
+
+/** A boundary to skip to, or null: one at 0 has nothing before it. */
+function startOrdinal(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
 function parse(line: string): RolloutLine | null {

@@ -18,6 +18,8 @@ import { availableAdapters } from "./adapters.js";
 import { configuredKey, ownedKeysAt } from "./key-source.js";
 import { makeDirPrivateSync, type PrivateDirReport } from "../private-files.js";
 import { START_FAILED_EXIT } from "./supervise.js";
+import { foreignFiles, foreignFilesFix, foreignFilesProblem, OWNERSHIP_FIX } from "./ownership.js";
+import { notifyDesktopBeforeExit } from "./status.js";
 import {
   claimDaemonLock,
   markReady,
@@ -89,6 +91,26 @@ async function main(): Promise<void> {
   // umask. Then what an older version left in ~/.engram is set to 0600 as
   // well.
   if (process.platform !== "win32") process.umask(0o077);
+
+  // Files in ~/.engram that are root's, from `sudo engram …` (engram#659).
+  // The daemon can't run with some of them (stopsDaemon). It used to fail
+  // on the first, exit with an error, and be started again every few
+  // seconds, for good. Now it says which, and how to make them the user's,
+  // and exits cleanly, which launchd and systemd leave stopped. The rest
+  // only warn.
+  const foreign = foreignFiles();
+  if (foreign?.stopsDaemon) {
+    log(`daemon exiting: ${foreignFilesProblem(foreign, "stopped")}`);
+    log(foreignFilesFix(foreign));
+    log("Then run: engram start");
+    // The log may be one of them, and nobody reads it: this reaches the user.
+    await notifyDesktopBeforeExit(
+      "Engram capture has stopped",
+      `Files in ~/.engram belong to ${foreign.root ? "root" : "another user"}, not to you. To fix it, run: ${OWNERSHIP_FIX}`,
+    );
+    process.exit(0);
+  }
+  if (foreign) log(`warning: ${foreignFilesProblem(foreign, "running")} ${foreignFilesFix(foreign)}`);
   const made = makeDirPrivateSync(ENGRAM_DIR);
 
   log(`daemon started (pid ${process.pid})`);

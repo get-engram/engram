@@ -31,10 +31,13 @@ import {
   SecretScrubber,
   READ_RETRY_MS,
   MAX_SERVER_HOLD_MS,
+  MISMATCH_RETRY_MS,
+  decryptFailed,
+  type Undecryptable,
   type VaultKeySource,
   type VaultLike,
 } from "../daemon/scrubber.js";
-import { VaultKeyUnreadable } from "../vault-key.js";
+import { VaultKeyMismatch, VaultKeyUnreadable } from "../vault-key.js";
 import { recordFailure, recordSuccess } from "../daemon/status.js";
 import type { ParsedMessage, SessionMeta } from "../daemon/types.js";
 
@@ -74,6 +77,8 @@ class FakeVault implements VaultLike {
   gets: string[] = [];
   listError: (() => unknown) | null = null;
   getErrors: Record<string, () => unknown> = {};
+  /** When each secret was last saved, as list() says it (engram#694). Unsaid if not set. */
+  saved: Record<string, string> = {};
   private gate: Promise<void> | null = null;
   private open: (() => void) | null = null;
 
@@ -89,11 +94,13 @@ class FakeVault implements VaultLike {
     this.gate = null;
   }
 
-  async list(): Promise<Array<{ name: string }>> {
+  async list(): Promise<Array<{ name: string; updatedAt?: string }>> {
     this.lists++;
     if (this.gate) await this.gate;
     if (this.listError) throw this.listError();
-    return Object.keys(this.secrets).map((name) => ({ name }));
+    return Object.keys(this.secrets).map((name) =>
+      this.saved[name] === undefined ? { name } : { name, updatedAt: this.saved[name] },
+    );
   }
 
   async get(name: string): Promise<string | null> {
@@ -1109,6 +1116,566 @@ class FakeServer {
   }
 }
 
+/** A vault whose every secret was saved with another vault key (engram#694). */
+const foreign = (secrets: Record<string, string>): FakeVault => {
+  const vault = new FakeVault(secrets);
+  for (const name of Object.keys(secrets)) vault.getErrors[name] = wrongKey;
+  return vault;
+};
+
+const HOLDING_2 =
+  "vault scrubber: holding sends — the vault key doesn't decrypt any of the vault's 2 secrets, so they " +
+  "can't be scrubbed. Capture goes on, and what it captures is sent once the secrets decrypt, or are " +
+  "deleted. See 'engram status'.";
+
+const REPLACED =
+  "vault scrubber: the vault key was replaced — reading the vault with the new one before sending " +
+  "(the one it replaced is still scrubbed)";
+
+describe("a vault key that decrypts none of the vault's secrets holds sends (engram#694)", () => {
+  it("holds for as long as it lasts: no bound releases it, nor do server errors meanwhile", async () => {
+    const vault = foreign({ A: "alpha-value", B: "bravo-value" });
+    const log: string[] = [];
+    const s = new SecretScrubber(vault, KEY, keyLog(log));
+    await s.refresh();
+    expect(await s.ready()).toBe(false);
+    expect(s.failure).toBeInstanceOf(VaultKeyMismatch);
+    expect((s.failure as VaultKeyMismatch).secrets).toBe(2);
+    expect(log).toEqual([HOLDING_2]);
+
+    // Two hours: still holding, and said once.
+    for (let i = 0; i < 120; i++) {
+      later(60_000);
+      expect(await s.ready()).toBe(false);
+    }
+    // Server errors meanwhile don't start the 15 minutes that release a
+    // hold: what was found of the key stands until a read finds otherwise.
+    vault.listError = busy;
+    for (let i = 0; i < 30; i++) {
+      later(60_000);
+      expect(await s.ready()).toBe(false);
+    }
+    expect(s.failure).toBeInstanceOf(VaultKeyMismatch);
+    expect(log.filter((l) => l.includes("holding sends"))).toEqual([HOLDING_2]);
+    expect(log.join("\n")).not.toContain("failed to read for 15 minutes");
+    // Nothing to scrub them with: why it holds.
+    expect(s.scrub("alpha-value bravo-value").text).toBe("alpha-value bravo-value");
+    expect(log.join("\n")).not.toMatch(/alpha-value|bravo-value/);
+  });
+
+  it("lists the vault again in 10 s, 30 s, 1 min, 2 min, then every 5 min; each secret is read again every 10 min", async () => {
+    // Each secret read writes an audit row: a list that is the same reads
+    // none of them again, until 10 minutes have passed.
+    const vault = foreign({ A: "alpha-value", B: "bravo-value" });
+    const s = new SecretScrubber(vault, KEY);
+    await s.refresh();
+    expect(await s.ready()).toBe(false);
+    expect(vault.gets).toEqual(["A", "B"]);
+
+    const after = async (ms: number) => {
+      later(ms);
+      expect(await s.ready()).toBe(false);
+      return [vault.lists, vault.gets.length];
+    };
+    expect(await after(MISMATCH_RETRY_MS[0] - 1)).toEqual([1, 2]);
+    expect(await after(1)).toEqual([2, 2]); // 10 s
+    expect(await after(MISMATCH_RETRY_MS[1] - 1)).toEqual([2, 2]);
+    expect(await after(1)).toEqual([3, 2]); // 30 s
+    expect(await after(MISMATCH_RETRY_MS[2] - 1)).toEqual([3, 2]);
+    expect(await after(1)).toEqual([4, 2]); // 1 min
+    expect(await after(MISMATCH_RETRY_MS[3] - 1)).toEqual([4, 2]);
+    expect(await after(1)).toEqual([5, 2]); // 2 min
+    expect(await after(MISMATCH_RETRY_MS[4])).toEqual([6, 2]); // 5 min: 8 min 40 s on
+    expect(await after(MISMATCH_RETRY_MS[4])).toEqual([7, 4]); // 13 min 40 s on: each read again
+    expect(await after(MISMATCH_RETRY_MS[4] - 1)).toEqual([7, 4]);
+    expect(await after(1)).toEqual([8, 4]); // every 5 min still, and the list is the same
+    expect(await after(MISMATCH_RETRY_MS[4])).toEqual([9, 6]); // 10 min since each was read
+  });
+
+  it("a secret saved again, added or deleted: each secret is read again at the next list", async () => {
+    const vault = foreign({ A: "alpha-value", B: "bravo-value" });
+    const log: string[] = [];
+    const s = new SecretScrubber(vault, KEY, keyLog(log));
+    await s.refresh();
+
+    // Saved again elsewhere, with the other key.
+    vault.saved.B = "2026-11-08T00:00:05Z";
+    later(MISMATCH_RETRY_MS[0]);
+    expect(await s.ready()).toBe(false);
+    expect([vault.lists, vault.gets.length]).toEqual([2, 4]);
+    expect(log).toEqual([HOLDING_2]); // the same count: nothing new to say
+
+    vault.secrets.C = "charlie-value";
+    vault.getErrors.C = wrongKey;
+    later(MISMATCH_RETRY_MS[1]);
+    expect(await s.ready()).toBe(false);
+    expect([vault.lists, vault.gets.length]).toEqual([3, 7]);
+    expect((s.failure as VaultKeyMismatch).secrets).toBe(3);
+
+    delete vault.secrets.A;
+    delete vault.secrets.C;
+    later(MISMATCH_RETRY_MS[2]);
+    expect(await s.ready()).toBe(false);
+    expect([vault.lists, vault.gets.length]).toEqual([4, 8]);
+    expect(log.slice(1)).toEqual([
+      "vault scrubber: still holding sends — the vault key doesn't decrypt any of the vault's 3 secrets",
+      "vault scrubber: still holding sends — the vault key doesn't decrypt the vault's secret",
+    ]);
+  });
+
+  it("lifts once the secrets it can't decrypt are deleted", async () => {
+    const vault = foreign({ A: "alpha-value", B: "bravo-value" });
+    const log: string[] = [];
+    const s = new SecretScrubber(vault, KEY, keyLog(log));
+    await s.refresh();
+
+    delete vault.secrets.A;
+    delete vault.secrets.B;
+    later(MISMATCH_RETRY_MS[0]);
+    expect(await s.ready()).toBe(true);
+    expect(s.failure).toBeUndefined();
+    expect(log).toEqual([
+      HOLDING_2,
+      "vault scrubber: the vault holds no secret now that can't be scrubbed — sending what was held",
+    ]);
+    // Settled: the next send doesn't read the vault again.
+    const lists = vault.lists;
+    later(2_000);
+    expect(await s.ready()).toBe(true);
+    expect(vault.lists).toBe(lists);
+  });
+
+  it("saved again with this key one at a time: held until the last, then what was held goes", async () => {
+    const vault = foreign({ A: "alpha-value", B: "bravo-value" });
+    const log: string[] = [];
+    const found: Undecryptable[] = [];
+    const s = new SecretScrubber(vault, KEY, keyLog(log), undefined, (f) => found.push(f));
+    await s.refresh();
+    expect(found).toEqual([{ secrets: 2, unscrubbed: 2, decrypted: 0, held: true }]);
+
+    // A saved again: it decrypts, and B still doesn't. What waits would go
+    // with B in it, so it waits still.
+    delete vault.getErrors.A;
+    vault.saved.A = "2026-11-08T00:00:05Z";
+    later(MISMATCH_RETRY_MS[0]);
+    expect(await s.ready()).toBe(false);
+    expect(s.failure).toBeInstanceOf(VaultKeyMismatch);
+    expect(s.failure).toMatchObject({ secrets: 1, decrypted: 1 });
+    // A is scrubbed meanwhile; B can't be.
+    expect(s.scrub("alpha-value bravo-value").text).toBe("[VAULT:A] bravo-value");
+    expect(log).toEqual([
+      HOLDING_2,
+      "vault scrubber: still holding sends — the vault key doesn't decrypt 1 of the vault's 2 secrets",
+    ]);
+    expect(found.at(-1)).toEqual({ secrets: 1, unscrubbed: 1, decrypted: 1, held: true });
+
+    // However long B goes unsaved: no bound releases it, and it is said once.
+    for (let i = 0; i < 30; i++) {
+      later(60_000);
+      expect(await s.ready()).toBe(false);
+    }
+    expect(log).toHaveLength(2);
+
+    // Then B: none is left that can't be scrubbed.
+    delete vault.getErrors.B;
+    vault.saved.B = "2026-11-08T00:31:00Z";
+    later(MISMATCH_RETRY_MS[4]);
+    expect(await s.ready()).toBe(true);
+    expect(s.failure).toBeUndefined();
+    expect(s.scrub("alpha-value bravo-value").text).toBe("[VAULT:A] [VAULT:B]");
+    expect(log.slice(2)).toEqual([
+      "vault scrubber: the vault key decrypts the vault's secrets now — sending what was held",
+    ]);
+    expect(found.at(-1)).toEqual({ secrets: 0, unscrubbed: 0, decrypted: 2, held: false });
+  });
+
+  it("one saved again with this key, the other deleted: what was held goes", async () => {
+    const vault = foreign({ A: "alpha-value", B: "bravo-value" });
+    const log: string[] = [];
+    const s = new SecretScrubber(vault, KEY, keyLog(log));
+    await s.refresh();
+    delete vault.getErrors.A;
+    vault.saved.A = "2026-11-08T00:00:05Z";
+    delete vault.secrets.B;
+    later(MISMATCH_RETRY_MS[0]);
+    expect(await s.ready()).toBe(true);
+    expect(log.slice(1)).toEqual([
+      "vault scrubber: the vault key decrypts the vault's secrets now — sending what was held",
+    ]);
+  });
+
+  it("another vault key saved: the vault is read with it before the next send, which goes once it decrypts", async () => {
+    const source = new FakeKeyFile(null);
+    source.finds = () => KEY_A;
+    const log: string[] = [];
+    const s = reading(source, foreign({ A: "alpha-value", B: "bravo-value" }), KEY_A, keyLog(log));
+    await s.refresh();
+    expect(await s.ready()).toBe(false);
+
+    // The same vault, read with the key its secrets were saved with.
+    const after = new FakeVault({ A: "alpha-value", B: "bravo-value" });
+    after.hold();
+    source.vault = after;
+    source.finds = () => KEY_B;
+    let ready: boolean | undefined;
+    void s.ready().then((r) => (ready = r));
+    await settle();
+    expect(source.keys).toEqual([KEY_B]);
+    expect(ready).toBeUndefined();
+    // Until the read with it says otherwise.
+    expect(s.failure).toBeInstanceOf(VaultKeyMismatch);
+
+    after.release();
+    await settle();
+    expect(ready).toBe(true);
+    expect(s.scrub("alpha-value bravo-value").text).toBe("[VAULT:A] [VAULT:B]");
+    expect(log).toEqual([
+      HOLDING_2,
+      REPLACED,
+      "vault scrubber: the vault key decrypts the vault's secrets now — sending what was held",
+    ]);
+  });
+
+  it("another vault key that decrypts none of them either: each is read with it, and the hold is said again", async () => {
+    const source = new FakeKeyFile(foreign({ A: "alpha-value", B: "bravo-value" }));
+    source.finds = () => KEY_A;
+    const log: string[] = [];
+    const s = reading(source, foreign({ A: "alpha-value", B: "bravo-value" }), KEY_A, keyLog(log));
+    await s.refresh();
+
+    source.finds = () => KEY_B;
+    later(2_000);
+    expect(await s.ready()).toBe(false);
+    expect(source.keys).toEqual([KEY_B]);
+    expect(log).toEqual([
+      HOLDING_2,
+      REPLACED,
+      "vault scrubber: still holding sends — the vault key doesn't decrypt any of the vault's 2 secrets",
+    ]);
+    // Listed again on the schedule from the start.
+    const lists = (source.vault as FakeVault).lists;
+    later(MISMATCH_RETRY_MS[0]);
+    expect(await s.ready()).toBe(false);
+    expect((source.vault as FakeVault).lists).toBe(lists + 1);
+  });
+
+  it("lifts when the API key can't read the vault any more: waiting can't change that", async () => {
+    const vault = foreign({ A: "alpha-value", B: "bravo-value" });
+    const log: string[] = [];
+    const s = new SecretScrubber(vault, KEY, keyLog(log));
+    await s.refresh();
+
+    vault.listError = noReadScope;
+    later(MISMATCH_RETRY_MS[0]);
+    expect(await s.ready()).toBe(true);
+    expect(log.slice(1)).toEqual([
+      "vault scrubber: this API key can't read the vault now — sending what was held",
+      expect.stringMatching(/^vault scrubber: this API key can't read the vault — scrubbing only the 1 secret\(s\)/),
+    ]);
+  });
+
+  it("a key that decrypts some of the secrets doesn't hold, and says how many it can't scrub", async () => {
+    const vault = new FakeVault({ A: "alpha-value", B: "bravo-value", C: "charlie-value" });
+    vault.getErrors.B = wrongKey;
+    vault.getErrors.C = wrongKey;
+    const log: string[] = [];
+    const found: Undecryptable[] = [];
+    const s = new SecretScrubber(vault, KEY, keyLog(log), undefined, (f) => found.push(f));
+    await s.refresh();
+    expect(await s.ready()).toBe(true);
+    expect(s.failure).toBeUndefined();
+    expect(log).toEqual(["vault scrubber: 2 secret(s) don't decrypt with this vault key, so they can't be scrubbed"]);
+    expect(found).toEqual([{ secrets: 2, unscrubbed: 2, decrypted: 1, held: false }]);
+
+    // Every read reports, and the log says it again only when it changes.
+    await s.refresh();
+    expect(found).toEqual([
+      { secrets: 2, unscrubbed: 2, decrypted: 1, held: false },
+      { secrets: 2, unscrubbed: 2, decrypted: 1, held: false },
+    ]);
+    delete vault.secrets.C;
+    await s.refresh();
+    expect(log.at(-1)).toBe("vault scrubber: 1 secret(s) don't decrypt with this vault key, so they can't be scrubbed");
+    expect(found.at(-1)).toEqual({ secrets: 1, unscrubbed: 1, decrypted: 1, held: false });
+    // A deleted too, leaving none that decrypts: as with a key that
+    // decrypts none of them from the start, sends wait.
+    delete vault.secrets.A;
+    await s.refresh();
+    expect(await s.ready()).toBe(false);
+    expect(s.failure).toBeInstanceOf(VaultKeyMismatch);
+    expect(found.at(-1)).toEqual({ secrets: 1, unscrubbed: 1, decrypted: 0, held: true });
+  });
+
+  it("a key replaced while the daemon runs: secrets read with the one before are scrubbed with those values, and don't hold", async () => {
+    const source = new FakeKeyFile(null);
+    source.finds = () => KEY_A;
+    const log: string[] = [];
+    const found: Undecryptable[] = [];
+    const s = new SecretScrubber(
+      new FakeVault({ A: "alpha-value", B: "bravo-value" }),
+      KEY_A,
+      keyLog(log),
+      { source },
+      (f) => found.push(f),
+    );
+    await s.refresh();
+    expect(await s.ready()).toBe(true);
+
+    // Another machine's key: nothing in the vault decrypts with it.
+    const after = foreign({ A: "alpha-value", B: "bravo-value" });
+    source.vault = after;
+    source.finds = () => KEY_B;
+    later(2_000);
+    expect(await s.ready()).toBe(true);
+    expect(s.scrub("alpha-value bravo-value").text).toBe("[VAULT:A] [VAULT:B]");
+    expect(log).toEqual([
+      REPLACED,
+      "vault scrubber: 2 secret(s) don't decrypt with this vault key — scrubbing them with the value " +
+        "read before, which a restart won't have",
+    ]);
+    expect(found.at(-1)).toEqual({ secrets: 2, unscrubbed: 0, decrypted: 0, held: false });
+
+    // Then one is saved again elsewhere, with the key before: its value
+    // now isn't known, so it can't be scrubbed.
+    after.saved.A = "2026-11-08T00:30:00Z";
+    await s.refresh(); // the interval's read
+    expect(await s.ready()).toBe(false);
+    expect(s.failure).toBeInstanceOf(VaultKeyMismatch);
+    expect(log.at(-1)).toBe(
+      "vault scrubber: holding sends — the vault key doesn't decrypt any of the vault's 2 secrets, so they " +
+        "can't all be scrubbed. Capture goes on, and what it captures is sent once the secrets decrypt, or " +
+        "are deleted. See 'engram status'.",
+    );
+    expect(found.at(-1)).toEqual({ secrets: 2, unscrubbed: 1, decrypted: 0, held: true });
+    // The value read before is scrubbed still.
+    expect(s.scrub("alpha-value bravo-value").text).toBe("[VAULT:A] [VAULT:B]");
+
+    // Then A is saved again with this key: it decrypts, and B, which
+    // doesn't, is scrubbed with the value read before. None is left that
+    // can't be scrubbed, so what was held goes, though the key doesn't
+    // decrypt every secret, and the log doesn't say it does (engram#694).
+    delete after.getErrors.A;
+    after.saved.A = "2026-11-08T00:40:00Z";
+    await s.refresh();
+    expect(await s.ready()).toBe(true);
+    expect(s.failure).toBeUndefined();
+    expect(s.scrub("alpha-value bravo-value").text).toBe("[VAULT:A] [VAULT:B]");
+    expect(log.slice(3)).toEqual([
+      "vault scrubber: the vault holds no secret now that can't be scrubbed — sending what was held",
+      "vault scrubber: 1 secret(s) don't decrypt with this vault key — scrubbing them with the value " +
+        "read before, which a restart won't have",
+    ]);
+    expect(found.at(-1)).toEqual({ secrets: 1, unscrubbed: 0, decrypted: 1, held: false });
+  });
+
+  it("a new API key: what was found goes with the old one, and the vault is read through the new one", async () => {
+    const log: string[] = [];
+    const found: Undecryptable[] = [];
+    const s = new SecretScrubber(new FakeVault({ A: "alpha-value" }), KEY, keyLog(log), undefined, (f) =>
+      found.push(f),
+    );
+    await s.refresh();
+    expect(found).toEqual([{ secrets: 0, unscrubbed: 0, decrypted: 1, held: false }]);
+
+    // Another account's vault: what decrypted through the account before
+    // says nothing of its secrets.
+    const other = foreign({ A: "alpha-value" });
+    other.hold();
+    const read = s.reconnect(other);
+    expect(found.at(-1)).toEqual({ secrets: 0, unscrubbed: 0, decrypted: 0, held: false });
+    other.release();
+    await read;
+    expect(await s.ready()).toBe(false);
+    expect(s.failure).toBeInstanceOf(VaultKeyMismatch);
+    expect(found.at(-1)).toEqual({ secrets: 1, unscrubbed: 1, decrypted: 0, held: true });
+    expect(log).toEqual([
+      "vault scrubber: holding sends — the vault key doesn't decrypt the vault's secret, so it can't be " +
+        "scrubbed. Capture goes on, and what it captures is sent once the secret decrypts, or is deleted. " +
+        "See 'engram status'.",
+    ]);
+
+    // And another: a hold found through one account goes with it.
+    const next = s.reconnect(new FakeVault({ B: "bravo-value" }));
+    expect(s.failure).toBeUndefined();
+    expect(found.at(-1)).toEqual({ secrets: 0, unscrubbed: 0, decrypted: 0, held: false });
+    await next;
+    expect(await s.ready()).toBe(true);
+  });
+
+  it("a read cut short says nothing of what the key decrypts: it neither holds, nor lifts, nor reports", async () => {
+    const vault = foreign({ A: "alpha-value", B: "bravo-value" });
+    const found: Undecryptable[] = [];
+    const s = new SecretScrubber(vault, KEY, undefined, undefined, (f) => found.push(f));
+    await s.refresh();
+
+    // B deleted, and A doesn't come back: no telling whether it would decrypt.
+    delete vault.secrets.B;
+    vault.getErrors.A = busy;
+    later(MISMATCH_RETRY_MS[0]);
+    expect(await s.ready()).toBe(false);
+    expect((s.failure as VaultKeyMismatch).secrets).toBe(2);
+    expect(found).toEqual([{ secrets: 2, unscrubbed: 2, decrypted: 0, held: true }]);
+
+    // A saved again with this key: the next read lifts it.
+    delete vault.getErrors.A;
+    later(READ_RETRY_MS[2]);
+    expect(await s.ready()).toBe(true);
+    expect(found.at(-1)).toEqual({ secrets: 0, unscrubbed: 0, decrypted: 1, held: false });
+  });
+
+  it("found by the interval's re-read of a complete set, it holds too, and an outage meanwhile keeps it", async () => {
+    // Sends went before: a secret saved again elsewhere, with another key,
+    // and a new one saved with it, leave none the key can decrypt.
+    const vault = new FakeVault({ A: "alpha-value" });
+    const s = new SecretScrubber(vault, KEY);
+    await s.refresh();
+    expect(await s.ready()).toBe(true);
+
+    vault.secrets.B = "bravo-value";
+    vault.getErrors.B = wrongKey;
+    vault.getErrors.A = wrongKey;
+    vault.saved.A = "2026-11-08T00:00:05Z";
+    await s.refresh();
+    expect(await s.ready()).toBe(false);
+    expect((s.failure as VaultKeyMismatch).secrets).toBe(2);
+
+    vault.listError = offline;
+    for (let i = 0; i < 20; i++) {
+      later(60_000);
+      expect(await s.ready()).toBe(false);
+    }
+    expect(s.failure).toBeInstanceOf(VaultKeyMismatch);
+  });
+
+  it("a status that can't be written changes nothing: it holds, and lifts", async () => {
+    const vault = foreign({ A: "alpha-value" });
+    const s = new SecretScrubber(vault, KEY, undefined, undefined, () => {
+      throw new Error("disk full");
+    });
+    await s.refresh();
+    expect(await s.ready()).toBe(false);
+    delete vault.secrets.A;
+    later(MISMATCH_RETRY_MS[0]);
+    expect(await s.ready()).toBe(true);
+  });
+
+  describe("held by the daemon before, as status.json says: still held", () => {
+    const CARRIED =
+      "vault scrubber: the daemon before held sends for secrets its vault key didn't decrypt — holding " +
+      "them still, until a read of the vault finds none that can't be scrubbed";
+
+    it("held before it reads: one saved again since decrypts, the other doesn't, and it holds", async () => {
+      // A was saved again with this key while no daemon ran; B wasn't.
+      const vault = foreign({ A: "alpha-value", B: "bravo-value" });
+      delete vault.getErrors.A;
+      const log: string[] = [];
+      const found: Undecryptable[] = [];
+      const s = new SecretScrubber(vault, KEY, keyLog(log), undefined, (f) => found.push(f));
+      s.continueMismatchHold({ secrets: 2, unscrubbed: 2, decrypted: 0 });
+      expect(s.failure).toBeInstanceOf(VaultKeyMismatch);
+      expect(log).toEqual([CARRIED]);
+      // Said at the start: status.json says it already.
+      expect(found).toEqual([]);
+
+      expect(await s.ready()).toBe(false);
+      expect(s.failure).toMatchObject({ secrets: 1, decrypted: 1 });
+      expect(s.scrub("alpha-value bravo-value").text).toBe("[VAULT:A] bravo-value");
+      expect(log).toEqual([
+        CARRIED,
+        "vault scrubber: still holding sends — the vault key doesn't decrypt 1 of the vault's 2 secrets",
+      ]);
+      expect(found).toEqual([{ secrets: 1, unscrubbed: 1, decrypted: 1, held: true }]);
+
+      // B deleted: what was held goes.
+      delete vault.secrets.B;
+      later(MISMATCH_RETRY_MS[0]);
+      expect(await s.ready()).toBe(true);
+      expect(s.failure).toBeUndefined();
+      expect(log.at(-1)).toBe("vault scrubber: the vault key decrypts the vault's secrets now — sending what was held");
+      expect(found.at(-1)).toEqual({ secrets: 0, unscrubbed: 0, decrypted: 1, held: false });
+    });
+
+    it("the same as the daemon before found: said again, and held", async () => {
+      const log: string[] = [];
+      const s = new SecretScrubber(foreign({ A: "alpha-value", B: "bravo-value" }), KEY, keyLog(log));
+      s.continueMismatchHold({ secrets: 2, unscrubbed: 2, decrypted: 0 });
+      expect(await s.ready()).toBe(false);
+      expect(log).toEqual([
+        CARRIED,
+        "vault scrubber: still holding sends — the vault key doesn't decrypt any of the vault's 2 secrets",
+      ]);
+    });
+
+    it("a first read that finds none it can't scrub: what was held goes at once", async () => {
+      const log: string[] = [];
+      const found: Undecryptable[] = [];
+      const s = new SecretScrubber(new FakeVault({ A: "alpha-value", B: "bravo-value" }), KEY, keyLog(log), undefined, (f) =>
+        found.push(f),
+      );
+      s.continueMismatchHold({ secrets: 2, unscrubbed: 2, decrypted: 0 });
+      expect(await s.ready()).toBe(true);
+      expect(s.failure).toBeUndefined();
+      expect(s.scrub("alpha-value bravo-value").text).toBe("[VAULT:A] [VAULT:B]");
+      expect(log).toEqual([CARRIED, "vault scrubber: the vault key decrypts the vault's secrets now — sending what was held"]);
+      expect(found).toEqual([{ secrets: 0, unscrubbed: 0, decrypted: 2, held: false }]);
+
+      // Each deleted while no daemon ran: the same.
+      const emptied = new FakeVault({});
+      const said: string[] = [];
+      const t = new SecretScrubber(emptied, KEY, keyLog(said));
+      t.continueMismatchHold({ secrets: 1, unscrubbed: 1, decrypted: 0 });
+      expect(await t.ready()).toBe(true);
+      expect(said.at(-1)).toBe(
+        "vault scrubber: the vault holds no secret now that can't be scrubbed — sending what was held",
+      );
+    });
+
+    it("no bound releases it: a vault that can't be read meanwhile holds it, and the hold is why", async () => {
+      const vault = foreign({ A: "alpha-value" });
+      delete vault.getErrors.A;
+      vault.listError = busy;
+      const log: string[] = [];
+      const s = new SecretScrubber(vault, KEY, keyLog(log));
+      s.continueMismatchHold({ secrets: 1, unscrubbed: 1, decrypted: 0 });
+      for (let i = 0; i < 30; i++) {
+        later(60_000);
+        expect(await s.ready()).toBe(false);
+      }
+      // What the syncer records: the hold, not the server's error.
+      expect(s.failure).toBeInstanceOf(VaultKeyMismatch);
+      expect(log.join("\n")).not.toContain("failed to read for");
+      // A decrypts now: once the vault reads, what was held goes.
+      vault.listError = null;
+      later(READ_RETRY_MS.at(-1) as number);
+      expect(await s.ready()).toBe(true);
+      expect(s.scrub("alpha-value").text).toBe("[VAULT:A]");
+    });
+
+    it("an account switch meanwhile: the hold goes with the account before", async () => {
+      const s = new SecretScrubber(foreign({ A: "alpha-value" }), KEY);
+      s.continueMismatchHold({ secrets: 1, unscrubbed: 1, decrypted: 0 });
+      const read = s.reconnect(new FakeVault({ B: "bravo-value" }));
+      expect(s.failure).toBeUndefined();
+      await read;
+      expect(await s.ready()).toBe(true);
+    });
+
+    it("counts status.json can't vouch for: at least one, never fewer than none", () => {
+      const s = new SecretScrubber(new FakeVault({}), KEY);
+      s.continueMismatchHold({ secrets: 0, unscrubbed: 0, decrypted: -3 });
+      expect(s.failure).toMatchObject({ secrets: 1, decrypted: 0 });
+    });
+  });
+
+  it("decryptFailed: a value that doesn't decrypt here, never a request that failed", () => {
+    expect(decryptFailed(wrongKey())).toBe(true);
+    expect(decryptFailed(new Error("Vault encryption key must be 32 bytes (AES-256). Got 16 bytes."))).toBe(true);
+    for (const err of [offline(), timedOut(), unavailable(), busy(), noReadScope(), new SyntaxError("Unexpected token")]) {
+      expect(decryptFailed(err), String(err)).toBe(false);
+    }
+  });
+});
+
 describe("nothing is sent before the vault has been read (engram#588)", () => {
   let dir: string;
   let db: DaemonDb;
@@ -1437,6 +2004,38 @@ describe("nothing is sent before the vault has been read (engram#588)", () => {
     expect(said).toHaveLength(1);
   });
 
+  it("sends held for one reason, then another: the new one is said, once (engram#694)", async () => {
+    const vault = new FakeVault({ PIN: "4821" });
+    const source = new FakeKeyFile(vault);
+    const scrubber = keyPending(source);
+    await scrubber.refresh(); // as start() does
+    const syncer = new Syncer(db, server.client(), scrubber);
+    await syncer.onMessages("s1", meta("s1"), msgs("the PIN is 4821"));
+    await syncer.flush();
+    expect(errorsLogged("holding queued messages until the vault key can be read")).toBe(1);
+
+    // The key put back, and the vault then can't be read with it: why sends
+    // wait now is said, once, until the bound on a server failing the read
+    // (engram#588).
+    source.finds = () => KEY;
+    vault.listError = unavailable;
+    for (let i = 0; i < 10; i++) {
+      later(60_000);
+      await syncer.flush();
+    }
+    expect(source.keys).toEqual([KEY]);
+    expect(server.sends).toHaveLength(0);
+    expect(errorsLogged("holding queued messages until the vault is read")).toBe(1);
+    expect(failures().at(-1)?.[1]).toBe("server");
+
+    // Read at last: what was held goes, scrubbed.
+    vault.listError = null;
+    later(READ_RETRY_MS.at(-1)!);
+    await syncer.flush();
+    expect(server.received).toEqual(["the PIN is [VAULT:PIN]"]);
+    expect(errorsLogged("holding queued messages until the vault key can be read")).toBe(1);
+  });
+
   it("a vault key file gone while sends wait for it keeps them waiting (engram#677)", async () => {
     const source = new FakeKeyFile(new FakeVault({ PIN: "4821" }));
     const scrubber = keyPending(source);
@@ -1506,5 +2105,99 @@ describe("nothing is sent before the vault has been read (engram#588)", () => {
     const scrubbed = ["the PIN is [VAULT:PIN]", "key [VAULT:vault-key]"];
     expect(server.received).toEqual(["hello", ...scrubbed]);
     expect(queued()).toEqual(["hello", ...scrubbed]);
+  });
+
+  it("a vault key that decrypts none of the vault's secrets: creates go through, and sends wait however long it lasts (engram#694)", async () => {
+    const vault = new FakeVault({ PIN: "4821", PASSPHRASE: "correct horse" });
+    vault.getErrors.PIN = wrongKey;
+    vault.getErrors.PASSPHRASE = wrongKey;
+    const scrubber = new SecretScrubber(vault, KEY);
+    await scrubber.refresh(); // as start() does
+    const syncer = new Syncer(db, server.client(), scrubber);
+
+    await syncer.onMessages("s1", meta("s1"), msgs("the PIN is 4821", "correct horse"));
+    await syncer.flush();
+    expect(server.creates).toBe(1);
+    expect(server.sends).toHaveLength(0);
+    const held =
+      "holding messages until the vault's secrets can be scrubbed: the vault key doesn't decrypt any of " +
+      "the vault's 2 secrets";
+    expect(failures().at(-1)).toEqual([held, "vault_mismatch", 2]);
+
+    // Two hours of flushes, the server failing for one of them: still
+    // waiting, and said once.
+    for (let i = 0; i < 120; i++) {
+      vault.listError = i >= 30 && i < 90 ? unavailable : null;
+      later(60_000);
+      await syncer.flush();
+    }
+    expect(server.sends).toHaveLength(0);
+    expect(recordSuccess).not.toHaveBeenCalled();
+    expect(errorsLogged("holding queued messages until each of the vault's secrets decrypts, or is deleted")).toBe(1);
+    expect(errorsLogged("holding queued messages until the vault is read")).toBe(0);
+    expect(failures().at(-1)).toEqual([held, "vault_mismatch", 2]);
+    expect(queued()).toEqual(["the PIN is 4821", "correct horse"]); // kept, to send once it's safe
+
+    // Each saved again with this key: listed anew, read, and what was held goes, scrubbed.
+    delete vault.getErrors.PIN;
+    delete vault.getErrors.PASSPHRASE;
+    vault.saved = { PIN: "2026-11-08T03:00:00Z", PASSPHRASE: "2026-11-08T03:00:00Z" };
+    later(MISMATCH_RETRY_MS[4]);
+    await syncer.flush();
+    const scrubbed = ["the PIN is [VAULT:PIN]", "[VAULT:PASSPHRASE]"];
+    expect(server.received).toEqual(scrubbed);
+    expect(queued()).toEqual(scrubbed);
+    expect(recordSuccess).toHaveBeenCalledTimes(1);
+    const said = vi.mocked(console.log).mock.calls.filter((c) => String(c[0]).includes("vault read"));
+    expect(said).toHaveLength(1);
+  });
+
+  it("a vault key that decrypts some of the vault's secrets doesn't hold: sends go, scrubbed of those it decrypts (engram#694)", async () => {
+    const vault = new FakeVault({ PIN: "4821", PASSPHRASE: "correct horse" });
+    vault.getErrors.PASSPHRASE = wrongKey;
+    const scrubber = new SecretScrubber(vault, KEY);
+    await scrubber.refresh();
+    const syncer = new Syncer(db, server.client(), scrubber);
+    await syncer.onMessages("s1", meta("s1"), msgs("the PIN is 4821"));
+    await syncer.flush();
+    expect(server.received).toEqual(["the PIN is [VAULT:PIN]"]);
+    expect(failures()).toEqual([]);
+  });
+
+  it("a daemon started after one that held: sends wait though some decrypt, the server failing or not, until none can't be scrubbed (engram#694)", async () => {
+    // PIN was saved again with this key while no daemon ran; PASSPHRASE wasn't.
+    const vault = new FakeVault({ PIN: "4821", PASSPHRASE: "correct horse" });
+    vault.getErrors.PASSPHRASE = wrongKey;
+    const scrubber = new SecretScrubber(vault, KEY);
+    scrubber.continueMismatchHold({ secrets: 2, unscrubbed: 2, decrypted: 0 });
+    await scrubber.refresh(); // as start() does
+    const syncer = new Syncer(db, server.client(), scrubber);
+
+    await syncer.onMessages("s1", meta("s1"), msgs("the PIN is 4821", "correct horse"));
+    await syncer.flush();
+    expect(server.sends).toHaveLength(0);
+    const held =
+      "holding messages until the vault's secrets can be scrubbed: the vault key doesn't decrypt 1 of " +
+      "the vault's 2 secrets";
+    expect(failures().at(-1)).toEqual([held, "vault_mismatch", 2]);
+
+    // An hour of flushes, the vault failing to read for half of it.
+    for (let i = 0; i < 60; i++) {
+      vault.listError = i < 30 ? unavailable : null;
+      later(60_000);
+      await syncer.flush();
+    }
+    expect(server.sends).toHaveLength(0);
+    expect(recordSuccess).not.toHaveBeenCalled();
+    expect(failures().at(-1)).toEqual([held, "vault_mismatch", 2]);
+    // Kept, scrubbed of what can be: PIN's value isn't kept here either.
+    expect(queued()).toEqual(["the PIN is [VAULT:PIN]", "correct horse"]);
+
+    // PASSPHRASE deleted: what was held goes, scrubbed of PIN.
+    delete vault.secrets.PASSPHRASE;
+    later(MISMATCH_RETRY_MS[4]);
+    await syncer.flush();
+    expect(server.received).toEqual(["the PIN is [VAULT:PIN]", "correct horse"]);
+    expect(recordSuccess).toHaveBeenCalledTimes(1);
   });
 });

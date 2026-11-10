@@ -65,6 +65,25 @@
  * can't be read any more holds sends, as at start: the key in it may not be
  * the one in use.
  *
+ * A vault key that reads, but decrypts none of the vault's secrets
+ * (engram#694) — another machine's, or a new one made after the key was
+ * lost — sent every secret as it was, and only the log said so. Now sends
+ * wait while it lasts, as for a key that can't be read: no bound releases
+ * them. A secret that decrypted before, through this account, and hasn't
+ * been saved again since, is scrubbed with the value read then: a key
+ * replaced while the daemon runs holds sends only once a secret it can't
+ * scrub is saved, or at a restart. The hold lifts once a complete read
+ * finds none it can't scrub: each decrypts, or was deleted, or saved
+ * again with this key. Saved again one at a time, the first that decrypts
+ * doesn't lift it: what waits would go with the others in it. Nor does a
+ * restart meanwhile: status.json says the daemon before held, and
+ * worker-main goes on holding (continueMismatchHold). While it holds, the
+ * vault is listed again on
+ * MISMATCH_RETRY_MS, and read in full when the list changes, and at least
+ * every MISMATCH_REREAD_MS. A key that decrypts some of the secrets but
+ * not others, with no hold before, doesn't hold; `engram status` says how
+ * many it can't scrub.
+ *
  * What it never does: write a value to disk, include one in a log line, or
  * send one anywhere. Values are refreshed from the vault on an interval and
  * dropped on stop. The daemon already runs as the user who owns the 0600
@@ -73,10 +92,20 @@
  */
 
 import { isRefusal } from "./status.js";
-import { asVaultKeyProblem, sameVaultKey, vaultKeySpellings, VaultKeyUnreadable } from "../vault-key.js";
+import {
+  asVaultKeyProblem,
+  sameVaultKey,
+  vaultKeySpellings,
+  VaultKeyMismatch,
+  VaultKeyUnreadable,
+} from "../vault-key.js";
 
 export interface VaultLike {
-  list(): Promise<Array<{ name: string }>>;
+  /**
+   * `updatedAt`: when the secret was last saved, as the server says it. It
+   * tells a secret saved again from one that wasn't (engram#694).
+   */
+  list(): Promise<Array<{ name: string; updatedAt?: string }>>;
   get(name: string): Promise<string | null>;
 }
 
@@ -108,6 +137,37 @@ export const READ_RETRY_MS = [10_000, 30_000, 60_000];
 export const MAX_SERVER_HOLD_MS = 15 * 60_000;
 
 /**
+ * What a complete read found of the secrets the vault key doesn't decrypt
+ * (engram#694): how many, how many of those have no value known from
+ * before, so can't be scrubbed, and how many it does decrypt. Counts only,
+ * never a name. `held`: sends wait for them.
+ */
+export interface Undecryptable {
+  secrets: number;
+  unscrubbed: number;
+  decrypted: number;
+  held: boolean;
+}
+
+/**
+ * While sends wait for secrets the key doesn't decrypt (engram#694): list
+ * the vault again in 10 s → 30 s → 1 min → 2 min → 5 min → 5 min …
+ */
+export const MISMATCH_RETRY_MS = [10_000, 30_000, 60_000, 120_000, 300_000];
+
+/** …and read each secret again at least this often, though the list is the same. */
+export const MISMATCH_REREAD_MS = 10 * 60_000;
+
+/** What a list says of each secret: its name, and when it was last saved. */
+function fingerprint(entries: Array<{ name: string; updatedAt?: string }>): string {
+  return JSON.stringify(
+    entries
+      .map((e): [string, string | null] => [e.name, e.updatedAt ?? null])
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)),
+  );
+}
+
+/**
  * How a vault request failed, and so whether waiting can help:
  *  - refused: the server's own refusal, repeated however long we wait;
  *  - network: no answer at all — offline, DNS, timed out;
@@ -125,6 +185,15 @@ function failureOf(err: unknown): Failure {
   const name = errorName(err);
   if (name === "TimeoutError" || errorText(err).startsWith("Network error:")) return "network";
   return REQUEST_ERRORS.has(name) || name === "SyntaxError" ? "server" : "local";
+}
+
+/**
+ * A vault read that failed here, not in the request: the value doesn't
+ * decrypt with this vault key (engram#694). `engram vault list --check`
+ * judges each secret as the daemon does.
+ */
+export function decryptFailed(err: unknown): boolean {
+  return failureOf(err) === "local";
 }
 
 function errorName(err: unknown): string {
@@ -164,7 +233,27 @@ export class SecretScrubber {
   /** The hold outlasted MAX_SERVER_HOLD_MS: sends go with what's known. */
   private released = false;
   private refusalLogged = false;
+  /** How many secrets don't decrypt with the key, as last said. */
   private undecryptable = 0;
+  /** Of those, how many have no value known from before, as last said. */
+  private unscrubbed = 0;
+  /**
+   * Sends wait for secrets the key doesn't decrypt, with no value known
+   * from before (engram#694): from a complete read that found it decrypts
+   * none of the vault's secrets, or from the daemon before, until one finds
+   * none it can't scrub.
+   */
+  private mismatch: VaultKeyMismatch | undefined = undefined;
+  /** The list it was found with. Undefined: read each secret next time. */
+  private mismatchPrint: string | undefined = undefined;
+  /** When each secret was last read while it holds. */
+  private fullReadAt = 0;
+  /**
+   * The secrets whose value is known: name → when it was last saved, as
+   * listed when it decrypted through this account, with the key in use or
+   * one before it. Not saved again since, the value read then is its value.
+   */
+  private own = new Map<string, string | undefined>();
 
   /** The vault key in use, trimmed: the one the vault is read with. */
   private vaultKey: string | undefined = undefined;
@@ -190,13 +279,16 @@ export class SecretScrubber {
    * interval (engram#693). Without one, `vaultKey` is the key for as long
    * as the scrubber runs. `key.problem`: the key couldn't be read at start,
    * so sends wait until it can be (engram#677); `vault` is null then, and
-   * `vaultKey` undefined.
+   * `vaultKey` undefined. `report`: told what each complete read finds of
+   * secrets the key doesn't decrypt, and nothing on a new client
+   * (engram#694).
    */
   constructor(
     private vault: VaultLike | null,
     vaultKey: string | undefined,
     private readonly log: (msg: string) => void = () => {},
     key?: { source: VaultKeySource; problem?: unknown },
+    private readonly report?: (found: Undecryptable) => void,
   ) {
     // Known before any read: scrubbed from the first message queued.
     if (vaultKey) this.useKey(vaultKey);
@@ -219,10 +311,14 @@ export class SecretScrubber {
     return [...this.values.keys()];
   }
 
-  /** Why the vault couldn't be read through the current client, while
-   *  ready() is false: a VaultKeyUnreadable while the key can't be read. */
+  /**
+   * Why sends wait, while ready() is false: a VaultKeyUnreadable while the
+   * key can't be read, a VaultKeyMismatch while they wait for secrets it
+   * doesn't decrypt (engram#694), else why the vault couldn't be read
+   * through the current client.
+   */
   get failure(): unknown {
-    return this.keyProblem ?? this.lastFailure;
+    return this.keyProblem ?? this.mismatch ?? this.lastFailure;
   }
 
   /**
@@ -267,6 +363,10 @@ export class SecretScrubber {
    * read with now, and ready() waits for that read. A key that can't be read
    * (engram#677) is read again only when its retry is due, and until it
    * reads, ready() is false, however long that takes.
+   *
+   * A key that decrypts none of the vault's secrets (engram#694) holds the
+   * same way: no bound releases it. The vault is listed again when its
+   * retry is due, on MISMATCH_RETRY_MS.
    */
   async ready(): Promise<boolean> {
     if (this.stopped) return false;
@@ -297,12 +397,28 @@ export class SecretScrubber {
 
   /**
    * Read the vault through a new client: the daemon's API key was replaced
-   * (engram#587). Reads at once, and ready() waits for that read. Until it
-   * settles, the current set stays in force, and a read that fails keeps it
-   * too.
+   * (engram#587), or it signed out. Reads at once, and ready() waits for
+   * that read. Until it settles, the current set stays in force, and a read
+   * that fails keeps it too. What was found of the key against the vault
+   * goes (engram#694): it may be another account's vault.
    */
   reconnect(vault: VaultLike | null): Promise<void> {
+    this.mismatch = undefined;
+    this.own = new Map();
+    this.undecryptable = 0;
+    this.unscrubbed = 0;
+    this.tell({ secrets: 0, unscrubbed: 0, decrypted: 0, held: false });
+    return this.readThrough(vault);
+  }
+
+  /**
+   * Read through `vault` from now on: a new client, or the vault read with
+   * a new key. Reads each secret, though the list is the same: a new key
+   * may decrypt what the last one didn't (engram#694).
+   */
+  private readThrough(vault: VaultLike | null): Promise<void> {
     this.vault = vault;
+    this.mismatchPrint = undefined;
     this.settledFor = undefined;
     this.lastFailure = undefined;
     this.retryAt = 0;
@@ -311,6 +427,24 @@ export class SecretScrubber {
     this.released = false;
     this.refusalLogged = false;
     return this.refresh();
+  }
+
+  /**
+   * The daemon before this one held sends for secrets its vault key didn't
+   * decrypt (engram#694), and `found` is what its last complete read found.
+   * They wait still, as if this one had held them: no bound releases them,
+   * until a complete read finds none it can't scrub. One that finds a
+   * secret it can't scrub goes on holding, though the key decrypts others,
+   * as saving them again one at a time does. Call before start().
+   */
+  continueMismatchHold(found: { secrets: number; unscrubbed: number; decrypted: number }): void {
+    this.mismatch = new VaultKeyMismatch(Math.max(1, found.secrets), Math.max(0, found.decrypted));
+    this.undecryptable = this.mismatch.secrets;
+    this.unscrubbed = Math.max(1, found.unscrubbed);
+    this.log(
+      "vault scrubber: the daemon before held sends for secrets its vault key didn't decrypt — " +
+        "holding them still, until a read of the vault finds none that can't be scrubbed",
+    );
   }
 
   /** Read now and on an interval: the key too, on the interval. */
@@ -339,9 +473,15 @@ export class SecretScrubber {
     // flight finds the scrubber stopped and keeps nothing.
     this.values.clear();
     this.keyForms = [];
+    this.own = new Map();
     this.settledFor = undefined;
     this.serverFailingSince = 0;
     this.released = false;
+    this.mismatch = undefined;
+    this.mismatchPrint = undefined;
+    this.fullReadAt = 0;
+    this.undecryptable = 0;
+    this.unscrubbed = 0;
   }
 
   /**
@@ -466,9 +606,11 @@ export class SecretScrubber {
     const first = this.vaultKey === undefined;
     this.useKey(key);
     // Lifted, and at once the read through `vault` starts: ready() waits
-    // for that read, as after any new client.
+    // for that read, as after any new client. The same account's vault: a
+    // hold for a key that doesn't match it stays until that read is done,
+    // and a value read with the key before is its value still (engram#694).
     this.liftKeyHold();
-    const done = this.reconnect(vault);
+    const done = this.readThrough(vault);
     this.log(
       held
         ? first
@@ -539,10 +681,15 @@ export class SecretScrubber {
     }
   }
 
-  /** The server has failed the read for MAX_SERVER_HOLD_MS. */
+  /**
+   * The server has failed the read for MAX_SERVER_HOLD_MS, and sends don't
+   * wait for secrets the key doesn't decrypt (engram#694): sending then
+   * would send what can't be scrubbed.
+   */
   private pastBound(): boolean {
     return (
       !this.stopped &&
+      this.mismatch === undefined &&
       this.serverFailingSince !== 0 &&
       Date.now() - this.serverFailingSince >= MAX_SERVER_HOLD_MS
     );
@@ -564,17 +711,28 @@ export class SecretScrubber {
     // The failure that leaves this read short of the vault, if any.
     let short: { err: unknown; failure: "network" | "server" } | null = null;
     let refused: unknown = undefined;
+    // What the read finds of the key against the vault (engram#694): the
+    // secrets it decrypts, those it doesn't, and of those, the ones with no
+    // value known from before. Counted only when each secret got an answer.
+    let decrypted = 0;
     let undecryptable = 0;
+    let unknown = 0;
+    let counted = true;
+    const own = new Map<string, string | undefined>();
+    let print: string | undefined;
 
     if (vault) {
-      let entries: Array<{ name: string }> = [];
+      let entries: Array<{ name: string; updatedAt?: string }> = [];
+      let listed = false;
       try {
         entries = await vault.list();
+        listed = true;
       } catch (err) {
         const failure = failureOf(err);
         if (failure === "refused") {
           refused = err;
         } else {
+          counted = false;
           this.log(
             `vault scrubber: reading the vault failed, keeping the ${this.values.size} secret(s) ` +
               `already known (${errorText(err)})`,
@@ -584,19 +742,40 @@ export class SecretScrubber {
         }
         // Nothing was read: every secret already known stays in force.
         for (const [name, value] of this.values) next.set(name, value);
+        for (const [name, saved] of this.own) own.set(name, saved);
+      }
+
+      if (listed) {
+        print = fingerprint(entries);
+        if (
+          this.mismatch !== undefined &&
+          print === this.mismatchPrint &&
+          Date.now() - this.fullReadAt < MISMATCH_REREAD_MS
+        ) {
+          // Nothing listed has changed since the read that held sends: each
+          // would read as it did then.
+          if (this.stopped || vault !== this.vault) return;
+          this.serverFailingSince = 0;
+          this.mismatchRetry();
+          return;
+        }
       }
 
       // After a request that got no answer, the rest would only wait out the
       // same timeout.
       let unreachable: { err: unknown } | null = null;
-      for (const { name } of entries) {
+      for (const { name, updatedAt } of entries) {
         let err: unknown;
         if (unreachable) {
           err = unreachable.err;
         } else {
           try {
             const value = await vault.get(name);
-            if (value && value.length >= MIN_SCRUB_LENGTH) next.set(name, value);
+            // Deleted since it was listed: nothing to scrub, nor to count.
+            if (typeof value !== "string") continue;
+            decrypted++;
+            own.set(name, updatedAt);
+            if (value.length >= MIN_SCRUB_LENGTH) next.set(name, value);
             continue;
           } catch (e) {
             err = e;
@@ -606,6 +785,7 @@ export class SecretScrubber {
         // already known for it (engram#588).
         const previous = this.values.get(name);
         if (previous !== undefined) next.set(name, previous);
+        if (this.own.has(name)) own.set(name, this.own.get(name));
         const failure = failureOf(err);
         if (failure === "refused") {
           refused ??= err;
@@ -613,8 +793,12 @@ export class SecretScrubber {
         }
         if (failure === "local") {
           undecryptable++;
+          // Its value is known still if it decrypted before, through this
+          // account, and hasn't been saved again since.
+          if (!(this.own.has(name) && this.own.get(name) === updatedAt)) unknown++;
           continue;
         }
+        counted = false;
         if (failure === "network") unreachable = { err };
         if (!(rereading && previous !== undefined) && (short === null || failure === "network")) {
           short = { err, failure };
@@ -630,22 +814,30 @@ export class SecretScrubber {
 
     const before = this.values.size;
     this.values = next;
+    this.own = own;
     if (next.size !== before) {
       this.log(`vault scrubber: protecting ${next.size} secret(s)`);
-    }
-    if (undecryptable !== this.undecryptable) {
-      this.undecryptable = undecryptable;
-      if (undecryptable > 0) {
-        this.log(
-          `vault scrubber: ${undecryptable} secret(s) don't decrypt with this vault key, ` +
-            `so they can't be scrubbed`,
-        );
-      }
     }
 
     if (short) {
       this.fellShort(vault, short.err, short.failure);
       return;
+    }
+
+    // Only a read in which each secret got an answer says what the key
+    // decrypts: a hold for it starts, or ends, only on one (engram#694).
+    if (counted) {
+      // Once sends wait, they wait until none is left that can't be
+      // scrubbed: saved again one at a time, the first that decrypts
+      // mustn't send what waits with the others in it.
+      const hold = unknown > 0 && (decrypted === 0 || this.mismatch !== undefined);
+      this.tell({ secrets: undecryptable, unscrubbed: unknown, decrypted, held: hold });
+      if (hold) {
+        this.holdForMismatch(new VaultKeyMismatch(undecryptable, decrypted), unknown, print);
+        return;
+      }
+      if (this.mismatch !== undefined) this.liftMismatch(decrypted, undecryptable, refused);
+      this.sayUndecryptable(undecryptable, unknown);
     }
 
     this.settledFor = vault;
@@ -660,6 +852,94 @@ export class SecretScrubber {
         `vault scrubber: this API key can't read the vault — scrubbing only the ${next.size} ` +
           `secret(s) already known (${errorText(refused)})`,
       );
+    }
+  }
+
+  /**
+   * Sends wait for secrets the key doesn't decrypt, with no value known
+   * from before (engram#694): no bound releases them. Said when it starts,
+   * and again when the count changes, or the vault read with a new key
+   * finds the same. The vault is listed again on MISMATCH_RETRY_MS.
+   */
+  private holdForMismatch(mismatch: VaultKeyMismatch, unknown: number, print: string | undefined): void {
+    const was = this.mismatch;
+    // Each secret read again, as after a new key.
+    const recheck = this.mismatchPrint === undefined;
+    this.mismatch = mismatch;
+    this.mismatchPrint = print;
+    this.fullReadAt = Date.now();
+    this.settledFor = undefined;
+    this.lastFailure = undefined;
+    this.serverFailingSince = 0;
+    this.released = false;
+    if (was === undefined) this.retryStep = 0;
+    this.mismatchRetry();
+    this.undecryptable = mismatch.secrets;
+    this.unscrubbed = unknown;
+    if (was === undefined) {
+      const one = mismatch.secrets === 1;
+      this.log(
+        `vault scrubber: holding sends — ${mismatch.message}, so ${one ? "it" : "they"} can't ` +
+          `${unknown < mismatch.secrets ? "all " : ""}be scrubbed. Capture goes on, and what it ` +
+          `captures is sent once ${one ? "the secret decrypts, or is" : "the secrets decrypt, or are"} ` +
+          "deleted. See 'engram status'.",
+      );
+    } else if (was.secrets !== mismatch.secrets || recheck) {
+      this.log(`vault scrubber: still holding sends — ${mismatch.message}`);
+    }
+  }
+
+  /** The next read while sends wait for secrets the key doesn't decrypt. */
+  private mismatchRetry(): void {
+    this.retryAt = Date.now() + MISMATCH_RETRY_MS[Math.min(this.retryStep, MISMATCH_RETRY_MS.length - 1)];
+    this.retryStep++;
+  }
+
+  /**
+   * A complete read finds none it can't scrub (engram#694): what waits goes.
+   * Those the key doesn't decrypt, if any, have a value known from before.
+   */
+  private liftMismatch(decrypted: number, undecryptable: number, refused: unknown): void {
+    this.mismatch = undefined;
+    this.mismatchPrint = undefined;
+    const why =
+      undecryptable === 0 && decrypted > 0
+        ? "the vault key decrypts the vault's secrets now"
+        : undecryptable === 0 && refused !== undefined
+          ? "this API key can't read the vault now"
+          : "the vault holds no secret now that can't be scrubbed";
+    this.log(`vault scrubber: ${why} — sending what was held`);
+  }
+
+  /**
+   * Say what a complete read finds of the secrets the key doesn't decrypt,
+   * when that changes: those with no value known from before go out as
+   * they are; the rest are scrubbed with the value read before, until a
+   * restart (engram#694).
+   */
+  private sayUndecryptable(undecryptable: number, unknown: number): void {
+    if (undecryptable === this.undecryptable && unknown === this.unscrubbed) return;
+    this.undecryptable = undecryptable;
+    this.unscrubbed = unknown;
+    if (unknown > 0) {
+      this.log(
+        `vault scrubber: ${unknown} secret(s) don't decrypt with this vault key, ` +
+          `so they can't be scrubbed`,
+      );
+    } else if (undecryptable > 0) {
+      this.log(
+        `vault scrubber: ${undecryptable} secret(s) don't decrypt with this vault key — scrubbing ` +
+          "them with the value read before, which a restart won't have",
+      );
+    }
+  }
+
+  /** Tell the daemon's status what a read found (engram#694). */
+  private tell(found: Undecryptable): void {
+    try {
+      this.report?.(found);
+    } catch {
+      // A status that can't be written changes nothing here.
     }
   }
 }

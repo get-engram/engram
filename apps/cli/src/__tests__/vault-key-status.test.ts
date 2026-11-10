@@ -377,4 +377,245 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("engram status, w
     await daemonStatus();
     expect(vaultLines()).toEqual([]);
   });
+
+  /** engram#694: the daemon's status.json, holding sends for a key that decrypts none of the vault's secrets. */
+  const mismatched = (extra: Record<string, unknown> = {}) =>
+    writeFileSync(
+      STATUS_FILE,
+      JSON.stringify({
+        health: "error",
+        error_type: "vault_mismatch",
+        last_error:
+          "holding messages until the vault's secrets can be scrubbed: the vault key doesn't decrypt any of the vault's 2 secrets",
+        last_error_at: SINCE,
+        pending_messages: 2,
+        consecutive_failures: 3,
+        vault_key: "file",
+        vault_undecryptable: { secrets: 2, unscrubbed: 2, decrypted: 0, held: true },
+        ...extra,
+      }),
+    );
+  /** What `engram status` says of a hold for two secrets it can't remove, after the headline. */
+  const HELD_FOR_TWO = [
+    "  They were saved with another key, so the daemon can't remove them from",
+    "  what it captures. Meanwhile, messages wait here rather than be sent with your",
+    "  vault's secrets in them. Nothing is lost. To send what waits, do one of these:",
+    "    Put the key they were saved with in ~/.engram/vault-key.",
+    "    Save each again with this key: engram vault set <NAME>",
+    "    Delete each you no longer use: engram vault delete <NAME>",
+    "  'engram vault list' lists them. Then the daemon sends what it held within",
+    "  5 minutes.",
+  ];
+  const MISMATCH = "  WARNING: Your vault key doesn't decrypt any of your vault's 2 secrets.";
+  /** What `engram status` says of a key that decrypts some of the vault's secrets. */
+  const PARTIAL = /^ {2}WARNING: \d+ secrets? in your vault (?:doesn't|don't) decrypt/;
+
+  it("running, holding sends for a key that decrypts none of the vault's secrets: why, what waits, the fixes (engram#694)", async () => {
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    mismatched();
+    daemonRunning();
+    await daemonStatus();
+    expect(block(MISMATCH)).toEqual([MISMATCH, ...HELD_FOR_TWO, "  2 messages waiting to sync", `  Last error: ${SINCE}`]);
+    // Said once: not the summary as well, nor the raw error, nor that some don't decrypt.
+    expect(out.filter((l) => l.includes("WARNING"))).toEqual([MISMATCH]);
+    expect(out.join("\n")).not.toContain("holding messages until");
+    expect(out.filter((l) => PARTIAL.test(l))).toEqual([]);
+    expect(out.join("\n")).not.toContain(VAULT_KEY);
+  });
+
+  it("holding sends, the daemon's key from ENGRAM_VAULT_KEY and one secret: set it again and restart from that shell (engram#694)", async () => {
+    mismatched({
+      vault_key: "env",
+      vault_undecryptable: { secrets: 1, unscrubbed: 1, decrypted: 0, held: true },
+      pending_messages: 1,
+    });
+    daemonRunning();
+    await daemonStatus();
+    expect(block("  WARNING: Your vault key doesn't decrypt your vault's secret.")).toEqual([
+      "  WARNING: Your vault key doesn't decrypt your vault's secret.",
+      "  It was saved with another key, so the daemon can't remove it from",
+      "  what it captures. Meanwhile, messages wait here rather than be sent with your",
+      "  vault's secrets in them. Nothing is lost. To send what waits, do one of these:",
+      "    Set ENGRAM_VAULT_KEY to the key it was saved with, then run",
+      "    'engram stop' and 'engram start' from that shell.",
+      "    Save it again with this key: engram vault set <NAME>",
+      "    Delete it, if you no longer use it: engram vault delete <NAME>",
+      "  'engram vault list' lists it. Then the daemon sends what it held within",
+      "  5 minutes.",
+      "  1 message waiting to sync",
+      `  Last error: ${SINCE}`,
+    ]);
+  });
+
+  it("holding sends since it decrypted none, some decrypting now: how many still don't, and the fixes but their key (engram#694)", async () => {
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    mismatched({
+      last_error:
+        "holding messages until the vault's secrets can be scrubbed: the vault key doesn't decrypt 2 of the vault's 3 secrets",
+      vault_undecryptable: { secrets: 2, unscrubbed: 2, decrypted: 1, held: true },
+    });
+    daemonRunning();
+    await daemonStatus();
+    const first = "  WARNING: 2 of your vault's 3 secrets don't decrypt with your vault key.";
+    expect(block(first)).toEqual([
+      first,
+      "  They were saved with another key, so the daemon can't remove them from",
+      "  what it captures. Meanwhile, messages wait here rather than be sent with your",
+      "  vault's secrets in them. Nothing is lost. To send what waits, do one of these:",
+      "    Save each again with this key: engram vault set <NAME>",
+      "    Delete each you no longer use: engram vault delete <NAME>",
+      "  'engram vault list --check' shows which. Then the daemon sends what it held",
+      "  within 5 minutes.",
+      "  2 messages waiting to sync",
+      `  Last error: ${SINCE}`,
+    ]);
+    // Not the key they were saved with: the one that decrypts now wouldn't
+    // with it. Nor that sending goes on.
+    expect(out.join("\n")).not.toContain("Put the key");
+    expect(out.filter((l) => PARTIAL.test(l))).toEqual([]);
+    expect(out.filter((l) => l.includes("WARNING"))).toEqual([first]);
+    // One of three, the daemon's key from ENGRAM_VAULT_KEY: not to set it again either.
+    out = [];
+    mismatched({
+      vault_key: "env",
+      vault_undecryptable: { secrets: 1, unscrubbed: 1, decrypted: 2, held: true },
+      pending_messages: 1,
+    });
+    await daemonStatus();
+    const one = "  WARNING: 1 of your vault's 3 secrets doesn't decrypt with your vault key.";
+    expect(block(one)).toEqual([
+      one,
+      "  It was saved with another key, so the daemon can't remove it from",
+      "  what it captures. Meanwhile, messages wait here rather than be sent with your",
+      "  vault's secrets in them. Nothing is lost. To send what waits, do one of these:",
+      "    Save it again with this key: engram vault set <NAME>",
+      "    Delete it, if you no longer use it: engram vault delete <NAME>",
+      "  'engram vault list --check' shows which. Then the daemon sends what it held",
+      "  within 5 minutes.",
+      "  1 message waiting to sync",
+      `  Last error: ${SINCE}`,
+    ]);
+    expect(out.join("\n")).not.toContain("Set ENGRAM_VAULT_KEY");
+  });
+
+  it("holding sends with nothing waiting yet: said, since what it captures next waits (engram#694)", async () => {
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    // As a daemon just started writes it, holding still what the one
+    // before held: nothing has gone, or failed, yet. The last error is
+    // another's, from before.
+    sending("file", {
+      last_error_at: SINCE,
+      vault_undecryptable: { secrets: 2, unscrubbed: 2, decrypted: 0, held: true },
+    });
+    daemonRunning();
+    await daemonStatus();
+    expect(block(MISMATCH)).toEqual([MISMATCH, ...HELD_FOR_TWO]);
+    expect(out).toContain(`Last sync:        ${SINCE}`);
+    expect(out.filter((l) => l.includes("WARNING"))).toEqual([MISMATCH]);
+    expect(out.join("\n")).not.toContain("waiting to sync");
+    expect(out.join("\n")).not.toContain("Last error");
+  });
+
+  it("holding sends with no count recorded: said without one (engram#694)", async () => {
+    mismatched({ vault_undecryptable: null, pending_messages: 0, last_error_at: null });
+    daemonRunning();
+    await daemonStatus();
+    const first = "  WARNING: Your vault key doesn't decrypt any of your vault's secrets.";
+    expect(block(first).slice(0, 2)).toEqual([
+      first,
+      "  They were saved with another key, so the daemon can't remove them from",
+    ]);
+    expect(out.join("\n")).not.toContain("waiting to sync");
+    expect(out.join("\n")).not.toContain("Last error");
+  });
+
+  it("signed out, or stopped: nothing is said of the key's secrets (engram#694)", async () => {
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    mismatched({ signed_out_at: SINCE });
+    daemonRunning();
+    await daemonStatus();
+    expect(out).toContain("  Signed out — capture is paused and nothing is sent.");
+    expect(vaultLines()).toEqual([]);
+    out = [];
+    daemon.answering = null;
+    mismatched();
+    await daemonStatus();
+    expect(vaultLines()).toEqual([]);
+    out = [];
+    sending("file", { vault_undecryptable: { secrets: 2, unscrubbed: 2, decrypted: 1, held: false } });
+    await daemonStatus();
+    expect(vaultLines()).toEqual([]);
+    out = [];
+    sending("file", { vault_undecryptable: { secrets: 2, unscrubbed: 2, decrypted: 0, held: true } });
+    await daemonStatus();
+    expect(vaultLines()).toEqual([]);
+  });
+
+  const FIX = [
+    "  Save each again with this key (engram vault set <NAME>), or delete each you",
+    "  no longer use (engram vault delete <NAME>). 'engram vault list --check'",
+    "  shows which don't decrypt.",
+  ];
+
+  it("sending, with a key that decrypts some of the vault's secrets: how many it can't remove, and the fix (engram#694)", async () => {
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    sending("file", { vault_undecryptable: { secrets: 2, unscrubbed: 2, decrypted: 1, held: false } });
+    daemonRunning();
+    await daemonStatus();
+    const first = "  WARNING: 2 secrets in your vault don't decrypt with your vault key.";
+    expect(block(first)).toEqual([
+      first,
+      "  They were saved with another key, so the daemon can't remove them from",
+      "  what it captures before sending it.",
+      ...FIX,
+    ]);
+    expect(out).toContain(`Last sync:        ${SINCE}`);
+    // Not putting their key back: the others don't decrypt with it.
+    expect(out.join("\n")).not.toContain("Put the key");
+    expect(out.join("\n")).not.toContain("messages wait here");
+  });
+
+  it("sending, with values for them read before: removed until it restarts (engram#694)", async () => {
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    sending("file", { vault_undecryptable: { secrets: 1, unscrubbed: 0, decrypted: 1, held: false } });
+    daemonRunning();
+    await daemonStatus();
+    const first = "  WARNING: 1 secret in your vault doesn't decrypt with your vault key.";
+    expect(block(first)).toEqual([
+      first,
+      "  It was saved with another key. The daemon still removes it from what",
+      "  it captures, with what it read before, but can't once it restarts.",
+      "  Save it again with this key (engram vault set <NAME>), or delete it if you",
+      "  no longer use it (engram vault delete <NAME>). 'engram vault list --check'",
+      "  shows which don't decrypt.",
+    ]);
+    out = [];
+    sending("file", { vault_undecryptable: { secrets: 3, unscrubbed: 1, decrypted: 1, held: false } });
+    await daemonStatus();
+    const three = "  WARNING: 3 secrets in your vault don't decrypt with your vault key.";
+    expect(block(three)).toEqual([
+      three,
+      "  They were saved with another key. The daemon can't remove 1 of them from",
+      "  what it captures before sending it, and the others only until it restarts.",
+      ...FIX,
+    ]);
+  });
+
+  it("failing for another reason, with a key that decrypts some: both are said (engram#694)", async () => {
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    sending("file", {
+      health: "warning",
+      error_type: "network",
+      last_error: "fetch failed",
+      last_error_at: SINCE,
+      pending_messages: 4,
+      vault_undecryptable: { secrets: 2, unscrubbed: 2, decrypted: 1, held: false },
+    });
+    daemonRunning();
+    await daemonStatus();
+    expect(out.filter((l) => l.includes("WARNING"))).toEqual([
+      "  WARNING: 2 secrets in your vault don't decrypt with your vault key.",
+      "  WARNING: Can't reach Engram — messages queued, will retry.",
+    ]);
+  });
 });

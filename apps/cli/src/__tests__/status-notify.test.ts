@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -26,9 +26,15 @@ vi.mock("node:child_process", async (importOriginal) => ({
 home.dir = mkdtempSync(join(tmpdir(), "engram-581-"));
 mkdirSync(join(home.dir, ".engram"));
 
-const { recordFailure, recordSuccess, notifyCommand, notifyDesktopBeforeExit, TOAST_STATEMENTS } = await import(
-  "../daemon/status.js"
-);
+const {
+  heldVaultMismatch,
+  recordFailure,
+  recordSuccess,
+  recordVaultUndecryptable,
+  notifyCommand,
+  notifyDesktopBeforeExit,
+  TOAST_STATEMENTS,
+} = await import("../daemon/status.js");
 
 const realPlatform = process.platform;
 function onPlatform(platform: NodeJS.Platform) {
@@ -127,6 +133,36 @@ describe("desktop notifications (engram#581)", () => {
     onPlatform("freebsd");
     expect(() => recordFailure("401", "auth", 1)).not.toThrow();
     expect(execFile).not.toHaveBeenCalled();
+  });
+
+  it("says sends wait on secrets the vault key doesn't decrypt, as an error from the first (engram#694)", () => {
+    onPlatform("linux");
+    recordFailure(
+      "holding messages until the vault's secrets can be scrubbed: the vault key doesn't decrypt any of the vault's 2 secrets",
+      "vault_mismatch",
+      3,
+    );
+    expect(execFile).toHaveBeenCalledTimes(1);
+    // True of none decrypting, and of some, once sends wait for the rest.
+    expect(execFile.mock.calls[0].slice(0, 2)).toEqual([
+      "notify-send",
+      [
+        "Engram needs attention",
+        "Your vault holds secrets your vault key doesn't decrypt, so messages wait here rather " +
+          "than be sent with those secrets in them. Nothing is lost.",
+      ],
+    ]);
+    // Something for the user to fix: it doesn't clear on its own.
+    const status = JSON.parse(readFileSync(join(home.dir, ".engram", "status.json"), "utf-8"));
+    expect(status).toMatchObject({
+      health: "error",
+      error_type: "vault_mismatch",
+      consecutive_failures: 1,
+      pending_messages: 3,
+    });
+    // Once while it lasts, however many sends wait on it.
+    recordFailure("holding messages until the vault's secrets can be scrubbed: …", "vault_mismatch", 4);
+    expect(execFile).toHaveBeenCalledTimes(1);
   });
 
   it("notifies once per error type until a sync succeeds", () => {
@@ -276,5 +312,92 @@ describe("a notification from a daemon about to exit (engram#659)", () => {
       throw new Error("spawn EAGAIN");
     });
     expect(await settled(notifyDesktopBeforeExit("t", "b"))).toBe(true);
+  });
+});
+
+describe("what the vault's last read found the key can't decrypt (engram#694)", () => {
+  const file = join(home.dir, ".engram", "status.json");
+  const written = () => JSON.parse(readFileSync(file, "utf-8"));
+
+  afterEach(() => recordVaultUndecryptable(null));
+
+  it("is written when it changes, and only then", () => {
+    recordVaultUndecryptable({ secrets: 2, unscrubbed: 1, decrypted: 1, held: false });
+    expect(written().vault_undecryptable).toEqual({ secrets: 2, unscrubbed: 1, decrypted: 1, held: false });
+    rmSync(file);
+    recordVaultUndecryptable({ secrets: 2, unscrubbed: 1, decrypted: 1, held: false });
+    expect(existsSync(file)).toBe(false);
+    recordVaultUndecryptable({ secrets: 2, unscrubbed: 0, decrypted: 1, held: false });
+    expect(written().vault_undecryptable).toEqual({ secrets: 2, unscrubbed: 0, decrypted: 1, held: false });
+    rmSync(file);
+    recordVaultUndecryptable({ secrets: 3, unscrubbed: 0, decrypted: 1, held: false });
+    expect(written().vault_undecryptable).toEqual({ secrets: 3, unscrubbed: 0, decrypted: 1, held: false });
+    // How many decrypt, and whether sends wait, change it too.
+    rmSync(file);
+    recordVaultUndecryptable({ secrets: 3, unscrubbed: 0, decrypted: 2, held: false });
+    expect(written().vault_undecryptable).toEqual({ secrets: 3, unscrubbed: 0, decrypted: 2, held: false });
+    rmSync(file);
+    recordVaultUndecryptable({ secrets: 3, unscrubbed: 1, decrypted: 2, held: true });
+    expect(written().vault_undecryptable).toEqual({ secrets: 3, unscrubbed: 1, decrypted: 2, held: true });
+    rmSync(file);
+    recordVaultUndecryptable({ secrets: 3, unscrubbed: 1, decrypted: 2, held: false });
+    expect(written().vault_undecryptable).toEqual({ secrets: 3, unscrubbed: 1, decrypted: 2, held: false });
+  });
+
+  it("is null when each secret decrypts, and isn't written again for that", () => {
+    recordVaultUndecryptable({ secrets: 1, unscrubbed: 1, decrypted: 0, held: true });
+    recordVaultUndecryptable({ secrets: 0, unscrubbed: 0, decrypted: 1, held: false });
+    expect(written().vault_undecryptable).toBeNull();
+    rmSync(file);
+    recordVaultUndecryptable(null);
+    recordVaultUndecryptable({ secrets: 0, unscrubbed: 0, decrypted: 0, held: false });
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it("outlasts sends that go and fail: a key that decrypts some doesn't hold them", () => {
+    recordVaultUndecryptable({ secrets: 1, unscrubbed: 1, decrypted: 1, held: false });
+    recordSuccess(0);
+    recordFailure("fetch failed", "network", 1);
+    expect(written()).toMatchObject({
+      error_type: "network",
+      vault_undecryptable: { secrets: 1, unscrubbed: 1, decrypted: 1, held: false },
+    });
+  });
+
+  it("outlasts the daemon: one started next reads what it held, before writing (engram#694)", () => {
+    recordVaultUndecryptable({ secrets: 2, unscrubbed: 1, decrypted: 3, held: true });
+    // Sends going, failing and succeeding change nothing of it.
+    recordFailure("holding messages until the vault's secrets can be scrubbed: …", "vault_mismatch", 2);
+    recordSuccess(0);
+    expect(heldVaultMismatch()).toEqual({ secrets: 2, unscrubbed: 1, decrypted: 3 });
+    // Nothing held: nothing to go on holding.
+    recordVaultUndecryptable({ secrets: 2, unscrubbed: 1, decrypted: 3, held: false });
+    expect(heldVaultMismatch()).toBeNull();
+    recordVaultUndecryptable(null);
+    expect(heldVaultMismatch()).toBeNull();
+    rmSync(file);
+    expect(heldVaultMismatch()).toBeNull();
+  });
+
+  it("goes on holding on what status.json says plainly, and only that (engram#694)", () => {
+    const wrote = (found: unknown) => writeFileSync(file, JSON.stringify({ health: "error", vault_undecryptable: found }));
+    // Without `held`, nothing says sends waited.
+    wrote({ secrets: 2, unscrubbed: 2 });
+    expect(heldVaultMismatch()).toBeNull();
+    for (const held of ["true", 1, null, false]) {
+      wrote({ secrets: 2, unscrubbed: 2, decrypted: 0, held });
+      expect(heldVaultMismatch()).toBeNull();
+    }
+    wrote("held");
+    expect(heldVaultMismatch()).toBeNull();
+    // Held: at least one couldn't be scrubbed, whatever the counts say.
+    wrote({ held: true });
+    expect(heldVaultMismatch()).toEqual({ secrets: 1, unscrubbed: 1, decrypted: 0 });
+    wrote({ secrets: -1, unscrubbed: "2", decrypted: 1.5, held: true });
+    expect(heldVaultMismatch()).toEqual({ secrets: 1, unscrubbed: 1, decrypted: 0 });
+    wrote({ secrets: 1, unscrubbed: 3, decrypted: 2, held: true });
+    expect(heldVaultMismatch()).toEqual({ secrets: 3, unscrubbed: 3, decrypted: 2 });
+    writeFileSync(file, "{ not json");
+    expect(heldVaultMismatch()).toBeNull();
   });
 });

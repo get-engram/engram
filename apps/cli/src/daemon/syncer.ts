@@ -20,7 +20,7 @@ import { queueing } from "./queue-error.js";
 import { plural } from "../output.js";
 import { isDefaultServer, normalizeServer, sameServer } from "../server-url.js";
 import type { SecretScrubber } from "./scrubber.js";
-import { VaultKeyUnreadable } from "../vault-key.js";
+import { VaultKeyMismatch, VaultKeyUnreadable } from "../vault-key.js";
 import type { ParsedMessage, SessionMeta, PendingRow } from "./types.js";
 
 // Claude Code transcript messages can be enormous (tool output dumps), and
@@ -415,8 +415,12 @@ export class Syncer {
   /** Rows orphaned by a pre-#370 daemon are adopted once per process. */
   private orphansAdopted = false;
 
-  /** Sends are waiting for the vault to be read (engram#588). */
-  private vaultHeld = false;
+  /**
+   * Sends are waiting for the vault (engram#588), and why, as last said: the
+   * key can't be read (engram#677), it decrypts none of the vault's secrets
+   * (engram#694), or the vault isn't read yet. A new why is said too.
+   */
+  private vaultHeld: "key" | "mismatch" | "read" | null = null;
 
   /** Per-conversation reduced batch size after a failed send (halves down to
    *  1 so even a single pathological message eventually goes alone; restored
@@ -664,7 +668,7 @@ export class Syncer {
     // Another key's permissions are its own.
     this.deletesRefused = false;
     this.batchOverride.clear();
-    this.vaultHeld = false;
+    this.vaultHeld = null;
     this.ownership = freshOwnership();
     this.gateLogged = false;
     // What was queued while no key was in use goes to the next key.
@@ -1490,7 +1494,7 @@ export class Syncer {
     if (this.active !== run) return false;
     if (ready) {
       if (this.vaultHeld) {
-        this.vaultHeld = false;
+        this.vaultHeld = null;
         console.log("[engram] vault read — sending the messages held for it");
       }
       return true;
@@ -1505,8 +1509,8 @@ export class Syncer {
     // user to fix, unlike the waits below: an error, in status.json and on
     // the desktop.
     if (err instanceof VaultKeyUnreadable) {
-      if (!this.vaultHeld) {
-        this.vaultHeld = true;
+      if (this.vaultHeld !== "key") {
+        this.vaultHeld = "key";
         console.error(
           `[engram] holding queued messages until the vault key can be read, so a vault ` +
             `secret in them can't be sent unredacted: ${err.message}`,
@@ -1515,6 +1519,25 @@ export class Syncer {
       recordFailure(
         `holding messages until the vault key can be read: ${err.message}`,
         "vault_key",
+        this.pendingCount(),
+      );
+      return;
+    }
+
+    // The key reads, but the vault holds secrets it doesn't decrypt
+    // (engram#694): they can't be scrubbed, and they would go out as they
+    // are. As above, the user's to fix, and nothing passes meanwhile.
+    if (err instanceof VaultKeyMismatch) {
+      if (this.vaultHeld !== "mismatch") {
+        this.vaultHeld = "mismatch";
+        console.error(
+          `[engram] holding queued messages until each of the vault's secrets decrypts, or is ` +
+            `deleted, so none of them is sent unredacted: ${err.message}`,
+        );
+      }
+      recordFailure(
+        `holding messages until the vault's secrets can be scrubbed: ${err.message}`,
+        "vault_mismatch",
         this.pendingCount(),
       );
       return;
@@ -1536,8 +1559,8 @@ export class Syncer {
       return;
     }
 
-    if (!this.vaultHeld) {
-      this.vaultHeld = true;
+    if (this.vaultHeld !== "read") {
+      this.vaultHeld = "read";
       console.error(
         `[engram] holding queued messages until the vault is read, so a secret in them ` +
           `can't be sent unredacted: ${reason}`,

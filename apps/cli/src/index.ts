@@ -192,6 +192,7 @@ ${bold("COMMANDS")}
   ${bold("vault set")} <name> [value] Store a named secret ${dim("(encrypted client-side)")}
   ${bold("vault get")} <name>         Retrieve a named secret ${dim("(decrypted locally)")}
   ${bold("vault list")}               List secret names ${dim("(never shows values)")}
+  ${bold("vault list --check")}       Also say which don't decrypt with your vault key
   ${bold("vault delete")} <name>      Delete a named secret permanently
 
   ${bold("exclude add")} [path]       Never capture sessions in a directory ${dim("(default: cwd)")}
@@ -239,7 +240,8 @@ ${dim(`v${VERSION} — https://getengram.app`)}
  *
  * Only the states a human must act on are surfaced: transcripts that can't
  * be queued on this machine (a full disk, engram#584), a rejected key, a
- * full memory, a vault key that can't be read (engram#677). Transient
+ * full memory, a vault key that can't be read (engram#677), or that
+ * decrypts none of the vault's secrets (engram#694). Transient
  * trouble (network, rate limits, 5xx) resolves itself and would just be
  * noise on every command.
  */
@@ -253,7 +255,21 @@ async function printSyncBanner(): Promise<void> {
       console.error(dim("  (run 'engram status' for details)"));
       console.error("");
     }
-    if (s.error_type !== "storage_full" && s.error_type !== "auth" && s.error_type !== "vault_key") return;
+    if (
+      s.error_type !== "storage_full" &&
+      s.error_type !== "auth" &&
+      s.error_type !== "vault_key" &&
+      s.error_type !== "vault_mismatch"
+    ) {
+      return;
+    }
+    if (s.error_type === "vault_mismatch") {
+      // A key file that reads proves nothing here: it is the key that
+      // doesn't match (engram#694). One that is gone, with no daemon
+      // running: the next starts without a key, and sends what was held.
+      const key = await vaultKeyFileState();
+      if (key === "none" && !daemonRuns()) return;
+    }
     if (s.error_type === "vault_key") {
       // A vault key that reads fine now: the daemon reads it again within a
       // minute, and sends what it held. One that is gone holds them only in

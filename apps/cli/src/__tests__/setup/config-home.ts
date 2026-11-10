@@ -17,3 +17,8 @@ afterAll(() => rmSync(dir, { recursive: true, force: true }));
 // when ~/.engram/vault-key doesn't hold it (engram#690), and starts the
 // daemon another way. A test that needs one sets its own.
 delete process.env.ENGRAM_VAULT_KEY;
+
+// Nor its API key, nor its server (engram#694): no test reaches a real
+// server with the shell's key. A test that needs one sets its own.
+delete process.env.ENGRAM_API_KEY;
+delete process.env.ENGRAM_BASE_URL;

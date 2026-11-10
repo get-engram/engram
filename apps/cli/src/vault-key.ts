@@ -49,6 +49,32 @@ export class VaultKeyUnreadable extends Error {
   }
 }
 
+/**
+ * The vault key reads, but decrypts none of the vault's secrets
+ * (engram#694): they were saved with another key. The daemon can't scrub
+ * them from what it captures, so it holds sends until they decrypt or are
+ * deleted. `secrets`: how many don't decrypt. Never a name, nor a value.
+ */
+export class VaultKeyMismatch extends Error {
+  /** The secrets it doesn't decrypt. */
+  readonly secrets: number;
+  /** The secrets it does: some, once sends wait already (engram#694). */
+  readonly decrypted: number;
+
+  constructor(secrets: number, decrypted = 0) {
+    super(
+      decrypted > 0
+        ? `the vault key doesn't decrypt ${secrets} of the vault's ${secrets + decrypted} secrets`
+        : secrets === 1
+          ? "the vault key doesn't decrypt the vault's secret"
+          : `the vault key doesn't decrypt any of the vault's ${secrets} secrets`,
+    );
+    this.name = "VaultKeyMismatch";
+    this.secrets = secrets;
+    this.decrypted = decrypted;
+  }
+}
+
 function readFailure(err: unknown): VaultKeyUnreadable {
   const code = (err as NodeJS.ErrnoException | null)?.code;
   const kind: VaultKeyProblem =

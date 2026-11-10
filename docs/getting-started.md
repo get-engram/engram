@@ -31,20 +31,29 @@ That adds Engram to all your projects. For a per-project `.mcp.json`, see the [C
 
 **Claude Desktop:**
 
-Add to your `claude_desktop_config.json`:
+Claude Desktop's config file only runs local servers, so connect through [mcp-remote](https://github.com/geelen/mcp-remote) (needs Node.js 18 or later). Add to your `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "engram": {
-      "url": "https://mcp.getengram.app/mcp",
-      "headers": {
-        "Authorization": "Bearer engram_sk_live_your_api_key_here"
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://mcp.getengram.app/mcp",
+        "--header",
+        "Authorization:${ENGRAM_AUTH}"
+      ],
+      "env": {
+        "ENGRAM_AUTH": "Bearer engram_sk_live_your_api_key_here"
       }
     }
   }
 }
 ```
+
+Or skip the config file: add Engram as a custom connector and sign in, and it works in Claude on the web and mobile too. See the [Claude Desktop guide](./guides/claude-desktop.md).
 
 ### 3. Store a Conversation
 
@@ -223,7 +232,7 @@ See [Secrets Vault](./vault.md) for the full guide.
 ## Next Steps
 
 - [Secrets Vault](./vault.md) — Client-side encryption for sensitive data
-- [API Reference](./api-reference.md) — All 7 MCP tools with parameters and examples
+- [API Reference](./api-reference.md) — Every MCP tool with parameters and examples
 - [Integrations](./integrations.md) — Claude Desktop, Cursor, Windsurf, custom clients
 - [Concepts](./concepts.md) — How storage and search work under the hood
 - [Architecture](./architecture.md) — Deep dive into how everything works

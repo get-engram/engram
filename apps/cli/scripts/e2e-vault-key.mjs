@@ -680,7 +680,10 @@ try {
   }
   const keyless = server.log.filter((x) => x.op.includes("no valid key")).length;
   check(keyless === 0, `no request came without a valid key (${keyless})`);
-  check(!stubLines().some((l) => l.startsWith("launchctl")), "launchctl was never run");
+  // launchctl only looked for the job a sudo install could have loaded into
+  // launchd's system domain, which changes nothing (engram#680).
+  const launchctl = stubLines().filter((l) => l.startsWith("launchctl") && l !== "launchctl print system/app.getengram.daemon");
+  check(launchctl.length === 0, `launchctl was run only to look in launchd's system domain${launchctl.length ? ` (also: ${launchctl.join("; ")})` : ""}`);
   check(reached(SECRET) === 0, `the secret never reached the server (${reached(SECRET)} requests)`);
   check(reached(NEW_SECRET) === 0, `the new secret never reached the server (${reached(NEW_SECRET)} requests)`);
   check(reached(THIRD_SECRET) === 0, `the third secret never reached the server (${reached(THIRD_SECRET)} requests)`);

@@ -288,6 +288,14 @@ function engram(args, { quiet = false } = {}) {
   return { status: r.status, out };
 }
 
+// The home has no API key, so `engram status` ends by saying so, and exits
+// 1 for that, as it does with no daemon. That it says so shows it ran
+// through to the end, past what it says of the daemon.
+const NO_KEY = "Not authenticated. Run 'engram signup' first.";
+function ranThrough(r) {
+  return check(r.status === 1 && r.out.includes(NO_KEY), `status runs through, to the account it has no key for (exit ${r.status})`);
+}
+
 function says(r, what, ...lines) {
   const missing = lines.filter((line) => !r.out.includes(line));
   return check(missing.length === 0, missing.length === 0 ? what : `${what} (missing: ${missing.map((l) => JSON.stringify(l)).join(", ")})`);
@@ -510,7 +518,7 @@ async function tiedByPidFile() {
   if (!wrote) return null;
 
   const status = engram(["status"]);
-  check(status.status === 0, "status exits 0");
+  ranThrough(status);
   says(
     status,
     "status says a daemon runs as root, how to stop it, and that its files are root's",
@@ -582,7 +590,7 @@ async function pidFileRemoved() {
   // for a dead daemon's, and removed it.
   unlinkSync(PID_FILE);
   const status = engram(["status"]);
-  check(status.status === 0, "status exits 0");
+  ranThrough(status);
   says(status, "status names it from the process list, with the command that stops it", "Status: stopped", UNTIED(M));
   const stop = engram(["stop"]);
   check(stop.status === 0, "stop exits 0");
@@ -635,7 +643,7 @@ async function systemJobRunsStandIn() {
   const plist = readFileSync(PLIST, "utf-8");
 
   const status = engram(["status"]);
-  check(status.status === 0, "status exits 0");
+  ranThrough(status);
   says(status, "status says the job runs a daemon as root, and to unload the job", STATUS_ROOT(J), `${PROBLEM(J)} ${WHY_STATUS}`, BOOTOUT);
   saysNot(status, "status says nothing of killing it, or of another job", "sudo kill", ALSO);
 
@@ -685,7 +693,7 @@ async function systemJobRunsWorker() {
   check(snapshot() === before && !isSocket(), `it made no file in ~/.engram (${snapshot()})`);
 
   const status = engram(["status"]);
-  check(status.status === 0, "status exits 0");
+  ranThrough(status);
   says(status, "status says the daemon is stopped, and the job is still loaded, and how to unload it", "Status: stopped", JOB_LEFT, UNLOAD);
   saysNot(status, "status says no daemon runs as root", "running as root");
 

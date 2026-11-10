@@ -462,7 +462,10 @@ try {
   const keyless = server.log.filter((x) => x.op.includes("no valid key")).length;
   check(keyless === 0, `no request came without a valid key (${keyless})`);
   const stubs = existsSync(STUB_LOG) ? readFileSync(STUB_LOG, "utf-8").split("\n").filter(Boolean) : [];
-  check(!stubs.some((l) => l.startsWith("launchctl")), "launchctl was never run");
+  // launchctl only looked for the job a sudo install could have loaded into
+  // launchd's system domain, which changes nothing (engram#680).
+  const launchctl = stubs.filter((l) => l.startsWith("launchctl") && l !== "launchctl print system/app.getengram.daemon");
+  check(launchctl.length === 0, `launchctl was run only to look in launchd's system domain${launchctl.length ? ` (also: ${launchctl.join("; ")})` : ""}`);
   const ops = {};
   for (const x of server.log) ops[`${x.op} [${x.key}]`] = (ops[`${x.op} [${x.key}]`] ?? 0) + 1;
   console.log("\nrequests the server saw:", JSON.stringify(ops, null, 1));

@@ -36,7 +36,7 @@ const { home, cli, daemon, systemd, spawn, execSync, execFileSync } = vi.hoisted
   // installed with brew runs from a versioned keg (engram#652).
   cli: { worker: null as string | null },
   // What answers on the daemon's socket: a daemon, or nothing.
-  daemon: { answering: null as { pid: number } | null },
+  daemon: { answering: null as { pid: number; stopping?: boolean } | null },
   // The fake user service manager: whether it answers, and whether it
   // refuses to enable the unit.
   systemd: { reachable: true, enableFails: false },
@@ -478,6 +478,23 @@ describe("engram install on Linux (engram#615)", () => {
     expect(spawn).not.toHaveBeenCalled();
     expect(systemctlCalls()).toEqual(["show --property=Version", "daemon-reload", "enable engram.service"]);
     expect(linked()).toBe(true);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("starts the daemon at once beside one that is stopping, with no launchd", async () => {
+    // Only macOS waits for it to exit first, where launchd would take it for
+    // the job's daemon (engram#691). The worker started here waits for it to
+    // go itself (engram#612).
+    daemon.answering = { pid: process.pid, stopping: true };
+    await daemonInstall();
+    expect(systemctlCalls()).toEqual(["show --property=Version", "daemon-reload", "enable engram.service"]);
+    expect(linked()).toBe(true);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(existsSync(join(home.dir, "Library"))).toBe(false);
+    const text = output();
+    expect(text).not.toContain("Waiting for the daemon that is stopping");
+    expect(text).not.toContain("still stopping");
+    expect(text).toContain("Engram daemon started");
     expect(process.exitCode).toBeUndefined();
   });
 

@@ -314,7 +314,7 @@ export async function daemonStart(
   // (engram#641). Not with settings in this environment that launchd's
   // daemon wouldn't have: the daemon is started here then, as before.
   const launchdFirst = "install" in flags && process.platform === "darwin" && !daemonEnvOverrides();
-  if (launchdFirst) enableLaunchdStartAtLogin();
+  if (launchdFirst) await enableLaunchdStartAtLogin();
 
   if (!reportStart(await startInBackground())) {
     process.exit(1);
@@ -1243,7 +1243,14 @@ function shellWord(path: string): string {
   return /^[\w@%+=:,./-]+$/.test(path) ? path : `'${path.replace(/'/g, "'\\''")}'`;
 }
 
-function enableLaunchdStartAtLogin(): void {
+/**
+ * Start at login on macOS, for `engram install` and `engram start
+ * --install`: write the plist, switch the job on in launchd, and have
+ * launchd load it, which starts the daemon (RunAtLoad). A job launchd has
+ * loaded already isn't loaded again, so it starts no daemon: with `start`
+ * (no daemon runs), launchd is asked to start one then (engram#691).
+ */
+async function enableLaunchdStartAtLogin(start = false): Promise<void> {
   if (!existsSync(workerPath())) {
     // Only a source checkout run through tsx gets here: the build ships it.
     console.error(red(`Can't turn on start at login: ${workerPath()} is missing.`));
@@ -1276,15 +1283,22 @@ function enableLaunchdStartAtLogin(): void {
   // Loading the job starts the daemon (a second one finds the first and
   // exits, engram#612). One launchd has loaded already is loaded again only
   // when the plist changed: unloading it stops the daemon launchd runs.
-  const failed = unchanged && switchedOn && agentLoaded() ? null : reloadAgent({ turnOn: true });
-  if (failed === null) {
-    console.log(`${bold("Auto-start enabled")} — daemon will start on login`);
-    console.log(`${dim("Plist:")} ${plistPath()}`);
-  } else {
+  const loadedAlready = unchanged && switchedOn && agentLoaded();
+  const failed = loadedAlready ? null : reloadAgent({ turnOn: true });
+  if (failed !== null) {
     console.log(`Plist written to ${plistPath()}`);
     console.log(dim(`  launchctl: ${failed}`));
     console.log(`Run manually: launchctl load -w ${shellWord(plistPath())}`);
+    return;
   }
+  console.log(`${bold("Auto-start enabled")} — daemon will start on login`);
+  console.log(`${dim("Plist:")} ${plistPath()}`);
+  // A job launchd had loaded already starts no daemon now: after `engram
+  // stop`, its daemon exited 0, which KeepAlive doesn't start again
+  // (engram#691). It is started as `engram start` starts it: through
+  // launchd, which starts it again after a crash. Windows and Linux start
+  // one here too.
+  if (start && loadedAlready && !reportStart(await startInBackground())) process.exitCode = 1;
 }
 
 /**
@@ -1680,7 +1694,7 @@ const START_AFTER_RESTART = "  Run 'engram start' to capture now, and again afte
  */
 async function enableStartAtLogin(running: boolean): Promise<void> {
   if (process.platform === "darwin") {
-    enableLaunchdStartAtLogin();
+    await enableLaunchdStartAtLogin(!running);
     return;
   }
   if (process.platform === "win32") {
@@ -1809,9 +1823,13 @@ async function disableStartAtLogin(): Promise<void> {
 export async function daemonInstall(): Promise<void> {
   if (refusedAsRoot("install")) return;
   await recordCaptureIntent("on", "install");
-  // A daemon that is stopping isn't counted: on Windows a new worker is
-  // started, which takes over once that one has gone.
-  const found = await findDaemon();
+  // A daemon that is stopping isn't counted: on Windows and Linux a new
+  // worker is started, which takes over once that one has gone. On macOS
+  // install waits for it to exit first, as `engram start` does: launchd
+  // takes one it runs for the job's daemon, still running, and would start
+  // none in its place (engram#691).
+  let found = await findDaemon();
+  if (process.platform === "darwin") found = await whileStopping(found);
   const running = found.state === "running" || found.state === "unresponsive";
   // Files in ~/.engram that are another user's (engram#659). Unless one
   // runs already, start at login would start a daemon that stops at once,
@@ -1824,6 +1842,15 @@ export async function daemonInstall(): Promise<void> {
       process.exitCode = 1;
       return;
     }
+  }
+  if (found.state === "stopping" && process.platform === "darwin") {
+    // Start at login all the same, but no start now: launchd would take the
+    // one stopping for the job's daemon if it runs it. (A job loaded now
+    // starts one, which waits for that one to go, engram#612.)
+    await enableLaunchdStartAtLogin();
+    console.error(red(`The daemon is still stopping (pid ${found.pid}). Run 'engram start' in a moment.`));
+    process.exitCode = 1;
+    return;
   }
   await enableStartAtLogin(running);
 }

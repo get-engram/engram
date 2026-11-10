@@ -589,6 +589,25 @@ describe("start at login on Windows (engram#602)", () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
+  it("engram install beside a daemon that is stopping starts one at once, with no launchd", async () => {
+    // Only macOS waits for it to exit first, where launchd would take it for
+    // the job's daemon (engram#691). The worker started here waits for it to
+    // go itself (engram#612).
+    onWindows();
+    daemon.answering = { pid: 4242, stopping: true };
+    madeUp(4242);
+    await daemonInstall();
+    expect(registry.value).toBe(ENTRY);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    noLaunchctl();
+    expect(existsSync(join(home.dir, "Library"))).toBe(false);
+    const text = output();
+    expect(text).not.toContain("Waiting for the daemon that is stopping");
+    expect(text).not.toContain("still stopping");
+    expect(text).toContain("Engram daemon started");
+    expect(process.exitCode).toBeUndefined();
+  });
+
   it("engram start --install starts one daemon and adds the entry", async () => {
     onWindows();
     await daemonStart([], { install: "" });

@@ -154,3 +154,54 @@ jobs:
       - name: Daemon smoke test
         working-directory: apps/cli
         run: node scripts/smoke-daemon.mjs
+
+  # The daemon's macOS code paths under the real launchd (engram#655): the
+  # unit tests check each launchctl call against a stub, so nothing else here
+  # shows launchd loading the plist `engram install` writes, and running it.
+  # The macOS temp folder is too long a place for the daemon's socket (about
+  # 100 bytes at most), so the daemon tests run under the runner's own.
+  cli-macos:
+    name: CLI on macOS (daemon start, start at login)
+    runs-on: macos-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the CLI
+        run: pnpm --filter '@getengram/cli...' build
+
+      - name: Test the CLI
+        working-directory: apps/cli
+        run: pnpm test
+
+      - name: Daemon smoke test
+        working-directory: apps/cli
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: node scripts/smoke-daemon.mjs
+
+      # Start at login under the user's own launchd: install, as at login, a
+      # crash and `engram stop`, an older CLI's plist and a broken one, a job
+      # switched off with launchctl, and uninstall.
+      - name: Daemon launchd test
+        working-directory: apps/cli
+        env:
+          TMPDIR: ${{ runner.temp }}
+          ENGRAM_E2E_LAUNCHD: "1"
+        run: node scripts/e2e-launchd.mjs

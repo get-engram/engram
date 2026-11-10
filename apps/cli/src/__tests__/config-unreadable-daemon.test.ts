@@ -211,6 +211,8 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("a config.json th
       await daemonStop();
       expect(errs).toEqual(unrecorded("stop"));
       expect(out).toEqual(["Daemon is not running."]);
+      // Not all it was asked to do: a script can tell.
+      expect(process.exitCode).toBe(1);
       expectUnchanged(BROKEN);
     });
 
@@ -230,6 +232,7 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("a config.json th
       expect(errs).toEqual(unrecorded("stop"));
       expect(out).toEqual(["Daemon stopped (pid 4242)"]);
       expect(process.kill).toHaveBeenCalledWith(4242, "SIGTERM");
+      expect(process.exitCode).toBe(1);
       expectUnchanged(BROKEN);
     });
 
@@ -238,12 +241,14 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("a config.json th
       await daemonStop();
       expect(errs).toEqual(NOTE);
       expect(JSON.parse(readFileSync(CONFIG_FILE, "utf-8"))).toEqual({ autocapture: "off" });
+      expect(process.exitCode).toBeUndefined();
     });
 
     it("records it in a good one, with what else is in it", async () => {
       config(JSON.stringify({ apiKey: "engram_sk_live_test_673_fine", excludePaths: ["/work"] }));
       await daemonStop();
       expect(errs).toEqual([]);
+      expect(process.exitCode).toBeUndefined();
       expect(JSON.parse(readFileSync(CONFIG_FILE, "utf-8"))).toEqual({
         apiKey: "engram_sk_live_test_673_fine",
         excludePaths: ["/work"],
@@ -258,6 +263,7 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("a config.json th
       await daemonUninstall();
       expect(errs).toEqual(unrecorded("uninstall"));
       expect(out).toEqual(["Auto-start isn't on."]);
+      expect(process.exitCode).toBe(1);
       expectUnchanged(BROKEN);
     });
   });
@@ -329,6 +335,26 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("a config.json th
       expect(said).not.toContain("Signed out");
       expect(said).not.toContain("engram auth login");
       expect(said).not.toContain(TAIL.slice(-4));
+    });
+
+    it("running, still signed in: said once, and not that the file reads fine", async () => {
+      config(BROKEN);
+      mkdirSync(join(home.dir, ".claude", "projects"), { recursive: true });
+      // The usual case: the key in use stays while the file can't be read
+      // (engram#594), and capture waits on it.
+      writeFileSync(
+        STATUS_FILE,
+        JSON.stringify({
+          capture_error: { kind: "config", message: "~/.engram/config.json isn't valid JSON", since: SINCE, files: 2 },
+        }),
+      );
+      daemonRunning();
+      await daemonStatus();
+      expect(out).toContain("  ✓ Claude Code    paused (config.json, see below)");
+      expect(out.filter((l) => l.includes("WARNING"))).toEqual([`  WARNING: ~/.engram/config.json isn't valid JSON, ${WAITS}`]);
+      const said = out.join("\n");
+      expect(said).not.toContain("reads fine");
+      expect(said).not.toContain("Signed out");
     });
 
     it("running, the file fixed: capture picks up on its own", async () => {

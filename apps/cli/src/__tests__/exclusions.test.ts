@@ -14,7 +14,7 @@ import {
 } from "../daemon/exclusions.js";
 import Database from "better-sqlite3";
 import { DaemonDb } from "../daemon/db.js";
-import { ExclusionsUnreadable, isCaptureHold } from "../daemon/queue-error.js";
+import { ExclusionsUnreadable, QueueWriteError, isCaptureHold, queueing } from "../daemon/queue-error.js";
 
 // Capture exclusions (engram#462). The opt-out phrase detector is the risky
 // piece: a false negative quietly ignores a privacy request; a false positive
@@ -279,6 +279,27 @@ describe("config.json that can't be read (engram#673)", () => {
     writeFileSync(cfg, JSON.stringify({ excludePaths: [repo] }));
     expect(isPathExcluded(join(repo, "sub"), cfg)).toBe(true);
     expect(isPathExcluded(join(dir, "other"), cfg)).toBe(false);
+  });
+
+  it("stays a config.json hold if a daemon.db step runs into it", () => {
+    // Said as a daemon.db failure, it would send the user after the disk.
+    writeFileSync(cfg, "{");
+    const hold = cantTell();
+    let thrown: unknown;
+    try {
+      queueing(() => {
+        throw hold;
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBe(hold);
+    // A daemon.db failure is still one (engram#584).
+    expect(() =>
+      queueing(() => {
+        throw new Error("database or disk is full");
+      }),
+    ).toThrow(QueueWriteError);
   });
 });
 

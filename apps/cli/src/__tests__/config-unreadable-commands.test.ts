@@ -419,3 +419,41 @@ describe("config.json changed while the server answers (engram#673)", () => {
     expect(readConfig()).toEqual({ excludePaths: [WORK], apiKey: NEW_KEY });
   });
 });
+
+describe("the usage check before an import (engram#673)", () => {
+  /** An export with one conversation, and a client that records where it stored. */
+  function anImport() {
+    const file = join(home.dir, "conversations.json");
+    const conversation = { uuid: "u-673", name: "Chat", created_at: "2026-11-09", chat_messages: [{ sender: "human", text: "hi" }] };
+    writeFileSync(file, JSON.stringify([conversation]));
+    const stored: string[] = [];
+    const client = {
+      createConversation: async () => ({ conversationId: "c-673", existing: false }),
+      store: async ({ conversationId }: { conversationId: string }) => void stored.push(conversationId),
+    };
+    return { file, stored, client };
+  }
+
+  it("asks the server config.json names, with its key", async () => {
+    writeConfig(JSON.stringify({ apiKey: SAVED_KEY, baseUrl: "http://127.0.0.1:8788/" }));
+    const { file, stored, client } = anImport();
+    const { importHistory } = await import("../commands/import.js");
+    expect(await exitCode(() => importHistory(client as never, [file], {}))).toBeNull();
+    expect(requests).toEqual([{ url: "http://127.0.0.1:8788/api/usage", auth: `Bearer ${SAVED_KEY}` }]);
+    expect(stored).toEqual(["c-673"]);
+  });
+
+  it("sends nothing once config.json can't be read, not ENGRAM_API_KEY to the default server either", async () => {
+    // The import's client was made before the file broke; the check reads it again.
+    writeConfig(BROKEN);
+    process.env.ENGRAM_API_KEY = ENV_KEY;
+    const { file, stored, client } = anImport();
+    const { importHistory } = await import("../commands/import.js");
+    expect(await exitCode(() => importHistory(client as never, [file], {}))).toBeNull();
+    expect(requests).toEqual([]);
+    // A check that can't be made never stops the import: the server holds the cap.
+    expect(stored).toEqual(["c-673"]);
+    expect(readFileSync(CONFIG, "utf-8")).toBe(BROKEN);
+    expectNoKeyInOutput();
+  });
+});

@@ -480,6 +480,10 @@ async function recordCaptureIntent(v: "on" | "off", command: string): Promise<vo
       config = {};
     } else {
       if (v === "off") {
+        // The daemon still stops, but capture comes back on with the next
+        // command once the file is fixed: not all that was asked, so the
+        // exit says so to a script that runs `engram stop`.
+        process.exitCode = 1;
         const why = err instanceof ConfigUnreadable ? err.message : "~/.engram/config.json can't be read";
         console.error(red(`Couldn't record that capture is off: ${why}.`));
         console.error(

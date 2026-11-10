@@ -78,7 +78,7 @@ Read the full [architecture deep-dive](https://getengram.app/docs/architecture).
 
 ## MCP tools
 
-Engram exposes 6 tools via MCP:
+Engram exposes 8 core tools via MCP:
 
 | Tool | Description |
 |------|-------------|
@@ -88,8 +88,10 @@ Engram exposes 6 tools via MCP:
 | `get_conversation` | Retrieve a conversation with its messages |
 | `list_conversations` | List conversations with filtering and pagination |
 | `delete_conversation` | Remove a conversation and its data |
+| `memory_status` | Show how much of the plan's storage is used |
+| `whoami` | Show which Engram account the connection is using |
 
-See the [API reference](https://getengram.app/docs/api-reference) for full parameters and examples.
+Connections that use an API key also get the secrets vault tools (`resolve_vault`, `vault_set`, `vault_get`, `vault_list`, `vault_delete`) and `manage_subscription`. See the [API reference](https://getengram.app/docs/api-reference) for full parameters and examples.
 
 ## Packages
 

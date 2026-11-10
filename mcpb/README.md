@@ -16,6 +16,7 @@ There is no API key to copy and no configuration to edit.
 - `create_conversation` / `append_messages` — save conversations
 - `get_conversation`, `list_conversations`, `delete_conversation`
 - `memory_status` — your usage against your plan
+- `whoami` — which Engram account Claude is connected to
 
 The same memory is shared with every MCP client you connect — ChatGPT,
 Cursor, Claude Code — so nothing is siloed in one tool.

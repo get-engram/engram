@@ -1,8 +1,8 @@
 # API Reference
 
-Engram exposes 7 core memory tools via the Model Context Protocol (MCP), plus vault and subscription tools on API-key surfaces. All tools are accessed through the `/mcp` endpoint using Streamable HTTP transport.
+Engram exposes 8 core memory tools via the Model Context Protocol (MCP). Connections that use an API key also get the vault and subscription tools (`resolve_vault`, `vault_set`, `vault_get`, `vault_list`, `vault_delete`, `manage_subscription`); connections that sign in with OAuth, such as the Claude and ChatGPT connectors, get the 8 core tools only. All tools are accessed through the `/mcp` endpoint using Streamable HTTP transport.
 
-All requests require an `Authorization: Bearer engram_sk_live_...` header.
+Requests authenticate with an API key (`Authorization: Bearer engram_sk_live_...`) or with the access token from OAuth sign-in.
 
 ---
 
@@ -264,6 +264,56 @@ Returns an error if the conversation is not found or doesn't belong to your orga
 
 ---
 
+## memory_status
+
+Show how full the account's memory is: lifetime storage used against the plan's capacity, plus a monthly meter on plans that have one. Read-only.
+
+### Parameters
+
+None.
+
+### Response
+
+```json
+{
+  "tier": "free",
+  "storage": {
+    "used": 8240,
+    "limit": 10000,
+    "remaining": 1760,
+    "bar": "[████████░░] 82%"
+  },
+  "note": "Memory never expires — deleting conversations frees space. More room: upgrade at getengram.app/pricing."
+}
+```
+
+`storage.limit` is `-1` on plans with unlimited storage, and `remaining` and `bar` are then left out. `monthly` (`used`, `limit`, `remaining`, `bar`) appears only on plans with a monthly limit. A brand-new account may also get an `activation` note. The `bar` strings are meant to be shown to the user as they are.
+
+---
+
+## whoami
+
+Show which Engram account the connection is using: organization name and email, tier, and how the connection authenticates. Read-only. Use it when you're unsure which account memories are being saved to or searched from.
+
+### Parameters
+
+None.
+
+### Response
+
+Plain text, one fact per line:
+
+```text
+Organization: Acme <dev@example.com>
+Org ID: org_…
+Tier: pro
+Auth: API key (key_…)
+```
+
+A connection that signs in with OAuth shows `Auth: OAuth client (…)` instead. A seat on a team account adds a `Seat:` line, and an account scheduled for deletion adds a warning line.
+
+---
+
 ## resolve_vault
 
 Retrieve encrypted vault entries by ID. Returns encrypted blobs — decryption happens client-side with your vault key.
@@ -405,6 +455,38 @@ Delete a named secret permanently. This action cannot be undone.
 Returns `{ "error": "Secret \"NAME\" not found" }` if the secret doesn't exist.
 
 See [Secrets Vault](./vault.md) for the full vault guide including CLI usage and SDK integration.
+
+---
+
+## manage_subscription
+
+View the current plan, or get a link to upgrade or manage it. Available on API-key connections only.
+
+### Parameters
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `action` | string | No | `"status"` (default) shows the current tier and limits. `"upgrade"` returns a Stripe Checkout link. `"portal"` returns a billing-portal link for an existing subscription |
+| `plan` | string | No | Plan for `"upgrade"`: `"pro"` (default) or `"team"` |
+| `quantity` | number | No | Number of seats, for `"upgrade"` with `"team"`. Raised to the plan's minimum if lower |
+
+### Response
+
+For `"status"`:
+
+```json
+{
+  "tier": "free",
+  "messages_per_month": -1,
+  "seats": 1,
+  "webhooks": false,
+  "upgrade_available": true
+}
+```
+
+`"upgrade"` returns a Stripe Checkout link as `{ "url": "…", "plan": "…", "message": "…" }`. If the account already has an active subscription, it returns a billing-portal link with `"already_subscribed": true` instead. `"portal"` returns `{ "url": "…", "message": "…" }`.
+
+Anyone on the account can check `"status"`, but only the organization owner can upgrade or open the portal; for a team member those return `{ "error": "forbidden", "message": "Only the organization owner can manage billing." }`. Other errors: `"missing_email"` (upgrading needs an email on the account) and `"no_subscription"` (`"portal"` with nothing to manage).
 
 ---
 

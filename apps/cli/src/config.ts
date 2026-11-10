@@ -4,6 +4,9 @@ import { join } from "node:path";
 import { ensurePrivateDirSync, writePrivateFileSync } from "./private-files.js";
 import { isMissing, parseConfigText, readFailure } from "./config-file.js";
 
+// Where it always was, for the commands that import it from here.
+export { resolveBaseUrl } from "./server-url.js";
+
 const CONFIG_DIR = join(homedir(), ".engram");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 
@@ -67,25 +70,4 @@ export function getApiKey(): string {
     process.exit(1);
   }
   return key;
-}
-
-const DEFAULT_BASE_URL = "https://mcp.getengram.app";
-
-export function getBaseUrl(): string {
-  return process.env.ENGRAM_BASE_URL ?? DEFAULT_BASE_URL;
-}
-
-/**
- * The server the CLI and the daemon talk to: ENGRAM_BASE_URL, then baseUrl
- * in config.json, then the default (docs/cli.md). Everything that sends a
- * key, checks one or signs in for one resolves it here (engram#625).
- * `engram auth login` checked keys against the default server whatever was
- * configured, and the account commands skipped config.json, so a key could
- * be checked or minted on one server, used on another, and sent to a server
- * the user hadn't configured.
- */
-export function resolveBaseUrl(config: { baseUrl?: unknown }): string {
-  const configured =
-    typeof config.baseUrl === "string" && config.baseUrl.trim() !== "" ? config.baseUrl.trim() : undefined;
-  return (process.env.ENGRAM_BASE_URL ?? configured ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
 }

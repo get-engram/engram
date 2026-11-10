@@ -149,8 +149,20 @@ CREATE TABLE IF NOT EXISTS gone_conversations (
 );
 `;
 
+/**
+ * Schema version 4 (engram#685): whether a row records which server it was
+ * captured for. key_fp names the account (accountFingerprint): the key's
+ * fingerprint alone on the default server, and with the server's tag on any
+ * other. Before version 4 the key's fingerprint stood for whatever server
+ * was configured, so a row from then, or one an older daemon writes after
+ * a downgrade, has server_known = 0: its server isn't known. A server
+ * other than the default is asked about such rows, never about those
+ * recorded for the default server (ownershipCandidates in syncer.ts).
+ */
+const SERVER_KNOWN_TABLES = ["pending_messages", "session_map", "remote_deletes"] as const;
+
 /** The schema version this code brings a daemon.db up to (user_version). */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /**
  * Deletes up to `limit` rows sent before a time, oldest first (engram#598).
@@ -199,6 +211,11 @@ function migrate(db: Database.Database): void {
     }
     db.exec(SCHEMA_V2);
     db.exec(SCHEMA_V3);
+    for (const table of SERVER_KNOWN_TABLES) {
+      if (!hasColumn(db, table, "server_known")) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN server_known INTEGER NOT NULL DEFAULT 0`);
+      }
+    }
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
   }).immediate();
 }
@@ -226,6 +243,9 @@ export class DaemonDb {
   /** False only for a read-only open of a daemon.db that an older daemon
    *  still owns (before version 3): no conversation is set aside there. */
   private goneKnown: boolean;
+  /** False only for a read-only open of a daemon.db that an older daemon
+   *  still owns (before version 4): no row records its server there. */
+  private serversKnown: boolean;
 
   /**
    * `readonly` is for the CLI reading a daemon's database while the daemon
@@ -237,6 +257,7 @@ export class DaemonDb {
       this.db = new Database(dbPath, { readonly: true, fileMustExist: true });
       this.keyed = hasColumn(this.db, "pending_messages", "key_fp");
       this.goneKnown = hasTable(this.db, "gone_conversations");
+      this.serversKnown = hasColumn(this.db, "pending_messages", "server_known");
       return;
     }
     // The queue holds captured transcript text, so its files are the
@@ -266,6 +287,7 @@ export class DaemonDb {
     migrate(this.db);
     this.keyed = true;
     this.goneKnown = true;
+    this.serversKnown = true;
   }
 
   // ── File offsets ──
@@ -312,8 +334,8 @@ export class DaemonDb {
     this.db
       .prepare(
         `INSERT OR REPLACE INTO session_map
-           (conversation_id, session_id, key_fp, project_dir, cwd, git_branch, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`,
+           (conversation_id, session_id, key_fp, project_dir, cwd, git_branch, created_at, server_known)
+         VALUES (?, ?, ?, ?, ?, ?, datetime('now'), 1)`,
       )
       .run(
         conversationId,
@@ -413,22 +435,25 @@ export class DaemonDb {
   ): { conversations: Array<{ conversationId: string; keyFp: string }>; dropped: number } {
     return this.db.transaction(() => {
       this.markSessionExcluded(sessionId, reason);
-      const conversations = (
-        this.db
-          .prepare(
-            "SELECT conversation_id, key_fp FROM session_map WHERE session_id = ? ORDER BY rowid",
-          )
-          .all(sessionId) as Array<{ conversation_id: string; key_fp: string }>
-      ).map((r) => ({ conversationId: r.conversation_id, keyFp: r.key_fp }));
+      const mapped = this.db
+        .prepare(
+          `SELECT conversation_id, key_fp, server_known FROM session_map
+            WHERE session_id = ? ORDER BY rowid`,
+        )
+        .all(sessionId) as Array<{ conversation_id: string; key_fp: string; server_known: number }>;
+      // A delete is for the server its conversation is on: what the mapping
+      // records about that server, the delete records too (engram#685).
       const remember = this.db.prepare(
-        `INSERT OR IGNORE INTO remote_deletes (conversation_id, key_fp, session_id, created_at)
-         VALUES (?, ?, ?, datetime('now'))`,
+        `INSERT OR IGNORE INTO remote_deletes
+           (conversation_id, key_fp, session_id, created_at, server_known)
+         VALUES (?, ?, ?, datetime('now'), ?)`,
       );
       let dropped = this.dropPendingSession(sessionId);
-      for (const c of conversations) {
-        remember.run(c.conversationId, c.keyFp || null, sessionId);
-        dropped += this.deleteAllForConversation(c.conversationId);
+      for (const r of mapped) {
+        remember.run(r.conversation_id, r.key_fp || null, sessionId, r.server_known);
+        dropped += this.deleteAllForConversation(r.conversation_id);
       }
+      const conversations = mapped.map((r) => ({ conversationId: r.conversation_id, keyFp: r.key_fp }));
       return { conversations, dropped };
     })();
   }
@@ -440,8 +465,9 @@ export class DaemonDb {
     this.db.transaction(() => {
       this.db
         .prepare(
-          `INSERT OR IGNORE INTO remote_deletes (conversation_id, key_fp, session_id, created_at)
-           VALUES (?, ?, ?, datetime('now'))`,
+          `INSERT OR IGNORE INTO remote_deletes
+             (conversation_id, key_fp, session_id, created_at, server_known)
+           VALUES (?, ?, ?, datetime('now'), 1)`,
         )
         .run(conversationId, keyFp, sessionId);
       this.dropPendingSession(sessionId);
@@ -585,14 +611,16 @@ export class DaemonDb {
 
   // ── Pending messages ──
 
-  /** Queue messages under the key of the account signed in when they were
-   *  captured (`null`: none was). */
+  /** Queue messages for the account signed in when they were captured
+   *  (`null`: none was, so no server is known either). */
   enqueue(conversationId: string, messages: ParsedMessage[], keyFp: string | null): void {
     const stmt = this.db.prepare(
       `INSERT INTO pending_messages
-         (conversation_id, role, content, tool_call_id, tool_name, metadata, created_at, key_fp)
-       VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?)`,
+         (conversation_id, role, content, tool_call_id, tool_name, metadata, created_at, key_fp,
+          server_known)
+       VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)`,
     );
+    const serverKnown = keyFp === null ? 0 : 1;
 
     const insertMany = this.db.transaction((msgs: ParsedMessage[]) => {
       for (const m of msgs) {
@@ -604,6 +632,7 @@ export class DaemonDb {
           m.toolName ?? null,
           m.metadata ? JSON.stringify(m.metadata) : null,
           keyFp,
+          serverKnown,
         );
       }
     });
@@ -827,50 +856,97 @@ export class DaemonDb {
     ).map((r) => r.key_fp);
   }
 
-  /** Hand everything queued or mapped under `fromFps` to `toFp`, in ONE
-   *  transaction — for keys the server confirmed are the same account's
-   *  (a rotated or re-issued key). */
+  /**
+   * Hand what is queued or mapped under each of `from` to `toFp`, in ONE
+   * transaction — for keys the server confirmed are the same account's (a
+   * rotated or re-issued key, engram#594). With `unknownServerOnly`, only
+   * the rows that don't record their server move (engram#685): those
+   * recorded for the default server stay its own. What moves records the
+   * server it now goes to.
+   */
   adoptKeys(
-    fromFps: string[],
+    from: ReadonlyArray<{ fp: string; unknownServerOnly?: boolean }>,
     toFp: string,
   ): { messages: number; sessions: number; deletes: number } {
-    const messagesStmt = this.db.prepare(
-      "UPDATE pending_messages SET key_fp = ? WHERE sent_at IS NULL AND key_fp = ?",
-    );
-    const sessionsStmt = this.db.prepare("UPDATE session_map SET key_fp = ? WHERE key_fp = ?");
-    const deletesStmt = this.db.prepare("UPDATE remote_deletes SET key_fp = ? WHERE key_fp = ?");
+    const statements = (only: string) => ({
+      messages: this.db.prepare(
+        `UPDATE pending_messages SET key_fp = ?, server_known = 1
+          WHERE sent_at IS NULL AND key_fp = ?${only}`,
+      ),
+      sessions: this.db.prepare(
+        `UPDATE session_map SET key_fp = ?, server_known = 1 WHERE key_fp = ?${only}`,
+      ),
+      deletes: this.db.prepare(
+        `UPDATE remote_deletes SET key_fp = ?, server_known = 1 WHERE key_fp = ?${only}`,
+      ),
+    });
+    const all = statements("");
+    const unknownOnly = statements(" AND server_known = 0");
     return this.db.transaction(() => {
       const moved = { messages: 0, sessions: 0, deletes: 0 };
-      for (const from of new Set(fromFps)) {
-        if (!from || from === toFp) continue;
-        moved.messages += messagesStmt.run(toFp, from).changes;
-        moved.sessions += sessionsStmt.run(toFp, from).changes;
-        moved.deletes += deletesStmt.run(toFp, from).changes;
+      for (const { fp, unknownServerOnly } of from) {
+        if (!fp || fp === toFp) continue;
+        const s = unknownServerOnly ? unknownOnly : all;
+        moved.messages += s.messages.run(toFp, fp).changes;
+        moved.sessions += s.sessions.run(toFp, fp).changes;
+        moved.deletes += s.deletes.run(toFp, fp).changes;
       }
       return moved;
     })();
   }
 
   /**
-   * Give `keyFp` everything that belongs to no key: rows from before
-   * version 1 and rows queued while signed out, the session mappings from
-   * before version 1, and the opt-out deletes an older daemon left in
-   * excluded_sessions. ONE transaction.
+   * The keys something here is queued, mapped or to be deleted under
+   * without a record of its server (engram#685): from before version 4,
+   * or from an older daemon. Rows queued while no key was in use aren't
+   * among them: claimLegacy gives those to an account, server and all.
+   */
+  unknownServerFps(): string[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT key_fp FROM pending_messages
+            WHERE sent_at IS NULL AND server_known = 0 AND key_fp IS NOT NULL AND key_fp <> ''
+           UNION
+           SELECT key_fp FROM session_map WHERE server_known = 0 AND key_fp <> ''
+           UNION
+           SELECT key_fp FROM remote_deletes
+            WHERE server_known = 0 AND key_fp IS NOT NULL AND key_fp <> ''`,
+        )
+        .all() as Array<{ key_fp: string }>
+    ).map((r) => r.key_fp);
+  }
+
+  /**
+   * Give the account `keyFp` everything that belongs to no key: rows from
+   * before version 1 and rows queued while signed out, the session mappings
+   * from before version 1, and the opt-out deletes an older daemon left in
+   * excluded_sessions. What it gets is its own, its server's included
+   * (engram#685). ONE transaction.
    */
   claimLegacy(keyFp: string): void {
     this.db.transaction(() => {
       // Two statements so each is an index search, not a scan of the queue.
       this.db
-        .prepare("UPDATE pending_messages SET key_fp = ? WHERE sent_at IS NULL AND key_fp IS NULL")
+        .prepare(
+          `UPDATE pending_messages SET key_fp = ?, server_known = 1
+            WHERE sent_at IS NULL AND key_fp IS NULL`,
+        )
         .run(keyFp);
-      this.db
-        .prepare("UPDATE pending_messages SET key_fp = ? WHERE sent_at IS NULL AND key_fp = ''")
-        .run(keyFp);
-      this.db.prepare("UPDATE session_map SET key_fp = ? WHERE key_fp = ''").run(keyFp);
       this.db
         .prepare(
-          `INSERT OR IGNORE INTO remote_deletes (conversation_id, key_fp, session_id, created_at)
-           SELECT delete_pending, ?, session_id, created_at
+          `UPDATE pending_messages SET key_fp = ?, server_known = 1
+            WHERE sent_at IS NULL AND key_fp = ''`,
+        )
+        .run(keyFp);
+      this.db
+        .prepare("UPDATE session_map SET key_fp = ?, server_known = 1 WHERE key_fp = ''")
+        .run(keyFp);
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO remote_deletes
+             (conversation_id, key_fp, session_id, created_at, server_known)
+           SELECT delete_pending, ?, session_id, created_at, 1
              FROM excluded_sessions WHERE delete_pending IS NOT NULL`,
         )
         .run(keyFp);
@@ -878,7 +954,9 @@ export class DaemonDb {
         .prepare("UPDATE excluded_sessions SET delete_pending = NULL WHERE delete_pending IS NOT NULL")
         .run();
       this.db
-        .prepare("UPDATE remote_deletes SET key_fp = ? WHERE key_fp IS NULL OR key_fp = ''")
+        .prepare(
+          "UPDATE remote_deletes SET key_fp = ?, server_known = 1 WHERE key_fp IS NULL OR key_fp = ''",
+        )
         .run(keyFp);
     })();
   }
@@ -886,14 +964,18 @@ export class DaemonDb {
   // ── Stats ──
 
   /**
-   * `pendingMessages` are the unsent messages `keyFp` will send, and
-   * `heldMessages` the ones waiting for another account. No `keyFp`: every
-   * unsent message is pending. `null`: nobody is signed in, so every unsent
-   * message is held. `notSentMessages` are those of conversations Engram
-   * said it doesn't have (engram#593), whoever is signed in: they're in
-   * neither of the other two.
+   * `pendingMessages` are the unsent messages the account `keyFp` will send,
+   * and `heldMessages` the ones waiting for another account. No `keyFp`:
+   * every unsent message is pending. `null`: nobody is signed in, so every
+   * unsent message is held. `unknownServerFp` (engram#685): the key's own
+   * fingerprint, for an account on a server other than the default — what
+   * the key queued without a record of its server is sent there too, once
+   * that server confirms the key (see ownershipCandidates in syncer.ts).
+   * `notSentMessages` are those of conversations Engram said it doesn't
+   * have (engram#593), whoever is signed in: they're in neither of the
+   * other two.
    */
-  getStats(keyFp?: string | null): {
+  getStats(keyFp?: string | null, unknownServerFp?: string): {
     trackedFiles: number;
     pendingMessages: number;
     heldMessages: number;
@@ -918,9 +1000,18 @@ export class DaemonDb {
     } else if (keyFp === null) {
       pending = 0;
       held = this.getHeldCount(null);
-    } else {
+    } else if (unknownServerFp === undefined || unknownServerFp === keyFp) {
       pending = this.getPendingCount(keyFp);
       held = this.getHeldCount(keyFp);
+    } else {
+      // Every row of a daemon.db from before version 4 is without a record
+      // of its server. Neither IS nor server_known (NOT NULL) yields NULL,
+      // so NOT takes exactly the rest.
+      const mine = this.serversKnown
+        ? "(key_fp IS ? OR (key_fp IS ? AND server_known = 0))"
+        : "(key_fp IS ? OR key_fp IS ?)";
+      pending = this.count(`${mine}${this.notGone()}`, keyFp, unknownServerFp);
+      held = this.count(`NOT ${mine}${this.notGone()}`, keyFp, unknownServerFp);
     }
     return {
       trackedFiles: files,

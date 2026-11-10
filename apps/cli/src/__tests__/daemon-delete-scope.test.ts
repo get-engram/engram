@@ -25,7 +25,8 @@ vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
 }));
 
 import { DaemonDb } from "../daemon/db.js";
-import { FIXED_KEY_FP, Syncer, keyFingerprint, type KeySource } from "../daemon/syncer.js";
+import { FIXED_KEY_FP, Syncer, keyFingerprint, type Account, type KeySource } from "../daemon/syncer.js";
+import { DEFAULT_BASE_URL } from "../server-url.js";
 import {
   isScopeRefusal,
   recordDeletesRefused,
@@ -174,13 +175,13 @@ const refusedCounts = () => vi.mocked(recordDeletesRefused).mock.calls.map((c) =
  *  the same account's (a rotated key). */
 function keySource(initial: string): KeySource & { configured: string | undefined } {
   const keys = {
-    current: initial,
+    current: { key: initial, server: DEFAULT_BASE_URL },
     configured: initial as string | undefined,
-    async read(): Promise<string | undefined> {
-      return keys.configured;
+    async read(): Promise<Account | undefined> {
+      return keys.configured === undefined ? undefined : { key: keys.configured, server: DEFAULT_BASE_URL };
     },
-    connect: (key: string) => server.client(key),
-    async ownedKeys(_key: string, hashes: string[]): Promise<string[]> {
+    connect: (account: Account) => server.client(account.key),
+    async ownedKeys(_account: Account, hashes: string[]): Promise<string[]> {
       return hashes;
     },
   };

@@ -24,6 +24,10 @@
  *     daemon wouldn't have, start starts the daemon itself, and a start
  *     after that says launchd doesn't run it. `engram start --install`
  *     turns start at login on first, and launchd starts the daemon.
+ *   - `engram install` after `engram stop`, the job loaded already, has
+ *     launchd start the daemon too (engram#691): a job launchd has loaded
+ *     isn't loaded again, which is what starts one at login. Installed
+ *     again, it starts no other.
  *   - A plist and a worker marked as downloaded (com.apple.quarantine) load
  *     and run all the same.
  *   - The plist an older CLI wrote, naming worker-main.js, is outdated:
@@ -557,6 +561,41 @@ async function run() {
     "start: says launchd won't restart it after a crash",
   );
   check(job()?.state !== "running", "start: leaves it running, and launchd's job stopped");
+  engram(["stop"]);
+  await waitFor("stop: no daemon runs", () => ourWorkers().length === 0);
+
+  // ── engram install after engram stop: launchd starts it (engram#691) ───────
+  // The job is loaded, and no daemon runs: the one `engram stop` stopped
+  // exited 0, which KeepAlive doesn't start again, and install doesn't load
+  // a job that is loaded already, which is what starts one.
+  const runsBeforeInstall = job()?.runs ?? 0;
+  const reinstall = engram(["install"], { env: launchdEnv });
+  check(reinstall.status === 0, "install after a stop: exits 0");
+  check(
+    reinstall.out.includes("Auto-start enabled — daemon will start on login"),
+    "install after a stop: turns start at login on",
+  );
+  check(!reinstall.out.includes("started directly"), "install after a stop: has launchd start the daemon");
+  const reinstalled = startedPid(reinstall.out);
+  const reinstalledJob = job();
+  check(
+    reinstalled !== null && reinstalledJob?.state === "running" && reinstalledJob.pid === reinstalled,
+    `install after a stop: the daemon it started is launchd's (pid ${reinstalled}; launchd's ${reinstalledJob?.pid}, ${reinstalledJob?.state})`,
+  );
+  check(
+    reinstalledJob?.runs === runsBeforeInstall + 1,
+    `launchctl print: runs went from ${runsBeforeInstall} to ${reinstalledJob?.runs}`,
+  );
+  if (reinstalled && isOurWorker(reinstalled)) {
+    await statusRunning(reinstalled, "install after a stop");
+    const installAgain = engram(["install"], { env: launchdEnv });
+    check(installAgain.status === 0, "install again: exits 0");
+    check(!installAgain.out.includes("Engram daemon started"), "install again: starts no other daemon");
+    check(
+      job()?.pid === reinstalled && isDeepStrictEqual(ourWorkers(), [reinstalled]),
+      `install again: the same daemon, and only it (${ourWorkers().join(", ")})`,
+    );
+  }
   engram(["stop"]);
   await waitFor("stop: no daemon runs", () => ourWorkers().length === 0);
 

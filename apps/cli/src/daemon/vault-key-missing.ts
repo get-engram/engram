@@ -98,25 +98,30 @@ export class MissingVaultKey {
     this.set(null);
   }
 
-  /** Recorded, and said in the log when there are some: a status write or a log that throws throws nothing here. */
+  /**
+   * Said in the log when there are some, then recorded: whoever finds the
+   * count in status.json finds the line in daemon.log too. A status write or
+   * a log that throws throws nothing here.
+   */
   private set(secrets: number | null): void {
     if (secrets === this.recorded) return;
     this.recorded = secrets;
+    if (secrets !== null) {
+      const values = secrets === 1 ? "its value isn't" : "their values aren't";
+      try {
+        this.log(
+          `vault scrubber: off, and this account's vault has ${plural(secrets, "secret")} — with no ` +
+            `vault key, ${values} removed from what is captured. Put the key in ~/.engram/vault-key ` +
+            "(engram vault save-key): it is read before the next send.",
+        );
+      } catch {
+        // Recorded in status.json all the same.
+      }
+    }
     try {
       this.record(secrets);
     } catch {
       // status.json is best effort.
-    }
-    if (secrets === null) return;
-    const values = secrets === 1 ? "its value isn't" : "their values aren't";
-    try {
-      this.log(
-        `vault scrubber: off, and this account's vault has ${plural(secrets, "secret")} — with no ` +
-          `vault key, ${values} removed from what is captured. Put the key in ~/.engram/vault-key ` +
-          "(engram vault save-key): it is read before the next send.",
-      );
-    } catch {
-      // Said in status.json all the same.
     }
   }
 }

@@ -68,6 +68,22 @@ describe("a daemon with no vault key, and the vault's secrets (engram#698)", () 
     expect(listed).toEqual([A, A]);
   });
 
+  it("says it in the log before status.json records it: whoever finds the count there finds the line", async () => {
+    const order: string[] = [];
+    const answers = [3];
+    const missing = new MissingVaultKey(
+      async () => answers.shift() ?? 0,
+      (secrets) => void order.push(`recorded ${secrets}`),
+      (msg) => void order.push(msg.includes("3 secrets") ? "said 3" : msg),
+      true,
+    );
+    await missing.check(A);
+    expect(order).toEqual(["said 3", "recorded 3"]);
+    // Nothing to say: recorded only.
+    missing.keyFound();
+    expect(order).toEqual(["said 3", "recorded 3", "recorded null"]);
+  });
+
   it("says one as one", async () => {
     const { missing, recorded, said, answers } = made();
     answers.push(1);

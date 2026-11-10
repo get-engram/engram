@@ -609,6 +609,8 @@ try {
   // ── 7. no key, and secrets in the vault (engram#698): counted, never named, and said; a key saved is read before the next send ──
   await waitFor("status.json: no key, and the vault's 2 secrets", () => syncStatus().vault_key_missing?.secrets === 2, 10_000);
   check(syncStatus().vault_key === null, "status.json: no key in use");
+  // Said before it is recorded; waited for all the same, as a log write can land a moment late.
+  await waitFor("daemon.log: no key, and the vault has 2 secrets", () => logCount(NO_KEY_COUNT(2)) > 0, 10_000);
   check(logCount(NO_KEY_COUNT(2)) === 1, "daemon.log: no key, and the vault has 2 secrets, said once");
   check(
     since("vault_list", t7).length === 1 && since("vault_get", t7).length === 0,
@@ -632,7 +634,8 @@ try {
   s4.say(`${said("x0")} nothing secret yet`);
   await waitFor("x0 arrives", () => arrived("x0").length === 1);
   await waitFor("status.json: 3 secrets now", () => syncStatus().vault_key_missing?.secrets === 3, 10_000);
-  check(logCount(NO_KEY_COUNT(3)) === 1, "daemon.log: told the vault changed, it counts 3");
+  await waitFor("daemon.log: told the vault changed, it counts 3", () => logCount(NO_KEY_COUNT(3)) > 0, 10_000);
+  check(logCount(NO_KEY_COUNT(3)) === 1, "daemon.log: 3 secrets, said once");
   check(
     since("vault_list", t7b).length === 1 && since("vault_get", t7b).length === 0,
     `listed once more, and no secret read (${since("vault_list", t7b).length}, ${since("vault_get", t7b).length})`,

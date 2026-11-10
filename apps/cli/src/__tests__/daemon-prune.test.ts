@@ -343,7 +343,7 @@ describe("daemon.db schema version 2 (engram#598)", () => {
     expect(db.storage()).toMatchObject({ incremental: true, freePages: 0 });
     const raw = track(new Database(dbPath, { readonly: true }));
     expect(raw.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
-    expect(SCHEMA_VERSION).toBe(3); // 3: engram#593
+    expect(SCHEMA_VERSION).toBe(4); // 3: engram#593, 4: engram#685
   });
 
   it("brings a version 1 daemon.db up to date once, keeping every row", () => {

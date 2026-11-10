@@ -175,6 +175,11 @@ const srv = http.createServer(async (req, res) => {
 });
 await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
 const baseUrl = `http://127.0.0.1:${srv.address().port}`;
+// On a server other than the default, the daemon keeps each delete under the
+// key and the server together: the key's fingerprint, "@", then a tag of the
+// server (engram#685). The owned-keys route still gets key fingerprints.
+const SERVER_TAG = createHash("sha256").update(baseUrl).digest("hex").slice(0, 32);
+const accountFp = (k) => `${fp(k)}@${SERVER_TAG}`;
 
 // ── The temporary home, the stubs, the CLI ──────────────────────────────────
 const root = mkdtempSync(join(tmpdir(), "engram-e2e-597-"));
@@ -358,7 +363,7 @@ try {
     st.health === "healthy" && st.consecutive_failures === 0 && st.error_type === null,
     `status.json: healthy (${st.health}, ${st.consecutive_failures}, ${st.error_type})`,
   );
-  check(remoteDeletes(fp(KEYS.READ_ONLY)) === 1, "the delete is kept in daemon.db");
+  check(remoteDeletes(accountFp(KEYS.READ_ONLY)) === 1, "the delete is kept in daemon.db");
   check(server.conversations.has(conv1), "and the conversation is still on the server");
   r = await engram("status");
   check(r.status === 0, "engram status exits 0");
@@ -381,7 +386,7 @@ try {
   await sleep(6_000);
   check(deletesSince(t3).length === 0, `no delete request for it (${deletesSince(t3).length})`);
   check(syncStatus().delete_refused?.since === since, "since is unchanged");
-  check(remoteDeletes(fp(KEYS.READ_ONLY)) === 2, "both deletes are kept in daemon.db");
+  check(remoteDeletes(accountFp(KEYS.READ_ONLY)) === 2, "both deletes are kept in daemon.db");
   const s3 = session();
   s3.say(said("s3 w1"));
   await waitFor("s3:w1 arrives", () => convWith(said("s3 w1")));
@@ -405,7 +410,7 @@ try {
   check(logCount(REFUSED(conv1, "2 opt-out deletes")) === 1, "daemon.log: 2 kept");
   st = syncStatus();
   check(st.delete_refused?.deletes === 2, `status.json after the restart: 2 waiting (${JSON.stringify(st.delete_refused)})`);
-  check(remoteDeletes(fp(KEYS.READ_ONLY)) === 2, "both deletes are still kept in daemon.db");
+  check(remoteDeletes(accountFp(KEYS.READ_ONLY)) === 2, "both deletes are still kept in daemon.db");
 
   // ── 5. a key that can delete, with no restart: both go, the warning clears ──
   const tSwitch = Date.now();

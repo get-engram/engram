@@ -66,7 +66,6 @@ vi.mock("../config.js", () => {
   return {
     loadConfigStrict,
     saveConfig: vi.fn(async () => {}),
-    getBaseUrl: () => "https://engram.invalid",
     resolveBaseUrl: () => "https://engram.invalid",
   };
 });

@@ -1,26 +1,56 @@
 /**
  * The two pieces of the daemon's KeySource that talk to something outside
- * the process (engram#594): config.json, for the key, and the server, for
- * which earlier keys are the signed-in account's. Kept out of
- * worker-main.ts, which starts the daemon when it is imported, so they can
- * be tested.
+ * the process (engram#594, engram#685): config.json, for the account (the
+ * key and its server), and that server, for which earlier keys are the
+ * signed-in account's. Kept out of worker-main.ts, which starts the daemon
+ * when it is imported, so they can be tested.
  */
 
 import { loadConfigStrict } from "../config.js";
+import { resolveBaseUrl } from "../server-url.js";
+import type { Account } from "./syncer.js";
 
 /** The most key hashes one owned-keys request may carry (the server's cap). */
 export const OWNED_KEYS_BATCH = 50;
 
 /**
- * The API key in config.json. Throws when the file can't be read or parsed,
- * or holds something that isn't a key: that is not a logout (engram#594),
- * and the key in use stays until the file can be read again.
+ * The account configured now (engram#685): the API key from ENGRAM_API_KEY,
+ * else config.json, and its server from ENGRAM_BASE_URL, else config.json,
+ * else the default (resolveBaseUrl) — both from ONE read of config.json, so
+ * a key is never paired with the server of another read. With both
+ * variables set the file isn't read.
+ *
+ * Throws when config.json is needed and can't be read or parsed, or holds
+ * an apiKey that isn't a string: that is not a logout (engram#594), and not
+ * the default server either. The account in use stays until the file can
+ * be read again, and a daemon that hasn't read it yet sends nothing.
  */
-export async function configuredKey(): Promise<string | undefined> {
-  const { apiKey } = await loadConfigStrict();
+export async function configuredAccount(): Promise<Account | undefined> {
+  const envKey = process.env.ENGRAM_API_KEY || undefined;
+  if (envKey && process.env.ENGRAM_BASE_URL?.trim()) {
+    return { key: envKey, server: resolveBaseUrl({}) };
+  }
+  const config = await loadConfigStrict();
+  const key = envKey ?? keyIn(config);
+  return key ? { key, server: resolveBaseUrl(config) } : undefined;
+}
+
+/** The API key in config.json's settings, if any. */
+function keyIn(config: { apiKey?: unknown }): string | undefined {
+  const { apiKey } = config;
   if (apiKey === undefined || apiKey === null || apiKey === "") return undefined;
   if (typeof apiKey !== "string") throw new Error("config.json: apiKey is not a string");
   return apiKey;
+}
+
+/**
+ * KeySource.ownedKeys: asked of the account's own server (engram#685), the
+ * one everything else for the account goes to — never another read's.
+ */
+export function ownedKeysOf(
+  fetchFn: typeof fetch = fetch,
+): (account: Account, keyHashes: string[]) => Promise<string[]> {
+  return (account, keyHashes) => ownedKeysAt(account.server, fetchFn)(account.key, keyHashes);
 }
 
 /**

@@ -7,6 +7,9 @@ import { join } from "node:path";
 // seconds, and treats "no key" as a logout. A config.json it can't read must
 // not look like one. And the one request that asks the server which earlier
 // keys are this account's sends key fingerprints only, never a key.
+//
+// engram#685: the key and its server come from the same read of the file,
+// and the earlier-keys check goes to that server.
 
 const { home } = vi.hoisted(() => ({ home: { dir: "" } }));
 
@@ -19,9 +22,16 @@ vi.mock("node:os", async (importOriginal) => ({
 home.dir = mkdtempSync(join(tmpdir(), "engram-594-key-"));
 const CONFIG = join(home.dir, ".engram", "config.json");
 
-const { configuredKey, ownedKeysAt, OWNED_KEYS_BATCH } = await import("../daemon/key-source.js");
+const { configuredAccount, ownedKeysAt, ownedKeysOf, OWNED_KEYS_BATCH } = await import("../daemon/key-source.js");
+const { DEFAULT_BASE_URL } = await import("../server-url.js");
 
 process.on("exit", () => rmSync(home.dir, { recursive: true, force: true }));
+
+const saved = { key: process.env.ENGRAM_API_KEY, server: process.env.ENGRAM_BASE_URL };
+const restoreEnv = (name: string, value: string | undefined) => {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+};
 
 const writeConfig = (text: string) => {
   mkdirSync(join(home.dir, ".engram"), { recursive: true });
@@ -30,26 +40,33 @@ const writeConfig = (text: string) => {
 
 beforeEach(() => {
   rmSync(join(home.dir, ".engram"), { recursive: true, force: true });
+  delete process.env.ENGRAM_API_KEY;
+  delete process.env.ENGRAM_BASE_URL;
 });
 
-describe("configuredKey: the key in config.json (engram#594)", () => {
+afterEach(() => {
+  restoreEnv("ENGRAM_API_KEY", saved.key);
+  restoreEnv("ENGRAM_BASE_URL", saved.server);
+});
+
+describe("configuredAccount: the key in config.json (engram#594)", () => {
   it("is the saved key", async () => {
     writeConfig(JSON.stringify({ apiKey: "engram_sk_test_1", baseUrl: "http://localhost:8787" }));
-    await expect(configuredKey()).resolves.toBe("engram_sk_test_1");
+    await expect(configuredAccount()).resolves.toMatchObject({ key: "engram_sk_test_1" });
   });
 
   it("no config.json, no apiKey, or an empty or null one is no key: signed out", async () => {
-    await expect(configuredKey()).resolves.toBeUndefined();
+    await expect(configuredAccount()).resolves.toBeUndefined();
     for (const config of [{}, { apiKey: "" }, { apiKey: null }, { baseUrl: "http://localhost:8787" }]) {
       writeConfig(JSON.stringify(config));
-      await expect(configuredKey()).resolves.toBeUndefined();
+      await expect(configuredAccount()).resolves.toBeUndefined();
     }
   });
 
   it("a config.json caught half-written, or damaged, throws instead of reading as a logout", async () => {
     writeConfig('{"apiKey": "engram_sk_te');
     // What it says never quotes the file: the key is in it (engram#673).
-    const half = await configuredKey().then(
+    const half = await configuredAccount().then(
       () => null,
       (err: unknown) => err,
     );
@@ -57,25 +74,81 @@ describe("configuredKey: the key in config.json (engram#594)", () => {
     expect((half as Error).message).toContain("isn't valid JSON");
     expect((half as Error).message).not.toContain("engram_sk_te");
     writeConfig("");
-    await expect(configuredKey()).rejects.toThrow("is empty");
+    await expect(configuredAccount()).rejects.toThrow("is empty");
     writeConfig("[]");
-    await expect(configuredKey()).rejects.toThrow("isn't a JSON object");
+    await expect(configuredAccount()).rejects.toThrow("isn't a JSON object");
     writeConfig("null");
-    await expect(configuredKey()).rejects.toThrow("isn't a JSON object");
+    await expect(configuredAccount()).rejects.toThrow("isn't a JSON object");
   });
 
   it("an apiKey that isn't a string throws", async () => {
     writeConfig(JSON.stringify({ apiKey: 42 }));
-    await expect(configuredKey()).rejects.toThrow("apiKey is not a string");
+    await expect(configuredAccount()).rejects.toThrow("apiKey is not a string");
     writeConfig(JSON.stringify({ apiKey: ["engram_sk_test_1"] }));
-    await expect(configuredKey()).rejects.toThrow("apiKey is not a string");
+    await expect(configuredAccount()).rejects.toThrow("apiKey is not a string");
   });
 
   it("a config.json that exists but can't be read throws", async () => {
     // A directory where the file should be: readFile fails with EISDIR,
     // as it does with EACCES, whoever the tests run as.
     mkdirSync(CONFIG, { recursive: true });
-    await expect(configuredKey()).rejects.toThrow();
+    await expect(configuredAccount()).rejects.toThrow();
+  });
+});
+
+describe("configuredAccount: the key's server comes from the same read (engram#685)", () => {
+  it("is config.json's baseUrl, or the default server when it names none", async () => {
+    writeConfig(JSON.stringify({ apiKey: "engram_sk_test_1", baseUrl: "http://localhost:8787/" }));
+    await expect(configuredAccount()).resolves.toEqual({ key: "engram_sk_test_1", server: "http://localhost:8787" });
+    for (const baseUrl of [undefined, "", "   ", 42]) {
+      writeConfig(JSON.stringify({ apiKey: "engram_sk_test_1", baseUrl }));
+      await expect(configuredAccount()).resolves.toEqual({ key: "engram_sk_test_1", server: DEFAULT_BASE_URL });
+    }
+  });
+
+  it("ENGRAM_BASE_URL names the server ahead of config.json, and the key still comes from the file", async () => {
+    process.env.ENGRAM_BASE_URL = "http://127.0.0.1:8701";
+    writeConfig(JSON.stringify({ apiKey: "engram_sk_test_1", baseUrl: "http://localhost:8787" }));
+    await expect(configuredAccount()).resolves.toEqual({ key: "engram_sk_test_1", server: "http://127.0.0.1:8701" });
+  });
+
+  it("an empty ENGRAM_BASE_URL names no server: config.json's is used", async () => {
+    writeConfig(JSON.stringify({ apiKey: "engram_sk_test_1", baseUrl: "http://localhost:8787" }));
+    for (const value of ["", "  "]) {
+      process.env.ENGRAM_BASE_URL = value;
+      await expect(configuredAccount()).resolves.toEqual({ key: "engram_sk_test_1", server: "http://localhost:8787" });
+    }
+  });
+
+  it("with only ENGRAM_API_KEY set, the server is still config.json's, so a file that can't be read throws", async () => {
+    process.env.ENGRAM_API_KEY = "engram_sk_test_env";
+    writeConfig(JSON.stringify({ apiKey: "engram_sk_test_1", baseUrl: "http://localhost:8787" }));
+    await expect(configuredAccount()).resolves.toEqual({ key: "engram_sk_test_env", server: "http://localhost:8787" });
+
+    // Not the default server: the key would go where the user didn't send it.
+    writeConfig('{"apiKey": "engram_sk_te');
+    await expect(configuredAccount()).rejects.toThrow("isn't valid JSON");
+    rmSync(CONFIG);
+    mkdirSync(CONFIG);
+    await expect(configuredAccount()).rejects.toThrow();
+
+    // No config.json at all is no settings: the default server.
+    rmSync(join(home.dir, ".engram"), { recursive: true, force: true });
+    await expect(configuredAccount()).resolves.toEqual({ key: "engram_sk_test_env", server: DEFAULT_BASE_URL });
+  });
+
+  it("with ENGRAM_API_KEY and ENGRAM_BASE_URL both set, config.json isn't read", async () => {
+    process.env.ENGRAM_API_KEY = "engram_sk_test_env";
+    process.env.ENGRAM_BASE_URL = "http://127.0.0.1:8701/";
+    mkdirSync(CONFIG, { recursive: true });
+    await expect(configuredAccount()).resolves.toEqual({ key: "engram_sk_test_env", server: "http://127.0.0.1:8701" });
+  });
+
+  it("an empty ENGRAM_API_KEY is no key: config.json's is used", async () => {
+    process.env.ENGRAM_API_KEY = "";
+    process.env.ENGRAM_BASE_URL = "http://127.0.0.1:8701";
+    writeConfig(JSON.stringify({ apiKey: "engram_sk_test_1" }));
+    await expect(configuredAccount()).resolves.toEqual({ key: "engram_sk_test_1", server: "http://127.0.0.1:8701" });
   });
 });
 
@@ -174,6 +247,19 @@ describe("ownedKeysAt: which earlier keys are this account's (engram#594)", () =
     await expect(ownedKeysAt("https://engram.test", fetch)(KEY, hashes)).rejects.toMatchObject({
       status: 503,
     });
+  });
+
+  it("ownedKeysOf asks the account's own server, with the account's key (engram#685)", async () => {
+    const { fetch, calls } = fakeFetch((asked) => json({ owned: asked }));
+    const ask = ownedKeysOf(fetch);
+    await expect(ask({ key: KEY, server: "http://127.0.0.1:8701/" }, [hash(1)])).resolves.toEqual([hash(1)]);
+    await expect(ask({ key: "engram_sk_test_other", server: "http://127.0.0.1:8702" }, [hash(2)])).resolves.toEqual([
+      hash(2),
+    ]);
+    expect(calls.map((c) => [c.url, new Headers(c.init.headers).get("Authorization")])).toEqual([
+      ["http://127.0.0.1:8701/api/account/owned-keys", `Bearer ${KEY}`],
+      ["http://127.0.0.1:8702/api/account/owned-keys", "Bearer engram_sk_test_other"],
+    ]);
   });
 
   it("a network failure rejects as it is (no status)", async () => {

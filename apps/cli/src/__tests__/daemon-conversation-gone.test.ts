@@ -26,7 +26,8 @@ vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
 }));
 
 import { DaemonDb, SCHEMA_VERSION } from "../daemon/db.js";
-import { FIXED_KEY_FP, GONE_RECHECK_MS, Syncer, keyFingerprint } from "../daemon/syncer.js";
+import { FIXED_KEY_FP, GONE_RECHECK_MS, Syncer, keyFingerprint, type Account } from "../daemon/syncer.js";
+import { DEFAULT_BASE_URL } from "../server-url.js";
 import { isConversationGone, recordFailure, recordSuccess } from "../daemon/status.js";
 import type { ParsedMessage, SessionMeta } from "../daemon/types.js";
 
@@ -450,15 +451,15 @@ describe("a conversation Engram no longer has (engram#593)", () => {
  *  own. */
 function keySource(initial: string) {
   const keys = {
-    current: initial,
+    current: { key: initial, server: DEFAULT_BASE_URL } as Account | undefined,
     configured: initial as string | undefined,
-    async read(): Promise<string | undefined> {
-      return keys.configured;
+    async read(): Promise<Account | undefined> {
+      return keys.configured === undefined ? undefined : { key: keys.configured, server: DEFAULT_BASE_URL };
     },
-    connect(key: string): Engram {
-      return server.client(key);
+    connect(account: Account): Engram {
+      return server.client(account.key);
     },
-    async ownedKeys(_key: string, _hashes: string[]): Promise<string[]> {
+    async ownedKeys(_account: Account, _hashes: string[]): Promise<string[]> {
       return [];
     },
   };
@@ -554,8 +555,8 @@ describe("daemon.db's record of them (engram#593)", () => {
     expect(version()).toEqual({ version: 2, table: false });
 
     db = new DaemonDb(join(dir, "daemon.db"));
-    expect(SCHEMA_VERSION).toBe(3);
-    expect(version()).toEqual({ version: 3, table: true });
+    expect(SCHEMA_VERSION).toBe(4);
+    expect(version()).toEqual({ version: 4, table: true });
     expect(db.getPendingCount()).toBe(2);
     expect(db.getNotSentCount()).toBe(0);
     expect(db.getPendingConversationIds(FIXED_KEY_FP)).toEqual(["conv_x"]);

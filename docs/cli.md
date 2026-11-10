@@ -177,6 +177,8 @@ The daemon that `engram install` starts at login may not get your shell's variab
 
 It saves only a vault key (32 bytes, base64-encoded), and never replaces a different key without `--force`, nor a file it can't read.
 
+A daemon already running reads the file again before it sends, so it uses the key saved there from its next send on, with no restart, unless it was started with `ENGRAM_VAULT_KEY` set, which it goes on using. `engram vault save-key` and `engram vault keygen --save` say which.
+
 | Flag | Description |
 |------|-------------|
 | `--force` | Replace a different key in the file, after backing it up to `~/.engram/vault-key.bak-<time>` |

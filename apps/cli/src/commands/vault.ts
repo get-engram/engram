@@ -2,6 +2,7 @@ import { dirname } from "node:path";
 import { generateVaultKey, type Engram } from "@getengram/sdk";
 import { bold, dim, plural, red } from "../output.js";
 import { confirmedDaemonInPidFile, probeDaemon } from "../daemon/instance.js";
+import { readStatus } from "../daemon/status.js";
 import { ensurePrivateDirSync, writePrivateFileSync } from "../private-files.js";
 import {
   envVaultKeyState,
@@ -75,6 +76,7 @@ export async function vaultKeygen(
     writePrivateFileSync(VAULT_KEY_FILE, key + "\n");
     console.log(`${bold("Vault key generated and saved to:")} ${VAULT_KEY_FILE}`);
     console.log(dim("Permissions set to owner-only (600)."));
+    await printDaemonKeyHint(true);
   } else {
     console.log(key);
   }
@@ -143,22 +145,42 @@ export async function vaultSaveKey(flags: Record<string, string>): Promise<void>
   writePrivateFileSync(VAULT_KEY_FILE, key + "\n");
   console.log(`${bold("Vault key saved to:")} ${VAULT_KEY_FILE}`);
   console.log(dim("Permissions set to owner-only (600). The daemon started at login reads it there."));
-  // The daemon reads its key when it starts.
-  if (await daemonRunning()) {
-    console.log(dim("The daemon running now read its key when it started. If that was without this one,"));
-    console.log(dim("as at login, run 'engram stop', then 'engram start'."));
-  }
+  await printDaemonKeyHint(false);
 }
 
 /**
- * A daemon is running: it answers, or is busy, on its socket; or, one from
- * before engram#612, which has none, its PID file names it, confirmed.
+ * What the daemon running now does with the key just saved, when one runs.
+ * One that reads its key again before sending (engram#693) uses it from
+ * its next send on, unless it was started with ENGRAM_VAULT_KEY, which
+ * wins over the file. One from before read its key when it started: a
+ * restart reads it. So does one that is busy and doesn't say which it is,
+ * or, from before engram#612, has no socket and only its PID file names it.
+ * `fresh`: a key just made, which no daemon can have had.
  */
-async function daemonRunning(): Promise<boolean> {
+async function printDaemonKeyHint(fresh: boolean): Promise<void> {
   const probe = await probeDaemon({ timeoutMs: 1_000 });
-  if (probe.state === "answered") return !probe.info.stopping;
-  if (probe.state === "silent") return true;
-  return confirmedDaemonInPidFile() !== null;
+  if (probe.state === "answered") {
+    if (probe.info.stopping) return;
+    if (probe.info.vaultKeyReread) {
+      console.log(
+        dim(
+          readStatus().vault_key === "env"
+            ? "The daemon running now was started with ENGRAM_VAULT_KEY, which it uses instead of the file."
+            : "The daemon running now reads it before its next send: no restart needed.",
+        ),
+      );
+      return;
+    }
+  } else if (probe.state !== "silent" && confirmedDaemonInPidFile() === null) {
+    return;
+  }
+  if (fresh) {
+    console.log(dim("The daemon running now read its key when it started. For it to use this one,"));
+    console.log(dim("run 'engram stop', then 'engram start'."));
+  } else {
+    console.log(dim("The daemon running now read its key when it started. If that was without this one,"));
+    console.log(dim("as at login, run 'engram stop', then 'engram start'."));
+  }
 }
 
 export async function vaultStatus(): Promise<void> {

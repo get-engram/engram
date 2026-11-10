@@ -381,7 +381,7 @@ const HELD = (problem) =>
 const READ_NOW = "vault scrubber: the vault key can be read now — reading the vault before sending what was held";
 const SENDING = "[engram] vault read — sending the messages held for it";
 const SCRUB_ON = "vault scrubber: on (";
-const SCRUB_OFF = "vault scrubber: off (";
+const SCRUB_OFF = "vault scrubber: off until a vault key is saved (";
 const NOTICE =
   "Your vault key (~/.engram/vault-key) can't be read, so messages wait here rather than be sent with your " +
   "vault's secrets in them. Nothing is lost.";

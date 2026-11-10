@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,6 +11,10 @@ import { join } from "node:path";
  * for no key, and send the vault's secrets as they were. A file that isn't
  * there is still no key, and ENGRAM_VAULT_KEY still wins over the file.
  *
+ * engram#693 — the scrubber reads the key again while the daemon runs, so
+ * there is one even with no key yet: a key saved later is read through the
+ * account in use. status.json says where the key in use came from.
+ *
  * In a temp home, with the lock, the scrubber, the syncer and the SDK's
  * client faked: the worker stops where the syncer would start. Nothing here
  * takes the real daemon's lock, changes the umask of this process, touches
@@ -20,9 +24,10 @@ import { join } from "node:path";
 interface MadeScrubber {
   vault: unknown;
   key: string | undefined;
-  pending:
+  /** How it reads the key again, and why it couldn't be read at start. */
+  keyFile:
     | {
-        problem: { name: string; kind: string; message: string };
+        problem?: { name: string; kind: string; message: string };
         source: { read(): Promise<string | undefined>; vaultWith(key: string): unknown };
       }
     | undefined;
@@ -78,6 +83,12 @@ const SERVER = "http://127.0.0.1:8788";
 const posix = process.platform !== "win32";
 const root = process.getuid?.() === 0;
 
+/** Where status.json says the daemon's key came from (engram#693). */
+function keyOrigin(): unknown {
+  const file = join(ENGRAM_DIR, "status.json");
+  return existsSync(file) ? (JSON.parse(readFileSync(file, "utf-8")) as { vault_key?: unknown }).vault_key : null;
+}
+
 /** What the worker logs, in place of stderr. */
 function captureLog(): string[] {
   const written: string[] = [];
@@ -118,8 +129,8 @@ async function runWorker(): Promise<{ log: () => string }> {
     ...(await importOriginal<typeof import("../daemon/scrubber.js")>()),
     SecretScrubber: class {
       private readonly made: MadeScrubber;
-      constructor(vault: unknown, key: string | undefined, _log: unknown, pending?: MadeScrubber["pending"]) {
-        this.made = { vault, key, pending, started: false, reconnects: [], instance: this };
+      constructor(vault: unknown, key: string | undefined, _log: unknown, keyFile?: MadeScrubber["keyFile"]) {
+        this.made = { vault, key, keyFile, started: false, reconnects: [], instance: this };
         made.scrubbers.push(this.made);
       }
       start() {
@@ -203,7 +214,7 @@ describe("a daemon started with a vault key it can't read (engram#677)", () => {
     expect(scrubber.vault).toBeNull();
     expect(scrubber.key).toBeUndefined();
     expect(scrubber.started).toBe(true);
-    expect(scrubber.pending?.problem).toMatchObject({
+    expect(scrubber.keyFile?.problem).toMatchObject({
       name: "VaultKeyUnreadable",
       kind: "folder",
       message: "~/.engram/vault-key is a folder, not a file",
@@ -220,12 +231,12 @@ describe("a daemon started with a vault key it can't read (engram#677)", () => {
     expect(log()).not.toContain("vault scrubber: off");
 
     // What it reads again is the file: still a folder, then a key.
-    await expect(scrubber.pending?.source.read()).rejects.toMatchObject({ kind: "folder" });
+    await expect(scrubber.keyFile?.source.read()).rejects.toMatchObject({ kind: "folder" });
     rmSync(KEY_FILE, { recursive: true });
     writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
-    await expect(scrubber.pending?.source.read()).resolves.toBe(VAULT_KEY);
+    await expect(scrubber.keyFile?.source.read()).resolves.toBe(VAULT_KEY);
     // Signed out: no account to read the vault through yet.
-    expect(scrubber.pending?.source.vaultWith(VAULT_KEY)).toBeNull();
+    expect(scrubber.keyFile?.source.vaultWith(VAULT_KEY)).toBeNull();
     expect(log()).not.toContain(VAULT_KEY);
   });
 
@@ -237,7 +248,7 @@ describe("a daemon started with a vault key it can't read (engram#677)", () => {
     const { log } = await runWorker();
     const [scrubber] = made.scrubbers;
     expect(scrubber).toMatchObject({ vault: null, key: undefined, started: true });
-    expect(scrubber.pending?.problem).toMatchObject({ kind: "folder" });
+    expect(scrubber.keyFile?.problem).toMatchObject({ kind: "folder" });
     const [keys] = made.keys as Keys[];
 
     // A switch while there is no key: no vault to read yet, and still held.
@@ -246,10 +257,10 @@ describe("a daemon started with a vault key it can't read (engram#677)", () => {
 
     rmSync(KEY_FILE, { recursive: true });
     writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
-    const key = await scrubber.pending?.source.read();
+    const key = await scrubber.keyFile?.source.read();
     expect(key).toBe(VAULT_KEY);
     // Through the account in use now: the one switched to.
-    expect(scrubber.pending?.source.vaultWith(VAULT_KEY)).toEqual({
+    expect(scrubber.keyFile?.source.vaultWith(VAULT_KEY)).toEqual({
       apiKey: OTHER_API_KEY,
       baseUrl: SERVER,
       vaultKey: VAULT_KEY,
@@ -268,7 +279,7 @@ describe("a daemon started with a vault key it can't read (engram#677)", () => {
     writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
     chmodSync(KEY_FILE, 0o000);
     const { log } = await runWorker();
-    expect(made.scrubbers[0]?.pending?.problem).toMatchObject({ kind: "permission" });
+    expect(made.scrubbers[0]?.keyFile?.problem).toMatchObject({ kind: "permission" });
     expect(log()).toContain(
       "vault scrubber: holding sends — ~/.engram/vault-key can't be read: permission denied. Capture goes on, " +
         "and what it captures is sent once the key can be read. " +
@@ -279,26 +290,86 @@ describe("a daemon started with a vault key it can't read (engram#677)", () => {
   it("an empty key file: held, not taken for no key", async () => {
     writeFileSync(KEY_FILE, "\n");
     const { log } = await runWorker();
-    expect(made.scrubbers[0]?.pending?.problem).toMatchObject({ kind: "empty" });
+    expect(made.scrubbers[0]?.keyFile?.problem).toMatchObject({ kind: "empty" });
     expect(log()).toContain("vault scrubber: holding sends — ~/.engram/vault-key is empty.");
   });
 
-  it("no key file: no vault, and nothing held", async () => {
+  it("no key file: off until a key is saved, and nothing held", async () => {
     const { log } = await runWorker();
-    expect(made.scrubbers).toEqual([]);
-    expect(made.syncers).toEqual([null]);
-    expect(log()).toContain("vault scrubber: off (no vault key configured — only pattern redaction applies)\n");
+    // One even with no key (engram#693): it reads the file again.
+    expect(made.scrubbers).toHaveLength(1);
+    const [scrubber] = made.scrubbers;
+    expect(scrubber).toMatchObject({ vault: null, key: undefined, started: true });
+    expect(scrubber.keyFile?.problem).toBeUndefined();
+    expect(made.syncers).toEqual([scrubber.instance]);
+    expect(log()).toContain(
+      "vault scrubber: off until a vault key is saved (no vault key configured — only pattern redaction applies)\n",
+    );
     expect(log()).not.toContain("holding sends");
+    expect(keyOrigin()).toBeNull();
+
+    // A key saved while it runs: read from the file, and in use from then on.
+    await expect(scrubber.keyFile?.source.read()).resolves.toBeUndefined();
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    await expect(scrubber.keyFile?.source.read()).resolves.toBe(VAULT_KEY);
+    // Signed out: no account to read the vault through yet.
+    expect(scrubber.keyFile?.source.vaultWith(VAULT_KEY)).toBeNull();
+    expect(keyOrigin()).toBe("file");
+    expect(log()).not.toContain(VAULT_KEY);
   });
 
-  it("a key that reads: on, with the key", async () => {
+  it("no key file, signed in: a key saved later is read through the account in use, then and after a switch", async () => {
+    writeFileSync(join(ENGRAM_DIR, "config.json"), JSON.stringify({ apiKey: API_KEY, baseUrl: SERVER }), {
+      mode: 0o600,
+    });
+    const { log } = await runWorker();
+    const [scrubber] = made.scrubbers;
+    expect(scrubber).toMatchObject({ vault: null, key: undefined, started: true });
+    const [keys] = made.keys as Keys[];
+
+    // A switch with no key: no vault to read.
+    keys.connect({ key: OTHER_API_KEY, server: SERVER });
+    expect(scrubber.reconnects).toEqual([null]);
+
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    const key = await scrubber.keyFile?.source.read();
+    expect(scrubber.keyFile?.source.vaultWith(key as string)).toEqual({
+      apiKey: OTHER_API_KEY,
+      baseUrl: SERVER,
+      vaultKey: VAULT_KEY,
+    } satisfies MadeVault);
+    expect(keyOrigin()).toBe("file");
+
+    // The next switch reads that account's vault with the key saved.
+    keys.connect({ key: API_KEY, server: SERVER });
+    expect(scrubber.reconnects).toEqual([
+      null,
+      { apiKey: API_KEY, baseUrl: SERVER, vaultKey: VAULT_KEY } satisfies MadeVault,
+    ]);
+    // Signed out: nothing kept.
+    (made.keys[0] as { disconnect(): void }).disconnect();
+    expect(scrubber.reconnects.at(-1)).toBeNull();
+    for (const secret of [VAULT_KEY, API_KEY, OTHER_API_KEY]) expect(log()).not.toContain(secret);
+  });
+
+  it("a key that reads: on, with the key, and it reads the file again", async () => {
     writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
     const { log } = await runWorker();
     expect(made.scrubbers).toHaveLength(1);
-    expect(made.scrubbers[0]).toMatchObject({ key: VAULT_KEY, pending: undefined, started: true });
-    expect(made.syncers).toEqual([made.scrubbers[0].instance]);
+    const [scrubber] = made.scrubbers;
+    expect(scrubber).toMatchObject({ key: VAULT_KEY, started: true });
+    expect(scrubber.keyFile?.problem).toBeUndefined();
+    expect(made.syncers).toEqual([scrubber.instance]);
     expect(log()).toContain("vault scrubber: on (exact-match redaction of named secrets and the vault key)\n");
     expect(log()).not.toContain(VAULT_KEY);
+    expect(keyOrigin()).toBe("file");
+
+    // Another key in its place: the one the vault is read with from then on.
+    writeFileSync(KEY_FILE, `${ENV_VAULT_KEY}\n`);
+    await expect(scrubber.keyFile?.source.read()).resolves.toBe(ENV_VAULT_KEY);
+    // The file gone: it says so, and the scrubber keeps the key it has.
+    rmSync(KEY_FILE);
+    await expect(scrubber.keyFile?.source.read()).resolves.toBeUndefined();
   });
 
   it("ENGRAM_VAULT_KEY set for the daemon still wins over a file it can't read", async () => {
@@ -306,9 +377,16 @@ describe("a daemon started with a vault key it can't read (engram#677)", () => {
     vi.stubEnv("ENGRAM_VAULT_KEY", ENV_VAULT_KEY);
     const { log } = await runWorker();
     expect(made.scrubbers).toHaveLength(1);
-    expect(made.scrubbers[0]).toMatchObject({ key: ENV_VAULT_KEY, pending: undefined });
+    const [scrubber] = made.scrubbers;
+    expect(scrubber).toMatchObject({ key: ENV_VAULT_KEY });
+    expect(scrubber.keyFile?.problem).toBeUndefined();
     expect(log()).toContain("vault scrubber: on");
     expect(log()).not.toContain("holding sends");
     expect(log()).not.toContain(ENV_VAULT_KEY);
+    // status.json says so: `engram vault save-key` tells the user the file
+    // isn't the key this daemon uses.
+    expect(keyOrigin()).toBe("env");
+    // And what it reads again is the variable, whatever the file is.
+    await expect(scrubber.keyFile?.source.read()).resolves.toBe(ENV_VAULT_KEY);
   });
 });

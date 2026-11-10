@@ -230,10 +230,16 @@ function knownVaultKey() {
 function redact(s) {
   let out = s.replace(/engram_sk_live_e2e_\w*/g, "<test key>").split(SECRET).join("<the secret>");
   const vk = knownVaultKey();
-  // keygen prints the key's first 8 characters.
+  // The key's first 8 characters too: keygen and status showed them before
+  // engram#699, and step 1 checks that nothing does now.
   if (vk) out = out.split(vk).join("<vault key>").split(vk.slice(0, 8)).join("<vault key>");
   return out;
 }
+/** Each 8 characters of the vault key that `text` shows: none, to pass (engram#699). */
+const keyShownIn = (text) => {
+  const vk = knownVaultKey() ?? "";
+  return Array.from({ length: Math.max(0, vk.length - 7) }, (_, i) => vk.slice(i, i + 8)).filter((e) => text.includes(e));
+};
 
 const pids = new Set();
 const alive = (pid) => {
@@ -271,7 +277,10 @@ async function waitFor(what, test, ms = 20_000) {
 /** What the last command said. */
 let lastOut = "";
 
-/** Run the built CLI as a user would. Async: the fake server is in this process. */
+/**
+ * Run the built CLI as a user would. Async: the fake server is in this
+ * process. `out` is redacted and printed; `raw` is what it said, unprinted.
+ */
 function engram(...args) {
   return new Promise((resolve) => {
     const child = spawn(node, [CLI, ...args], { env, cwd: root, stdio: ["ignore", "pipe", "pipe"] });
@@ -281,11 +290,12 @@ function engram(...args) {
     const timer = setTimeout(() => child.kill("SIGKILL"), 60_000);
     child.on("close", (status) => {
       clearTimeout(timer);
-      out = redact(out.replace(/\x1b\[[0-9;]*m/g, ""));
+      const raw = out.replace(/\x1b\[[0-9;]*m/g, "");
+      out = redact(raw);
       lastOut = out;
       console.log(`\n$ engram ${redact(args.join(" "))}  (exit ${status})`);
       for (const line of out.trimEnd().split("\n")) console.log(`  │ ${line}`);
-      resolve({ status, out });
+      resolve({ status, out, raw });
     });
   });
 }
@@ -400,6 +410,16 @@ try {
   r = await engram("vault", "keygen", "--save");
   check(r.status === 0, "vault keygen --save exits 0");
   check(Buffer.from(knownVaultKey() ?? "", "base64").length === 32, "the vault key is saved: 32 bytes");
+  // engram#699: a fingerprint anyone can work out from the key, and none of the key.
+  const keyFp = createHash("sha256")
+    .update(Buffer.from(knownVaultKey() ?? "", "base64"))
+    .digest("hex")
+    .slice(0, 8);
+  check(r.raw.includes(`Key fingerprint: ${keyFp}\n`), "keygen --save: the key's fingerprint, the first 8 hex of SHA-256 over its bytes");
+  check(keyShownIn(r.raw).length === 0, `keygen --save: none of the key (${keyShownIn(r.raw).length} of its 8-character runs shown)`);
+  r = await engram("vault", "status");
+  check(r.status === 0 && r.raw.includes(`Key fingerprint: ${keyFp}\n`), "vault status: the same fingerprint");
+  check(keyShownIn(r.raw).length === 0, `vault status: none of the key (${keyShownIn(r.raw).length} of its 8-character runs shown)`);
   r = await engram("vault", "set", SECRET_NAME, "--value", SECRET);
   check(r.status === 0, "vault set exits 0");
   check(server.vault.has(SECRET_NAME) && reached(SECRET) === 0, "the server keeps the secret encrypted, never as it is");

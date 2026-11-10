@@ -56,9 +56,11 @@ import {
   readUnit,
   removeUnit,
   rewriteUnit,
+  startUnit,
   systemctlPath,
   systemdReachable,
   unitPath,
+  unitPid,
   type UnitState,
 } from "./systemd.js";
 import {
@@ -277,7 +279,7 @@ export async function daemonStart(
     // loading the launchd agent starts a worker there and then, which finds
     // this daemon and exits (engram#612).
     if ("install" in flags) await enableStartAtLogin(true);
-    printOutsideLaunchd(found);
+    printOutsideManager(found);
     return;
   }
 
@@ -309,12 +311,18 @@ export async function daemonStart(
   repairRunEntryIfBroken();
   repairSystemdUnitIfStale();
 
-  // On macOS, start at login first: loading the agent has launchd start the
-  // daemon, and then it is launchd's, which starts it again after a crash
-  // (engram#641). Not with settings in this environment that launchd's
-  // daemon wouldn't have: the daemon is started here then, as before.
-  const launchdFirst = "install" in flags && process.platform === "darwin" && !daemonEnvOverrides();
-  if (launchdFirst) await enableLaunchdStartAtLogin();
+  // Start at login first where the service manager starts the daemon then:
+  // on macOS, loading the agent has launchd start it (engram#641); on Linux,
+  // with the unit enabled, systemd is asked to (engram#689). Then it is
+  // theirs, and they start it again after a crash. Not with settings in this
+  // environment that their daemon wouldn't have: the daemon is started here
+  // then, as before. Nor without a systemd user session: that start at login
+  // isn't available is said after the start, as before.
+  const platform = process.platform;
+  const managerFirst =
+    "install" in flags && !daemonEnvOverrides() && (platform === "darwin" || (platform === "linux" && systemdSession()));
+  if (managerFirst && platform === "darwin") await enableLaunchdStartAtLogin();
+  if (managerFirst && platform === "linux") await enableSystemdStartAtLogin(true, false);
 
   if (!reportStart(await startInBackground())) {
     process.exit(1);
@@ -323,37 +331,55 @@ export async function daemonStart(
   console.log(`${dim("Log:")} ${LOG_FILE}`);
   console.log(`${dim("DB:")}  ${DB_FILE}`);
 
-  if ("install" in flags && !launchdFirst) {
+  if ("install" in flags && !managerFirst) {
     await enableStartAtLogin(true);
   }
 }
 
 /**
- * Said when the daemon runs, and launchd isn't running it though it could
- * (engram#641): launchd doesn't start that one again after a crash. A daemon
- * `engram start` spawned before this version, or with a key, a server or the
- * vault key set that launchd's daemon wouldn't have, or one launchd's own
- * found running when the agent was loaded. A stop and a start hand it to
- * launchd. Not when the version hint says to do that anyway. `engram start`
+ * Said when the daemon runs, and launchd or systemd isn't running it though
+ * it could (engram#641, engram#689): it doesn't start that one again after
+ * a crash. A daemon `engram start` spawned before this version, or with a
+ * key, a server or the vault key set that their daemon wouldn't have, or
+ * one theirs found running as it started. A stop and a start hand it to
+ * them. Not when the version hint says to do that anyway. `engram start`
  * and `engram install` say it when they find the daemon running, and
  * `engram status` under its Auto-start line (engram#692).
  *
  * `switchedOn`: the caller asked launchctl already, and launchd hasn't the
  * job switched off.
  */
-function printOutsideLaunchd(found: DaemonFound, switchedOn = false): void {
+function printOutsideManager(found: DaemonFound, switchedOn = false): void {
   if (found.state !== "running" || found.older) return;
   if (found.version && VERSION !== "unknown" && found.version !== VERSION) return;
-  if (!launchdRunsThisCli()) return;
-  const pid = agentPid();
-  if (pid === found.pid) return;
-  if (pid === null && !agentLoaded()) return;
-  if (!switchedOn && agentDisabled() === true) return;
+  const manager = outsideLaunchd(found.pid, switchedOn) ? "launchd" : outsideSystemd(found.pid) ? "systemd" : null;
+  if (manager === null) return;
   console.log(
     dim(
-      `  The running daemon (pid ${found.pid}) wasn't started by launchd, so launchd won't restart it after a crash: run 'engram stop' and then 'engram start' to fix that.`,
+      `  The running daemon (pid ${found.pid}) wasn't started by ${manager}, so ${manager} won't restart it after a crash: run 'engram stop' and then 'engram start' to fix that.`,
     ),
   );
+}
+
+/** launchd could run this CLI's daemon, and doesn't run `pid`. */
+function outsideLaunchd(pid: number, switchedOn: boolean): boolean {
+  if (!launchdRunsThisCli()) return false;
+  const agent = agentPid();
+  if (agent === pid) return false;
+  if (agent === null && !agentLoaded()) return false;
+  return switchedOn || agentDisabled() !== true;
+}
+
+/**
+ * systemd could run this CLI's daemon, and doesn't run `pid`: the unit's
+ * MainPID is another, or 0 when it runs none. Not when no service manager
+ * answers, which could start it.
+ */
+function outsideSystemd(pid: number): boolean {
+  if (!systemdRunsThisCli()) return false;
+  const file = systemctlPath();
+  const unit = file === null ? null : unitPid(file, "MainPID");
+  return unit !== null && unit !== pid;
 }
 
 /**
@@ -385,24 +411,27 @@ const REPORT_MARGIN_MS = 2_000;
  * Start the daemon in the background, and wait for it to be ready (see
  * waitForWorker). On Windows through the supervisor, which starts it again
  * after an error (engram#613). On macOS through launchd, which does that
- * too, when its agent is loaded (engram#641).
+ * too, when its agent is loaded (engram#641), and on Linux through systemd,
+ * when its unit is enabled (engram#689).
  */
 function startInBackground(): Promise<WorkerStart> {
   if (process.platform === "win32") {
     const reportUntil = Date.now() + START_WAIT_MS - REPORT_MARGIN_MS;
     return waitForWorker(spawnSupervisor(reportUntil), START_WAIT_MS, { supervisor: true });
   }
-  if (launchdCanStart()) return startThroughLaunchd();
+  const manager = serviceManager();
+  if (manager) return startThroughManager(manager);
   return waitForWorker(spawnWorker());
 }
 
 /**
  * Settings in this command's environment that a daemon spawned from it
- * inherits, and one launchd starts doesn't have: launchd gives its job only
- * the plist's environment (engram#641). A key or a server set here, or the
- * vault key, which the daemon scrubs vault values with, unless
- * ~/.engram/vault-key holds it, which launchd's daemon reads (engram#690).
- * With one of them set, the daemon is spawned, as before.
+ * inherits, and one the service manager starts doesn't have: launchd gives
+ * its job only the plist's environment (engram#641), and systemd its unit
+ * only the unit's and its own (engram#689). A key or a server set here, or
+ * the vault key, which the daemon scrubs vault values with, unless
+ * ~/.engram/vault-key holds it, which their daemon reads (engram#690). With
+ * one of them set, the daemon is spawned, as before.
  */
 function daemonEnvOverrides(): boolean {
   return Boolean(
@@ -432,57 +461,95 @@ function launchdCanStart(): boolean {
   return launchdRunsThisCli() && agentLoaded() && agentDisabled() !== true;
 }
 
+/** A service manager that can start the daemon, and starts it again after a crash. */
+interface ServiceManager {
+  name: "launchd" | "systemd";
+  /** The command it is asked through, named with what it says when it refuses. */
+  tool: "launchctl" | "systemctl";
+  /** Ask it to start the daemon: null when it took that, else what it said. */
+  start: () => string | null;
+  /** The PID of the daemon it started; null while there is none to name. */
+  pid: () => number | null;
+}
+
 /**
- * Have launchd start the daemon, and wait for it to be ready (engram#641).
- * launchd starts the daemon it runs again after a crash; one spawned, it
- * doesn't. The daemon is spawned, as before, when launchd won't start it,
- * or hasn't within LAUNCHD_SPAWN_WAIT_MS: said, since that one isn't
- * restarted.
+ * The service manager that can start this CLI's daemon now: launchd, when
+ * its agent is loaded and not switched off (launchdCanStart, engram#641), or
+ * systemd, when its unit is ours, enabled and current, and the user's
+ * service manager answers (engram#689). Null when neither can: the daemon is
+ * spawned then, as before, and nothing more is said.
  */
-async function startThroughLaunchd(): Promise<WorkerStart> {
-  const refused = kickstartAgent();
+function serviceManager(): ServiceManager | null {
+  if (launchdCanStart()) return { name: "launchd", tool: "launchctl", start: kickstartAgent, pid: agentPid };
+  if (!systemdRunsThisCli()) return null;
+  const file = systemctlPath();
+  if (file === null || !systemdReachable(file)) return null;
+  return {
+    name: "systemd",
+    tool: "systemctl",
+    start: () => startUnit(file),
+    // The last process systemd started for the unit, which it names until
+    // the next: one that exits as it starts is still seen to have started.
+    // 0 before it has started any.
+    pid: () => unitPid(file, "ExecMainPID") || null,
+  };
+}
+
+/**
+ * Have the service manager start the daemon, and wait for it to be ready
+ * (engram#641, engram#689). It starts the daemon it runs again after a
+ * crash; one spawned, it doesn't. The daemon is spawned, as before, when it
+ * won't start it, or hasn't within MANAGER_SPAWN_WAIT_MS: said, since that
+ * one isn't restarted.
+ */
+async function startThroughManager(manager: ServiceManager): Promise<WorkerStart> {
+  const refused = manager.start();
   if (refused === null) {
-    const started = await waitForAgent();
+    const started = await waitForAgent(START_WAIT_MS, MANAGER_SPAWN_WAIT_MS, manager.pid);
     if (started !== null) return started;
   }
-  const why = refused === null ? "didn't start the daemon in time" : `couldn't start the daemon (launchctl: ${refused})`;
-  console.log(dim(`  launchd ${why}, so it is started directly, and won't be restarted after a crash.`));
+  const why =
+    refused === null ? "didn't start the daemon in time" : `couldn't start the daemon (${manager.tool}: ${refused})`;
+  console.log(dim(`  ${manager.name} ${why}, so it is started directly, and won't be restarted after a crash.`));
   return waitForWorker(spawnWorker());
 }
 
 /**
- * How long `engram start` waits for launchd to start the daemon it asked
- * for before spawning one itself. launchd starts it at once, as a rule.
+ * How long `engram start` waits for launchd or systemd to start the daemon
+ * it asked for before spawning one itself. They start it at once, as a rule.
  */
-const LAUNCHD_SPAWN_WAIT_MS = 3_000;
+const MANAGER_SPAWN_WAIT_MS = 3_000;
 
 /**
- * Wait for the daemon launchd was asked to start (kickstartAgent) to
- * answer on its socket as ready, as waitForWorker waits for one spawned.
- * Its PID is launchd's (agentPid), asked for at once: launchd names the
- * process as it starts it, so one that exits as it starts is still seen to
- * have started. Gives up as soon as that process has exited with nothing
- * holding the socket: it couldn't start. A daemon that answers, ready, is
- * the one running: launchd's, or one started beside it, which launchd's
- * leaves the capture to (engram#612).
+ * Wait for the daemon the service manager was asked to start (kickstartAgent,
+ * startUnit) to answer on its socket as ready, as waitForWorker waits for
+ * one spawned. Its PID is the service manager's (`pidOf`: agentPid by
+ * default), asked for at once: launchd names the process as it starts it,
+ * and systemd keeps naming the last one it started, so one that exits as it
+ * starts is still seen to have started. Gives up as soon as that process
+ * has exited with nothing holding the socket: it couldn't start. A daemon
+ * that answers, ready, is the one running: the service manager's, or one
+ * started beside it, which the service manager's leaves the capture to
+ * (engram#612).
  *
- * Null when launchd hasn't started a process for the job within
+ * Null when the service manager hasn't started a process within
  * `spawnWaitMs`: the caller spawns the daemon then. Exported for tests.
  */
 export async function waitForAgent(
   timeoutMs = START_WAIT_MS,
-  spawnWaitMs = LAUNCHD_SPAWN_WAIT_MS,
+  spawnWaitMs = MANAGER_SPAWN_WAIT_MS,
+  pidOf: () => number | null = agentPid,
 ): Promise<WorkerStart | null> {
   const start = Date.now();
   const deadline = start + timeoutMs;
-  let pid = agentPid();
+  let pid = pidOf();
   while (Date.now() < deadline) {
     await sleep(100);
     const probe = await probeDaemon({ timeoutMs: 1_000 });
     if (probe.state === "answered" && probe.info.ready && !probe.info.stopping) {
       return { state: "running", pid: probe.info.pid };
     }
-    pid ??= agentPid();
+    pid ??= pidOf();
     // A daemon holds the socket, and is still loading.
     if (probe.state === "answered" || probe.state === "silent") continue;
     if (pid === null) {
@@ -921,14 +988,15 @@ export async function daemonStatus(): Promise<void> {
  * read while it runs (engram#651).
  *
  * `found`: the daemon that runs. Under the line, when start at login is on
- * and launchd doesn't run that daemon, though it could: it won't be started
- * again after a crash (engram#692).
+ * and launchd or systemd doesn't run that daemon, though it could: it won't
+ * be started again after a crash (engram#692, engram#689).
  */
 function printAutoStart(found?: DaemonFound): boolean {
   const { on, line } = autoStart();
   if (line !== null) console.log(line);
-  // On: launchd hasn't the job switched off, as autoStart asked.
-  if (on && found) printOutsideLaunchd(found, true);
+  // On: launchd hasn't the job switched off, as autoStart asked, or the
+  // systemd unit is enabled.
+  if (on && found) printOutsideManager(found, true);
   return on;
 }
 
@@ -1760,6 +1828,30 @@ function unitForThisCli(): { text: string } | { error: string } {
   }
 }
 
+/** The unit's text as it is now; null when there is none to read. */
+function installedUnitText(): string | null {
+  try {
+    return readFileSync(unitPath(), "utf-8");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The unit is ours, enabled and current, for this CLI (unitForThisCli), and
+ * the daemon systemd starts from it has everything this command's
+ * environment would give one (daemonEnvOverrides): systemd can run this
+ * CLI's daemon (engram#689). No systemctl call. One the user disabled is
+ * left to them: the daemon is spawned then, as before.
+ */
+function systemdRunsThisCli(): boolean {
+  if (process.platform !== "linux" || daemonEnvOverrides()) return false;
+  const unit = readUnit();
+  if (unit.kind !== "ours" || !unit.enabled) return false;
+  const made = unitForThisCli();
+  return "text" in made && installedUnitText() === made.text;
+}
+
 /**
  * Rewrite an enabled unit of ours that names a Node or a CLI that has since
  * moved, or that an older CLI wrote, or that names them in a Homebrew version
@@ -1780,7 +1872,20 @@ export function repairSystemdUnitIfStale(unit: UnitState = readUnit()): boolean 
   return true;
 }
 
-async function enableSystemdStartAtLogin(running: boolean): Promise<void> {
+/** A systemd user session: there is a user service manager, and it answers. */
+function systemdSession(): boolean {
+  const file = systemctlPath();
+  return file !== null && systemdReachable(file);
+}
+
+/**
+ * Start at login on Linux, for `engram install` and `engram start
+ * --install`: write the unit, and enable it. `running`: a daemon runs, or
+ * the caller starts one next, for what is said where there is no start at
+ * login. `start`: start the daemon too, as `engram start` does: through
+ * systemd, once the unit is enabled (engram#689).
+ */
+async function enableSystemdStartAtLogin(running: boolean, start = !running): Promise<void> {
   removeStrayPlist();
   if (readUnit().kind === "foreign") {
     console.error(red(`Can't turn on start at login: ${unitPath()} is there already, and Engram didn't write it.`));
@@ -1818,9 +1923,10 @@ async function enableSystemdStartAtLogin(running: boolean): Promise<void> {
   console.log(`${dim("Unit:")} ${unitPath()}`);
   await printLoginVaultKeyWarning();
   // Enabled, not started: systemd starts it from the next login on. The
-  // daemon now is started as 'engram start' starts it, with this shell's
-  // environment, and never beside a running one.
-  if (!running && !reportStart(await startInBackground())) {
+  // daemon now is started as 'engram start' starts it: by systemd, unless
+  // this shell's environment has settings systemd's daemon wouldn't
+  // (engram#689); never beside a running one.
+  if (start && !reportStart(await startInBackground())) {
     process.exitCode = 1;
   }
 }
@@ -2008,13 +2114,15 @@ async function disableStartAtLogin(): Promise<void> {
 export async function daemonInstall(): Promise<void> {
   if (refusedAsRoot("install")) return;
   await recordCaptureIntent("on", "install");
-  // A daemon that is stopping isn't counted: on Windows and Linux a new
-  // worker is started, which takes over once that one has gone. On macOS
-  // install waits for it to exit first, as `engram start` does: launchd
-  // takes one it runs for the job's daemon, still running, and would start
-  // none in its place (engram#691).
+  // A daemon that is stopping isn't counted: on Windows a new worker is
+  // started, which takes over once that one has gone. On macOS and Linux
+  // install waits for it to exit first, as `engram start` does: launchd or
+  // systemd takes one it runs for its daemon, still running, and would start
+  // none in its place (engram#691, engram#689).
+  const platform = process.platform;
+  const managed = platform === "darwin" || platform === "linux";
   let found = await findDaemon();
-  if (process.platform === "darwin") found = await whileStopping(found);
+  if (managed) found = await whileStopping(found);
   const running = found.state === "running" || found.state === "unresponsive";
   // Files in ~/.engram that are another user's (engram#659). Unless one
   // runs already, start at login would start a daemon that stops at once,
@@ -2028,20 +2136,21 @@ export async function daemonInstall(): Promise<void> {
       return;
     }
   }
-  if (found.state === "stopping" && process.platform === "darwin") {
-    // Start at login all the same, but no start now: launchd would take the
-    // one stopping for the job's daemon if it runs it. (A job loaded now
-    // starts one, which waits for that one to go, engram#612.)
-    await enableLaunchdStartAtLogin();
+  if (found.state === "stopping" && managed) {
+    // Start at login all the same, but no start now: launchd or systemd
+    // would take the one stopping for theirs if they run it. (A job loaded
+    // now starts one, which waits for that one to go, engram#612.)
+    if (platform === "darwin") await enableLaunchdStartAtLogin();
+    else await enableSystemdStartAtLogin(false, false);
     console.error(red(`The daemon is still stopping (pid ${found.pid}). Run 'engram start' in a moment.`));
     process.exitCode = 1;
     return;
   }
   await enableStartAtLogin(running);
   // A daemon that runs stays the one that runs: one launchd starts as the
-  // agent loads finds it and exits (engram#612). Said when launchd doesn't
-  // run it, as `engram start --install` says it (engram#692).
-  printOutsideLaunchd(found);
+  // agent loads finds it and exits (engram#612). Said when launchd or
+  // systemd doesn't run it, as `engram start --install` says it (engram#692).
+  printOutsideManager(found);
 }
 
 /**
@@ -2089,29 +2198,28 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
     if (!(process.env.ENGRAM_API_KEY ?? config.apiKey)) return; // nothing to capture into
     let changed = false;
     const found = await findDaemon(500);
-    // On macOS, with no daemon at all, start at login first: then launchd
-    // starts the daemon, and starts it again after a crash (engram#641).
-    // Not with settings in this environment that launchd's daemon wouldn't
-    // have: the daemon is spawned then, as before.
-    const launchdFirst = platform === "darwin" && found.state === "stopped" && !daemonEnvOverrides();
-    let startAtLogin: "changed" | "unchanged" | "failed" | "unavailable" | undefined = launchdFirst
-      ? autoEnableLaunchdStartAtLogin()
-      : undefined;
-    if (found.state === "stopped" || found.state === "stopping") {
-      // On Windows through the supervisor, as at sign-in, so a worker that
-      // exits with an error is started again (engram#613). Nothing waits on
-      // it here, so it is never asked to report a failed start.
-      if (platform === "win32") spawnSupervisor();
-      else if (!(launchdFirst && launchdCanStart() && kickstartAgent() === null)) spawnWorker();
-      changed = true;
-      await sleep(500);
-    }
-    startAtLogin ??=
+    const autoEnableStartAtLogin = (): "changed" | "unchanged" | "failed" | "unavailable" =>
       platform === "darwin"
         ? autoEnableLaunchdStartAtLogin()
         : platform === "win32"
           ? autoEnableWindowsStartAtLogin()
           : autoEnableSystemdStartAtLogin();
+    // On macOS and Linux, with no daemon at all, start at login first: then
+    // launchd or systemd starts the daemon, and starts it again after a crash
+    // (engram#641, engram#689). Not with settings in this environment that
+    // their daemon wouldn't have: the daemon is spawned then, as before.
+    const managerFirst = platform !== "win32" && found.state === "stopped" && !daemonEnvOverrides();
+    let startAtLogin = managerFirst ? autoEnableStartAtLogin() : undefined;
+    if (found.state === "stopped" || found.state === "stopping") {
+      // On Windows through the supervisor, as at sign-in, so a worker that
+      // exits with an error is started again (engram#613). Nothing waits on
+      // it here, so it is never asked to report a failed start.
+      if (platform === "win32") spawnSupervisor();
+      else if (!(managerFirst && serviceManager()?.start() === null)) spawnWorker();
+      changed = true;
+      await sleep(500);
+    }
+    startAtLogin ??= autoEnableStartAtLogin();
     if (startAtLogin === "changed") changed = true;
     const startAtLoginFailed = startAtLogin === "failed";
     const startAtLoginUnavailable = startAtLogin === "unavailable";

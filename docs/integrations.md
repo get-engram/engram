@@ -4,7 +4,9 @@ Engram works with any MCP-compatible client. Here's how to connect the most comm
 
 ## Claude Desktop
 
-Add to your `claude_desktop_config.json`:
+Add Engram as a custom connector: in Claude, open **Customize → Connectors**, click **+**, choose **Add custom connector**, and enter `https://mcp.getengram.app/mcp`. Claude opens Engram's sign-in page; approve the connection. The connector works in Claude on the web, desktop and mobile, and gives Claude Engram's 8 core memory tools.
+
+To connect with an API key instead, use Claude Desktop's config file. It only runs local (stdio) servers, so Engram goes through [mcp-remote](https://github.com/geelen/mcp-remote) (needs Node.js 18 or later):
 
 **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
@@ -13,16 +15,23 @@ Add to your `claude_desktop_config.json`:
 {
   "mcpServers": {
     "engram": {
-      "url": "https://mcp.getengram.app/mcp",
-      "headers": {
-        "Authorization": "Bearer engram_sk_live_your_key_here"
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://mcp.getengram.app/mcp",
+        "--header",
+        "Authorization:${ENGRAM_AUTH}"
+      ],
+      "env": {
+        "ENGRAM_AUTH": "Bearer engram_sk_live_your_key_here"
       }
     }
   }
 }
 ```
 
-Restart Claude Desktop. Engram's 6 tools will appear in Claude's tool list.
+Restart Claude Desktop. With an API key, Claude gets the 8 core memory tools plus the vault and subscription tools. The [Claude Desktop guide](./guides/claude-desktop.md) covers the details, including Windows.
 
 ## Claude Code (CLI)
 

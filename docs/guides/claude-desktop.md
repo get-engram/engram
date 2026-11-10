@@ -2,7 +2,22 @@
 
 Give Claude Desktop persistent memory across conversations using Engram.
 
-## Setup
+## Easiest: add Engram as a connector
+
+No config file and no API key to copy. The connector works in Claude Desktop, on claude.ai and in the Claude mobile apps.
+
+1. Sign up free at [getengram.app](https://getengram.app) (if you haven't).
+2. In Claude, open **Customize → Connectors**, click **+**, and choose **Add custom connector**.
+3. Name it **Engram**, enter the URL `https://mcp.getengram.app/mcp`, and add it. Leave the sign-in settings at their defaults.
+4. Claude opens Engram's sign-in page. Sign in and approve the connection.
+
+Claude now has Engram's 8 core memory tools. To check the connection, ask Claude **"Which Engram account are you using?"** It answers with Engram's `whoami` tool.
+
+Custom connectors work on every Claude plan; the Free plan allows one. On Team and Enterprise plans, an owner may need to add Engram first under **Organization settings → Connectors**.
+
+## Alternative: config-file setup
+
+Use this to connect with an API key or to a self-hosted instance. Claude Desktop's config file only runs local (stdio) servers, so it reaches Engram through [mcp-remote](https://github.com/geelen/mcp-remote), a small bridge that needs [Node.js](https://nodejs.org) 18 or later.
 
 ### 1. Get an API Key
 
@@ -10,7 +25,7 @@ Sign up at [getengram.app](https://getengram.app) or [self-host](../self-hosting
 
 ### 2. Add the MCP Server
 
-Edit your Claude Desktop config file:
+In Claude Desktop, open **Settings → Developer → Edit Config**, or open the file directly:
 
 **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
@@ -19,18 +34,31 @@ Edit your Claude Desktop config file:
 {
   "mcpServers": {
     "engram": {
-      "url": "https://mcp.getengram.app/mcp",
-      "headers": {
-        "Authorization": "Bearer engram_sk_live_your_key_here"
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://mcp.getengram.app/mcp",
+        "--header",
+        "Authorization:${ENGRAM_AUTH}"
+      ],
+      "env": {
+        "ENGRAM_AUTH": "Bearer engram_sk_live_your_key_here"
       }
     }
   }
 }
 ```
 
+For a self-hosted instance, use your server's `/mcp` URL in place of `https://mcp.getengram.app/mcp`.
+
+Keep `Authorization:${ENGRAM_AUTH}` exactly as written, with no space after the colon. mcp-remote recommends this form because Claude Desktop on Windows breaks arguments that contain spaces. To sign in through your browser instead of using a key, use `"args": ["-y", "mcp-remote", "https://mcp.getengram.app/mcp"]` and leave out the `env` block.
+
+Don't put a `url` or `headers` entry in this file. Claude Desktop doesn't connect to remote servers listed there; each server needs a `command`.
+
 ### 3. Restart Claude Desktop
 
-Quit and reopen Claude Desktop. Engram's 6 tools will appear in Claude's tool list (click the hammer icon to verify).
+Quit and reopen Claude Desktop. With an API key, Claude gets Engram's 8 core memory tools plus the vault and subscription tools. Signed in through the browser instead, it gets the 8 core tools.
 
 ---
 
@@ -142,7 +170,7 @@ You can create separate projects for different areas of your life:
 | Personal | Preferences, travel plans, recommendations |
 | Research | Topics you're exploring, papers discussed |
 
-All projects share the same Engram memory (same API key), so context from one project can surface in another if relevant. The `agent_id` and `tags` help distinguish where memories came from.
+All projects share the same Engram memory (same Engram account), so context from one project can surface in another if relevant. The `agent_id` and `tags` help distinguish where memories came from.
 
 ---
 
@@ -151,4 +179,4 @@ All projects share the same Engram memory (same API key), so context from one pr
 - **Be specific in project instructions.** The more context you give Claude about what to remember, the better its memory will be.
 - **Use different tags per project.** This helps filter memories when searching.
 - **Mention prior context.** If Claude recalls something from Engram, it will mention it. If it misses something, just say "remember when we discussed X?" — it will search again.
-- **Works with Claude Code.** If you use the same API key in Claude Code and Claude Desktop, they share memory. Debug a bug in Claude Code, discuss the architecture in Claude Desktop.
+- **Works with Claude Code.** If Claude Code and Claude Desktop connect to the same Engram account, they share memory. Debug a bug in Claude Code, discuss the architecture in Claude Desktop.

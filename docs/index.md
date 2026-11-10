@@ -7,7 +7,7 @@ Memory infrastructure for AI agents. Engram stores complete, uncompressed conver
 | | |
 |---|---|
 | **[Getting Started](./getting-started.md)** | Connect in 2 minutes |
-| **[API Reference](./api-reference.md)** | All 6 MCP tools with parameters and examples |
+| **[API Reference](./api-reference.md)** | Every MCP tool with parameters and examples |
 | **[Integrations](./integrations.md)** | Claude Desktop, Cursor, Windsurf, custom clients |
 
 ## Learn

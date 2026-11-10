@@ -1797,10 +1797,15 @@ describe("the Windows sign-in launcher (engram#602)", () => {
   it("the worker claims its lock with Node built-ins only, before the ABI preflight", () => {
     // worker.ts takes the single-daemon lock (instance.ts, engram#612) and
     // then preflights better-sqlite3: neither may load it. The daemon's
-    // body comes after, through import().
+    // body comes after, through import(). The lock looks for a daemon
+    // running as root, in launchd's system domain too (engram#680).
     expect(modulesLoaded(["worker.ts"], false)).toEqual([
+      "as-root.ts",
+      "command-path.ts",
+      "homebrew.ts",
       "instance.ts",
       "launch.ts",
+      "launchd.ts",
       "powershell.ts",
       "preflight.ts",
       "private-files.ts",
@@ -1815,8 +1820,12 @@ describe("the Windows sign-in launcher (engram#602)", () => {
     // It runs from sign-in to sign-out, beside the worker and before its
     // preflight: Node built-ins only, import() included.
     expect(modulesLoaded(["supervisor.ts"], true)).toEqual([
+      "as-root.ts",
+      "command-path.ts",
+      "homebrew.ts",
       "instance.ts",
       "launch.ts",
+      "launchd.ts",
       "powershell.ts",
       "private-files.ts",
       "supervise.ts",

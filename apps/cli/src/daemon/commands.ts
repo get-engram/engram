@@ -64,6 +64,14 @@ import {
   type UnitState,
 } from "./systemd.js";
 import {
+  findRootDaemon,
+  rootDaemonLines,
+  systemJobLeft,
+  untiedRootLine,
+  untiedRootWorkers,
+  type RootDaemon,
+} from "./root-daemon.js";
+import {
   PLIST_VERSION,
   agentDisabled,
   agentLoaded,
@@ -75,6 +83,7 @@ import {
   plistPath,
   readPlist,
   reloadAgent,
+  systemJob,
   unloadAgent,
   writePlistFile,
   type PlistState,
@@ -123,6 +132,13 @@ type DaemonFound =
    * minute or two. `pid`: when launchd or the PID file names the daemon.
    */
   | { state: "unresponsive"; pid: number | null }
+  /**
+   * Nothing of the user's runs, and a daemon runs as root for them
+   * (engram#680): `sudo engram start` or `sudo engram install` started it
+   * before engram#653. They can't stop it with `engram stop`, and no
+   * daemon of theirs starts while it runs.
+   */
+  | ({ state: "root" } & RootDaemon)
   | { state: "stopped" };
 
 function fromAnswer(probe: Probe): DaemonFound | null {
@@ -153,23 +169,30 @@ async function findDaemon(timeoutMs?: number): Promise<DaemonFound> {
   if (answered) return answered;
   if (probe.state === "silent") {
     // The PID file is left as it is: a daemon busy starting wrote it.
-    return { state: "unresponsive", pid: readLaunchdPid() ?? confirmedPidFile(false) };
+    return { state: "unresponsive", pid: readLaunchdPid() ?? usersOwn(pidFileDaemon(false)) };
   }
   // Nothing answers. A daemon from before engram#612 has no socket, but
   // launchd, or its PID file confirmed, still finds it. (A daemon since
   // listens before it writes the PID file.) Where no socket can be used
   // (probe "unavailable"), that is how every daemon is found.
-  const pid = readLaunchdPid() ?? confirmedPidFile(true);
-  if (pid === null) return { state: "stopped" };
-  return { state: "running", pid, ready: true, older: probe.state === "none" };
+  const launchd = readLaunchdPid();
+  const inFile = launchd === null ? pidFileDaemon(true) : null;
+  const pid = launchd ?? usersOwn(inFile);
+  if (pid !== null) return { state: "running", pid, ready: true, older: probe.state === "none" };
+  // One running as root for them (engram#680), named in the PID file or run
+  // by a job in launchd's system domain. Its socket, if it has one, is
+  // root's: the probe can't use it.
+  const root = findRootDaemon(inFile);
+  return root === null ? { state: "stopped" } : { state: "root", ...root };
 }
 
 /**
  * The daemon the PID file names, when that process is confirmed to be it
- * (see identifyProcess). `tidy`: remove a file that names a process that has
- * exited, or another program.
+ * (see identifyProcess). `root`: it runs as root for this user (engram#680);
+ * its file is kept, as it is still running. `tidy`: remove a file that
+ * names a process that has exited, or another program.
  */
-function confirmedPidFile(tidy: boolean): number | null {
+function pidFileDaemon(tidy: boolean): { pid: number; root: boolean } | null {
   const pid = pidInFile();
   if (pid === null || pid === process.pid) return null;
   if (!alive(pid)) {
@@ -178,7 +201,12 @@ function confirmedPidFile(tidy: boolean): number | null {
   }
   const what = identifyProcess(pid);
   if (what === "other" && tidy) removePidFileIf(pid);
-  return what === "daemon" ? pid : null;
+  return what === "daemon" || what === "root" ? { pid, root: what === "root" } : null;
+}
+
+/** Its PID, when it runs as the user. */
+function usersOwn(found: { pid: number; root: boolean } | null): number | null {
+  return found !== null && !found.root ? found.pid : null;
 }
 
 /** "Daemon already running", for a start that finds one. */
@@ -271,6 +299,16 @@ export async function daemonStart(
   }
   // Files in ~/.engram that are another user's (engram#659).
   const foreign = foreignFiles();
+  if (found.state === "root") {
+    // A daemon started beside it would exit at once (engram#680), and with
+    // --install, so would the one start at login starts.
+    printRootDaemon(found, "No daemon of yours starts while it runs.", {
+      foreign,
+      again: "install" in flags ? "engram start --install" : "engram start",
+    });
+    process.exitCode = 1;
+    return;
+  }
   if (found.state === "running" || found.state === "unresponsive") {
     printAlreadyRunning(found);
     // It runs, so they haven't stopped it: only said.
@@ -294,6 +332,10 @@ export async function daemonStart(
       return;
     }
   }
+
+  // A daemon running as root that nothing ties to this user (engram#680):
+  // said, as theirs would run beside it.
+  printUntiedRootWorkers([], foreign);
 
   const foreground = "foreground" in flags || "f" in flags;
 
@@ -397,6 +439,38 @@ function printForeignFiles(foreign: ForeignFiles, daemon: "running" | "stopped",
 /** Whether they stop the daemon, or its start. */
 function stopsCapture(foreign: ForeignFiles | null): boolean {
   return foreign !== null && (foreign.stopsDaemon || foreign.stopsStart);
+}
+
+/**
+ * engram#680, for `engram start`, `stop` and `install`, which do nothing
+ * while a daemon runs as root for the user. `why`: what that means for the
+ * command. Then what stops it, and what makes capture theirs again: the
+ * files it made (`foreign`), made theirs, and `again`, the command to run
+ * again, if any.
+ */
+function printRootDaemon(
+  root: RootDaemon,
+  why: string,
+  { foreign, again }: { foreign: ForeignFiles | null; again?: string },
+): void {
+  const { problem, fixes } = rootDaemonLines(root);
+  console.error(red(`${problem} ${why}`));
+  for (const fix of fixes) console.error(dim(`  ${fix}`));
+  if (foreign) {
+    console.error(red(foreignFilesProblem(foreign)));
+    console.error(dim(`  ${foreignFilesFix(foreign, true)}`));
+  }
+  if (again) console.error(dim(`  Then run '${again}' again.`));
+}
+
+/**
+ * Daemons running as root that nothing ties to this user, besides `known`
+ * (engram#680): only said. Most likely theirs, from `sudo engram start`
+ * with a CLI that then removed its PID file, but that can't be told.
+ */
+function printUntiedRootWorkers(known: (number | null)[], foreign: ForeignFiles | null): void {
+  const untied = untiedRootWorkers(known, foreign);
+  if (untied.length > 0) console.error(red(untiedRootLine(untied)));
 }
 
 /**
@@ -738,6 +812,13 @@ export async function daemonStop(): Promise<void> {
     // this, and doesn't (engram#613).
     if (process.platform === "win32") writeStopRequest({ pid: null });
     console.log("Daemon is not running.");
+    printUntiedRootWorkers([], foreignFiles());
+    return;
+  }
+  if (found.state === "root") {
+    // It can't be signalled, and launchd may run it (engram#680).
+    printRootDaemon(found, "'engram stop' can't stop it.", { foreign: foreignFiles() });
+    process.exitCode = 1;
     return;
   }
   if (found.pid === null) {
@@ -805,6 +886,15 @@ export async function daemonStop(): Promise<void> {
   // Its own exit removes the PID file; one killed outright can't.
   removePidFileIf(pid);
   console.log(`Daemon stopped (pid ${pid})`);
+  // One running as root beside it still captures (engram#680): capture
+  // hasn't stopped.
+  const root = findRootDaemon();
+  const foreign = foreignFiles();
+  if (root !== null) {
+    printRootDaemon(root, "'engram stop' can't stop it.", { foreign });
+    process.exitCode = 1;
+  }
+  printUntiedRootWorkers([pid, root?.pid ?? null, root?.job?.pid ?? null], foreign);
 }
 
 /**
@@ -908,12 +998,49 @@ async function printDbStats(foreign: ForeignFiles | null, config: Config | null)
  * engram#659, in `engram status`. `stopped`: the daemon isn't running, so
  * once they are the user's, it has to be started.
  */
-function printForeignFilesWarning(foreign: ForeignFiles, stopped: boolean): void {
-  console.log("");
+function printForeignFilesWarning(foreign: ForeignFiles, stopped: boolean, blankBefore = true): void {
+  if (blankBefore) console.log("");
   console.log(red(`  ${foreignFilesProblem(foreign, stopped ? "stopped" : "running")}`));
   console.log(dim(`  ${foreignFilesFix(foreign)}`));
   if (stopped && stopsCapture(foreign)) console.log(dim("  Then run: engram start"));
   console.log("");
+}
+
+/**
+ * engram#680, in `engram status`: the daemon running as root for the user
+ * that it found, or one besides theirs, from `sudo engram start` or `sudo
+ * engram install` before engram#653; any other daemon running as root; and
+ * Engram's job left in launchd's system domain. True when it said any.
+ */
+function printRootWarnings(found: DaemonFound, foreign: ForeignFiles | null): boolean {
+  const job = found.state === "root" ? found.job : systemJob();
+  const root = found.state === "root" ? found : findRootDaemon(undefined, job);
+  const own = found.state === "stopped" || found.state === "root" ? null : found.pid;
+  // The job's daemon is said with the job.
+  const untied = untiedRootWorkers([own, root?.pid ?? null, job?.pid ?? null], foreign);
+  if (root === null && untied.length === 0 && job === null) return false;
+  console.log("");
+  if (root !== null) {
+    const { problem, fixes } = rootDaemonLines(root);
+    const why =
+      found.state === "root"
+        ? "'engram stop' can't stop it, and no daemon of yours starts while it runs."
+        : "It runs beside yours, and only one should.";
+    console.log(red(`  ${problem} ${why}`));
+    for (const fix of fixes) console.log(dim(`  ${fix}`));
+    if (found.state === "root") {
+      if (foreign) {
+        console.log(red(`  ${foreignFilesProblem(foreign)}`));
+        console.log(dim(`  ${foreignFilesFix(foreign, true)}`));
+      }
+      console.log(dim("  Then run: engram start"));
+    }
+  } else if (job !== null) {
+    console.log(dim(`  ${systemJobLeft()}`));
+  }
+  if (untied.length > 0) console.log(red(`  ${untiedRootLine(untied)}`));
+  console.log("");
+  return true;
 }
 
 export async function daemonStatus(): Promise<void> {
@@ -930,7 +1057,8 @@ export async function daemonStatus(): Promise<void> {
 
     // Still show DB stats if available
     await printDbStats(foreign, config);
-    if (foreign) printForeignFilesWarning(foreign, true);
+    const saidRoot = printRootWarnings(found, foreign);
+    if (foreign) printForeignFilesWarning(foreign, true, !saidRoot);
     if (problem) printConfigWarning(problem);
     if (key instanceof VaultKeyUnreadable) printVaultKeyWarning(key, null);
     // A broken start-at-login entry is often why it's stopped. Files that
@@ -951,6 +1079,8 @@ export async function daemonStatus(): Promise<void> {
 
   if (found.state === "stopping") {
     console.log(`${bold("Status:")} stopping (pid ${found.pid})`);
+  } else if (found.state === "root") {
+    console.log(`${bold("Status:")} running as root (pid ${found.pid}), started with sudo`);
   } else if (found.state === "unresponsive") {
     const held = process.platform === "win32" ? "the daemon's named pipe" : "~/.engram/daemon.sock";
     console.log(
@@ -966,7 +1096,9 @@ export async function daemonStatus(): Promise<void> {
   }
 
   await printDbStats(foreign, config);
-  if (foreign) printForeignFilesWarning(foreign, false);
+  // With one running as root, what it made is said with it.
+  const saidRoot = printRootWarnings(found, foreign);
+  if (foreign && found.state !== "root") printForeignFilesWarning(foreign, false, !saidRoot);
 
   const syncStatus = readStatus();
   printHostStatus(
@@ -2132,7 +2264,8 @@ async function disableStartAtLogin(): Promise<void> {
       clearStartupSwitch();
       console.log(`${bold("Auto-start disabled")} — the Windows startup entry is removed`);
     }
-    if ((await findDaemon()).state !== "stopped") {
+    const state = (await findDaemon()).state;
+    if (state !== "stopped" && state !== "root") {
       console.log(dim("  The daemon keeps running until 'engram stop' or sign-out."));
     }
     return;
@@ -2155,7 +2288,8 @@ async function disableStartAtLogin(): Promise<void> {
       }
       console.log(`${bold("Auto-start disabled")} — the systemd unit is removed`);
     }
-    if ((await findDaemon()).state !== "stopped") {
+    const state = (await findDaemon()).state;
+    if (state !== "stopped" && state !== "root") {
       console.log(dim("  The daemon keeps running until 'engram stop' or sign-out."));
     }
     return;
@@ -2180,6 +2314,15 @@ export async function daemonInstall(): Promise<void> {
   // runs already, start at login would start a daemon that stops at once,
   // or whose log can't be opened: it isn't turned on.
   const foreign = foreignFiles();
+  if (found.state === "root") {
+    // The daemon start at login started would exit at once (engram#680).
+    printRootDaemon(found, "Start at login wasn't turned on: no daemon of yours starts while it runs.", {
+      foreign,
+      again: "engram install",
+    });
+    process.exitCode = 1;
+    return;
+  }
   if (foreign) {
     const stops = !running && stopsCapture(foreign);
     printForeignFiles(foreign, running ? "running" : "stopped", stops ? "install" : undefined);
@@ -2250,6 +2393,18 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
     if (!(process.env.ENGRAM_API_KEY ?? config.apiKey)) return; // nothing to capture into
     let changed = false;
     const found = await findDaemon(500);
+    // One runs as root for them (engram#680): none of theirs would start
+    // beside it, and start at login is left as it is. After other commands,
+    // `engram status` says so.
+    if (found.state === "root") {
+      if (after === "login") {
+        const { problem, fixes } = rootDaemonLines(found);
+        console.log(dim(`  Auto-capture wasn't turned on. ${problem}`));
+        for (const fix of fixes) console.log(dim(`  ${fix}`));
+        console.log(dim("  Then run: engram start"));
+      }
+      return;
+    }
     const autoEnableStartAtLogin = (): "changed" | "unchanged" | "failed" | "unavailable" =>
       platform === "darwin"
         ? autoEnableLaunchdStartAtLogin()

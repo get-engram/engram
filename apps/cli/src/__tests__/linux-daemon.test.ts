@@ -35,8 +35,12 @@ const { home, cli, daemon, systemd, spawn, execSync, execFileSync } = vi.hoisted
   // This build's worker, when it isn't the one in the test's home: a CLI
   // installed with brew runs from a versioned keg (engram#652).
   cli: { worker: null as string | null },
-  // What answers on the daemon's socket: a daemon, or nothing.
-  daemon: { answering: null as { pid: number; stopping?: boolean; version?: string } | null },
+  // What answers on the daemon's socket: a daemon, or nothing. `root`: a
+  // process that runs the worker as root (engram#680).
+  daemon: {
+    answering: null as { pid: number; stopping?: boolean; version?: string } | null,
+    root: null as number | null,
+  },
   // The fake user service manager: whether it answers, and whether it
   // refuses to enable the unit. The daemon it runs for the unit (MainPID, 0
   // for none) and the last one it started (ExecMainPID), what it says when
@@ -85,7 +89,8 @@ vi.mock("../daemon/launch.js", async (importOriginal) => {
     workerPath: () => cli.worker ?? path.join(home.dir, "cli", "dist", "daemon", "worker.js"),
   };
 });
-// The probe answers from `daemon.answering`; the rest is the real module.
+// The probe answers from `daemon.answering`, and `daemon.root` runs as root;
+// the rest is the real module.
 vi.mock("../daemon/instance.js", async (importOriginal) => {
   const real = await importOriginal<typeof import("../daemon/instance.js")>();
   const probeDaemon = async (): Promise<Probe> => {
@@ -93,7 +98,9 @@ vi.mock("../daemon/instance.js", async (importOriginal) => {
     if (a === null) return { state: "none", stale: false };
     return { state: "answered", info: { ready: true, stopping: false, stopFile: false, vaultKeyReread: true, vaultChangeNotice: true, version: real.VERSION, ...a } };
   };
-  return { ...real, probeDaemon };
+  const identifyProcess = (pid: number): ReturnType<typeof real.identifyProcess> =>
+    pid === daemon.root ? "root" : real.identifyProcess(pid);
+  return { ...real, probeDaemon, identifyProcess };
 });
 
 /** What the test setup gave this file, before any test stubs it. */
@@ -369,6 +376,7 @@ beforeEach(() => {
   systemd.starts = "daemon";
   systemd.pidUnreadable = false;
   daemon.answering = null;
+  daemon.root = null;
   madeUp.clear();
   cli.worker = null;
   rmSync(CONFIG, { recursive: true, force: true });
@@ -781,6 +789,25 @@ describe("engram uninstall on Linux (engram#615)", () => {
     expect(text).toContain("The daemon keeps running until 'engram stop' or sign-out.");
     expect(signals()).toEqual([]);
     expect(process.exitCode).toBeUndefined();
+  });
+
+  it("doesn't say one running as root keeps running until 'engram stop', which can't stop it (engram#680)", async () => {
+    writeUnit(unitWith());
+    // `sudo engram start` (CLI 0.6.1 and before) left one running as root,
+    // its PID in the PID file.
+    const root = 4_244;
+    mkdirSync(ENGRAM_DIR, { recursive: true });
+    writeFileSync(PID_FILE, String(root));
+    madeUp.add(root);
+    daemon.root = root;
+    await daemonUninstall();
+    expect(existsSync(UNIT)).toBe(false);
+    expect(linked()).toBe(false);
+    expect(said()).toBe("Auto-start disabled — the systemd unit is removed");
+    expect(signals()).toEqual([]);
+    expect(process.exitCode).toBeUndefined();
+    // Kept: it still runs.
+    expect(readFileSync(PID_FILE, "utf-8")).toBe(String(root));
   });
 
   it("removes the link and the unit with no service manager to ask", async () => {

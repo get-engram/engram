@@ -297,6 +297,50 @@ function launchctl(args: string[]): string {
   });
 }
 
+/**
+ * The job in launchd's system domain, where it runs as root (engram#680).
+ * `launchctl load` run as root loads a plist there, wherever the plist is:
+ * `sudo engram install` did, and `sudo engram start` reloading a stale
+ * plist, before engram#653.
+ */
+export const SYSTEM_JOB = `system/${PLIST_LABEL}`;
+
+/** How to unload SYSTEM_JOB, which stops the daemon it runs. */
+export const SYSTEM_JOB_UNLOAD = `sudo launchctl bootout ${SYSTEM_JOB}`;
+
+/** Engram's job in launchd's system domain: `pid`, the daemon it runs, null when none runs. */
+export interface SystemJob {
+  pid: number | null;
+}
+
+/**
+ * The system-domain job in `launchctl print` output, when it was loaded
+ * from `plist`: this user's own plist, so its daemon runs in their
+ * ~/.engram. A job loaded from anywhere else isn't this user's. The job's
+ * own keys are indented by one tab; what is nested in them, by more.
+ * Pure: the tests pass made-up output.
+ */
+export function parseSystemJob(output: string, plist: string): SystemJob | null {
+  const path = /^\tpath = (.*)$/m.exec(output)?.[1];
+  if (path !== plist) return null;
+  const pid = /^\tpid = (\d+)$/m.exec(output)?.[1];
+  return { pid: pid === undefined ? null : Number(pid) };
+}
+
+/**
+ * Engram's job in launchd's system domain, loaded from this user's plist;
+ * null when there is none, or it can't be told. `launchctl print` needs no
+ * root to look. macOS only.
+ */
+export function systemJob(): SystemJob | null {
+  if (process.platform !== "darwin") return null;
+  try {
+    return parseSystemJob(launchctl(["print", SYSTEM_JOB]), plistPath());
+  } catch {
+    return null; // none loaded (launchctl exits 113), or launchctl failed
+  }
+}
+
 /** The user's login session, where agents run. */
 function guiDomain(): string {
   return `gui/${process.getuid?.() ?? 0}`;

@@ -213,7 +213,7 @@ export function foreignFilesProblem(f: ForeignFiles, daemon?: "running" | "stopp
   return `${whose}, so the daemon can't start.`;
 }
 
-/** "Make it yours with: sudo chown …" */
-export function foreignFilesFix(f: ForeignFiles): string {
-  return `Make ${foreignAreMany(f) ? "them" : "it"} yours with: ${OWNERSHIP_FIX}`;
+/** "Make it yours with: sudo chown …". `then`: "Then make it yours …", after another step. */
+export function foreignFilesFix(f: ForeignFiles, then = false): string {
+  return `${then ? "Then make" : "Make"} ${foreignAreMany(f) ? "them" : "it"} yours with: ${OWNERSHIP_FIX}`;
 }

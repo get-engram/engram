@@ -78,3 +78,47 @@ describe("a worker that fails before it is ready (engram#613)", () => {
     expect(existsSync(join(home.dir, ".engram"))).toBe(false);
   });
 });
+
+describe("a worker running as root for the user (engram#680)", () => {
+  const REFUSED = {
+    state: "refused",
+    message: "daemon exiting: it runs as root, and Engram's daemon runs as you. Run 'engram start' as yourself, without sudo",
+  };
+
+  it("exits 0, which launchd leaves stopped, before its preflight", async () => {
+    vi.doMock("../daemon/instance.js", () => ({ claimDaemonLock: vi.fn(async () => REFUSED) }));
+    const ensureNativeSqlite = vi.fn(() => true);
+    vi.doMock("../daemon/preflight.js", () => ({ ensureNativeSqlite }));
+    const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Exited(`exit ${code}`);
+    }) as never);
+    captureLog();
+    await expect(import("../daemon/worker.js")).rejects.toThrow(Exited);
+    expect(exit).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledWith(0);
+    expect(ensureNativeSqlite).not.toHaveBeenCalled();
+  });
+
+  it("exits 0 before it sets anything up, when a plist from before 0.4.2 starts worker-main.js", async () => {
+    vi.doMock("../daemon/instance.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("../daemon/instance.js")>()),
+      claimDaemonLock: vi.fn(async () => REFUSED),
+    }));
+    const umask = vi.spyOn(process, "umask");
+    // The first exit stops main() where it is. The one after, which main()'s
+    // catch makes of that throw, does nothing: waited for, so it never
+    // reaches the real process.exit once the mocks are restored.
+    const exit = vi
+      .spyOn(process, "exit")
+      .mockImplementationOnce(((code?: number) => {
+        throw new Exited(`exit ${code}`);
+      }) as never)
+      .mockImplementation((() => undefined) as never);
+    captureLog();
+    await import("../daemon/worker-main.js");
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledTimes(2));
+    expect(exit.mock.calls[0]).toEqual([0]);
+    expect(umask).not.toHaveBeenCalled();
+    expect(existsSync(join(home.dir, ".engram"))).toBe(false);
+  });
+});

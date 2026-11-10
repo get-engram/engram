@@ -23,6 +23,11 @@
  * daemon.pid is still written, for CLIs from before this change, and is
  * trusted only for a process confirmed to be the daemon (identifyProcess).
  *
+ * A daemon running as root in the user's ~/.engram is never the daemon
+ * (engram#680): a worker started as root exits at once, and one already
+ * running as root, which `sudo engram start` or `sudo engram install` left
+ * before engram#653, keeps any other from starting while it runs.
+ *
  * IMPORTANT: Node built-ins only. worker.ts claims the lock before the
  * native-module preflight, so nothing here may load better-sqlite3, directly
  * or through another module (see launch.ts).
@@ -30,11 +35,13 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { lstatSync, readFileSync, statSync, unlinkSync, type BigIntStats } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, statSync, unlinkSync, type BigIntStats } from "node:fs";
 import { createRequire } from "node:module";
 import { connect, createServer, type Server } from "node:net";
 import { dirname, join } from "node:path";
+import { rootForAnotherUser } from "./as-root.js";
 import { ENGRAM_DIR, PID_FILE } from "./launch.js";
+import { systemJob, type SystemJob } from "./launchd.js";
 import { powerShellArgs, windowsPowerShellPath } from "./powershell.js";
 import { ensurePrivateDirSync, readSmallFileSync, writePrivateFileSync } from "../private-files.js";
 
@@ -415,11 +422,41 @@ async function boundTo(endpoint: Endpoint, id: string): Promise<{ dev: bigint; i
   return { dev: before.dev, ino: before.ino };
 }
 
-/** The daemon named in the PID file, when it is alive and confirmed to be the daemon (and isn't this process). */
-export function confirmedDaemonInPidFile(): number | null {
+/**
+ * The daemon named in the PID file, when it is alive and confirmed to be
+ * one (and isn't this process): the user's own, or, `root`, one running as
+ * root (engram#680).
+ */
+export function daemonInPidFile(): { pid: number; root: boolean } | null {
   const pid = pidInFile();
   if (pid === null || pid === process.pid || !alive(pid)) return null;
-  return identifyProcess(pid) === "daemon" ? pid : null;
+  const what = identifyProcess(pid);
+  return what === "daemon" || what === "root" ? { pid, root: what === "root" } : null;
+}
+
+/** The user's own daemon, named in the PID file and confirmed (see daemonInPidFile). */
+export function confirmedDaemonInPidFile(): number | null {
+  const found = daemonInPidFile();
+  return found !== null && !found.root ? found.pid : null;
+}
+
+/**
+ * A daemon running as root for this user (engram#680), which `sudo engram
+ * start` or `sudo engram install` started before engram#653: `inFile`, the
+ * one the PID file names, or, on macOS, the one `job` runs, the job such an
+ * install loaded into launchd's system domain from the user's own plist. A
+ * CLI from before this change removed the PID file of a daemon it couldn't
+ * signal. Each is looked up unless the caller has, the job only when the
+ * PID file names none. Null when none runs.
+ */
+export function rootDaemonPid(
+  inFile: { pid: number; root: boolean } | null = daemonInPidFile(),
+  job?: SystemJob | null,
+): number | null {
+  if (inFile?.root) return inFile.pid;
+  const loaded = job === undefined ? systemJob() : job;
+  if (loaded?.pid == null || loaded.pid === process.pid) return null;
+  return identifyProcess(loaded.pid) === "root" ? loaded.pid : null;
 }
 
 /**
@@ -596,21 +633,34 @@ export function alive(pid: number): boolean {
 const WORKER_SCRIPT = /(?:^|[\s/\\])dist[\\/]daemon[\\/]worker(?:-main)?\.js(?:["\s]|$)/;
 
 /**
- * Whether `pid` is this user's daemon: a process of the user's running the
- * worker's script. "unknown" when that can't be found out (`ps` or
- * PowerShell failed, or Windows won't say, as for a process run as
- * administrator), which is never taken for the daemon. A daemon started
- * with `engram start --foreground` runs the CLI's script, and is found
- * through its socket only.
+ * What a process that runs `args` as the user `owner` is to the user `me`:
+ * their daemon, a daemon running as root (engram#680), or something else.
+ * Root's only for a user who isn't root. Pure: the tests pass made-up
+ * processes.
  */
-export function identifyProcess(pid: number): "daemon" | "other" | "unknown" {
+export function processKind(owner: number, args: string, me: number | undefined): "daemon" | "root" | "other" {
+  if (!WORKER_SCRIPT.test(args.trim())) return "other";
+  if (owner === me) return "daemon";
+  return owner === 0 && me !== undefined && me !== 0 ? "root" : "other";
+}
+
+/**
+ * Whether `pid` is this user's daemon: a process of the user's running the
+ * worker's script. "root": the worker's script running as root, for a user
+ * who isn't (engram#680), which the user can't signal. "unknown" when that
+ * can't be found out (`ps` or PowerShell failed, or Windows won't say, as
+ * for a process run as administrator), which is never taken for the
+ * daemon. A daemon started with `engram start --foreground` runs the CLI's
+ * script, and is found through its socket only.
+ */
+export function identifyProcess(pid: number): "daemon" | "root" | "other" | "unknown" {
   if (process.platform === "win32") return identifyOnWindows(pid);
   const uid = process.geteuid?.();
   if (process.platform === "linux") {
     try {
       const owner = statSync(`/proc/${pid}`).uid;
-      const args = readFileSync(`/proc/${pid}/cmdline`, "utf-8").split("\0").join(" ").trim();
-      return owner === uid && WORKER_SCRIPT.test(args) ? "daemon" : "other";
+      const args = readFileSync(`/proc/${pid}/cmdline`, "utf-8").split("\0").join(" ");
+      return processKind(owner, args, uid);
     } catch (err) {
       return errCode(err) === "ENOENT" ? "other" : "unknown";
     }
@@ -628,7 +678,60 @@ export function identifyProcess(pid: number): "daemon" | "other" | "unknown" {
   }
   const match = /^\s*(\d+)\s+(.*)$/.exec(out.split("\n")[0] ?? "");
   if (!match) return "other";
-  return Number(match[1]) === uid && WORKER_SCRIPT.test(match[2].trim()) ? "daemon" : "other";
+  return processKind(Number(match[1]), match[2], uid);
+}
+
+/**
+ * Every process that runs the worker's script as root, when this user
+ * isn't root (engram#680), whatever started it: on macOS, `ps`; on Linux,
+ * /proc. None on Windows, or when they can't be listed. Only ever said, in
+ * `engram status` and `engram start`: nothing ties one of these to this
+ * user, as the PID file or launchd's system domain does.
+ */
+export function rootWorkerPids(): number[] {
+  const me = process.geteuid?.();
+  if (me === undefined || me === 0) return [];
+  const found: number[] = [];
+  const take = (pid: number, owner: number, args: string): void => {
+    if (pid !== process.pid && processKind(owner, args, me) === "root") found.push(pid);
+  };
+  if (process.platform === "linux") {
+    let entries: string[];
+    try {
+      entries = readdirSync("/proc");
+    } catch {
+      return [];
+    }
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const owner = statSync(`/proc/${entry}`).uid;
+        if (owner !== 0) continue;
+        take(Number(entry), owner, readFileSync(`/proc/${entry}/cmdline`, "utf-8").split("\0").join(" "));
+      } catch {
+        // gone since, or hidden
+      }
+    }
+    return found;
+  }
+  if (process.platform !== "darwin") return [];
+  let out: unknown;
+  try {
+    out = execFileSync("/bin/ps", ["-A", "-ww", "-o", "pid=,uid=,args="], {
+      encoding: "utf-8",
+      timeout: 5_000,
+      maxBuffer: 16 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    return [];
+  }
+  if (typeof out !== "string") return [];
+  for (const line of out.split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    if (match) take(Number(match[1]), Number(match[2]), match[3]);
+  }
+  return found;
 }
 
 // ── Identifying a process on Windows (engram#640) ──
@@ -819,7 +922,12 @@ export type Claim =
    * Asked to stop (SIGTERM, SIGINT, SIGHUP) before the lock was decided: it
    * has let go of what it held, and should exit 0 (engram#669).
    */
-  | { state: "stopped" };
+  | { state: "stopped" }
+  /**
+   * Running as root for another user (engram#680): never the daemon. It
+   * took nothing, and should exit 0, so launchd doesn't start it again.
+   */
+  | { state: "refused"; message: string };
 
 let log: (msg: string) => void = () => {};
 let claim: Promise<Claim> | null = null;
@@ -1002,6 +1110,17 @@ export interface ClaimOptions {
 
 async function claimOnce(options: ClaimOptions): Promise<Claim> {
   log = options.log;
+  // Root, running the daemon for the user (engram#680): `sudo engram start`
+  // with a CLI from before engram#653, or a job such a CLI loaded into
+  // launchd's system domain, started again. As root it would make files in
+  // the user's ~/.engram that their own daemon can't write, and the user
+  // couldn't stop it. It takes nothing: no socket, no PID file.
+  if (rootForAnotherUser()) {
+    const message =
+      "daemon exiting: it runs as root, and Engram's daemon runs as you. Run 'engram start' as yourself, without sudo";
+    log(message);
+    return { state: "refused", message };
+  }
   // Before the socket answers: the answer says whether it does.
   watchStopFile = options.stopFile ?? process.platform === "win32";
   // Before the socket answers, too: `engram stop` finds the daemon by it,
@@ -1039,13 +1158,23 @@ async function claimOnce(options: ClaimOptions): Promise<Claim> {
 
   // A daemon from before engram#612 has no socket: its PID file, confirmed,
   // is the only sign of it.
-  const older = confirmedDaemonInPidFile();
-  if (older !== null) {
+  const inFile = daemonInPidFile();
+  if (inFile !== null && !inFile.root) {
     if (result.state === "held") unlockEndpoint(result.held);
     const message =
       result.state === "held"
-        ? `an older daemon is already running (pid ${older}); this one is exiting. Run 'engram stop' and then 'engram start' to update it`
-        : `another daemon is already running (pid ${older}); this one is exiting`;
+        ? `an older daemon is already running (pid ${inFile.pid}); this one is exiting. Run 'engram stop' and then 'engram start' to update it`
+        : `another daemon is already running (pid ${inFile.pid}); this one is exiting`;
+    log(message);
+    return { state: "taken", message, retry: false };
+  }
+
+  // Nor has one running as root (engram#680), which the user can't stop:
+  // two daemons would capture the same transcripts.
+  const root = rootDaemonPid(inFile);
+  if (root !== null) {
+    if (result.state === "held") unlockEndpoint(result.held);
+    const message = `a daemon started with sudo is still running as root (pid ${root}); this one is exiting. Run 'engram status' to see how to stop it`;
     log(message);
     return { state: "taken", message, retry: false };
   }

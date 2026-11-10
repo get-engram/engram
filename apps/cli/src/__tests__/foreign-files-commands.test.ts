@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -19,8 +19,9 @@ import type { Probe } from "../daemon/instance.js";
 
 const { home, daemon, given, imported, spawn, execSync, execFileSync, execFile, saveConfig } = vi.hoisted(() => ({
   home: { dir: "" },
-  // What answers on the daemon's socket: a daemon, or nothing.
-  daemon: { answering: null as { pid: number } | null },
+  // What answers on the daemon's socket: a daemon, or nothing. And a
+  // daemon running as root for the user, if one runs (engram#680).
+  daemon: { answering: null as { pid: number } | null, root: null as number | null },
   // What in ~/.engram is root's and 0600, by name; ".engram" for the folder.
   given: { roots: [] as string[] },
   imported: { worker: false },
@@ -71,7 +72,15 @@ vi.mock("../daemon/instance.js", async (importOriginal) => {
     if (a === null) return { state: "none", stale: false };
     return { state: "answered", info: { ready: true, stopping: false, stopFile: false, vaultKeyReread: true, vaultChangeNotice: true, version: real.VERSION, ...a } };
   };
-  return { ...real, probeDaemon };
+  return {
+    ...real,
+    probeDaemon,
+    // The daemon running as root, as /proc would tell it (engram#680):
+    // alive, and root's.
+    alive: (pid: number) => pid === daemon.root || real.alive(pid),
+    identifyProcess: (pid: number) => (pid === daemon.root ? "root" : real.identifyProcess(pid)),
+    rootWorkerPids: () => (daemon.root === null ? [] : [daemon.root]),
+  };
 });
 // The real check, of owners and access given here: the user is uid 1000,
 // and what given.roots names is root's and 0600.
@@ -133,6 +142,7 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
     out = [];
     errs = [];
     daemon.answering = null;
+    daemon.root = null;
     given.roots = [];
     imported.worker = false;
     rmSync(CONFIG, { recursive: true, force: true });
@@ -576,6 +586,102 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
       await daemonStop();
       expect(errs).toEqual(["Failed to stop daemon (pid 4242)"]);
       expect(process.exitCode).toBe(1);
+    });
+  });
+
+  describe("with the daemon that made them still running as root (engram#680)", () => {
+    const ROOT = 4243;
+    const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
+    const PROBLEM = `A daemon started with sudo is still running as root (pid ${ROOT}).`;
+    // Said after how to stop it: made the user's while it runs, it makes more.
+    const FILES = ["daemon.db in ~/.engram belongs to root, not to you, so the daemon can't start.", `  Then make it yours with: ${FIX}`];
+
+    beforeEach(() => {
+      // `sudo engram start` before engram#653: its PID file names it, and
+      // the database it made is root's.
+      daemon.root = ROOT;
+      writeFileSync(PID_FILE, String(ROOT));
+      given.roots = ["daemon.db"];
+    });
+
+    it("start and install say to stop it, then to make the files the user's, and change nothing", async () => {
+      const runs: [() => Promise<void>, string, string][] = [
+        [() => daemonStart([], {}), "No daemon of yours starts while it runs.", "engram start"],
+        [() => daemonStart([], { install: "" }), "No daemon of yours starts while it runs.", "engram start --install"],
+        [() => daemonInstall(), "Start at login wasn't turned on: no daemon of yours starts while it runs.", "engram install"],
+      ];
+      for (const [run, why, again] of runs) {
+        errs.length = 0;
+        process.exitCode = undefined;
+        await run();
+        expect(process.exitCode).toBe(1);
+        expect(errs).toEqual([`${PROBLEM} ${why}`, `  Stop it with: sudo kill ${ROOT}`, ...FILES, `  Then run '${again}' again.`]);
+      }
+      expect(out).toEqual([]);
+      expectNothingStarted();
+      expect(readFileSync(PID_FILE, "utf-8")).toBe(String(ROOT));
+    });
+
+    it("status says it runs as root, how to stop it, then to make the files the user's, once", async () => {
+      await daemonStatus();
+      expect(out).toContain(`Status: running as root (pid ${ROOT}), started with sudo`);
+      expect(out.join("\n")).toContain(
+        [
+          "",
+          `  ${PROBLEM} 'engram stop' can't stop it, and no daemon of yours starts while it runs.`,
+          `  Stop it with: sudo kill ${ROOT}`,
+          `  ${FILES[0]}`,
+          FILES[1],
+          "  Then run: engram start",
+          "",
+        ].join("\n"),
+      );
+      expect(out.filter((line) => line.includes("belongs to root"))).toHaveLength(1);
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it("status, its PID file gone, says it as one nothing ties to the user, then the files, a blank line between", async () => {
+      rmSync(PID_FILE);
+      await daemonStatus();
+      expect(out[0]).toBe("Status: stopped");
+      const text = out.join("\n");
+      expect(text).toContain(
+        [
+          "",
+          `  A daemon is running as root (pid ${ROOT}), most likely started with sudo. Stop it with: sudo kill ${ROOT}`,
+          "",
+          `  ${DB_IS_ROOTS} the daemon can't start, and nothing new is captured.`,
+          `  Make it yours with: ${FIX}`,
+          "  Then run: engram start",
+          "",
+        ].join("\n"),
+      );
+      expect(text).not.toContain("\n\n\n");
+    });
+
+    it("status, with the user's own daemon running, says the one beside it, then the files, a blank line between", async () => {
+      rmSync(PID_FILE);
+      daemonRunning();
+      await daemonStatus();
+      expect(out[0]).toBe(`Status: running (pid ${process.pid})`);
+      const text = out.join("\n");
+      expect(text).toContain(
+        [
+          "",
+          `  A daemon is running as root (pid ${ROOT}), most likely started with sudo. Stop it with: sudo kill ${ROOT}`,
+          "",
+          `  ${DB_IS_ROOTS}`,
+        ].join("\n"),
+      );
+      expect(text).not.toContain("\n\n\n");
+    });
+
+    it("stop says it can't stop it, then to make the files the user's", async () => {
+      await daemonStop();
+      expect(process.exitCode).toBe(1);
+      expect(errs).toEqual([`${PROBLEM} 'engram stop' can't stop it.`, `  Stop it with: sudo kill ${ROOT}`, ...FILES]);
+      expect(out).toEqual([]);
+      expect(readFileSync(PID_FILE, "utf-8")).toBe(String(ROOT));
     });
   });
 });

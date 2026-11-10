@@ -118,6 +118,7 @@ const {
 const { claudeProjectDir } = await import("../daemon/parser.js");
 const { recoveredSessionMeta } = await import("../daemon/db.js");
 const { openUrlCommand } = await import("../commands/upgrade.js");
+const { throughOptLink } = await import("../daemon/homebrew.js");
 
 const REG_EXE = "C:\\Windows\\System32\\reg.exe";
 const RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -127,7 +128,8 @@ const APPROVED_EXPORTED = "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\Curr
 // the time it was switched off.
 const SWITCHED_OFF = "hex:03,00,00,00,d0,7a,1b,9c,2f,4e,dc,01";
 const SWITCHED_ON = "hex:02,00,00,00,00,00,00,00,00,00,00,00";
-const ENTRY = `"${realpathSync.native(process.execPath)}" "${LOGIN_START}"`;
+// Through Homebrew's opt link where the tests run on a Mac with Homebrew's Node (engram#652).
+const ENTRY = `"${throughOptLink(realpathSync.native(process.execPath))}" "${LOGIN_START}"`;
 const BROKEN_ENTRY = '"C:\\old\\node.exe" "C:\\old\\cli\\dist\\daemon\\login-start.js"';
 
 /** A string value as a .reg file writes it. */

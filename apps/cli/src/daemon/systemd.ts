@@ -13,6 +13,7 @@ import {
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { commandFailure, commandPath } from "./command-path.js";
+import { pinnedToKeg } from "./homebrew.js";
 
 // Start at login on Linux (engram#615): a systemd user unit,
 // ~/.config/systemd/user/engram.service. `systemctl --user enable` links it
@@ -200,6 +201,12 @@ export type UnitState =
       /** The Node or the worker it starts is gone, or it can't be read. */
       broken: boolean;
       version: number;
+      /**
+       * An older CLI wrote it: an older version, or one that starts Node or
+       * the worker in a Homebrew version, which the next `brew upgrade`
+       * removes (engram#652). `engram start` and auto-capture rewrite it.
+       */
+      outdated: boolean;
     };
 
 /** The unit at unitPath(), as far as the CLI is concerned. */
@@ -212,9 +219,23 @@ export function readUnit(): UnitState {
     const code = (err as NodeJS.ErrnoException).code;
     return code === "ENOENT" || code === "ENOTDIR" ? { kind: "none" } : { kind: "foreign" };
   }
-  const version = new RegExp(`^Environment=${VERSION_ENV}=(\\d+)[ \\t]*$`, "m").exec(text);
-  if (!version) return { kind: "foreign" };
-  return { kind: "ours", enabled: linkThere(wantsPath()), broken: unitBroken(text), version: Number(version[1]) };
+  const stamp = new RegExp(`^Environment=${VERSION_ENV}=(\\d+)[ \\t]*$`, "m").exec(text);
+  if (!stamp) return { kind: "foreign" };
+  const version = Number(stamp[1]);
+  const programs = programsIn(text);
+  return {
+    kind: "ours",
+    enabled: linkThere(wantsPath()),
+    // Either program is gone (Node moved, the CLI uninstalled).
+    broken: programs === null || !existsSync(programs.node) || !existsSync(programs.worker),
+    version,
+    // A newer version's is a later CLI's to judge, as with the plist.
+    outdated:
+      version < UNIT_VERSION ||
+      (version === UNIT_VERSION &&
+        programs !== null &&
+        (pinnedToKeg(programs.node) || pinnedToKeg(programs.worker))),
+  };
 }
 
 function linkThere(path: string): boolean {
@@ -226,12 +247,12 @@ function linkThere(path: string): boolean {
   }
 }
 
-/** Either program ExecStart names is gone (Node moved, the CLI uninstalled). */
-function unitBroken(text: string): boolean {
+/** The Node and the worker ExecStart starts; null when it isn't as generateUnit writes it. */
+function programsIn(text: string): { node: string; worker: string } | null {
   const line = /^ExecStart=(.*)$/m.exec(text);
   const words = line ? execWords(line[1]) : null;
-  if (!words || words.length < 6 || words[0] !== "/bin/sh" || words[1] !== "-c") return true;
-  return !existsSync(words[4]) || !existsSync(words[5]);
+  if (!words || words.length < 6 || words[0] !== "/bin/sh" || words[1] !== "-c") return null;
+  return { node: words[4], worker: words[5] };
 }
 
 /**

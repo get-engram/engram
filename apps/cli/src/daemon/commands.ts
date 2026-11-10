@@ -15,6 +15,7 @@ import {
 import { formatWait } from "./backoff.js";
 import { ALL_ADAPTERS } from "./adapters.js";
 import { rootForAnotherUser } from "./as-root.js";
+import { commandFailure } from "./command-path.js";
 import {
   ENGRAM_DIR,
   LOG_FILE,
@@ -651,20 +652,27 @@ export async function daemonStatus(): Promise<void> {
   printAutoStart();
 }
 
-/** Print how the daemon starts at login; true when it is set to and should work. */
+/**
+ * Print how the daemon starts at login; true when it is set to and should
+ * work. What it says to run works whether the daemon runs or not: `engram
+ * start` finds a running daemon and repairs nothing, and status is mostly
+ * read while it runs (engram#651).
+ */
 function printAutoStart(): boolean {
   if (process.platform === "darwin") return printLaunchdAutoStart(readPlist());
   if (process.platform === "linux") return printSystemdAutoStart(readUnit());
 
   const entry = readRunEntry();
   if (entry === null) return false;
-  if (runEntryBroken(entry)) {
-    console.log(`${dim("Auto-start:")} enabled (Windows sign-in)` + red("  — broken, run 'engram start' to repair"));
-  } else if (switchedOffInStartupApps()) {
+  // Said before broken, as on macOS and Linux: one switched off doesn't
+  // start at sign-in either way, and 'engram install' switches it back on.
+  if (switchedOffInStartupApps()) {
     console.log(
       `${dim("Auto-start:")} off — switched off in Windows Startup apps` +
         dim("  ('engram install' turns it back on)"),
     );
+  } else if (runEntryBroken(entry)) {
+    console.log(`${dim("Auto-start:")} enabled (Windows sign-in)` + red("  — broken, run 'engram install' to repair"));
   } else {
     console.log(`${dim("Auto-start:")} enabled (Windows sign-in)`);
     return true;
@@ -682,13 +690,13 @@ function printLaunchdAutoStart(plist: PlistState): boolean {
     return false;
   }
   if (plist.broken) {
-    console.log(`${dim("Auto-start:")} enabled (launchd)` + red("  — broken, run 'engram start' to repair"));
+    console.log(`${dim("Auto-start:")} enabled (launchd)` + red("  — broken, run 'engram install' to repair"));
     return false;
   }
   const stale = plist.version < PLIST_VERSION;
   console.log(
     `${dim("Auto-start:")} enabled (launchd)` +
-      (stale ? red("  — outdated config, run 'engram start' to update") : ""),
+      (stale ? red("  — outdated config, run 'engram install' to update") : ""),
   );
   return true;
 }
@@ -703,12 +711,12 @@ function printSystemdAutoStart(unit: UnitState): boolean {
     return false;
   }
   if (unit.broken) {
-    console.log(`${dim("Auto-start:")} enabled (systemd)` + red("  — broken, run 'engram start' to repair"));
+    console.log(`${dim("Auto-start:")} enabled (systemd)` + red("  — broken, run 'engram install' to repair"));
     return false;
   }
   console.log(
     `${dim("Auto-start:")} enabled (systemd)` +
-      (unit.version < UNIT_VERSION ? red("  — outdated config, run 'engram start' to update") : ""),
+      (unit.version < UNIT_VERSION ? red("  — outdated config, run 'engram install' to update") : ""),
   );
   return true;
 }
@@ -1128,24 +1136,26 @@ function runEntryBroken(entry: string): boolean {
   return !m || !existsSync(m[1]) || !existsSync(m[2]);
 }
 
-function writeRunEntry(): boolean {
+/** Add the entry, or point it at this CLI. Null when reg did; else what reg said, to print. */
+function writeRunEntry(): string | null {
   try {
     runReg([
       "add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ",
       "/d", runEntryCommand(nodePathForEntry(), loginStartPath()), "/f",
     ]);
-    return true;
-  } catch {
-    return false;
+    return null;
+  } catch (err: unknown) {
+    return commandFailure(err);
   }
 }
 
-function deleteRunEntry(): boolean {
+/** Remove the entry. Null when reg did; else what reg said, to print. */
+function deleteRunEntry(): string | null {
   try {
     runReg(["delete", RUN_KEY, "/v", RUN_VALUE, "/f"]);
-    return true;
-  } catch {
-    return false;
+    return null;
+  } catch (err: unknown) {
+    return commandFailure(err);
   }
 }
 
@@ -1156,7 +1166,7 @@ function deleteRunEntry(): boolean {
  */
 export function repairRunEntryIfBroken(entry: string | null = readRunEntry()): boolean {
   if (entry === null || !runEntryBroken(entry)) return false;
-  if (!existsSync(loginStartPath()) || !writeRunEntry()) return false;
+  if (!existsSync(loginStartPath()) || writeRunEntry() !== null) return false;
   console.log(bold("Updated the start-at-login entry"));
   return true;
 }
@@ -1336,11 +1346,18 @@ async function enableWindowsStartAtLogin(running: boolean): Promise<void> {
   if (!existsSync(entryPath)) {
     // Only a source checkout run through tsx gets here: the build ships it.
     console.error(red(`Can't turn on start at login: ${entryPath} is missing.`));
+    process.exitCode = 1;
     return;
   }
-  if (!writeRunEntry()) {
+  // Said here, as on macOS and Linux: status sends people to 'engram install'
+  // to repair start at login, so this is where they learn why it can't be
+  // (engram#651).
+  const failed = writeRunEntry();
+  if (failed !== null) {
     console.error(red("Couldn't add the Windows startup entry."));
+    console.error(dim(`  reg: ${failed}`));
     console.error(dim(`  It goes in ${RUN_KEY} as "${RUN_VALUE}". Run 'engram install' to try again.`));
+    process.exitCode = 1;
     return;
   }
   clearStartupSwitch();
@@ -1371,7 +1388,7 @@ function autoEnableWindowsStartAtLogin(): "changed" | "unchanged" | "failed" {
   if (entry !== null) return repairRunEntryIfBroken(entry) ? "changed" : "unchanged";
   // Only a source checkout run through tsx has no login-start.js: the build ships it.
   if (!existsSync(loginStartPath())) return "unchanged";
-  if (!writeRunEntry()) return "failed";
+  if (writeRunEntry() !== null) return "failed";
   if (switchedOffInStartupApps()) {
     console.log(`${bold("Start at login is switched off")} in Windows Startup apps`);
     console.log(dim("  Switch Engram on there, or run 'engram install', to start the daemon when you sign in."));
@@ -1391,13 +1408,17 @@ async function disableStartAtLogin(): Promise<void> {
   if (process.platform === "win32") {
     if (readRunEntry() === null) {
       console.log("Auto-start isn't on.");
-    } else if (deleteRunEntry()) {
+    } else {
+      const failed = deleteRunEntry();
+      if (failed !== null) {
+        console.error(red("Couldn't remove the Windows startup entry."));
+        console.error(dim(`  reg: ${failed}`));
+        console.error(dim(`  Remove "${RUN_VALUE}" from ${RUN_KEY}, or switch it off under Startup apps.`));
+        process.exitCode = 1;
+        return;
+      }
       clearStartupSwitch();
       console.log(`${bold("Auto-start disabled")} — the Windows startup entry is removed`);
-    } else {
-      console.error(red("Couldn't remove the Windows startup entry."));
-      console.error(dim(`  Remove "${RUN_VALUE}" from ${RUN_KEY}, or switch it off under Startup apps.`));
-      return;
     }
     if ((await findDaemon()).state !== "stopped") {
       console.log(dim("  The daemon keeps running until 'engram stop' or sign-out."));

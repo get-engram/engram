@@ -197,6 +197,23 @@ function fakeReg(_file: string, args: string[]): string {
   }
 }
 
+/**
+ * What execFileSync throws when reg refuses: "Command failed:" and the
+ * command line, then what reg said, which it has on stderr too.
+ */
+function regRefused(args: string[]): Error {
+  const said = "ERROR: Access is denied.\r\n\r\n";
+  return Object.assign(new Error(`Command failed: ${REG_EXE} ${args.join(" ")}\n${said}`), { status: 1, stderr: said });
+}
+
+/** reg refuses `verb` on the Run key; the rest is as fakeExec has it. */
+function regRefuses(verb: "add" | "delete"): void {
+  execFileSync.mockImplementation((file: string, args: string[], options?: { env?: Record<string, string | undefined> }) => {
+    if (file === REG_EXE && args[0] === verb && args[1] === RUN_KEY) throw regRefused(args);
+    return fakeExec(file, args, options);
+  });
+}
+
 const POWERSHELL = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const USER_SID = "S-1-5-21-1004336348-1177238915-682003330-1001";
 const OTHER_SID = "S-1-5-21-1004336348-1177238915-682003330-1002";
@@ -692,7 +709,97 @@ describe("start at login on Windows (engram#602)", () => {
     registry.value = BROKEN_ENTRY;
     await daemonStatus();
     expect(output()).toContain("running");
-    expect(output()).toContain("broken, run 'engram start' to repair");
+    expect(output()).toContain("broken, run 'engram install' to repair");
+  });
+
+  it("engram status points at what repairs the entry while the daemon runs: engram install (engram#651)", async () => {
+    onWindows();
+    daemonRunning();
+    registry.value = BROKEN_ENTRY;
+    await daemonStatus();
+    expect(output()).toContain("Auto-start: enabled (Windows sign-in)  — broken, run 'engram install' to repair");
+    // engram start finds the daemon running, and repairs nothing.
+    await daemonStart([], {});
+    expect(registry.value).toBe(BROKEN_ENTRY);
+    await daemonInstall();
+    expect(registry.value).toBe(ENTRY);
+    expect(spawn).not.toHaveBeenCalled();
+    (console.log as Mock).mockClear();
+    (console.error as Mock).mockClear();
+    await daemonStatus();
+    expect(output()).toContain("Auto-start: enabled (Windows sign-in)");
+    expect(output()).not.toMatch(/broken|engram start/);
+  });
+
+  it("engram status says an entry switched off in Startup apps is off, broken or not (engram#651)", async () => {
+    onWindows();
+    registry.value = BROKEN_ENTRY;
+    registry.approved = SWITCHED_OFF;
+    await daemonStatus();
+    expect(output()).toContain("Auto-start: off — switched off in Windows Startup apps  ('engram install' turns it back on)");
+    expect(output()).not.toContain("broken");
+    expect(output()).not.toContain("enabled (Windows sign-in)");
+  });
+
+  it("engram install says why it couldn't repair the entry, once, and fails (engram#651)", async () => {
+    onWindows();
+    daemonRunning();
+    registry.value = BROKEN_ENTRY;
+    regRefuses("add");
+    await daemonInstall();
+    expect(registry.value).toBe(BROKEN_ENTRY);
+    const lines = output().split("\n");
+    expect(lines).toContain("Couldn't add the Windows startup entry.");
+    // What reg said, not the command line execFileSync puts first.
+    expect(lines.filter((l) => l === "  reg: ERROR: Access is denied.")).toHaveLength(1);
+    expect(output()).not.toContain("Command failed");
+    expect(output()).not.toContain("Auto-start enabled");
+    expect(process.exitCode).toBe(1);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("engram install says why it couldn't add the entry, and fails, with no daemon started (engram#651)", async () => {
+    onWindows();
+    regRefuses("add");
+    await daemonInstall();
+    expect(registry.value).toBeNull();
+    expect(output().split("\n")).toContain("  reg: ERROR: Access is denied.");
+    expect(process.exitCode).toBe(1);
+    // Nothing to start at sign-in, so nothing is started now either: as when
+    // the plist or unit can't be written.
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("engram install fails when there is no sign-in script to point the entry at", async () => {
+    // Only a source checkout run through tsx has no login-start.js.
+    onWindows();
+    rmSync(LOGIN_START);
+    try {
+      await daemonInstall();
+    } finally {
+      writeFileSync(LOGIN_START, "");
+    }
+    expect(output()).toContain(`Can't turn on start at login: ${LOGIN_START} is missing.`);
+    expect(regCalls("add")).toHaveLength(0);
+    expect(process.exitCode).toBe(1);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("engram uninstall says why it couldn't remove the entry, and fails (engram#651)", async () => {
+    onWindows();
+    registry.value = ENTRY;
+    registry.approved = SWITCHED_OFF;
+    regRefuses("delete");
+    await daemonUninstall();
+    expect(registry.value).toBe(ENTRY);
+    // The switch stays with the entry it belongs to.
+    expect(registry.approved).toBe(SWITCHED_OFF);
+    const lines = output().split("\n");
+    expect(lines).toContain("Couldn't remove the Windows startup entry.");
+    expect(lines.filter((l) => l === "  reg: ERROR: Access is denied.")).toHaveLength(1);
+    expect(output()).not.toContain("Command failed");
+    expect(output()).not.toContain("Auto-start disabled");
+    expect(process.exitCode).toBe(1);
   });
 
   it("engram status says when the entry is switched off in Startup apps", async () => {

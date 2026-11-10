@@ -452,6 +452,61 @@ describe("Watcher saves its resume offset only past emitted content", () => {
     expect(second.out.map((o) => [o.sessionId, o.meta.cwd])).toEqual([["sess-parent", "/work/moved"]]);
   });
 
+  // engram#583: a paginated subagent rollout numbers its records, and its
+  // own session_meta (record 0) says which is its own first. The ones before
+  // that are its parent's, copied in, and skipped — after a restart too.
+  const numbered = <T extends object>(ordinal: number, record: T) => ({ ordinal, ...record });
+  const subagentHead = (start: number, parentStart: number) => [
+    numbered(0, xMeta({ id: UUID_SUB, session_id: UUID_A, cwd: "/work/sub", subagent_history_start_ordinal: start })),
+    // Its parent's, copied in. A subagent's parent can be a subagent too,
+    // with a boundary that counts only in the parent's own file.
+    numbered(1, xMeta({ id: UUID_B, session_id: UUID_A, cwd: "/work/sub", subagent_history_start_ordinal: parentStart })),
+  ];
+
+  it("resumes a subagent rollout part-way into its parent's copied history, still skipping it", () => {
+    const db = openDb();
+    const SUB = codexPath(UUID_SUB);
+    append(SUB, ...subagentHead(6, 3), numbered(2, xTurn("/work/sub")), numbered(3, xUser("parent's question")));
+    const first = collector();
+    watcherFor(db, "codex", first.onMessages).read(SUB);
+    expect(first.out).toEqual([]);
+
+    // A new process reads on from the saved offset, with the head replayed.
+    append(
+      SUB,
+      numbered(4, xAsst("parent's answer")),
+      numbered(5, xUser("parent: hand this to a subagent")),
+      numbered(6, xUser("the subagent's task")),
+      numbered(7, xAsst("the subagent's answer")),
+    );
+    const second = collector();
+    watcherFor(db, "codex", second.onMessages).read(SUB);
+    expect(second.out.map((o) => [o.messages[0].content, o.sessionId, o.meta.cwd])).toEqual([
+      ["the subagent's task", UUID_A, "/work/sub"],
+      ["the subagent's answer", UUID_A, "/work/sub"],
+    ]);
+  });
+
+  it("skips nothing after a restart that can't read the file's own session_meta back, rather than go by the parent's", () => {
+    const db = openDb();
+    const SUB = codexPath(UUID_SUB);
+    // Record 0 is too long to replay: the head window ends inside it, so the
+    // parent's session_meta is the only one a restart reads back. Its
+    // boundary (50) counts in the parent's own file; taken for this one, it
+    // would drop the subagent's own messages numbered 6 to 49. Skipping
+    // nothing instead, a copied message can be captured again, but none of
+    // the subagent's own is lost.
+    const [own, parents] = subagentHead(6, 50);
+    append(SUB, { ...own, payload: { ...own.payload, pad: "x".repeat(1024 * 1024 + 1) } }, parents);
+    append(SUB, numbered(2, xUser("parent's question")));
+    watcherFor(db, "codex", () => {}).read(SUB);
+
+    append(SUB, numbered(4, xUser("copied, numbered 4")), numbered(6, xUser("the subagent's task")));
+    const second = collector();
+    watcherFor(db, "codex", second.onMessages).read(SUB);
+    expect(texts(second.out)).toEqual(["copied, numbered 4", "the subagent's task"]);
+  });
+
   it("withholds a vault get's output written after a restart", () => {
     const db = openDb();
     const A = claudePath("a");

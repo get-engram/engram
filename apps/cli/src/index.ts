@@ -24,6 +24,7 @@ import { vaultKeygen, vaultStatus, loadVaultKey, vaultSet, vaultGet, vaultList, 
 import { excludeAdd, excludeRemove, excludeList } from "./commands/exclude.js";
 import { bold, dim, red } from "./output.js";
 import { readStatus, syncErrorSummary, captureErrorSummary } from "./daemon/status.js";
+import { foreignFiles, foreignFilesFix, foreignFilesProblem } from "./daemon/ownership.js";
 
 // Read from package.json rather than duplicated here. The previous hardcoded
 // constant had drifted to 0.3.4 while the package shipped 0.5.1, so
@@ -238,6 +239,26 @@ function printSyncBanner(): void {
   }
 }
 
+/**
+ * Files in ~/.engram that are another user's (engram#659), from `sudo
+ * engram …`. Looked for here, before every command, rather than recorded
+ * in status.json with capture_error: the daemon that would record it is
+ * what they stop, status.json may be one of them, and a record would
+ * outlast the fix. Once they are the user's, the capture check after the
+ * next command starts the daemon again.
+ */
+function printForeignFilesBanner(): void {
+  try {
+    const foreign = foreignFiles();
+    if (!foreign) return;
+    console.error(red(bold("engram:")) + ` ${foreignFilesProblem(foreign)}`);
+    console.error(dim(`  ${foreignFilesFix(foreign)}`));
+    console.error("");
+  } catch {
+    // Never let this block the command the user asked for.
+  }
+}
+
 async function main(): Promise<void> {
   const raw = process.argv.slice(2);
 
@@ -285,6 +306,9 @@ async function main(): Promise<void> {
   if (cmd !== "status" && cmd !== "daemon status" && cmd !== "usage") {
     printSyncBanner();
   }
+  // start, install and status say it themselves.
+  const SAYS_FOREIGN_FILES = new Set(["start", "daemon start", "install", "daemon install", "status", "daemon status"]);
+  if (!SAYS_FOREIGN_FILES.has(cmd)) printForeignFilesBanner();
 
   try {
     switch (cmd) {

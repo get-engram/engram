@@ -1,0 +1,259 @@
+import { afterAll, describe, expect, it } from "vitest";
+import { chmodSync, constants, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
+import {
+  foreignFiles,
+  foreignFilesFix,
+  foreignFilesProblem,
+  OWNERSHIP_FIX,
+  type ForeignFiles,
+  type OwnershipCheck,
+} from "../daemon/ownership.js";
+
+/**
+ * engram#659 — files in ~/.engram that aren't the user's, as `sudo engram …`
+ * leaves them.
+ *
+ * Owners and access are given, not made: making a file another user's takes
+ * root, and nothing here runs as root or changes an owner. One test at the
+ * end looks at a real temp directory, as a user other than its owner.
+ */
+
+const { R_OK, W_OK, X_OK } = constants;
+const ME = 501;
+const ROOT = 0;
+const OTHER = 502;
+
+const tmp = mkdtempSync(join(tmpdir(), "engram-659o-"));
+afterAll(() => rmSync(tmp, { recursive: true, force: true }));
+
+/** Never looked at: owners and access come from the table. */
+const DIR = join(tmp, "given", ".engram");
+
+/** Who owns a file, and what this user can't do to it. */
+interface Given {
+  uid: number;
+  deny?: number;
+}
+
+const mine: Given = { uid: ME };
+/** Root's and 0600: what `sudo engram …` leaves. */
+const roots: Given = { uid: ROOT, deny: R_OK | W_OK | X_OK };
+/** Root's and 0644. */
+const rootsReadable: Given = { uid: ROOT, deny: W_OK | X_OK };
+
+/** foreignFiles on a ~/.engram given as a table: "." is the folder. */
+function check(files: Record<string, Given>, options: OwnershipCheck = {}): ForeignFiles | null {
+  const at = (path: string): Given | undefined => (path === DIR ? files["."] : files[basename(path)]);
+  return foreignFiles({
+    platform: "darwin",
+    euid: ME,
+    env: {},
+    dir: DIR,
+    ownerOf: (path) => at(path)?.uid ?? null,
+    canAccess: (path, mode) => ((at(path)?.deny ?? 0) & mode) === 0,
+    ...options,
+  });
+}
+
+const ALL = [
+  "daemon.db",
+  "daemon.db-wal",
+  "daemon.db-shm",
+  "config.json",
+  "vault-key",
+  "daemon.log",
+  "status.json",
+  "daemon.pid",
+  "daemon.sock",
+];
+
+describe("foreignFiles (engram#659)", () => {
+  it("finds nothing when everything in ~/.engram is the user's", () => {
+    expect(check(Object.fromEntries([[".", mine], ...ALL.map((name) => [name, mine])]))).toBeNull();
+  });
+
+  it("finds nothing before ~/.engram is made", () => {
+    expect(check({ "daemon.db": roots })).toBeNull();
+  });
+
+  it("never looks on Windows, as root, or with no effective uid", () => {
+    const files = { ".": mine, "daemon.db": roots };
+    expect(check(files)).not.toBeNull();
+    expect(check(files, { platform: "win32" })).toBeNull();
+    expect(check(files, { euid: 0 })).toBeNull();
+    // To root, even the user's own socket would be another user's.
+    expect(check({ ".": mine, "daemon.sock": mine }, { euid: 0 })).toBeNull();
+    expect(check(files, { euid: null })).toBeNull();
+  });
+
+  it.each(["daemon.db", "daemon.db-wal", "daemon.db-shm"])("finds a root-owned %s stops the daemon", (name) => {
+    expect(check({ ".": mine, [name]: roots })).toEqual({
+      dir: false,
+      files: [name],
+      root: true,
+      stopsDaemon: true,
+      stopsStart: false,
+    });
+    // SQLite opens it to write, too.
+    expect(check({ ".": mine, [name]: rootsReadable })?.stopsDaemon).toBe(true);
+  });
+
+  it("doesn't count a file another user owns that this user can use all the same", () => {
+    // A network home that maps owners wrongly, or root's and 0666.
+    expect(check({ ".": mine, "daemon.db": { uid: ROOT }, "config.json": { uid: OTHER } })).toBeNull();
+  });
+
+  it("never counts the user's own folder or files, whatever their mode", () => {
+    // No chown makes them usable: they aren't someone else's.
+    const closed: Given = { uid: ME, deny: R_OK | W_OK | X_OK };
+    expect(check({ ".": closed, "daemon.db": { uid: ME, deny: R_OK | W_OK }, "config.json": { uid: ME, deny: R_OK } })).toBeNull();
+  });
+
+  it("finds an unreadable config.json stops the daemon, even with ENGRAM_API_KEY set (engram#673)", () => {
+    const found = check({ ".": mine, "config.json": roots }, { env: { ENGRAM_API_KEY: "egm_test" } });
+    expect(found).toMatchObject({ files: ["config.json"], stopsDaemon: true, stopsStart: false });
+  });
+
+  it("finds a config.json it can read but not update a warning", () => {
+    const found = check({ ".": mine, "config.json": rootsReadable });
+    expect(found).toMatchObject({ files: ["config.json"], stopsDaemon: false, stopsStart: false });
+    expect(foreignFilesProblem(found!)).toBe(
+      "config.json in ~/.engram belongs to root, not to you, so Engram can't update it.",
+    );
+  });
+
+  it("finds an unreadable vault-key stops the daemon, unless ENGRAM_VAULT_KEY is set", () => {
+    expect(check({ ".": mine, "vault-key": roots })).toMatchObject({ files: ["vault-key"], stopsDaemon: true });
+    // Then it isn't read, but still can't be updated.
+    expect(check({ ".": mine, "vault-key": roots }, { env: { ENGRAM_VAULT_KEY: "k" } })).toMatchObject({
+      files: ["vault-key"],
+      stopsDaemon: false,
+      stopsStart: false,
+    });
+    expect(check({ ".": mine, "vault-key": rootsReadable })).toMatchObject({ stopsDaemon: false });
+  });
+
+  it("finds an unwritable daemon.log stops a start in the background, not the daemon", () => {
+    const found = check({ ".": mine, "daemon.log": rootsReadable });
+    expect(found).toMatchObject({ files: ["daemon.log"], stopsDaemon: false, stopsStart: true });
+    expect(foreignFilesProblem(found!)).toBe("daemon.log in ~/.engram belongs to root, not to you, so the daemon can't start.");
+  });
+
+  it("finds status.json and daemon.pid it can't update warnings", () => {
+    const found = check({ ".": mine, "status.json": rootsReadable, "daemon.pid": roots });
+    expect(found).toMatchObject({ files: ["status.json", "daemon.pid"], stopsDaemon: false, stopsStart: false });
+    expect(foreignFilesProblem(found!)).toBe(
+      "status.json and daemon.pid in ~/.engram belong to root, not to you, so Engram can't update them.",
+    );
+    expect(foreignFilesFix(found!)).toBe(`Make them yours with: ${OWNERSHIP_FIX}`);
+  });
+
+  it("finds another user's socket stops the daemon, whatever its mode (engram#612)", () => {
+    const found = check({ ".": mine, "daemon.sock": { uid: OTHER } });
+    expect(found).toEqual({ dir: false, files: ["daemon.sock"], root: false, stopsDaemon: true, stopsStart: false });
+    expect(foreignFilesProblem(found!, "stopped")).toBe(
+      "daemon.sock in ~/.engram belongs to another user, not to you, so the daemon can't start, and nothing new is captured.",
+    );
+  });
+
+  it("finds ~/.engram itself, when it is root's and closed to the user", () => {
+    const found = check({ ".": roots, "daemon.db": mine });
+    expect(found).toEqual({ dir: true, files: [], root: true, stopsDaemon: true, stopsStart: false });
+    expect(foreignFilesProblem(found!)).toBe("~/.engram belongs to root, not to you, so the daemon can't start.");
+    expect(foreignFilesFix(found!)).toBe(`Make it yours with: ${OWNERSHIP_FIX}`);
+    // Open to the user, it is only a folder: what is in it is looked at.
+    expect(check({ ".": { uid: ROOT }, "daemon.db": mine })).toBeNull();
+    expect(check({ ".": { uid: ROOT }, "daemon.db": roots })).toMatchObject({ dir: false, files: ["daemon.db"] });
+  });
+
+  it("says root only when root owns every one of them", () => {
+    const found = check({ ".": mine, "daemon.db": roots, "config.json": { uid: OTHER, deny: R_OK } });
+    expect(found).toMatchObject({ files: ["daemon.db", "config.json"], root: false });
+    expect(foreignFilesProblem(found!, "stopped")).toBe(
+      "daemon.db and config.json in ~/.engram belong to another user, not to you, so the daemon can't start, and nothing new is captured.",
+    );
+  });
+
+  it("names them in order, and no more than four", () => {
+    const every = check(Object.fromEntries([[".", mine], ...ALL.map((name) => [name, roots])]));
+    expect(every?.files).toEqual(ALL);
+    expect(every).toMatchObject({ root: true, stopsDaemon: true, stopsStart: true });
+    expect(foreignFilesProblem(every!, "running")).toBe(
+      "daemon.db, daemon.db-wal, daemon.db-shm and 6 more in ~/.engram belong to root, not to you, " +
+        "so the daemon can't start again once it stops.",
+    );
+    const four = check({ ".": mine, "vault-key": rootsReadable, "status.json": roots, "daemon.pid": roots, "config.json": rootsReadable });
+    expect(foreignFilesProblem(four!)).toBe(
+      "config.json, vault-key, status.json and daemon.pid in ~/.engram belong to root, not to you, so Engram can't update them.",
+    );
+  });
+
+  it("says what they stop by whether the daemon runs, where that is known", () => {
+    const db = check({ ".": mine, "daemon.db": roots });
+    const IS = "daemon.db in ~/.engram belongs to root, not to you, so";
+    expect(foreignFilesProblem(db!, "stopped")).toBe(`${IS} the daemon can't start, and nothing new is captured.`);
+    // Started before they were root's: it captures until it stops.
+    expect(foreignFilesProblem(db!, "running")).toBe(`${IS} the daemon can't start again once it stops.`);
+    expect(foreignFilesProblem(db!)).toBe(`${IS} the daemon can't start.`);
+    // daemon.log stops a start, so it is said the same way.
+    const log = check({ ".": mine, "daemon.log": roots });
+    expect(foreignFilesProblem(log!, "stopped")).toBe(
+      "daemon.log in ~/.engram belongs to root, not to you, so the daemon can't start, and nothing new is captured.",
+    );
+    expect(foreignFilesProblem(log!, "running")).toBe(
+      "daemon.log in ~/.engram belongs to root, not to you, so the daemon can't start again once it stops.",
+    );
+    // What only warns doesn't depend on it.
+    const status = check({ ".": mine, "status.json": roots });
+    for (const daemon of ["running", "stopped", undefined] as const) {
+      expect(foreignFilesProblem(status!, daemon)).toBe(
+        "status.json in ~/.engram belongs to root, not to you, so Engram can't update it.",
+      );
+    }
+  });
+
+  it("gives the fix as a command the user's own shell fills in", () => {
+    // The shell expands "$(id -un)" and ~ before sudo runs: the user's name
+    // and home, not root's.
+    expect(OWNERSHIP_FIX).toBe('sudo chown -R "$(id -un)" ~/.engram');
+  });
+
+  it("looks at a real folder, by owner and by access", () => {
+    const dir = join(tmp, "real", ".engram");
+    mkdirSync(dir, { recursive: true });
+    for (const name of ["daemon.db", "config.json", "status.json", "daemon.sock"]) writeFileSync(join(dir, name), "");
+    expect(foreignFiles({ dir, platform: "linux" })).toBeNull();
+    // As someone else: this user can still use every one of them, so only
+    // the socket counts, which is never taken for the daemon's. (Windows
+    // gives every file owner 0.)
+    const owner = statSync(dir).uid;
+    const asOther = foreignFiles({ dir, platform: "linux", euid: owner + 1000 });
+    expect(asOther).toMatchObject({ dir: false, files: ["daemon.sock"], root: owner === 0, stopsDaemon: true });
+    // Nothing there: not looked at.
+    expect(foreignFiles({ dir: join(tmp, "none", ".engram"), platform: "linux", euid: owner + 1000 })).toBeNull();
+  });
+
+  // Root can use any file, whatever its mode.
+  it.skipIf(process.geteuid?.() === 0)("goes by what this user can do to a real file", () => {
+    // The user's own, with every permission taken off, looked at as someone
+    // else: counted, because this user can't use it. (On Windows, this sets
+    // the read-only flag.)
+    const dir = join(tmp, "closed", ".engram");
+    mkdirSync(dir, { recursive: true });
+    const db = join(dir, "daemon.db");
+    writeFileSync(db, "");
+    chmodSync(db, 0o000);
+    try {
+      const owner = statSync(dir).uid;
+      expect(foreignFiles({ dir, platform: "linux", euid: owner + 1000 })).toMatchObject({
+        dir: false,
+        files: ["daemon.db"],
+        stopsDaemon: true,
+      });
+    } finally {
+      chmodSync(db, 0o600);
+    }
+  });
+});

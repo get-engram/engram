@@ -664,15 +664,19 @@ export function notifyCommand(
  *
  * Deliberately fire-and-forget and fully swallowed: notification tooling is
  * absent on plenty of systems (headless Linux, minimal containers) and a
- * failure to notify must never disturb syncing.
+ * failure to notify must never disturb syncing. `done` is called once it
+ * has been shown, or has failed, or there was no way to show it.
  */
-function notifyDesktop(title: string, body: string): void {
+function notifyDesktop(title: string, body: string, done: () => void = () => {}): void {
   try {
     // A static import (engram#581): this used to be a lazy `require`, which
     // does not exist in this ES-module build. It threw, the catch below
     // swallowed it, and no notification was ever shown.
     const command = notifyCommand(title, body);
-    if (!command) return;
+    if (!command) {
+      done();
+      return;
+    }
     execFile(
       command.file,
       command.args,
@@ -682,9 +686,26 @@ function notifyDesktop(title: string, body: string): void {
         windowsHide: true,
         timeout: NOTIFY_TIMEOUT_MS,
       },
-      () => {},
+      () => done(),
     );
   } catch {
     // no notification tooling — the log line and the CLI banner still stand
+    done();
   }
+}
+
+/**
+ * A desktop notification from a daemon about to exit: settles once it has
+ * been shown, or after `ms`. launchd and systemd end whatever a job leaves
+ * running when its main process exits, so a notifier started just before
+ * the exit, and not waited for, would never be shown.
+ */
+export function notifyDesktopBeforeExit(title: string, body: string, ms = 10_000): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    notifyDesktop(title, body, () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }

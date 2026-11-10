@@ -28,6 +28,7 @@ import { bold, dim, red } from "./output.js";
 import { readStatus, syncErrorSummary, captureErrorSummary, configProblemSummary } from "./daemon/status.js";
 import { foreignFiles, foreignFilesFix, foreignFilesProblem } from "./daemon/ownership.js";
 import { findRootDaemon, rootDaemonLines } from "./daemon/root-daemon.js";
+import { asRootRefusal, rootForAnotherUser } from "./daemon/as-root.js";
 import { alive, pidInFile } from "./daemon/instance.js";
 
 // Read from package.json rather than duplicated here. The previous hardcoded
@@ -378,6 +379,23 @@ async function main(): Promise<void> {
 
   const { command, args, flags } = parseArgs(raw);
   const cmd = command.join(" ");
+
+  // Run as root for the user, as with sudo, only help and version run, and
+  // they print only themselves: nothing in ~/.engram is read or written
+  // (engram#682). Another command would save what it writes as root's, in
+  // the user's ~/.engram on macOS, where sudo keeps HOME, or set Engram up
+  // for root on Linux.
+  if (rootForAnotherUser()) {
+    if (cmd === "help") printHelp();
+    else if (cmd === "version") console.log(`engram ${VERSION}`);
+    else {
+      const { problem, fix } = asRootRefusal(cmd);
+      console.error(red(problem));
+      console.error(dim(fix));
+      process.exitCode = 1;
+    }
+    return;
+  }
 
   // Capture is the product default: any authenticated interactive use of
   // the CLI ensures the daemon is running (unless the user explicitly ran

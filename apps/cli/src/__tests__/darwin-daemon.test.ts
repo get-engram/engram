@@ -37,7 +37,12 @@ const { home, cli, daemon, launchd, spawn, execSync, execFileSync } = vi.hoisted
   cli: { worker: null as string | null },
   // What answers on the daemon's socket: a daemon, or nothing. `silent`:
   // something holds it and doesn't answer, as a daemon busy starting does.
-  daemon: { answering: null as { pid: number } | null, silent: false },
+  // `unavailable`: no socket can be used, so the PID file is all there is.
+  daemon: {
+    answering: null as { pid: number; ready?: boolean; version?: string } | null,
+    silent: false,
+    unavailable: false,
+  },
   // The fake launchd: the job it has loaded, and what it refuses.
   launchd: {
     loaded: false,
@@ -71,6 +76,18 @@ const { home, cli, daemon, launchd, spawn, execSync, execFileSync } = vi.hoisted
     disabledOutput: null as string | null,
     printDisabledFails: false,
     enableFails: false,
+    /**
+     * What the daemon launchd starts for `kickstart` does (engram#641): it
+     * answers, ready; it exits as it starts, with launchd still naming its
+     * PID; or launchd starts none.
+     */
+    kickstarts: "ready" as "ready" | "dies" | "never",
+    kickstartFails: false,
+    /**
+     * The daemon launchd started has exited: launchd names its PID until a
+     * moment later, here until the next look at the socket.
+     */
+    reaping: false,
     /** Calls the fake didn't expect; each fails the test. */
     unexpected: [] as string[],
   },
@@ -111,7 +128,12 @@ vi.mock("../daemon/launch.js", async (importOriginal) => {
 vi.mock("../daemon/instance.js", async (importOriginal) => {
   const real = await importOriginal<typeof import("../daemon/instance.js")>();
   const probeDaemon = async (): Promise<Probe> => {
+    if (launchd.reaping) {
+      launchd.reaping = false;
+      launchd.pid = null;
+    }
     if (daemon.silent) return { state: "silent" };
+    if (daemon.unavailable) return { state: "unavailable", reason: "no socket here" };
     const a = daemon.answering;
     if (a === null) return { state: "none", stale: false };
     return { state: "answered", info: { ready: true, stopping: false, stopFile: false, version: real.VERSION, ...a } };
@@ -137,6 +159,8 @@ const ENGRAM_DIR = join(home.dir, ".engram");
 const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
 const WORKER = join(home.dir, "cli", "dist", "daemon", "worker.js");
 const LABEL = "app.getengram.daemon";
+/** A PID fakeKill finds no process for. */
+const DEAD_PID = 999_999;
 /** The user's login session, as launchd.ts names it. */
 const DOMAIN = `gui/${process.getuid?.() ?? 0}`;
 mkdirSync(dirname(WORKER), { recursive: true });
@@ -154,6 +178,7 @@ const {
   daemonStatus,
   daemonUninstall,
   repairLaunchdIfStale,
+  waitForAgent,
 } = await import("../daemon/commands.js");
 const {
   PLIST_VERSION,
@@ -274,6 +299,19 @@ function unload(): void {
   launchd.lingering = launchd.stillLoadedFor;
 }
 
+/** launchd starts the job's daemon, which then does what `launchd.kickstarts` says. */
+function startJob(): void {
+  if (launchd.kickstarts === "never") return;
+  if (launchd.kickstarts === "dies") {
+    // No process has this PID: it has exited, and launchd names it for a moment yet.
+    launchd.pid = DEAD_PID;
+    launchd.reaping = true;
+    return;
+  }
+  launchd.pid = process.pid;
+  daemonRunning();
+}
+
 /** launchctl, against the fake launchd above: what the real one does with it. */
 function fakeLaunchctl(file: string, args: string[]): string {
   const command = args.join(" ");
@@ -330,6 +368,18 @@ function fakeLaunchctl(file: string, args: string[]): string {
     unload();
     return "";
   }
+  // Only ever without -k, which would stop the daemon launchd runs first, and
+  // without -p (engram#641).
+  if (is("kickstart", `${DOMAIN}/${LABEL}`)) {
+    const refused = `Could not kickstart service "${DOMAIN}/${LABEL}"`;
+    if (launchd.switchedOff) throw failed(command, `${refused}: 119: Service is disabled\n`);
+    if (launchd.kickstartFails || !launchd.loaded) {
+      throw failed(command, `${refused}: 113: Could not find specified service\n`);
+    }
+    // A job that runs its daemon already is left as it is.
+    if (launchd.pid === null) startJob();
+    return "";
+  }
   launchd.unexpected.push(command);
   throw new Error(`unexpected launchctl ${command}`);
 }
@@ -371,9 +421,10 @@ function daemonRunning(): void {
   daemon.answering = { pid: process.pid };
 }
 
-/** The daemon is gone, as after a restart. */
+/** The daemon is gone, as after a restart: nothing answers, and launchd runs none. */
 function daemonGone(): void {
   daemon.answering = null;
+  launchd.pid = null;
   rmSync(PID_FILE, { force: true });
 }
 
@@ -437,15 +488,23 @@ beforeEach(() => {
     disabledOutput: null,
     printDisabledFails: false,
     enableFails: false,
+    kickstarts: "ready",
+    kickstartFails: false,
+    reaping: false,
     unexpected: [],
   });
   daemon.answering = null;
   daemon.silent = false;
+  daemon.unavailable = false;
   cli.worker = null;
   rmSync(join(home.dir, "Library"), { recursive: true, force: true });
   rmSync(PID_FILE, { force: true });
   writeFileSync(WORKER, "");
   vi.stubEnv("PATH", BIN);
+  // What a daemon spawned from here would have and launchd's wouldn't (engram#641).
+  vi.stubEnv("ENGRAM_API_KEY", undefined);
+  vi.stubEnv("ENGRAM_BASE_URL", undefined);
+  vi.stubEnv("ENGRAM_VAULT_KEY", undefined);
   spawn.mockReset().mockImplementation(fakeSpawn);
   execSync.mockReset();
   execFileSync.mockReset().mockImplementation(fakeLaunchctl);
@@ -913,10 +972,14 @@ describe("engram install on macOS (engram#616)", () => {
     await daemonStart([], { install: "" });
     expect(spawn).not.toHaveBeenCalled();
     expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
-    expect(launchctlCalls()).toEqual(["print-disabled", "bootout", "unload", "list", "bootstrap"]);
+    // Then whether launchd runs it (engram#641).
+    expect(launchctlCalls()).toEqual(["print-disabled", "bootout", "unload", "list", "bootstrap", "list", "list", "print-disabled"]);
     const text = output();
     expect(text).toContain("Daemon already running");
     expect(text).toContain("Auto-start enabled — daemon will start on login");
+    // The daemon launchd starts finds this one and leaves the capture to it
+    // (engram#612): launchd doesn't start this one again after a crash.
+    expect(text).toContain(`The running daemon (pid ${process.pid}) wasn't started by launchd, so launchd won't restart it after a crash: run 'engram stop' and then 'engram start' to fix that.`);
   });
 });
 
@@ -928,9 +991,21 @@ describe("engram start on macOS (engram#616)", () => {
     await daemonStart([], {});
     expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
     expect(launchd.loadedText).toBe(plistWith());
-    expect(launchctlCalls()).toEqual(["list", "print-disabled", "bootout", "list", "bootstrap"]);
+    // Then launchd starts the daemon (engram#641).
+    expect(launchctlCalls()).toEqual([
+      "list",
+      "print-disabled",
+      "bootout",
+      "list",
+      "bootstrap",
+      "list",
+      "print-disabled",
+      "kickstart",
+      "list",
+    ]);
     expect(output()).toContain(`Updated auto-start configuration (plist v${PLIST_VERSION})`);
-    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(launchd.pid).toBe(process.pid);
     expect(process.exitCode).toBeUndefined();
   });
 
@@ -949,8 +1024,10 @@ describe("engram start on macOS (engram#616)", () => {
       expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
       expect(launchd.loadedText).toBe(plistWith());
       expect(said()).toContain("Updated auto-start configuration");
+      expect(launchd.pid).toBe(process.pid);
     }
-    expect(spawn).toHaveBeenCalledTimes(6);
+    // launchd starts each (engram#641).
+    expect(spawn).not.toHaveBeenCalled();
   });
 
   permissionsIt("rewrites one others can write 0644, which launchd then loads", async () => {
@@ -962,15 +1039,24 @@ describe("engram start on macOS (engram#616)", () => {
   });
 
   it("leaves a current plist, and a newer CLI's, as they are", async () => {
-    for (const text of [plistWith(), plistWith({ node: join(home.dir, "gone", "node") }, PLIST_VERSION + 1)]) {
+    for (const [text, calls] of [
+      // The look for a daemon launchd runs, and whether launchd has the job,
+      // to start the daemon (engram#641). It hasn't: the daemon is spawned.
+      [plistWith(), ["list", "list"]],
+      // Only the look: launchd's job runs another CLI.
+      [plistWith({ node: join(home.dir, "gone", "node") }, PLIST_VERSION + 1), ["list"]],
+    ] as const) {
       writePlist(text);
       daemonGone();
       execFileSync.mockClear();
+      spawn.mockClear();
       await daemonStart([], {});
       expect(readFileSync(PLIST, "utf-8")).toBe(text);
-      // Only the look for a daemon launchd runs.
-      expect(launchctlCalls()).toEqual(["list"]);
-      expect(said()).not.toContain("Updated auto-start configuration");
+      expect(launchctlCalls()).toEqual(calls);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const text_ = said();
+      expect(text_).not.toContain("Updated auto-start configuration");
+      expect(text_).not.toContain("launchd");
     }
   });
 
@@ -1031,7 +1117,20 @@ describe("engram start on macOS (engram#616)", () => {
     launchd.loaded = true;
     launchd.stillLoadedFor = 3;
     await daemonStart([], {});
-    expect(launchctlCalls()).toEqual(["list", "print-disabled", "bootout", "list", "list", "list", "list", "bootstrap"]);
+    expect(launchctlCalls()).toEqual([
+      "list",
+      "print-disabled",
+      "bootout",
+      "list",
+      "list",
+      "list",
+      "list",
+      "bootstrap",
+      "list",
+      "print-disabled",
+      "kickstart",
+      "list",
+    ]);
     expect(launchd.loadedText).toBe(plistWith());
   });
 
@@ -1041,7 +1140,19 @@ describe("engram start on macOS (engram#616)", () => {
     launchd.bootoutFails = true;
     launchd.bootstrapFails = true;
     await daemonStart([], {});
-    expect(launchctlCalls()).toEqual(["list", "print-disabled", "bootout", "unload", "list", "bootstrap", "load"]);
+    expect(launchctlCalls()).toEqual([
+      "list",
+      "print-disabled",
+      "bootout",
+      "unload",
+      "list",
+      "bootstrap",
+      "load",
+      "list",
+      "print-disabled",
+      "kickstart",
+      "list",
+    ]);
     // Not -w: that would switch back on a job the user switched off (engram#654).
     expect(loads()).toEqual([`load ${PLIST}`]);
     expect(launchd.loadedText).toBe(plistWith());
@@ -1060,6 +1171,348 @@ describe("engram start on macOS (engram#616)", () => {
     }
     expect(launchctlCalls()).toEqual(["bootout", "list", "list", "list", "list", "list", "bootstrap", "load"]);
     expect(loads()).toEqual([`load ${PLIST}`]);
+  });
+});
+
+describe("engram start through launchd (engram#641)", () => {
+  /** This CLI's job, loaded, with no daemon running. */
+  function jobLoaded(): void {
+    writePlist(plistWith());
+    load(PLIST);
+  }
+
+  const KICKSTART = ["kickstart", `${DOMAIN}/${LABEL}`];
+  /** What a start says when launchctl refused the kickstart with `refusal`. */
+  const startedDirectly = (refusal: string) =>
+    `launchd couldn't start the daemon (launchctl: Could not kickstart service "${DOMAIN}/${LABEL}": ${refusal}), so it is started directly, and won't be restarted after a crash.`;
+  const HINT = `The running daemon (pid ${process.pid}) wasn't started by launchd, so launchd won't restart it after a crash: run 'engram stop' and then 'engram start' to fix that.`;
+
+  it("has launchd start the daemon when its job is loaded: launchd starts it again after a crash", async () => {
+    jobLoaded();
+    await daemonStart([], {});
+    // The look for a daemon launchd runs; whether it has the job, switched
+    // on; the kickstart; and the PID launchd gives the daemon.
+    expect(launchctlCalls()).toEqual(["list", "list", "print-disabled", "kickstart", "list"]);
+    // Never -k, which would stop the daemon launchd runs, and never -p.
+    expect(execFileSync.mock.calls[3][1]).toEqual(KICKSTART);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(launchd.pid).toBe(process.pid);
+    const text = output();
+    expect(text).toContain(`Engram daemon started (pid ${process.pid})`);
+    expect(text).toContain(`Log: ${LOG_FILE}`);
+    expect(text).not.toContain("launchd");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("with --install, turns start at login on first, and then launchd starts the daemon", async () => {
+    await daemonStart([], { install: "" });
+    expect(launchctlCalls()).toEqual([
+      "print-disabled",
+      "bootout",
+      "unload",
+      "list",
+      "bootstrap",
+      "list",
+      "print-disabled",
+      "kickstart",
+      "list",
+    ]);
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+    expect(spawn).not.toHaveBeenCalled();
+    expect(launchd.pid).toBe(process.pid);
+    const text = output();
+    expect(text.indexOf("Auto-start enabled")).toBeGreaterThanOrEqual(0);
+    expect(text.indexOf("Auto-start enabled")).toBeLessThan(text.indexOf("Engram daemon started"));
+    expect(text).not.toContain("wasn't started by launchd");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("with --install and a key set here, starts the daemon itself first, as before", async () => {
+    vi.stubEnv("ENGRAM_API_KEY", "eng_test_641");
+    await daemonStart([], { install: "" });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(launchctlCalls()).toEqual(["print-disabled", "bootout", "unload", "list", "bootstrap"]);
+    expect(spawn.mock.invocationCallOrder[0]).toBeLessThan(execFileSync.mock.invocationCallOrder[0]);
+    const text = output();
+    expect(text.indexOf("Engram daemon started")).toBeGreaterThanOrEqual(0);
+    expect(text.indexOf("Engram daemon started")).toBeLessThan(text.indexOf("Auto-start enabled"));
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("starts the daemon itself, and says launchd won't restart it, when launchctl won't start it", async () => {
+    jobLoaded();
+    launchd.kickstartFails = true;
+    await daemonStart([], {});
+    expect(launchctlCalls()).toEqual(["list", "list", "print-disabled", "kickstart"]);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const text = output();
+    expect(text).toContain(startedDirectly("113: Could not find specified service"));
+    expect(text).toContain(`Engram daemon started (pid ${process.pid})`);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("starts the daemon itself with a key, a server or the vault key set here: launchd's wouldn't have them", async () => {
+    jobLoaded();
+    for (const [name, value] of [
+      ["ENGRAM_API_KEY", "eng_test_641"],
+      ["ENGRAM_BASE_URL", "http://127.0.0.1:9"],
+      ["ENGRAM_VAULT_KEY", "test-vault-key-641"],
+    ]) {
+      daemonGone();
+      execFileSync.mockClear();
+      spawn.mockClear();
+      vi.stubEnv(name, value);
+      await daemonStart([], {});
+      // Only the look for a daemon launchd runs.
+      expect(launchctlCalls()).toEqual(["list"]);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(said()).not.toContain("launchd");
+      vi.stubEnv(name, undefined);
+    }
+
+    // A server that is only spaces is none, as the daemon reads it.
+    daemonGone();
+    execFileSync.mockClear();
+    spawn.mockClear();
+    vi.stubEnv("ENGRAM_BASE_URL", "  ");
+    await daemonStart([], {});
+    expect(launchctlCalls()).toEqual(["list", "list", "print-disabled", "kickstart", "list"]);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("starts the daemon itself, saying nothing of launchd, when the job isn't loaded, or is switched off", async () => {
+    writePlist(plistWith());
+    await daemonStart([], {});
+    expect(launchctlCalls()).toEqual(["list", "list"]);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(said()).not.toContain("launchd");
+
+    jobLoaded();
+    launchd.switchedOff = true;
+    daemonGone();
+    execFileSync.mockClear();
+    spawn.mockClear();
+    await daemonStart([], {});
+    expect(launchctlCalls()).toEqual(["list", "list", "print-disabled"]);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(said()).not.toContain("launchd");
+    expect(launchd.switchedOff).toBe(true);
+  });
+
+  it("tries launchd when launchctl can't say whether the job is switched off, and says so when it refuses", async () => {
+    jobLoaded();
+    launchd.switchedOff = true;
+    launchd.printDisabledFails = true;
+    await daemonStart([], {});
+    expect(launchctlCalls()).toEqual(["list", "list", "print-disabled", "kickstart"]);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(output()).toContain(startedDirectly("119: Service is disabled"));
+    expect(launchd.switchedOff).toBe(true);
+  });
+
+  it("fails when the daemon launchd starts exits as it starts, and starts no other", async () => {
+    jobLoaded();
+    launchd.kickstarts = "dies";
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    await daemonStart([], {});
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(spawn).not.toHaveBeenCalled();
+    // Its PID, asked for as launchd started it: launchd has dropped it since.
+    expect(launchctlCalls()).toEqual(["list", "list", "print-disabled", "kickstart", "list"]);
+    expect(launchd.pid).toBeNull();
+    const text = output();
+    expect(text).toContain("Daemon failed to start. Check the log:");
+    expect(text).not.toContain("started directly");
+  });
+
+  it("starts the daemon itself, and says so, when launchd hasn't started one in time", async () => {
+    jobLoaded();
+    launchd.kickstarts = "never";
+    let now = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => (now += 1_000));
+    try {
+      await daemonStart([], {});
+    } finally {
+      clock.mockRestore();
+    }
+    const calls = launchctlCalls();
+    expect(calls.slice(0, 4)).toEqual(["list", "list", "print-disabled", "kickstart"]);
+    // Then the PID launchd gives the daemon, asked for until it gives up.
+    expect(calls.slice(4).length).toBeGreaterThan(0);
+    expect(new Set(calls.slice(4))).toEqual(new Set(["list"]));
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const text = output();
+    expect(text).toContain(
+      "launchd didn't start the daemon in time, so it is started directly, and won't be restarted after a crash.",
+    );
+    expect(text).toContain(`Engram daemon started (pid ${process.pid})`);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  describe("waiting for launchd's daemon", () => {
+    beforeEach(() => {
+      launchd.loaded = true;
+    });
+
+    it("is done when a daemon answers, ready: launchd's, or one started beside it", async () => {
+      launchd.pid = process.pid;
+      daemonRunning();
+      expect(await waitForAgent()).toEqual({ state: "running", pid: process.pid });
+
+      daemon.answering = { pid: 4242 };
+      expect(await waitForAgent()).toEqual({ state: "running", pid: 4242 });
+    });
+
+    it("is still starting while the daemon loads, or holds the socket and doesn't answer", async () => {
+      launchd.pid = process.pid;
+      daemon.answering = { pid: process.pid, ready: false };
+      expect(await waitForAgent(300, 100)).toEqual({ state: "starting", pid: process.pid });
+
+      daemon.answering = null;
+      daemon.silent = true;
+      expect(await waitForAgent(300, 100)).toEqual({ state: "starting", pid: process.pid });
+      // Not launchd's, as far as it says: still not one to spawn beside.
+      launchd.pid = null;
+      expect(await waitForAgent(300, 100)).toEqual({ state: "starting", pid: null });
+    });
+
+    it("fails as soon as launchd's daemon has exited with nothing on the socket", async () => {
+      launchd.pid = DEAD_PID;
+      expect(await waitForAgent()).toEqual({ state: "failed" });
+    });
+
+    it("gives up, for a spawn, when launchd hasn't started a process for the job", async () => {
+      const started = Date.now();
+      expect(await waitForAgent(5_000, 200)).toBeNull();
+      expect(Date.now() - started).toBeLessThan(2_000);
+    });
+
+    it("takes the PID file for it where there is no socket to ask", async () => {
+      launchd.pid = process.pid;
+      daemon.unavailable = true;
+      expect(await waitForAgent(300, 100)).toEqual({ state: "starting", pid: process.pid });
+      mkdirSync(ENGRAM_DIR, { recursive: true });
+      writeFileSync(PID_FILE, String(process.pid));
+      expect(await waitForAgent()).toEqual({ state: "running", pid: process.pid });
+    });
+  });
+
+  describe("a daemon launchd doesn't run", () => {
+    it("is said when launchd could run it: a stop and a start hand it to launchd", async () => {
+      jobLoaded();
+      daemonRunning();
+      await daemonStart([], {});
+      expect(launchctlCalls()).toEqual(["list", "list", "print-disabled"]);
+      expect(spawn).not.toHaveBeenCalled();
+      const text = output();
+      expect(text).toContain(`Daemon already running (pid ${process.pid})`);
+      expect(text).toContain(HINT);
+    });
+
+    it("isn't said for launchd's own daemon, or where launchd couldn't run it", async () => {
+      // launchd's own.
+      jobLoaded();
+      launchd.pid = process.pid;
+      daemonRunning();
+      await daemonStart([], {});
+      expect(launchctlCalls()).toEqual(["list"]);
+      expect(said()).not.toContain("wasn't started by launchd");
+
+      // The job isn't loaded.
+      unload();
+      execFileSync.mockClear();
+      await daemonStart([], {});
+      expect(launchctlCalls()).toEqual(["list", "list"]);
+      expect(said()).not.toContain("wasn't started by launchd");
+
+      // It is switched off.
+      load(PLIST);
+      launchd.switchedOff = true;
+      execFileSync.mockClear();
+      await daemonStart([], {});
+      expect(launchctlCalls()).toEqual(["list", "list", "print-disabled"]);
+      expect(said()).not.toContain("wasn't started by launchd");
+      launchd.switchedOff = null;
+
+      // A key set here, which launchd's wouldn't have.
+      vi.stubEnv("ENGRAM_API_KEY", "eng_test_641");
+      execFileSync.mockClear();
+      await daemonStart([], {});
+      expect(launchctlCalls()).toEqual([]);
+      expect(said()).not.toContain("wasn't started by launchd");
+      vi.stubEnv("ENGRAM_API_KEY", undefined);
+
+      // A newer CLI's plist, and none.
+      writePlist(plistWith({ node: join(home.dir, "gone", "node") }, PLIST_VERSION + 1));
+      execFileSync.mockClear();
+      await daemonStart([], {});
+      expect(launchctlCalls()).toEqual([]);
+      expect(said()).not.toContain("wasn't started by launchd");
+      rmSync(PLIST);
+      execFileSync.mockClear();
+      await daemonStart([], {});
+      expect(launchctlCalls()).toEqual([]);
+      expect(said()).not.toContain("wasn't started by launchd");
+      expect(spawn).not.toHaveBeenCalled();
+    });
+
+    it("isn't said when the daemon is another version's: the version hint says to stop and start it", async () => {
+      jobLoaded();
+      daemonRunning();
+      daemon.answering = { pid: process.pid, version: "0.0.1" };
+      await daemonStart([], {});
+      const text = output();
+      expect(text).toContain("It runs version 0.0.1");
+      expect(text).not.toContain("wasn't started by launchd");
+      expect(launchctlCalls()).toEqual([]);
+
+      // Nor for one from before engram#612, which launchd may well run.
+      daemonGone();
+      launchd.pid = 4242;
+      execFileSync.mockClear();
+      vi.mocked(console.log).mockClear();
+      await daemonStart([], {});
+      const older = output();
+      expect(older).toContain("It's from an older version of Engram");
+      expect(older).not.toContain("wasn't started by launchd");
+      expect(launchctlCalls()).toEqual(["list"]);
+      expect(spawn).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("auto-capture", () => {
+    signedInAtATerminal();
+
+    it("has launchd start the daemon when its job is loaded", async () => {
+      jobLoaded();
+      await autoEnableCapture({ after: "command" });
+      expect(launchctlCalls()).toEqual(["list", "list", "print-disabled", "kickstart"]);
+      expect(execFileSync.mock.calls[3][1]).toEqual(KICKSTART);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(launchd.pid).toBe(process.pid);
+      expect(said()).toContain("Auto-capture is on");
+    });
+
+    it("starts the daemon itself when launchctl won't, saying nothing more of it", async () => {
+      jobLoaded();
+      launchd.kickstartFails = true;
+      await autoEnableCapture({ after: "command" });
+      expect(launchctlCalls()).toEqual(["list", "list", "print-disabled", "kickstart"]);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const text = said();
+      expect(text).toContain("Auto-capture is on");
+      expect(text).not.toContain("launchd");
+    });
+
+    it("starts the daemon itself first with a key set here, then turns on start at login", async () => {
+      vi.stubEnv("ENGRAM_API_KEY", "eng_test_641");
+      await autoEnableCapture({ after: "login" });
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(launchctlCalls()).toEqual(["print-disabled", "bootstrap"]);
+      expect(spawn.mock.invocationCallOrder[0]).toBeLessThan(execFileSync.mock.invocationCallOrder[0]);
+      expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+      expect(said()).toContain("Auto-start enabled — daemon will start on login");
+    });
   });
 });
 
@@ -1231,13 +1684,16 @@ describe("auto-capture on macOS (engram#616)", () => {
 
   it("starts the daemon and turns on start at login after sign-in, then says nothing more", async () => {
     await autoEnableCapture({ after: "login" });
-    expect(spawn).toHaveBeenCalledTimes(1);
     const text = said();
     expect(text).toContain("Auto-start enabled — daemon will start on login");
     expect(text).toContain("Auto-capture is on");
     expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
-    expect(launchctlCalls()).toEqual(["print-disabled", "bootstrap"]);
+    // Start at login first, and then launchd starts the daemon, which it
+    // starts again after a crash (engram#641).
+    expect(launchctlCalls()).toEqual(["print-disabled", "bootstrap", "list", "print-disabled", "kickstart"]);
     expect(launchd.loadedText).toBe(plistWith());
+    expect(launchd.pid).toBe(process.pid);
+    expect(spawn).not.toHaveBeenCalled();
 
     execFileSync.mockClear();
     for (let command = 0; command < 3; command++) {
@@ -1245,7 +1701,7 @@ describe("auto-capture on macOS (engram#616)", () => {
       expect(said()).toBe("");
     }
     expect(execFileSync).not.toHaveBeenCalled();
-    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn).not.toHaveBeenCalled();
     expect(process.exitCode).toBeUndefined();
   });
 
@@ -1554,7 +2010,18 @@ describe("a job switched off in launchd (engram#654)", () => {
     daemonRunning();
     await daemonStart([], { install: "" });
     expect(spawn).not.toHaveBeenCalled();
-    expect(launchctlCalls()).toEqual(["print-disabled", "enable", "bootout", "unload", "list", "bootstrap"]);
+    // Then whether launchd runs it (engram#641).
+    expect(launchctlCalls()).toEqual([
+      "print-disabled",
+      "enable",
+      "bootout",
+      "unload",
+      "list",
+      "bootstrap",
+      "list",
+      "list",
+      "print-disabled",
+    ]);
     expect(launchd.switchedOff).toBe(false);
     expect(launchd.loaded).toBe(true);
   });
@@ -1602,7 +2069,8 @@ describe("a job switched off in launchd (engram#654)", () => {
       await autoEnableCapture({ after: "login" });
       expect(spawn).toHaveBeenCalledTimes(1);
       expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
-      expect(launchctlCalls()).toEqual(["print-disabled"]);
+      // And whether launchd has the job, to start the daemon (engram#641): it hasn't.
+      expect(launchctlCalls()).toEqual(["print-disabled", "list"]);
       expect(launchd.loaded).toBe(false);
       expect(launchd.switchedOff).toBe(true);
       const text = said();
@@ -1757,16 +2225,27 @@ describe("a CLI and a Node installed with brew (engram#652)", () => {
     await asBrewCli(() => daemonStart([], {}));
     expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(THROUGH_OPT));
     expect(launchd.loadedText).toBe(plistWith(THROUGH_OPT));
-    expect(launchctlCalls()).toEqual(["list", "print-disabled", "bootout", "list", "bootstrap"]);
+    // Then launchd starts the daemon (engram#641).
+    expect(launchctlCalls()).toEqual([
+      "list",
+      "print-disabled",
+      "bootout",
+      "list",
+      "bootstrap",
+      "list",
+      "print-disabled",
+      "kickstart",
+      "list",
+    ]);
     expect(said()).toContain(`Updated auto-start configuration (plist v${PLIST_VERSION})`);
-    expect(spawn).toHaveBeenCalledTimes(1);
 
-    // Current from then on.
+    // Current from then on, and launchd's to start.
     daemonGone();
     execFileSync.mockClear();
     await asBrewCli(() => daemonStart([], {}));
     expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(THROUGH_OPT));
-    expect(launchctlCalls()).toEqual(["list"]);
+    expect(launchctlCalls()).toEqual(["list", "list", "print-disabled", "kickstart", "list"]);
+    expect(spawn).not.toHaveBeenCalled();
     expect(said()).not.toContain("Updated auto-start configuration");
     expect(process.exitCode).toBeUndefined();
   });

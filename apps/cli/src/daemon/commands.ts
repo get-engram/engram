@@ -67,6 +67,7 @@ import {
   agentPid,
   enableAgent,
   generatePlist,
+  kickstartAgent,
   loadAgent,
   plistPath,
   readPlist,
@@ -275,6 +276,7 @@ export async function daemonStart(
     // loading the launchd agent starts a worker there and then, which finds
     // this daemon and exits (engram#612).
     if ("install" in flags) await enableStartAtLogin(true);
+    printOutsideLaunchd(found);
     return;
   }
 
@@ -306,6 +308,13 @@ export async function daemonStart(
   repairRunEntryIfBroken();
   repairSystemdUnitIfStale();
 
+  // On macOS, start at login first: loading the agent has launchd start the
+  // daemon, and then it is launchd's, which starts it again after a crash
+  // (engram#641). Not with settings in this environment that launchd's
+  // daemon wouldn't have: the daemon is started here then, as before.
+  const launchdFirst = "install" in flags && process.platform === "darwin" && !daemonEnvOverrides();
+  if (launchdFirst) enableLaunchdStartAtLogin();
+
   if (!reportStart(await startInBackground())) {
     process.exit(1);
     return;
@@ -313,9 +322,31 @@ export async function daemonStart(
   console.log(`${dim("Log:")} ${LOG_FILE}`);
   console.log(`${dim("DB:")}  ${DB_FILE}`);
 
-  if ("install" in flags) {
+  if ("install" in flags && !launchdFirst) {
     await enableStartAtLogin(true);
   }
+}
+
+/**
+ * Said when `engram start` finds the daemon running, and launchd isn't
+ * running it though it could (engram#641): launchd doesn't start that one
+ * again after a crash. A daemon `engram start` spawned before this version,
+ * or one launchd's own found running when the agent was loaded. A stop and
+ * a start hand it to launchd. Not when the version hint says to do that
+ * anyway.
+ */
+function printOutsideLaunchd(found: DaemonFound): void {
+  if (found.state !== "running" || found.older) return;
+  if (found.version && VERSION !== "unknown" && found.version !== VERSION) return;
+  if (!launchdRunsThisCli()) return;
+  const pid = agentPid();
+  if (pid === found.pid) return;
+  if ((pid === null && !agentLoaded()) || agentDisabled() === true) return;
+  console.log(
+    dim(
+      `  The running daemon (pid ${found.pid}) wasn't started by launchd, so launchd won't restart it after a crash: run 'engram stop' and then 'engram start' to fix that.`,
+    ),
+  );
 }
 
 /**
@@ -346,14 +377,113 @@ const REPORT_MARGIN_MS = 2_000;
 /**
  * Start the daemon in the background, and wait for it to be ready (see
  * waitForWorker). On Windows through the supervisor, which starts it again
- * after an error (engram#613); launchd does that on macOS.
+ * after an error (engram#613). On macOS through launchd, which does that
+ * too, when its agent is loaded (engram#641).
  */
 function startInBackground(): Promise<WorkerStart> {
   if (process.platform === "win32") {
     const reportUntil = Date.now() + START_WAIT_MS - REPORT_MARGIN_MS;
     return waitForWorker(spawnSupervisor(reportUntil), START_WAIT_MS, { supervisor: true });
   }
+  if (launchdCanStart()) return startThroughLaunchd();
   return waitForWorker(spawnWorker());
+}
+
+/**
+ * Settings in this command's environment that a daemon spawned from it
+ * inherits, and one launchd starts doesn't have: launchd gives its job only
+ * the plist's environment (engram#641). A key or a server set here, or the
+ * vault key, which the daemon scrubs vault values with. With one of them
+ * set, the daemon is spawned, as before.
+ */
+function daemonEnvOverrides(): boolean {
+  return Boolean(
+    process.env.ENGRAM_API_KEY || process.env.ENGRAM_BASE_URL?.trim() || process.env.ENGRAM_VAULT_KEY,
+  );
+}
+
+/**
+ * The agent is ours and current, for this CLI (plistForThisCli), and the
+ * daemon launchd starts from it has everything this command's environment
+ * would give one (daemonEnvOverrides). No launchctl call.
+ */
+function launchdRunsThisCli(): boolean {
+  if (process.platform !== "darwin" || daemonEnvOverrides() || !isLaunchdInstalled()) return false;
+  const made = plistForThisCli();
+  return "text" in made && installedPlistText() === made.text;
+}
+
+/**
+ * launchd can start this CLI's daemon (engram#641): launchdRunsThisCli,
+ * and the agent is loaded and not switched off. A plist of another CLI's,
+ * or one not loaded, is left as it is, and the daemon is spawned.
+ */
+function launchdCanStart(): boolean {
+  return launchdRunsThisCli() && agentLoaded() && agentDisabled() !== true;
+}
+
+/**
+ * Have launchd start the daemon, and wait for it to be ready (engram#641).
+ * launchd starts the daemon it runs again after a crash; one spawned, it
+ * doesn't. The daemon is spawned, as before, when launchd won't start it,
+ * or hasn't within LAUNCHD_SPAWN_WAIT_MS: said, since that one isn't
+ * restarted.
+ */
+async function startThroughLaunchd(): Promise<WorkerStart> {
+  const refused = kickstartAgent();
+  if (refused === null) {
+    const started = await waitForAgent();
+    if (started !== null) return started;
+  }
+  const why = refused === null ? "didn't start the daemon in time" : `couldn't start the daemon (launchctl: ${refused})`;
+  console.log(dim(`  launchd ${why}, so it is started directly, and won't be restarted after a crash.`));
+  return waitForWorker(spawnWorker());
+}
+
+/**
+ * How long `engram start` waits for launchd to start the daemon it asked
+ * for before spawning one itself. launchd starts it at once, as a rule.
+ */
+const LAUNCHD_SPAWN_WAIT_MS = 3_000;
+
+/**
+ * Wait for the daemon launchd was asked to start (kickstartAgent) to
+ * answer on its socket as ready, as waitForWorker waits for one spawned.
+ * Its PID is launchd's (agentPid), asked for at once: launchd names the
+ * process as it starts it, so one that exits as it starts is still seen to
+ * have started. Gives up as soon as that process has exited with nothing
+ * holding the socket: it couldn't start. A daemon that answers, ready, is
+ * the one running: launchd's, or one started beside it, which launchd's
+ * leaves the capture to (engram#612).
+ *
+ * Null when launchd hasn't started a process for the job within
+ * `spawnWaitMs`: the caller spawns the daemon then. Exported for tests.
+ */
+export async function waitForAgent(
+  timeoutMs = START_WAIT_MS,
+  spawnWaitMs = LAUNCHD_SPAWN_WAIT_MS,
+): Promise<WorkerStart | null> {
+  const start = Date.now();
+  const deadline = start + timeoutMs;
+  let pid = agentPid();
+  while (Date.now() < deadline) {
+    await sleep(100);
+    const probe = await probeDaemon({ timeoutMs: 1_000 });
+    if (probe.state === "answered" && probe.info.ready && !probe.info.stopping) {
+      return { state: "running", pid: probe.info.pid };
+    }
+    pid ??= agentPid();
+    // A daemon holds the socket, and is still loading.
+    if (probe.state === "answered" || probe.state === "silent") continue;
+    if (pid === null) {
+      if (Date.now() - start >= spawnWaitMs) return null;
+      continue;
+    }
+    // No socket on this machine (see daemonEndpoint): the PID file is all there is.
+    if (probe.state === "unavailable" && pidInFile() === pid) return { state: "running", pid };
+    if (!alive(pid)) return { state: "failed" };
+  }
+  return { state: "starting", pid };
 }
 
 /** Say how a worker just spawned got on; false when it didn't start. */
@@ -1671,16 +1801,24 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
     if (!(process.env.ENGRAM_API_KEY ?? config.apiKey)) return; // nothing to capture into
     let changed = false;
     const found = await findDaemon(500);
+    // On macOS, with no daemon at all, start at login first: then launchd
+    // starts the daemon, and starts it again after a crash (engram#641).
+    // Not with settings in this environment that launchd's daemon wouldn't
+    // have: the daemon is spawned then, as before.
+    const launchdFirst = platform === "darwin" && found.state === "stopped" && !daemonEnvOverrides();
+    let startAtLogin: "changed" | "unchanged" | "failed" | "unavailable" | undefined = launchdFirst
+      ? autoEnableLaunchdStartAtLogin()
+      : undefined;
     if (found.state === "stopped" || found.state === "stopping") {
       // On Windows through the supervisor, as at sign-in, so a worker that
       // exits with an error is started again (engram#613). Nothing waits on
       // it here, so it is never asked to report a failed start.
       if (platform === "win32") spawnSupervisor();
-      else spawnWorker();
+      else if (!(launchdFirst && launchdCanStart() && kickstartAgent() === null)) spawnWorker();
       changed = true;
       await sleep(500);
     }
-    const startAtLogin =
+    startAtLogin ??=
       platform === "darwin"
         ? autoEnableLaunchdStartAtLogin()
         : platform === "win32"

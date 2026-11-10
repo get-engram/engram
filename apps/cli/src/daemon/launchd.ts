@@ -415,6 +415,23 @@ export function loadAgent({ turnOn = false }: { turnOn?: boolean } = {}): string
   }
 }
 
+/**
+ * Have launchd start the daemon now: `launchctl kickstart`, which runs the
+ * job whatever its launch conditions, as after `engram stop`, whose exit 0
+ * KeepAlive doesn't restart (engram#641). launchd starts the daemon again
+ * after a crash then, as it does the one it starts at login. A job that
+ * runs already is left running: never `-k`, which would kill it first. The
+ * error when launchd wouldn't.
+ */
+export function kickstartAgent(): string | null {
+  try {
+    launchctl(["kickstart", `${guiDomain()}/${PLIST_LABEL}`]);
+    return null;
+  } catch (err: unknown) {
+    return commandFailure(err);
+  }
+}
+
 /** Unload the agent, which stops a daemon launchd runs for it. Quiet when it isn't loaded. */
 export function unloadAgent(): void {
   try {

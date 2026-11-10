@@ -17,6 +17,13 @@
  *     exits 0, and isn't, even when the stop comes while it is still starting
  *     (engram#669: that one was ended by the signal, which launchd takes for
  *     a crash).
+ *   - With the job loaded, `engram start` has launchd start the daemon
+ *     (engram#641): the daemon it reports is the job's, launchd starts it
+ *     again after it was killed, and a start right after a stop is the
+ *     job's too. With a server set in its environment, which launchd's
+ *     daemon wouldn't have, start starts the daemon itself, and a start
+ *     after that says launchd doesn't run it. `engram start --install`
+ *     turns start at login on first, and launchd starts the daemon.
  *   - A plist and a worker marked as downloaded (com.apple.quarantine) load
  *     and run all the same.
  *   - The plist an older CLI wrote, naming worker-main.js, is outdated:
@@ -178,6 +185,13 @@ const env = {
   ENGRAM_BASE_URL: NOWHERE,
   LANG: "en_US.UTF-8",
 };
+/**
+ * The same without ENGRAM_BASE_URL. With it set, `engram start` starts the
+ * daemon itself, since launchd's daemon wouldn't have it (engram#641);
+ * without it, both read the server address from config.json.
+ */
+const launchdEnv = { ...env };
+delete launchdEnv.ENGRAM_BASE_URL;
 
 let failures = 0;
 function check(ok, what) {
@@ -204,8 +218,8 @@ async function waitFor(what, test, ms = 20_000) {
   return null;
 }
 
-function engram(args, { quiet = false } = {}) {
-  const r = spawnSync(NODE, [CLI, ...args], { env, cwd: root, encoding: "utf-8", timeout: 90_000 });
+function engram(args, { quiet = false, env: environment = env } = {}) {
+  const r = spawnSync(NODE, [CLI, ...args], { env: environment, cwd: root, encoding: "utf-8", timeout: 90_000 });
   const out = `${r.stdout ?? ""}${r.stderr ?? ""}`.replace(/\x1b\[[0-9;]*m/g, "");
   if (!quiet) {
     console.log(`\n$ engram ${args.join(" ")}  (exit ${r.status})`);
@@ -463,6 +477,89 @@ async function run() {
       `last terminating signal ${stopped?.lastSignal ?? "none"})`,
   );
 
+  // ── engram start: launchd starts the daemon (engram#641) ───────────────────
+  // The job is loaded, and its daemon stopped.
+  const runsBeforeStart = job()?.runs ?? 0;
+  const kickAt = Date.now();
+  const kick = engram(["start"], { env: launchdEnv });
+  console.log(`      start took ${Date.now() - kickAt} ms`);
+  check(kick.status === 0, "start: exits 0");
+  check(!kick.out.includes("started directly"), "start: has launchd start the daemon");
+  const kicked = startedPid(kick.out);
+  const kickedJob = job();
+  check(
+    kicked !== null && kickedJob?.state === "running" && kickedJob.pid === kicked,
+    `start: the daemon it started is launchd's (pid ${kicked}; launchd's ${kickedJob?.pid}, ${kickedJob?.state})`,
+  );
+  check(kickedJob?.runs === runsBeforeStart + 1, `launchctl print: runs went from ${runsBeforeStart} to ${kickedJob?.runs}`);
+  if (!kicked || !isOurWorker(kicked)) return;
+  check(commandOf(kicked) === `${NODE} ${WORKER}`, `ps: this Node, running this worker (${commandOf(kicked)})`);
+
+  const twice = engram(["start"], { env: launchdEnv });
+  check(twice.out.includes(`Daemon already running (pid ${kicked})`), `start again: the daemon runs (pid ${kicked})`);
+  check(!twice.out.includes("wasn't started by launchd"), "start again: says nothing of launchd, which runs it");
+  check(
+    job()?.pid === kicked && isDeepStrictEqual(ourWorkers(), [kicked]),
+    `start again: the same daemon, and only it (${ourWorkers().join(", ")})`,
+  );
+
+  // Killed outright: launchd starts it again, as it does the one it starts at login.
+  process.kill(kicked, "SIGKILL");
+  const respawned = await waitForJob("launchd starts the daemon start had it start again after it was killed", kicked);
+  if (!respawned) return;
+  const respawnedAt = Date.now();
+  await statusRunning(respawned, "after the kill");
+
+  // At once after a stop, as `engram stop && engram start` does: within the
+  // job's ThrottleInterval (10s) of launchd starting the last one. kickstart
+  // runs a job "immediately, regardless of its configured launch conditions"
+  // (launchctl(1)); were it put off, start would wait 3s for it, and then
+  // start the daemon itself, and say so.
+  const stopRespawned = engram(["stop"]);
+  check(stopRespawned.out.includes(`Daemon stopped (pid ${respawned})`), `stop: stops the daemon (pid ${respawned})`);
+  const sinceLast = Date.now() - respawnedAt;
+  const restartAt = Date.now();
+  const restart = engram(["start"], { env: launchdEnv });
+  const restartMs = Date.now() - restartAt;
+  const restartJob = job();
+  console.log(
+    `      start at once after a stop, ${sinceLast} ms after launchd started the last daemon: ` +
+      `took ${restartMs} ms; the job is ${restartJob?.state} (pid ${restartJob?.pid})`,
+  );
+  check(restart.status === 0, "start at once after a stop: exits 0");
+  check(!restart.out.includes("started directly"), "start at once after a stop: launchd starts the daemon in time");
+  const restartedPid = startedPid(restart.out);
+  const throughLaunchd = restartedPid !== null && restartJob?.state === "running" && restartJob.pid === restartedPid;
+  check(
+    throughLaunchd,
+    `start at once after a stop: the daemon is launchd's (pid ${restartedPid}; launchd's ${restartJob?.pid})`,
+  );
+  // A start launchd put off comes in by the end of the ThrottleInterval: let
+  // it, so what follows begins with no daemon.
+  if (!throughLaunchd) await sleep(Math.max(0, 12_000 - (Date.now() - respawnedAt)));
+
+  // With a server set here, start starts the daemon itself; a start after
+  // that says launchd doesn't run it, and how to hand it over.
+  engram(["stop"]);
+  await waitFor("stop: no daemon runs", () => ourWorkers().length === 0);
+  const direct = engram(["start"]);
+  const directPid = startedPid(direct.out);
+  check(direct.status === 0 && directPid !== null, `start with ENGRAM_BASE_URL set: starts the daemon (pid ${directPid})`);
+  const directJob = job();
+  check(
+    directJob !== null && directJob.state !== "running",
+    `start with ENGRAM_BASE_URL set: launchd doesn't run it (the job is ${directJob?.state})`,
+  );
+  const outside = engram(["start"], { env: launchdEnv });
+  check(outside.out.includes(`Daemon already running (pid ${directPid})`), `start: the daemon runs (pid ${directPid})`);
+  check(
+    outside.out.includes(`The running daemon (pid ${directPid}) wasn't started by launchd`),
+    "start: says launchd won't restart it after a crash",
+  );
+  check(job()?.state !== "running", "start: leaves it running, and launchd's job stopped");
+  engram(["stop"]);
+  await waitFor("stop: no daemon runs", () => ourWorkers().length === 0);
+
   // ── Marked as downloaded: launchd loads and runs it all the same ────────────
   bootout();
   await waitForGone("bootout: launchd lets go of the job");
@@ -566,6 +663,30 @@ async function run() {
   const none = engram(["status"]);
   check(none.out.includes("Status: stopped"), "status: stopped");
   check(autoStartLine(none.out) === null, `status: nothing about start at login (${autoStartLine(none.out)})`);
+
+  // ── engram start --install: start at login first, then launchd starts the daemon (engram#641)
+  const withInstall = engram(["start", "--install"], { env: launchdEnv });
+  check(withInstall.status === 0, "start --install: exits 0");
+  const enabledAt = withInstall.out.indexOf("Auto-start enabled — daemon will start on login");
+  check(
+    enabledAt >= 0 && withInstall.out.indexOf("Engram daemon started") > enabledAt,
+    "start --install: turns start at login on, and then the daemon is started",
+  );
+  check(plistText() === INSTALLED, "start --install: the plist is the one install writes");
+  const installedPid = startedPid(withInstall.out);
+  const installedJob = job();
+  check(
+    installedPid !== null && installedJob?.state === "running" && installedJob.pid === installedPid,
+    `start --install: the daemon is launchd's (pid ${installedPid}; launchd's ${installedJob?.pid})`,
+  );
+  // Loading the job started the daemon; kickstart, without -k, left it running.
+  check(installedJob?.runs === 1, `launchctl print: launchd started it once (runs ${installedJob?.runs})`);
+  if (installedPid) {
+    await waitFor(`one daemon runs: pid ${installedPid}`, () => isDeepStrictEqual(ourWorkers(), [installedPid]));
+  }
+  const removed = engram(["uninstall"]);
+  check(removed.status === 0, "uninstall: exits 0");
+  await waitForGone("uninstall: launchd lets go of the job, and its daemon stops");
 
   // ── A plist from before engram#616, which launchd can't load ───────────────
   mkdirSync(dirname(PLIST), { recursive: true });

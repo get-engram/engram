@@ -1,7 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { Engram, type MessageInput } from "@getengram/sdk";
-import { loadConfig, resolveBaseUrl } from "../config.js";
+import { resolveBaseUrl } from "../config.js";
+import { configForUse } from "../config-guard.js";
 import { green, dim, bold, plural } from "../output.js";
 
 import { parseStorageFullError } from "../storage-error.js";
@@ -340,7 +341,11 @@ export function storageWarning(
 /** Fetch lifetime storage usage; returns null on any failure (never blocks the import). */
 async function fetchStorageUsage(): Promise<StorageUsage | null> {
   try {
-    const config = await loadConfig();
+    // Strict (engram#673): never the default server in place of the one
+    // config.json names.
+    const read = await configForUse();
+    if ("problem" in read) return null;
+    const config = read.config;
     const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
     if (!apiKey) return null;
     const baseUrl = resolveBaseUrl(config);

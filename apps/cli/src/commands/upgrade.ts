@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { win32 } from "node:path";
-import { loadConfig, resolveBaseUrl } from "../config.js";
+import { resolveBaseUrl } from "../config.js";
+import { loadConfigForUse } from "../config-guard.js";
 import { green, red, dim } from "../output.js";
 
 
@@ -54,7 +55,8 @@ export async function upgrade(
   args: string[],
   flags: Record<string, string>,
 ): Promise<void> {
-  const config = await loadConfig();
+  // Strict (engram#673): see getClient.
+  const config = await loadConfigForUse();
   const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
 
   if (!apiKey) {

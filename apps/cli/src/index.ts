@@ -2,7 +2,8 @@
 
 import { createRequire } from "node:module";
 import { Engram } from "@getengram/sdk";
-import { loadConfig, resolveBaseUrl } from "./config.js";
+import { resolveBaseUrl } from "./config.js";
+import { configProblem, loadConfigForUse } from "./config-guard.js";
 import { authLogin, authLogout, authStatus } from "./commands/auth.js";
 import { signup, login, link, whoami } from "./commands/login.js";
 import {
@@ -23,7 +24,7 @@ import { status as showStatus } from "./commands/status.js";
 import { vaultKeygen, vaultStatus, loadVaultKey, vaultSet, vaultGet, vaultList, vaultDelete } from "./commands/vault.js";
 import { excludeAdd, excludeRemove, excludeList } from "./commands/exclude.js";
 import { bold, dim, red } from "./output.js";
-import { readStatus, syncErrorSummary, captureErrorSummary } from "./daemon/status.js";
+import { readStatus, syncErrorSummary, captureErrorSummary, configProblemSummary } from "./daemon/status.js";
 import { foreignFiles, foreignFilesFix, foreignFilesProblem } from "./daemon/ownership.js";
 
 // Read from package.json rather than duplicated here. The previous hardcoded
@@ -110,7 +111,10 @@ function parseArgs(argv: string[]): {
 }
 
 async function getClient(): Promise<Engram> {
-  const config = await loadConfig();
+  // Strict (engram#673): a config.json that can't be read isn't "not
+  // authenticated", and ENGRAM_API_KEY isn't sent to the default server in
+  // place of the one it names.
+  const config = await loadConfigForUse();
   const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
 
   if (!apiKey) {
@@ -221,7 +225,9 @@ ${dim(`v${VERSION} — https://getengram.app`)}
 function printSyncBanner(): void {
   try {
     const s = readStatus();
-    if (s.capture_error) {
+    // Waiting on config.json (engram#673): printConfigBanner says why, from
+    // the file itself. Once it reads fine, the daemon picks up on its own.
+    if (s.capture_error && s.capture_error.kind !== "config") {
       console.error(red(bold("engram:")) + ` ${captureErrorSummary(s.capture_error)}`);
       console.error(dim("  (run 'engram status' for details)"));
       console.error("");
@@ -257,6 +263,20 @@ function printForeignFilesBanner(): void {
   } catch {
     // Never let this block the command the user asked for.
   }
+}
+
+/**
+ * A ~/.engram/config.json that can't be read (engram#673): capture waits on
+ * it, and commands that use or save settings stop. Read from the file here,
+ * before every command, rather than from status.json: the daemon may not
+ * be running, and a record would outlast the fix.
+ */
+async function printConfigBanner(): Promise<void> {
+  const problem = await configProblem();
+  if (!problem) return;
+  console.error(red(bold("engram:")) + ` ${configProblemSummary(problem.message)}`);
+  console.error(dim("  (run 'engram status' for details)"));
+  console.error("");
 }
 
 async function main(): Promise<void> {
@@ -303,6 +323,15 @@ async function main(): Promise<void> {
   // command instead — this is the moment the user is actually looking.
   // The status commands and `usage` print their own detail, so skip the
   // banner there.
+  // These say it themselves: the status commands, and those that save
+  // settings, which refuse to save over the file, or save an empty one and
+  // say what that means (engram#673).
+  const SAYS_CONFIG_PROBLEM = new Set([
+    "status", "daemon status", "signup", "login", "auth login", "auth logout",
+    "stop", "daemon stop", "uninstall", "daemon uninstall",
+    "exclude", "exclude add", "exclude remove", "exclude rm", "exclude list", "exclude ls",
+  ]);
+  if (!SAYS_CONFIG_PROBLEM.has(cmd)) await printConfigBanner();
   if (cmd !== "status" && cmd !== "daemon status" && cmd !== "usage") {
     printSyncBanner();
   }

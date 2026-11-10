@@ -90,12 +90,15 @@ vi.mock("node:child_process", async (importOriginal) => ({
   execFileSync,
   execFile: vi.fn(),
 }));
-vi.mock("../config.js", () => ({
-  loadConfig: vi.fn(async () => ({})),
-  saveConfig: vi.fn(async () => {}),
-  getBaseUrl: () => "https://engram.invalid",
-  resolveBaseUrl: () => "https://engram.invalid",
-}));
+vi.mock("../config.js", () => {
+  const loadConfigStrict = vi.fn(async () => ({}));
+  return {
+    loadConfigStrict,
+    saveConfig: vi.fn(async () => {}),
+    getBaseUrl: () => "https://engram.invalid",
+    resolveBaseUrl: () => "https://engram.invalid",
+  };
+});
 // An install has dist/daemon/worker.js beside launch.js; under vitest the
 // module beside launch.ts is worker.ts. Point at a file that exists.
 vi.mock("../daemon/launch.js", async (importOriginal) => {
@@ -144,7 +147,7 @@ mkdirSync(NO_BIN);
 writeFileSync(LAUNCHCTL, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
 
 const { LOG_FILE } = await import("../daemon/launch.js");
-const { loadConfig } = await import("../config.js");
+const { loadConfigStrict } = await import("../config.js");
 const {
   autoEnableCapture,
   daemonInstall,
@@ -403,7 +406,7 @@ function said(): string {
  */
 function signedInAtATerminal(): void {
   const realIsTTY = process.stdin.isTTY;
-  const config = vi.mocked(loadConfig);
+  const config = vi.mocked(loadConfigStrict);
 
   beforeEach(() => {
     vi.stubEnv("ENGRAM_NO_AUTOCAPTURE", "");

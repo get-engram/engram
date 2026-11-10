@@ -8,6 +8,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { Engram } from "@getengram/sdk";
 import { loadConfigStrict, resolveBaseUrl } from "../config.js";
+import { ConfigUnreadable } from "../config-file.js";
 import { DaemonDb } from "./db.js";
 import { Pruner } from "./prune.js";
 import { Watcher } from "./watcher.js";
@@ -180,7 +181,11 @@ async function main(): Promise<void> {
     configBaseUrl = typeof config.baseUrl === "string" ? config.baseUrl : undefined;
     if (!apiKey) apiKey = await configuredKey();
   } catch (err: unknown) {
-    log(`couldn't read ~/.engram/config.json (${errorText(err)}) — will keep trying`);
+    // Never the file's text, which holds the key (engram#673).
+    log(
+      `${err instanceof ConfigUnreadable ? err.message : `couldn't read ~/.engram/config.json (${errorText(err)})`}` +
+        " — will keep trying",
+    );
   }
 
   const baseUrl = resolveBaseUrl({ baseUrl: configBaseUrl });

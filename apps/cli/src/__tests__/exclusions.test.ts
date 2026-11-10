@@ -14,6 +14,7 @@ import {
 } from "../daemon/exclusions.js";
 import Database from "better-sqlite3";
 import { DaemonDb } from "../daemon/db.js";
+import { ExclusionsUnreadable, isCaptureHold } from "../daemon/queue-error.js";
 
 // Capture exclusions (engram#462). The opt-out phrase detector is the risky
 // piece: a false negative quietly ignores a privacy request; a false positive
@@ -184,6 +185,100 @@ describe(".engramignore markers + config integration", () => {
 
   it("undefined cwd is never excluded", () => {
     expect(isPathExcluded(undefined)).toBe(false);
+  });
+});
+
+// engram#673: a config.json that is there but can't be read, or doesn't
+// hold settings, read as no exclusions, and every session was captured,
+// excluded or not. Now whether a folder is excluded can't be told, and the
+// watcher holds the transcript until it can.
+describe("config.json that can't be read (engram#673)", () => {
+  /** The end of a made-up key: what must never reach a message. */
+  const TAIL = "Q9Z7LEAK";
+  let dir: string;
+  let repo: string;
+  let cfg: string;
+
+  beforeEach(() => {
+    resetExclusionCaches();
+    dir = mkdtempSync(join(tmpdir(), "engram-673-excl-"));
+    repo = join(dir, "repo");
+    mkdirSync(repo, { recursive: true });
+    cfg = join(dir, "config.json");
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  function cantTell(cwd: string = repo): ExclusionsUnreadable {
+    try {
+      isPathExcluded(cwd, cfg);
+    } catch (err) {
+      if (err instanceof ExclusionsUnreadable) return err;
+      throw err;
+    }
+    throw new Error("it didn't throw");
+  }
+
+  it("can't tell whether a folder is excluded when config.json isn't JSON", () => {
+    writeFileSync(cfg, `{"apiKey":"engram_sk_live_test_673_${TAIL}","n":x}`);
+    const err = cantTell();
+    expect(err.reason).toBe("~/.engram/config.json isn't valid JSON");
+    expect(err.message).toBe(
+      "can't tell which folders are excluded from capture: ~/.engram/config.json isn't valid JSON",
+    );
+    expect(err.kind).toBe("config");
+    expect(isCaptureHold(err)).toBe(true);
+    expect(err.cause).toBeUndefined();
+    expect(`${err.stack}`).not.toContain(TAIL.slice(-4));
+  });
+
+  it.each([
+    ["", "~/.engram/config.json is empty"],
+    ['{"excludePaths": "/x"}', "~/.engram/config.json has an excludePaths that isn't a list of paths"],
+    ['{"excludePaths": ["/x", 1]}', "~/.engram/config.json has an excludePaths that isn't a list of paths"],
+    ["[]", "~/.engram/config.json isn't a JSON object"],
+  ])("can't tell from %j", (text, reason) => {
+    writeFileSync(cfg, text);
+    expect(cantTell().reason).toBe(reason);
+  });
+
+  it("can't tell from a folder", () => {
+    mkdirSync(cfg);
+    expect(cantTell().reason).toBe("~/.engram/config.json is a folder, not a file");
+  });
+
+  it.skipIf(process.platform === "win32")("can't tell from a link to a file that isn't there", () => {
+    symlinkSync(join(dir, "unmounted", "config.json"), cfg);
+    expect(cantTell().reason).toBe("~/.engram/config.json is a link to a file that isn't there");
+  });
+
+  it("still excludes a folder with a marker", () => {
+    writeFileSync(cfg, "{");
+    writeFileSync(join(repo, IGNORE_MARKER), "");
+    expect(isPathExcluded(join(repo, "src"), cfg)).toBe(true);
+  });
+
+  it("still captures a session with no working directory, which no folder excludes", () => {
+    writeFileSync(cfg, "{");
+    expect(isPathExcluded(undefined, cfg)).toBe(false);
+  });
+
+  it("finds none when there is no config.json", () => {
+    expect(isPathExcluded(repo, cfg)).toBe(false);
+  });
+
+  it("doesn't fall back on what it read before, and honours the file once fixed", () => {
+    writeFileSync(cfg, JSON.stringify({ excludePaths: [] }));
+    expect(isPathExcluded(repo, cfg)).toBe(false);
+
+    // Damaged in place, at a different size, so a coarse mtime can't hide it.
+    writeFileSync(cfg, '{"excludePaths": [');
+    expect(cantTell().reason).toBe("~/.engram/config.json isn't valid JSON");
+    // Nothing from the failure is kept.
+    expect(cantTell().reason).toBe("~/.engram/config.json isn't valid JSON");
+
+    writeFileSync(cfg, JSON.stringify({ excludePaths: [repo] }));
+    expect(isPathExcluded(join(repo, "sub"), cfg)).toBe(true);
+    expect(isPathExcluded(join(dir, "other"), cfg)).toBe(false);
   });
 });
 

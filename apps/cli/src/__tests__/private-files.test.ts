@@ -96,7 +96,7 @@ const {
   STALE_TEMP_MS,
   writePrivateFileSync,
 } = await import("../private-files.js");
-const { loadConfig, saveConfig } = await import("../config.js");
+const { loadConfigStrict, saveConfig } = await import("../config.js");
 const { vaultKeygen } = await import("../commands/vault.js");
 const { LOG_FILE, prepareLogSync } = await import("../daemon/launch.js");
 const { DaemonDb } = await import("../daemon/db.js");
@@ -522,7 +522,7 @@ describe("makeDirPrivateSync: the daemon's start (engram#627)", () => {
 describe("the files in ~/.engram (engram#627)", () => {
   it("config.json on a fresh install: ~/.engram 0700, config.json 0600", async () => {
     await saveConfig({ apiKey: "engram_sk_test_627" });
-    expect((await loadConfig()).apiKey).toBe("engram_sk_test_627");
+    expect((await loadConfigStrict()).apiKey).toBe("engram_sk_test_627");
     if (posix) {
       expect(mode(ENGRAM)).toBe(0o700);
       expect(mode(join(ENGRAM, "config.json"))).toBe(0o600);
@@ -537,7 +537,7 @@ describe("the files in ~/.engram (engram#627)", () => {
     await saveConfig({ apiKey: "engram_sk_test_new" });
     expect(mode(ENGRAM)).toBe(0o700);
     expect(mode(join(ENGRAM, "config.json"))).toBe(0o600);
-    expect((await loadConfig()).apiKey).toBe("engram_sk_test_new");
+    expect((await loadConfigStrict()).apiKey).toBe("engram_sk_test_new");
   });
 
   it("a config.json save cut short leaves the old one whole, key and all", async () => {
@@ -546,7 +546,7 @@ describe("the files in ~/.engram (engram#627)", () => {
       throw errno("ENOSPC");
     });
     await expect(saveConfig({ apiKey: "engram_sk_test_new" })).rejects.toThrow("ENOSPC");
-    expect(await loadConfig()).toEqual({ apiKey: "engram_sk_test_old", baseUrl: "http://127.0.0.1:9" });
+    expect(await loadConfigStrict()).toEqual({ apiKey: "engram_sk_test_old", baseUrl: "http://127.0.0.1:9" });
     expect(temps(ENGRAM)).toEqual([]);
   });
 

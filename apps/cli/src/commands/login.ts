@@ -1,11 +1,41 @@
 import { createInterface } from "node:readline";
-import { saveConfig, loadConfig, resolveBaseUrl } from "../config.js";
+import { saveConfig, loadConfigStrict, resolveBaseUrl, type Config } from "../config.js";
+import { ConfigUnreadable } from "../config-file.js";
+import { loadConfigForUpdate, loadConfigForUse } from "../config-guard.js";
 import { green, red, dim, bold } from "../output.js";
 import { Engram } from "@getengram/sdk";
 import { autoEnableCapture } from "../daemon/commands.js";
 
-/** The server these commands talk to: see resolveBaseUrl (engram#625). */
-const apiUrl = async (): Promise<string> => resolveBaseUrl(await loadConfig());
+/**
+ * The server these commands talk to: see resolveBaseUrl (engram#625). Read
+ * strictly (engram#673): from a config.json that couldn't be read, it was
+ * the default server whatever the file named, and the key went there.
+ */
+const apiUrl = async (): Promise<string> => resolveBaseUrl(await loadConfigForUse());
+
+/**
+ * Save `key`, just made for this machine, into config.json with what else
+ * is in it. Read again, as it may have changed while the server answered,
+ * and not saved over when it can't be read now (engram#673). `command`:
+ * the one to run again once it's fixed.
+ */
+async function saveNewKey(key: string, command: string): Promise<void> {
+  let config: Config;
+  try {
+    config = await loadConfigStrict();
+  } catch (err: unknown) {
+    if (!(err instanceof ConfigUnreadable && err.empty)) {
+      const why = err instanceof ConfigUnreadable ? err.message : "~/.engram/config.json can't be read";
+      console.error(red(`Error: ${why}, so the new API key wasn't saved.`));
+      console.error(`  Fix the file, then run 'engram ${command}' again.`);
+      process.exit(1);
+    }
+    // Empty: said by loadConfigForUpdate, before the key was made.
+    config = {};
+  }
+  config.apiKey = key;
+  await saveConfig(config);
+}
 
 /** Prompt for input (hides input for passwords). */
 function prompt(question: string, hidden = false): Promise<string> {
@@ -55,7 +85,11 @@ function prompt(question: string, hidden = false): Promise<string> {
  * No email, no password. Just get a key and start using Engram.
  */
 export async function signup(): Promise<void> {
-  const existing = await loadConfig();
+  // Before an account is made (engram#673): read leniently, a file that
+  // couldn't be read had no key in it, so a second account was made, and
+  // its key saved over the file, the first one's key and the folders
+  // excluded from capture with it.
+  const existing = await loadConfigForUpdate();
   if (existing.apiKey) {
     console.error(
       "You already have an account. Your API key is saved in ~/.engram/config.json\n\n" +
@@ -67,7 +101,7 @@ export async function signup(): Promise<void> {
 
   console.log("Creating account...");
 
-  const res = await fetch(`${await apiUrl()}/signup/anonymous`, {
+  const res = await fetch(`${resolveBaseUrl(existing)}/signup/anonymous`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
   });
@@ -83,9 +117,7 @@ export async function signup(): Promise<void> {
     api_key: string;
   };
 
-  const config = await loadConfig();
-  config.apiKey = data.api_key;
-  await saveConfig(config);
+  await saveNewKey(data.api_key, "signup");
 
   console.log(green("✓ Account created"));
   console.log(`  Organization: ${data.organization_id}`);
@@ -101,7 +133,7 @@ export async function signup(): Promise<void> {
  * Creates a Supabase user and links it to the existing org.
  */
 export async function link(args: string[] = [], flags: Record<string, string> = {}): Promise<void> {
-  const config = await loadConfig();
+  const config = await loadConfigForUse();
   const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
 
   if (!apiKey) {
@@ -195,7 +227,7 @@ async function setWebPassword(apiKey: string, password: string): Promise<void> {
  * Shows the org, email (or anonymous), and tier for the active API key.
  */
 export async function whoami(): Promise<void> {
-  const config = await loadConfig();
+  const config = await loadConfigForUse();
   const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
   if (!apiKey) {
     console.log("Not authenticated.");
@@ -290,6 +322,10 @@ async function confirmSavedKeyIsFor(
  * Calls Supabase auth, then the worker /signup to get an API key.
  */
 export async function login(args: string[] = [], flags: Record<string, string> = {}): Promise<void> {
+  // Before the password is asked for (engram#673). Read leniently, a file
+  // that couldn't be read named no server, so the password went to the
+  // default one, and the key it got was saved over the file.
+  const existing = await loadConfigForUpdate();
   const email = flags.email || await prompt("Email: ");
   const password = flags.password || await prompt("Password: ", true);
 
@@ -301,7 +337,7 @@ export async function login(args: string[] = [], flags: Record<string, string> =
   console.log("Signing in...");
 
   // Authenticate via worker — keeps Supabase credentials server-side
-  const signupRes = await fetch(`${await apiUrl()}/signup/login`, {
+  const signupRes = await fetch(`${resolveBaseUrl(existing)}/signup/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ email: email.trim(), password }),
@@ -313,7 +349,7 @@ export async function login(args: string[] = [], flags: Record<string, string> =
     // saved key belonged to, and capture went on into that one (engram#594).
     const conflict = (await signupRes.json().catch(() => ({}))) as { organization_id?: unknown };
     const orgId = typeof conflict.organization_id === "string" ? conflict.organization_id : null;
-    const config = await loadConfig();
+    const config = await loadConfigForUse();
     if (config.apiKey) {
       await confirmSavedKeyIsFor(email.trim(), orgId, config.apiKey);
       console.log(green(`✓ Signed in as ${email.trim()}`));
@@ -339,9 +375,7 @@ export async function login(args: string[] = [], flags: Record<string, string> =
     api_key: string;
   };
 
-  const config = await loadConfig();
-  config.apiKey = data.api_key;
-  await saveConfig(config);
+  await saveNewKey(data.api_key, "login");
 
   console.log(green(`✓ Signed in as ${email.trim()}`));
   console.log(`  API key saved to ~/.engram/config.json`);

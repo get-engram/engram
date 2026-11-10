@@ -42,12 +42,15 @@ vi.mock("node:child_process", async (importOriginal) => ({
   execFileSync,
   execFile,
 }));
-vi.mock("../config.js", () => ({
-  loadConfig: vi.fn(async () => ({ apiKey: "engram-test-key-659" })),
-  saveConfig,
-  getBaseUrl: () => "https://engram.invalid",
-  resolveBaseUrl: () => "https://engram.invalid",
-}));
+vi.mock("../config.js", () => {
+  const loadConfigStrict = vi.fn(async () => ({ apiKey: "engram-test-key-659" }));
+  return {
+    loadConfigStrict,
+    saveConfig,
+    getBaseUrl: () => "https://engram.invalid",
+    resolveBaseUrl: () => "https://engram.invalid",
+  };
+});
 // An install has dist/daemon/worker.js beside launch.js; under vitest the
 // module beside launch.ts is worker.ts. Point at a file that exists.
 vi.mock("../daemon/launch.js", async (importOriginal) => {

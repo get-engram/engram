@@ -30,7 +30,7 @@ async function runLogin(opts: {
 }): Promise<{ exit: number | null }> {
   vi.resetModules();
   vi.doMock("../config.js", () => ({
-    loadConfig: async () => (opts.savedKey ? { apiKey: opts.savedKey } : {}),
+    loadConfigStrict: async () => (opts.savedKey ? { apiKey: opts.savedKey } : {}),
     saveConfig,
     getBaseUrl: () => "http://127.0.0.1:9",
     resolveBaseUrl: () => "http://127.0.0.1:9",

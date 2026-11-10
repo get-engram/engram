@@ -3,12 +3,15 @@ import { readFileSync, existsSync, mkdtempSync, realpathSync, rmSync } from "nod
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, win32 } from "node:path";
 import { bold, dim, plural, red } from "../output.js";
-import { loadConfig, saveConfig } from "../config.js";
+import { loadConfigStrict, saveConfig, type Config } from "../config.js";
+import { ConfigUnreadable } from "../config-file.js";
+import { inspectConfig, printEmptyConfigNote } from "../config-guard.js";
 import { writePrivateFileSync } from "../private-files.js";
 import {
   readStatus,
   syncErrorSummary,
   captureErrorSummary,
+  configProblemSummary,
   deleteRefusedSummary,
   type SyncStatus,
 } from "./status.js";
@@ -73,14 +76,14 @@ import {
   type PlistState,
 } from "./launchd.js";
 
-/** Render the per-host capture status (engram#261). `signedOut`: the
- *  daemon runs without a key, so nothing is captured (engram#594). */
-function printHostStatus(signedOut = false): void {
+/** Render the per-host capture status (engram#261). `paused`: why nothing
+ *  is captured, e.g. the daemon runs without a key (engram#594). */
+function printHostStatus(paused?: string): void {
   console.log(`${dim("Hosts:")}`);
   for (const a of ALL_ADAPTERS) {
     const on = a.available();
     const mark = on ? "✓" : "·";
-    const state = on ? (signedOut ? "paused (signed out)" : "capturing") : "not installed";
+    const state = on ? (paused ? `paused (${paused})` : "capturing") : "not installed";
     console.log(`  ${mark} ${a.label.padEnd(14)} ${dim(state)}`);
   }
 }
@@ -253,7 +256,7 @@ export async function daemonStart(
   flags: Record<string, string>,
 ): Promise<void> {
   if (refusedAsRoot("start")) return;
-  await recordCaptureIntent("on");
+  await recordCaptureIntent("on", "start");
   // `engram stop` and then `engram start`: the last daemon may still be
   // finishing a send. A worker started now would only wait for it too.
   const found = await whileStopping(await findDaemon());
@@ -457,9 +460,36 @@ async function waitForOther(deadline: number): Promise<WorkerStart> {
   }
 }
 
-async function recordCaptureIntent(v: "on" | "off"): Promise<void> {
+/**
+ * Record whether capture is on, for the capture check after other commands
+ * (autoEnableCapture). `command`: the one that was run.
+ *
+ * A config.json that can't be read isn't saved over (engram#673): it holds
+ * the API key and the folders excluded from capture. Read leniently, as it
+ * was, `engram stop` replaced it with only `autocapture`. Nothing is lost
+ * by not recording "on": nothing turns capture off meanwhile, and the
+ * banner before the command said what is wrong with the file.
+ */
+async function recordCaptureIntent(v: "on" | "off", command: string): Promise<void> {
+  let config: Config;
   try {
-    const config = await loadConfig();
+    config = await loadConfigStrict();
+  } catch (err: unknown) {
+    if (err instanceof ConfigUnreadable && err.empty) {
+      printEmptyConfigNote();
+      config = {};
+    } else {
+      if (v === "off") {
+        const why = err instanceof ConfigUnreadable ? err.message : "~/.engram/config.json can't be read";
+        console.error(red(`Couldn't record that capture is off: ${why}.`));
+        console.error(
+          dim(`  Once it's fixed, run 'engram ${command}' again, or the next engram command turns capture back on.`),
+        );
+      }
+      return;
+    }
+  }
+  try {
     config.autocapture = v;
     await saveConfig(config);
   } catch {
@@ -490,7 +520,7 @@ export const STOP_PICKUP_MS = 10_000;
  * (engram#640).
  */
 export async function daemonStop(): Promise<void> {
-  await recordCaptureIntent("off");
+  await recordCaptureIntent("off", "stop");
   const found = await findDaemon();
   if (found.state === "stopped") {
     // A supervisor waiting to start the daemon again after an error finds
@@ -615,13 +645,12 @@ async function askToStop(pid: number, id: string): Promise<"taken" | "ignored" |
  * conversation Engram no longer has is "not sent" (engram#593): it stays on
  * this machine, and the conversation isn't created again.
  */
-async function printDbStats(foreign: ForeignFiles | null): Promise<void> {
+async function printDbStats(foreign: ForeignFiles | null, config: Config | null): Promise<void> {
   if (!existsSync(DB_FILE)) return;
   try {
     const { DaemonDb } = await import("./db.js");
     const { keyFingerprint } = await import("./syncer.js");
-    const config = await loadConfig();
-    const key = process.env.ENGRAM_API_KEY || config.apiKey;
+    const key = process.env.ENGRAM_API_KEY || config?.apiKey;
     const db = new DaemonDb(DB_FILE, { readonly: true });
     let stats: ReturnType<typeof db.getStats>;
     try {
@@ -671,16 +700,21 @@ export async function daemonStatus(): Promise<void> {
   const found = await findDaemon();
   // Files in ~/.engram that are another user's (engram#659).
   const foreign = foreignFiles();
+  // A config.json that can't be read (engram#673): capture waits on it.
+  const { config, problem } = await inspectConfig();
 
   if (found.state === "stopped") {
     console.log(`${bold("Status:")} stopped`);
 
     // Still show DB stats if available
-    await printDbStats(foreign);
+    await printDbStats(foreign, config);
     if (foreign) printForeignFilesWarning(foreign, true);
+    if (problem) printConfigWarning(problem);
     // A broken start-at-login entry is often why it's stopped. Files that
-    // aren't the user's, said above, are why, when they stop it.
-    if (printAutoStart() && !stopsCapture(foreign) && (await loadConfig()).autocapture !== "off") {
+    // aren't the user's, said above, are why, when they stop it. With
+    // config.json unreadable, whether 'engram stop' recorded capture off
+    // can't be told.
+    if (printAutoStart() && !stopsCapture(foreign) && config !== null && config.autocapture !== "off") {
       // Not stopped by 'engram stop', which records autocapture "off", and
       // started at sign-in, so it stopped by itself (engram#613).
       console.log(dim("  It should be running: start at login is on. It may have stopped after an error."));
@@ -706,14 +740,16 @@ export async function daemonStatus(): Promise<void> {
     printVersionHint(found);
   }
 
-  await printDbStats(foreign);
+  await printDbStats(foreign, config);
   if (foreign) printForeignFilesWarning(foreign, false);
 
   const syncStatus = readStatus();
-  printHostStatus(Boolean(syncStatus.signed_out_at));
+  printHostStatus(
+    problem ? "config.json, see below" : syncStatus.signed_out_at ? "signed out" : undefined,
+  );
 
   // Show sync health warnings
-  printSyncWarnings(syncStatus);
+  printSyncWarnings(syncStatus, problem);
 
   console.log(`${dim("Log:")} ${LOG_FILE}`);
 
@@ -788,23 +824,55 @@ function printSystemdAutoStart(unit: UnitState): boolean {
   return true;
 }
 
-function printSyncWarnings(status: SyncStatus): void {
+/**
+ * engram#673, in `engram status`: config.json can't be read, so capture
+ * waits on it, and commands that save settings won't save over it.
+ */
+function printConfigWarning(problem: ConfigUnreadable): void {
+  console.log("");
+  console.log(red(`  WARNING: ${configProblemSummary(problem.message)}`));
+  if (problem.empty) {
+    console.log(dim("  Add back any folders you had excluded ('engram exclude add <path>'),"));
+    console.log(dim("  then sign in again ('engram login')."));
+  } else {
+    console.log(dim("  Fix the file: it holds your API key and the folders you excluded, so Engram"));
+    console.log(dim("  won't save over it. To start over instead: run 'engram stop', remove it, add"));
+    console.log(dim("  back the folders you excluded ('engram exclude add <path>'), then 'engram login'."));
+  }
+  console.log("");
+}
+
+/** `problem`: config.json can't be read (engram#673), said above. */
+function printSyncWarnings(status: SyncStatus, problem: ConfigUnreadable | null): void {
+  if (problem) printConfigWarning(problem);
+
   // No key saved (engram#594): the daemon runs, but captures and sends
   // nothing until one is. Nothing queued is lost meanwhile.
   if (status.signed_out_at) {
-    console.log("");
-    console.log(red("  Signed out — capture is paused and nothing is sent."));
-    console.log(dim("  Run 'engram auth login' to resume. Queued messages stay on this machine."));
-    console.log(dim(`  Since: ${status.signed_out_at}`));
-    console.log("");
+    // With config.json unreadable, whether a key is saved can't be told,
+    // and signing in has to wait for the fix: said above, instead.
+    if (!problem) {
+      console.log("");
+      console.log(red("  Signed out — capture is paused and nothing is sent."));
+      console.log(dim("  Run 'engram auth login' to resume. Queued messages stay on this machine."));
+      console.log(dim(`  Since: ${status.signed_out_at}`));
+      console.log("");
+    }
     return;
   }
 
   // Capture comes before sending: what can't be queued here can't be sent
-  // either, however healthy syncing is (engram#584).
-  if (status.capture_error) {
+  // either, however healthy syncing is (engram#584). Waiting on a
+  // config.json that can't be read is said above.
+  if (status.capture_error && !(problem && status.capture_error.kind === "config")) {
     console.log("");
-    console.log(red(`  WARNING: ${captureErrorSummary(status.capture_error)}`));
+    if (status.capture_error.kind === "config") {
+      // The daemon tries again on its own: 5 minutes apart at most.
+      console.log(red("  Capture is waiting on ~/.engram/config.json, which reads fine now."));
+      console.log(dim("  It picks up where it stopped within 5 minutes: nothing is skipped."));
+    } else {
+      console.log(red(`  WARNING: ${captureErrorSummary(status.capture_error)}`));
+    }
     console.log(dim(`  Since: ${status.capture_error.since}`));
     console.log("");
   }
@@ -1525,7 +1593,7 @@ async function disableStartAtLogin(): Promise<void> {
 
 export async function daemonInstall(): Promise<void> {
   if (refusedAsRoot("install")) return;
-  await recordCaptureIntent("on");
+  await recordCaptureIntent("on", "install");
   // A daemon that is stopping isn't counted: on Windows a new worker is
   // started, which takes over once that one has gone.
   const found = await findDaemon();
@@ -1583,7 +1651,9 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
       }
       return;
     }
-    const config = await loadConfig();
+    // Strict (engram#673): one that can't be read may say capture is off.
+    // A daemon started now would only wait on it; the banner said why.
+    const config = await loadConfigStrict();
     if (config.autocapture === "off") return; // user said stop; respect it
     if (!(process.env.ENGRAM_API_KEY ?? config.apiKey)) return; // nothing to capture into
     let changed = false;
@@ -1628,6 +1698,6 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
 }
 
 export async function daemonUninstall(): Promise<void> {
-  await recordCaptureIntent("off");
+  await recordCaptureIntent("off", "uninstall");
   await disableStartAtLogin();
 }

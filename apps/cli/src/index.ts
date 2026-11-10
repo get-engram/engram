@@ -21,7 +21,7 @@ import { autoEnableCapture } from "./daemon/commands.js";
 import { upgrade } from "./commands/upgrade.js";
 import { usage as showUsage } from "./commands/usage.js";
 import { status as showStatus } from "./commands/status.js";
-import { vaultKeygen, vaultStatus, vaultSet, vaultGet, vaultList, vaultDelete } from "./commands/vault.js";
+import { vaultKeygen, vaultSaveKey, vaultStatus, vaultSet, vaultGet, vaultList, vaultDelete } from "./commands/vault.js";
 import { readVaultKey, vaultKeyFileState, vaultKeyFix, VaultKeyUnreadable } from "./vault-key.js";
 import { excludeAdd, excludeRemove, excludeList } from "./commands/exclude.js";
 import { bold, dim, red } from "./output.js";
@@ -187,6 +187,7 @@ ${bold("COMMANDS")}
 
   ${bold("vault keygen")}             Generate a new vault encryption key
   ${bold("vault keygen --save")}      Generate and save key to ~/.engram/vault-key
+  ${bold("vault save-key")}           Save ENGRAM_VAULT_KEY to ~/.engram/vault-key ${dim("(for the daemon at login)")}
   ${bold("vault status")}             Show vault configuration status
   ${bold("vault set")} <name> [value] Store a named secret ${dim("(encrypted client-side)")}
   ${bold("vault get")} <name>         Retrieve a named secret ${dim("(decrypted locally)")}
@@ -474,6 +475,10 @@ async function main(): Promise<void> {
       // Vault commands
       case "vault keygen":
         await vaultKeygen(args, flags);
+        break;
+
+      case "vault save-key":
+        await vaultSaveKey(flags);
         break;
 
       case "vault set":

@@ -18,6 +18,13 @@ import { rootForAnotherUser } from "./as-root.js";
 import { commandFailure } from "./command-path.js";
 import { throughOptLink } from "./homebrew.js";
 import {
+  foreignFiles,
+  foreignFilesFix,
+  foreignFilesProblem,
+  OWNERSHIP_FIX,
+  type ForeignFiles,
+} from "./ownership.js";
+import {
   ENGRAM_DIR,
   LOG_FILE,
   START_WAIT_MS,
@@ -255,13 +262,29 @@ export async function daemonStart(
     process.exitCode = 1;
     return;
   }
+  // Files in ~/.engram that are another user's (engram#659).
+  const foreign = foreignFiles();
   if (found.state === "running" || found.state === "unresponsive") {
     printAlreadyRunning(found);
+    // It runs, so they haven't stopped it: only said.
+    if (foreign) printForeignFiles(foreign, "running");
     // --install still asks for start at login (engram#602). On macOS,
     // loading the launchd agent starts a worker there and then, which finds
     // this daemon and exits (engram#612).
     if ("install" in flags) await enableStartAtLogin(true);
     return;
+  }
+
+  if (foreign) {
+    // A daemon started now would stop at once, or its log couldn't be
+    // opened: none is started. Not in the foreground either, which doesn't
+    // need the log: the fix is the same, and takes a moment.
+    const stops = stopsCapture(foreign);
+    printForeignFiles(foreign, "stopped", stops ? "start" : undefined);
+    if (stops) {
+      process.exitCode = 1;
+      return;
+    }
   }
 
   const foreground = "foreground" in flags || "f" in flags;
@@ -290,6 +313,23 @@ export async function daemonStart(
   if ("install" in flags) {
     await enableStartAtLogin(true);
   }
+}
+
+/**
+ * Say what in ~/.engram is another user's, and how to make it the user's
+ * (engram#659). `daemon`: whether it runs. `again`: the command they
+ * stopped, to run again then. `engram start` and `engram install` say it
+ * themselves: the banner before a command isn't shown for them.
+ */
+function printForeignFiles(foreign: ForeignFiles, daemon: "running" | "stopped", again?: "start" | "install"): void {
+  console.error(red(foreignFilesProblem(foreign, daemon)));
+  console.error(dim(`  ${foreignFilesFix(foreign)}`));
+  if (again) console.error(dim(`  Then run 'engram ${again}' again.`));
+}
+
+/** Whether they stop the daemon, or its start. */
+function stopsCapture(foreign: ForeignFiles | null): boolean {
+  return foreign !== null && (foreign.stopsDaemon || foreign.stopsStart);
 }
 
 /**
@@ -497,6 +537,11 @@ export async function daemonStop(): Promise<void> {
           return;
         }
         console.error(red(`Failed to stop daemon (pid ${pid})`));
+        // Root's, as a rule: `sudo engram start`, which a CLI from before
+        // engram#653 ran as root (engram#659).
+        if (process.platform !== "win32" && (err as NodeJS.ErrnoException).code === "EPERM") {
+          console.error(dim(`  It runs as another user (root, if it was started with sudo). Stop it with: sudo kill ${pid}`));
+        }
         process.exitCode = 1;
         return;
       }
@@ -570,7 +615,7 @@ async function askToStop(pid: number, id: string): Promise<"taken" | "ignored" |
  * conversation Engram no longer has is "not sent" (engram#593): it stays on
  * this machine, and the conversation isn't created again.
  */
-async function printDbStats(): Promise<void> {
+async function printDbStats(foreign: ForeignFiles | null): Promise<void> {
   if (!existsSync(DB_FILE)) return;
   try {
     const { DaemonDb } = await import("./db.js");
@@ -601,20 +646,41 @@ async function printDbStats(): Promise<void> {
     }
     console.log(`${dim("Files tracked:")}     ${stats.trackedFiles}`);
   } catch {
-    console.log(dim("Local capture DB unreadable (native module mismatch?) — the daemon rebuilds it on start."));
+    if (foreign?.files.some((name) => name.startsWith("daemon.db"))) {
+      // engram#659: not the native module, and no start repairs it.
+      console.log(dim("Local capture DB unreadable: it isn't yours, see below."));
+    } else {
+      console.log(dim("Local capture DB unreadable (native module mismatch?) — the daemon rebuilds it on start."));
+    }
   }
+}
+
+/**
+ * engram#659, in `engram status`. `stopped`: the daemon isn't running, so
+ * once they are the user's, it has to be started.
+ */
+function printForeignFilesWarning(foreign: ForeignFiles, stopped: boolean): void {
+  console.log("");
+  console.log(red(`  ${foreignFilesProblem(foreign, stopped ? "stopped" : "running")}`));
+  console.log(dim(`  ${foreignFilesFix(foreign)}`));
+  if (stopped && stopsCapture(foreign)) console.log(dim("  Then run: engram start"));
+  console.log("");
 }
 
 export async function daemonStatus(): Promise<void> {
   const found = await findDaemon();
+  // Files in ~/.engram that are another user's (engram#659).
+  const foreign = foreignFiles();
 
   if (found.state === "stopped") {
     console.log(`${bold("Status:")} stopped`);
 
     // Still show DB stats if available
-    await printDbStats();
-    // A broken start-at-login entry is often why it's stopped.
-    if (printAutoStart() && (await loadConfig()).autocapture !== "off") {
+    await printDbStats(foreign);
+    if (foreign) printForeignFilesWarning(foreign, true);
+    // A broken start-at-login entry is often why it's stopped. Files that
+    // aren't the user's, said above, are why, when they stop it.
+    if (printAutoStart() && !stopsCapture(foreign) && (await loadConfig()).autocapture !== "off") {
       // Not stopped by 'engram stop', which records autocapture "off", and
       // started at sign-in, so it stopped by itself (engram#613).
       console.log(dim("  It should be running: start at login is on. It may have stopped after an error."));
@@ -640,7 +706,8 @@ export async function daemonStatus(): Promise<void> {
     printVersionHint(found);
   }
 
-  await printDbStats();
+  await printDbStats(foreign);
+  if (foreign) printForeignFilesWarning(foreign, false);
 
   const syncStatus = readStatus();
   printHostStatus(Boolean(syncStatus.signed_out_at));
@@ -1462,7 +1529,20 @@ export async function daemonInstall(): Promise<void> {
   // A daemon that is stopping isn't counted: on Windows a new worker is
   // started, which takes over once that one has gone.
   const found = await findDaemon();
-  await enableStartAtLogin(found.state === "running" || found.state === "unresponsive");
+  const running = found.state === "running" || found.state === "unresponsive";
+  // Files in ~/.engram that are another user's (engram#659). Unless one
+  // runs already, start at login would start a daemon that stops at once,
+  // or whose log can't be opened: it isn't turned on.
+  const foreign = foreignFiles();
+  if (foreign) {
+    const stops = !running && stopsCapture(foreign);
+    printForeignFiles(foreign, running ? "running" : "stopped", stops ? "install" : undefined);
+    if (stops) {
+      process.exitCode = 1;
+      return;
+    }
+  }
+  await enableStartAtLogin(running);
 }
 
 /**
@@ -1492,6 +1572,17 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
     return;
   }
   try {
+    // Files in ~/.engram that are another user's (engram#659): a daemon
+    // started now would stop at once, after every command. The banner
+    // before the command said why.
+    if (stopsCapture(foreignFiles())) {
+      if (after === "login") {
+        console.log(
+          dim(`  Auto-capture wasn't turned on: files in ~/.engram aren't yours. Make them yours with: ${OWNERSHIP_FIX}`),
+        );
+      }
+      return;
+    }
     const config = await loadConfig();
     if (config.autocapture === "off") return; // user said stop; respect it
     if (!(process.env.ENGRAM_API_KEY ?? config.apiKey)) return; // nothing to capture into

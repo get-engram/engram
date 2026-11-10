@@ -25,17 +25,22 @@ export type SyncErrorType =
 
 /**
  * Transcripts that can't be queued in daemon.db (engram#584): a full disk,
- * a daemon.db that is locked, read-only or damaged. Each such file is held
+ * a daemon.db that is locked, read-only or damaged. Or, with `kind`
+ * "config", transcripts held because ~/.engram/config.json can't say which
+ * folders are excluded from capture (engram#673). Each such file is held
  * at the line that failed and retried with backoff, so its lines are read
  * again rather than skipped, but nothing new is captured from it meanwhile.
  */
 export interface CaptureError {
-  /** What daemon.db said, e.g. "database or disk is full". */
+  /** What daemon.db said, e.g. "database or disk is full"; with `kind`
+   *  "config", what is wrong with config.json. Never the file's text. */
   message: string;
   /** When capture first stalled. Kept until every file is queued again. */
   since: string;
   /** How many transcripts are waiting. */
   files: number;
+  /** "config": config.json can't be read. Absent: daemon.db can't queue. */
+  kind?: "config";
 }
 
 /**
@@ -254,19 +259,26 @@ export function recordDeletesRefused(deletes: number): void {
 }
 
 /**
- * A transcript's new lines couldn't be queued in daemon.db; the watcher
- * holds the file at the failing line and retries it (engram#584). The
- * first stall of an episode is logged as a warning and raised as a desktop
- * notification: when the disk is full, daemon.log and status.json may not
- * be writable either, and the notification still gets through.
+ * A transcript's new lines couldn't be queued in daemon.db (engram#584),
+ * or config.json couldn't say whether its folder is excluded (`kind`
+ * "config", engram#673); the watcher holds the file at the failing line
+ * and retries it. The first stall of an episode is logged as a warning and
+ * raised as a desktop notification: when the disk is full, daemon.log and
+ * status.json may not be writable either, and the notification still gets
+ * through.
  */
-export function recordCaptureStall(filePath: string, message: string): void {
+export function recordCaptureStall(
+  filePath: string,
+  message: string,
+  kind: "queue" | "config" = "queue",
+): void {
   const first = stalledFiles.size === 0;
   stalledFiles.add(filePath);
   currentStatus.capture_error = {
     message,
     since: currentStatus.capture_error?.since ?? new Date().toISOString(),
     files: stalledFiles.size,
+    ...(kind === "config" ? { kind } : {}),
   };
   writeStatus();
   if (!first) return;
@@ -276,6 +288,15 @@ export function recordCaptureStall(filePath: string, message: string): void {
   console.error(`[engram] Run 'engram status' for details.`);
   if (Date.now() - lastCaptureNotifyAt >= CAPTURE_NOTIFY_INTERVAL_MS) {
     lastCaptureNotifyAt = Date.now();
+    if (kind === "config") {
+      // The message is short and names the file; it isn't cut.
+      notifyDesktop(
+        "Engram paused capture",
+        `${message}, so Engram can't tell which folders you excluded. Fix it, and ` +
+          `capture resumes where it stopped.`,
+      );
+      return;
+    }
     // The reason is cut short, not the advice after it. The advice covers
     // a locked or read-only daemon.db as well as a full disk.
     const reason = message.length > 60 ? `${message.slice(0, 59)}…` : message;
@@ -573,10 +594,30 @@ export function syncErrorSummary(
  */
 export function captureErrorSummary(c: CaptureError): string {
   const files = c.files === 1 ? "1 transcript is" : `${n(c.files)} transcripts are`;
+  if (c.kind === "config") {
+    return (
+      `Engram can't read the folders you excluded from capture (${c.message}), so ${files} ` +
+      `waiting. Fix the file, and capture picks up where it stopped: nothing is skipped, ` +
+      `and nothing from an excluded folder is captured.`
+    );
+  }
   return (
     `Engram can't queue new messages on this machine (${c.message}), so ${files} ` +
     `waiting. Free up disk space, or check that ~/.engram/daemon.db can be ` +
     `written. Capture picks up where it stopped, so nothing is skipped.`
+  );
+}
+
+/**
+ * One-line summary of a config.json that can't be read (engram#673), from
+ * the file itself, in the second person: the CLI banner and `engram
+ * status`. The daemon records it only once a new message waits, and not at
+ * all while it isn't running.
+ */
+export function configProblemSummary(message: string): string {
+  return (
+    `${message}, so Engram can't tell which folders you excluded from capture. ` +
+    `New messages wait until it's fixed; nothing is skipped.`
   );
 }
 

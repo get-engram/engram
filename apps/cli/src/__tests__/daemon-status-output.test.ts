@@ -35,12 +35,15 @@ vi.mock("node:child_process", async (importOriginal) => ({
 }));
 
 const KEY = "engram-test-key-628";
-vi.mock("../config.js", () => ({
-  loadConfig: vi.fn(async () => ({ apiKey: "engram-test-key-628" })),
-  saveConfig: vi.fn(async () => {}),
-  getBaseUrl: () => "https://engram.invalid",
-  resolveBaseUrl: () => "https://engram.invalid",
-}));
+vi.mock("../config.js", () => {
+  const loadConfigStrict = vi.fn(async () => ({ apiKey: "engram-test-key-628" }));
+  return {
+    loadConfigStrict,
+    saveConfig: vi.fn(async () => {}),
+    getBaseUrl: () => "https://engram.invalid",
+    resolveBaseUrl: () => "https://engram.invalid",
+  };
+});
 
 vi.mock("../daemon/instance.js", async (importOriginal) => {
   const real = await importOriginal<typeof import("../daemon/instance.js")>();

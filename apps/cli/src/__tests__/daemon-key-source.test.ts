@@ -48,13 +48,20 @@ describe("configuredKey: the key in config.json (engram#594)", () => {
 
   it("a config.json caught half-written, or damaged, throws instead of reading as a logout", async () => {
     writeConfig('{"apiKey": "engram_sk_te');
-    await expect(configuredKey()).rejects.toThrow();
+    // What it says never quotes the file: the key is in it (engram#673).
+    const half = await configuredKey().then(
+      () => null,
+      (err: unknown) => err,
+    );
+    expect(half).toBeInstanceOf(Error);
+    expect((half as Error).message).toContain("isn't valid JSON");
+    expect((half as Error).message).not.toContain("engram_sk_te");
     writeConfig("");
-    await expect(configuredKey()).rejects.toThrow();
+    await expect(configuredKey()).rejects.toThrow("is empty");
     writeConfig("[]");
-    await expect(configuredKey()).rejects.toThrow("not a JSON object");
+    await expect(configuredKey()).rejects.toThrow("isn't a JSON object");
     writeConfig("null");
-    await expect(configuredKey()).rejects.toThrow("not a JSON object");
+    await expect(configuredKey()).rejects.toThrow("isn't a JSON object");
   });
 
   it("an apiKey that isn't a string throws", async () => {

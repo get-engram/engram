@@ -1,15 +1,39 @@
-import { loadConfig, saveConfig } from "../config.js";
+import { loadConfigStrict, saveConfig, type Config } from "../config.js";
+import { ConfigUnreadable, excludePathsOf } from "../config-file.js";
+import { loadConfigForUpdate } from "../config-guard.js";
 import { normalizeExcludePath, samePath, IGNORE_MARKER } from "../daemon/exclusions.js";
-import { bold, dim } from "../output.js";
+import { bold, dim, red } from "../output.js";
 
 // `engram exclude` — keep whole repos/directories out of capture (engram#462).
-// The daemon hot-reloads the list (mtime check on config.json), so changes
-// apply to the next captured batch with no restart.
+// The daemon checks config.json for changes before each captured batch, so
+// changes apply to the next one with no restart.
+
+/** Stop, saying why the excluded folders can't be `what` (engram#673). */
+function cantUse(err: unknown, what: string): never {
+  const why = err instanceof ConfigUnreadable ? err.message : "~/.engram/config.json can't be read";
+  console.error(red(`Error: ${why}, so the folders excluded from capture can't be ${what}.`));
+  console.error("  Fix the file, then run this again.");
+  process.exit(1);
+}
+
+/**
+ * config.json's settings and the folders excluded in them, for a command
+ * that changes the list and saves the file (engram#673). Read leniently, a
+ * file that couldn't be read was saved with only the one change: the API
+ * key and every other excluded folder were gone.
+ */
+async function loadForUpdate(): Promise<{ config: Config; paths: string[] }> {
+  const config = await loadConfigForUpdate();
+  try {
+    return { config, paths: excludePathsOf(config) };
+  } catch (err: unknown) {
+    cantUse(err, "changed");
+  }
+}
 
 export async function excludeAdd(args: string[]): Promise<void> {
   const target = normalizeExcludePath(args[0] ?? process.cwd());
-  const config = await loadConfig();
-  const paths = config.excludePaths ?? [];
+  const { config, paths } = await loadForUpdate();
   // On macOS and Windows, ~/Code/x and ~/code/x are one directory (engram#619).
   const existing = paths.find((p) => samePath(p, target));
   if (existing !== undefined) {
@@ -26,8 +50,7 @@ export async function excludeAdd(args: string[]): Promise<void> {
 
 export async function excludeRemove(args: string[]): Promise<void> {
   const target = normalizeExcludePath(args[0] ?? process.cwd());
-  const config = await loadConfig();
-  const paths = config.excludePaths ?? [];
+  const { config, paths } = await loadForUpdate();
   const removed = paths.filter((p) => samePath(p, target));
   if (removed.length === 0) {
     console.error(`Not in the exclude list: ${target}`);
@@ -41,8 +64,17 @@ export async function excludeRemove(args: string[]): Promise<void> {
 }
 
 export async function excludeList(): Promise<void> {
-  const config = await loadConfig();
-  const paths = config.excludePaths ?? [];
+  let paths: string[];
+  try {
+    paths = excludePathsOf(await loadConfigStrict());
+  } catch (err: unknown) {
+    if (!(err instanceof ConfigUnreadable && err.empty)) cantUse(err, "listed");
+    // Capture waits on it (engram#673), and what it listed is gone.
+    console.error(red("~/.engram/config.json is empty, so capture waits. Add back any folders you had"));
+    console.error(red("  excluded ('engram exclude add <path>'), then sign in again ('engram login')."));
+    console.error("");
+    paths = [];
+  }
   if (paths.length === 0) {
     console.log(dim("No excluded paths."));
   } else {

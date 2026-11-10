@@ -73,10 +73,12 @@ describe("the banner before a command (engram#659)", () => {
 
   /** `engram <words>`: the entry runs its command as it is imported. */
   async function engram(...words: string[]): Promise<void> {
+    // What this command runs or prints, not what the one before it did.
+    const before = ran.length + out.length;
     process.argv = [argv[0], "engram", ...words];
     vi.resetModules();
     await import("../index.js");
-    await vi.waitFor(() => expect(ran.length + out.length).toBeGreaterThan(0));
+    await vi.waitFor(() => expect(ran.length + out.length).toBeGreaterThan(before));
   }
 
   it("says whose they are and the fix before any other command", async () => {

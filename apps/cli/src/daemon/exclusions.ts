@@ -1,6 +1,14 @@
-import { statSync, existsSync, readFileSync, realpathSync } from "node:fs";
+import { statSync, existsSync, realpathSync } from "node:fs";
 import { join, dirname, resolve, sep } from "node:path";
 import { homedir } from "node:os";
+import {
+  ConfigUnreadable,
+  excludePathsOf,
+  isMissing,
+  readConfigFileSync,
+  readFailure,
+} from "../config-file.js";
+import { ExclusionsUnreadable } from "./queue-error.js";
 
 // Capture exclusions (engram#462): two ways to keep a session out of Engram.
 //
@@ -22,10 +30,12 @@ export const IGNORE_MARKER = ".engramignore";
 // ── Config-based path exclusions (hot-reloaded) ──
 
 // The daemon is long-lived; `engram exclude add` must take effect without a
-// restart. Re-read config.json only when its mtime changes — a stat per
-// message batch is negligible.
+// restart. Re-read config.json only when it changes — a stat per message
+// batch is negligible. The CLI replaces the file in one step (a new inode),
+// and its size follows what is in it, so a change within one tick of a
+// coarse mtime is seen too. Only a read that succeeds is cached.
 let cachedPaths: string[] = [];
-let cachedMtimeMs = -1;
+let cachedStamp = "";
 
 /** Normalize for prefix comparison: absolute, no trailing separator. */
 export function normalizeExcludePath(p: string): string {
@@ -67,21 +77,31 @@ function spellings(p: string): string[] {
   }
 }
 
-/** Every excluded path, each as configured and with symlinks resolved. */
+/**
+ * Every excluded path, each as configured and with symlinks resolved. No
+ * config.json means none.
+ *
+ * Throws ConfigUnreadable when there is a config.json, but which paths it
+ * excludes can't be told (engram#673): it can't be read, isn't JSON, or
+ * its excludePaths isn't a list of paths. That used to read as none, and
+ * every session was captured, excluded or not.
+ */
 export function loadExcludePaths(configFile: string = CONFIG_FILE): string[] {
+  let stamp: string;
   try {
-    const mtimeMs = statSync(configFile).mtimeMs;
-    if (mtimeMs !== cachedMtimeMs) {
-      const raw = JSON.parse(readFileSync(configFile, "utf-8")) as {
-        excludePaths?: string[];
-      };
-      cachedPaths = (raw.excludePaths ?? []).flatMap((p) => spellings(normalizeExcludePath(p)));
-      cachedMtimeMs = mtimeMs;
-    }
-  } catch {
+    const st = statSync(configFile);
+    stamp = `${st.mtimeMs}:${st.size}:${st.ino}`;
+  } catch (err: unknown) {
+    if (!isMissing(err, configFile)) throw readFailure(err);
     cachedPaths = [];
-    cachedMtimeMs = -1;
+    cachedStamp = "";
+    return cachedPaths;
   }
+  if (stamp === cachedStamp) return cachedPaths;
+  const config = readConfigFileSync(configFile);
+  const paths = config === null ? [] : excludePathsOf(config);
+  cachedPaths = paths.flatMap((p) => spellings(normalizeExcludePath(p)));
+  cachedStamp = stamp;
   return cachedPaths;
 }
 
@@ -133,16 +153,32 @@ export function hasIgnoreMarker(cwd: string, nowMs: number = Date.now()): boolea
 export function resetExclusionCaches(): void {
   markerCache.clear();
   cachedPaths = [];
-  cachedMtimeMs = -1;
+  cachedStamp = "";
 }
 
-/** Full path check: config exclusions + .engramignore markers. */
+/**
+ * Full path check: config exclusions + .engramignore markers.
+ *
+ * Throws ExclusionsUnreadable when config.json can't be read and no marker
+ * excludes `cwd`: whether it is excluded can't be told, and the watcher
+ * holds the session until it can (engram#673). A session with no working
+ * directory is under no excluded folder, whatever config.json says.
+ */
 export function isPathExcluded(
   cwd: string | undefined,
   configFile: string = CONFIG_FILE,
 ): boolean {
   if (!cwd) return false;
-  const paths = loadExcludePaths(configFile);
+  let paths: string[];
+  try {
+    paths = loadExcludePaths(configFile);
+  } catch (err: unknown) {
+    // A marker excludes the folder whatever config.json says.
+    if (hasIgnoreMarker(cwd)) return true;
+    throw new ExclusionsUnreadable(
+      err instanceof ConfigUnreadable ? err.message : "~/.engram/config.json can't be read",
+    );
+  }
   if (paths.length > 0) {
     const dirs = spellings(normalizeExcludePath(cwd));
     if (paths.some((p) => dirs.some((d) => isUnder(d, p)))) return true;

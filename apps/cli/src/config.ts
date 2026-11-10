@@ -2,11 +2,12 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ensurePrivateDirSync, writePrivateFileSync } from "./private-files.js";
+import { isMissing, parseConfigText, readFailure } from "./config-file.js";
 
 const CONFIG_DIR = join(homedir(), ".engram");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 
-interface Config {
+export interface Config {
   apiKey?: string;
   baseUrl?: string;
   /** "off" = the user explicitly stopped capture; the CLI must not
@@ -18,36 +19,28 @@ interface Config {
   excludePaths?: string[];
 }
 
-export async function loadConfig(): Promise<Config> {
-  try {
-    const raw = await readFile(CONFIG_FILE, "utf-8");
-    return JSON.parse(raw);
-  } catch {
-    return {};
-  }
-}
-
 /**
- * Like loadConfig, but a config.json that exists and can't be read or
- * parsed THROWS instead of reading as empty. The daemon re-reads the key
- * every couple of seconds and treats "no key" as a logout (engram#594), so
- * a file caught half-written, or one damaged by hand, must not look like
- * one: that would stop capture for nothing. Only a missing file means
- * there is no config.
+ * The settings in ~/.engram/config.json: none when there is no such file.
+ * One that exists and can't be read or parsed THROWS a ConfigUnreadable,
+ * never reads as no settings. The daemon re-reads the key every couple of
+ * seconds and treats "no key" as a logout (engram#594), so a file caught
+ * half-written, or one damaged by hand, must not look like one: that would
+ * stop capture for nothing. And a command that saved over it would replace
+ * the key and the excluded folders in it (engram#673).
+ *
+ * There is no lenient version on purpose: reading a damaged file as no
+ * settings, then saving, is how the key and the exclusions were lost. The
+ * error never quotes the file, which holds the key: the daemon logs it.
  */
 export async function loadConfigStrict(): Promise<Config> {
   let raw: string;
   try {
     raw = await readFile(CONFIG_FILE, "utf-8");
   } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException | null)?.code === "ENOENT") return {};
-    throw err;
+    if (isMissing(err, CONFIG_FILE)) return {};
+    throw readFailure(err);
   }
-  const parsed = JSON.parse(raw) as unknown;
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("config.json is not a JSON object");
-  }
-  return parsed as Config;
+  return parseConfigText(raw) as Config;
 }
 
 /**

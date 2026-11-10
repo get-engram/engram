@@ -178,6 +178,12 @@ export interface DaemonInfo {
   stopping: boolean;
   /** It stops when STOP_FILE asks it to (engram#613): on Windows, from this version on. */
   stopFile: boolean;
+  /**
+   * It reads the vault key again before sending (engram#693): a key saved
+   * while it runs is used without a restart. One from before reads it only
+   * at start.
+   */
+  vaultKeyReread: boolean;
 }
 
 const self = {
@@ -197,6 +203,7 @@ function answer(id: string): string {
     ready: self.ready,
     stopping: self.stopping,
     stop_file: watchStopFile,
+    vault_key_reread: true,
   })}\n`;
 }
 
@@ -226,6 +233,7 @@ export function parseAnswer(line: string): DaemonInfo | null {
     ready: a.ready === true,
     stopping: a.stopping === true,
     stopFile: a.stop_file === true,
+    vaultKeyReread: a.vault_key_reread === true,
   };
 }
 

@@ -63,6 +63,7 @@ const {
   vaultKeyFileState,
   VaultKeyUnreadable,
   vaultKeyFix,
+  vaultKeySpellings,
 } = await import("../vault-key.js");
 const { vaultKeygen, vaultSaveKey, vaultStatus } = await import("../commands/vault.js");
 const { daemonEndpoint } = await import("../daemon/instance.js");
@@ -463,6 +464,16 @@ describe("a vault key as the SDK reads one (engram#690)", () => {
     expect(sameVaultKey(LEAK, ` ${LEAK}\n`)).toBe(true);
     expect(sameVaultKey(LEAK, KEY)).toBe(false);
   });
+
+  it("each way a key may be written, as the daemon scrubs it: trimmed, padded and not (engram#693)", () => {
+    const unpadded = KEY.replace(/=+$/, "");
+    expect(vaultKeySpellings(`  ${KEY}\n`)).toEqual([KEY, unpadded]);
+    expect(vaultKeySpellings(`${unpadded}\n`)).toEqual([unpadded, KEY]);
+    // Not a vault key: as it is written, trimmed.
+    expect(vaultKeySpellings(` ${LEAK}\n`)).toEqual([LEAK]);
+    const short = Buffer.alloc(16, 7).toString("base64");
+    expect(vaultKeySpellings(short)).toEqual([short]);
+  });
 });
 
 describe("ENGRAM_VAULT_KEY against ~/.engram/vault-key, which the daemon at login reads (engram#690)", () => {
@@ -541,6 +552,49 @@ describe("ENGRAM_VAULT_KEY against ~/.engram/vault-key, which the daemon at logi
   });
 });
 
+/** `server` listening where the daemon does. Returns how to stop it, and close what it holds open. */
+async function onDaemonEndpoint(server: Server): Promise<() => Promise<void>> {
+  const endpoint = daemonEndpoint();
+  if ("unavailable" in endpoint) throw new Error(endpoint.unavailable);
+  const open = new Set<Socket>();
+  server.on("connection", (socket) => {
+    socket.on("error", () => {});
+    open.add(socket);
+    socket.on("close", () => open.delete(socket));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(endpoint.path, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  return () =>
+    new Promise<void>((resolve) => {
+      for (const socket of open) socket.destroy();
+      server.close(() => resolve());
+    });
+}
+
+/**
+ * A daemon answering on its socket, as `engram status` finds one. `reread`:
+ * one that reads its vault key again while it runs (engram#693); without it,
+ * one from before, which read it when it started. Returns how to stop it.
+ */
+function daemonAnswering({ stopping = false, reread = false } = {}): Promise<() => Promise<void>> {
+  const answer = { engram: "daemon", protocol: 1, pid: 4242, ready: true, stopping, stop_file: true };
+  const line = `${JSON.stringify(reread ? { ...answer, vault_key_reread: true } : answer)}\n`;
+  return onDaemonEndpoint(createServer((socket) => socket.end(line)));
+}
+
+/**
+ * A daemon too busy to answer, as in its first start after an update: it
+ * takes the connection, and says nothing. Returns how to stop it.
+ */
+function daemonBusy(): Promise<() => Promise<void>> {
+  return onDaemonEndpoint(createServer(() => {}));
+}
+
 describe("engram vault save-key (engram#690)", () => {
   const SAVED = [
     `Vault key saved to: ${VAULT_KEY_FILE}`,
@@ -556,44 +610,6 @@ describe("engram vault save-key (engram#690)", () => {
     const said = [...out, ...errs].join("\n");
     for (const key of [KEY, ENV_KEY]) expect(said).not.toContain(key.slice(0, 8));
     expect(said).not.toContain(LEAK);
-  }
-
-  /** `server` listening where the daemon does. Returns how to stop it, and close what it holds open. */
-  async function onDaemonEndpoint(server: Server): Promise<() => Promise<void>> {
-    const endpoint = daemonEndpoint();
-    if ("unavailable" in endpoint) throw new Error(endpoint.unavailable);
-    const open = new Set<Socket>();
-    server.on("connection", (socket) => {
-      socket.on("error", () => {});
-      open.add(socket);
-      socket.on("close", () => open.delete(socket));
-    });
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(endpoint.path, () => {
-        server.off("error", reject);
-        resolve();
-      });
-    });
-    return () =>
-      new Promise<void>((resolve) => {
-        for (const socket of open) socket.destroy();
-        server.close(() => resolve());
-      });
-  }
-
-  /** A daemon answering on its socket, as `engram status` finds one. Returns how to stop it. */
-  function daemonAnswering(stopping = false): Promise<() => Promise<void>> {
-    const line = `${JSON.stringify({ engram: "daemon", protocol: 1, pid: 4242, ready: true, stopping, stop_file: true })}\n`;
-    return onDaemonEndpoint(createServer((socket) => socket.end(line)));
-  }
-
-  /**
-   * A daemon too busy to answer, as in its first start after an update: it
-   * takes the connection, and says nothing. Returns how to stop it.
-   */
-  function daemonBusy(): Promise<() => Promise<void>> {
-    return onDaemonEndpoint(createServer(() => {}));
   }
 
   it("ENGRAM_VAULT_KEY unset, or empty: refused, and nothing written", async () => {
@@ -735,7 +751,7 @@ describe("engram vault save-key (engram#690)", () => {
     expect(readFileSync(KEY_FILE, "utf-8")).toBe(`${ENV_KEY}\n`);
   });
 
-  it("a daemon running: it read its key when it started, and how to start it again with this one", async () => {
+  it("a daemon running, from before engram#693: it read its key when it started, and how to start it again with this one", async () => {
     vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
     const stop = await daemonAnswering();
     try {
@@ -766,7 +782,7 @@ describe("engram vault save-key (engram#690)", () => {
 
   it("a daemon stopping, or none: nothing about starting it again", async () => {
     vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
-    const stop = await daemonAnswering(true);
+    const stop = await daemonAnswering({ stopping: true });
     try {
       await vaultSaveKey({});
     } finally {
@@ -778,6 +794,78 @@ describe("engram vault save-key (engram#690)", () => {
     rmSync(KEY_FILE);
     await vaultSaveKey({});
     expect(out).toEqual(SAVED);
+  });
+});
+
+describe("the daemon running now, after a key is saved (engram#693)", () => {
+  const REREAD = "The daemon running now reads it before its next send: no restart needed.";
+  const ENV = "The daemon running now was started with ENGRAM_VAULT_KEY, which it uses instead of the file.";
+  const STATUS_FILE = join(ENGRAM, "status.json");
+
+  /**
+   * What save-key, then keygen --save, say of the daemon running now: the
+   * lines after the two that say where the key went. `daemon`: what answers.
+   */
+  async function hints(daemon: () => Promise<() => Promise<void>>): Promise<{ saved: string[]; made: string[] }> {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
+    // No key there, so neither is refused.
+    rmSync(KEY_FILE, { force: true });
+    const stop = await daemon();
+    try {
+      await vaultSaveKey({});
+      const saved = out.slice(2);
+      out = [];
+      rmSync(KEY_FILE);
+      await vaultKeygen([], { save: "" });
+      // Up to the blank line before how to use the key.
+      return { saved, made: out.slice(2, out.indexOf("")) };
+    } finally {
+      await stop();
+    }
+  }
+
+  it("one that reads its key again: from its next send on, with no restart", async () => {
+    expect(await hints(() => daemonAnswering({ reread: true }))).toEqual({ saved: [REREAD], made: [REREAD] });
+    // Its status says it read its key from the file, or that it has none.
+    for (const vaultKey of ["file", null]) {
+      out = [];
+      writeFileSync(STATUS_FILE, JSON.stringify({ health: "healthy", vault_key: vaultKey }));
+      expect(await hints(() => daemonAnswering({ reread: true })), String(vaultKey)).toEqual({
+        saved: [REREAD],
+        made: [REREAD],
+      });
+    }
+  });
+
+  it("one started with ENGRAM_VAULT_KEY: it goes on with that one, whatever the file holds", async () => {
+    writeFileSync(STATUS_FILE, JSON.stringify({ health: "healthy", vault_key: "env" }));
+    expect(await hints(() => daemonAnswering({ reread: true }))).toEqual({ saved: [ENV], made: [ENV] });
+  });
+
+  it("one from before, or one too busy to say which: how to start it again, for a key just made too", async () => {
+    const restart = {
+      saved: [
+        "The daemon running now read its key when it started. If that was without this one,",
+        "as at login, run 'engram stop', then 'engram start'.",
+      ],
+      made: [
+        "The daemon running now read its key when it started. For it to use this one,",
+        "run 'engram stop', then 'engram start'.",
+      ],
+    };
+    expect(await hints(() => daemonAnswering())).toEqual(restart);
+    out = [];
+    expect(await hints(daemonBusy)).toEqual(restart);
+    // Its status, from a daemon that read its key again, says nothing of this one.
+    out = [];
+    writeFileSync(STATUS_FILE, JSON.stringify({ health: "healthy", vault_key: "env" }));
+    expect(await hints(() => daemonAnswering())).toEqual(restart);
+  });
+
+  it("one stopping, or none: nothing about it", async () => {
+    expect(await hints(() => daemonAnswering({ stopping: true, reread: true }))).toEqual({ saved: [], made: [] });
+    out = [];
+    expect(await hints(async () => async () => {})).toEqual({ saved: [], made: [] });
   });
 });
 

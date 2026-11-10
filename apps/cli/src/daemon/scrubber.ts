@@ -53,6 +53,18 @@
  * holds them still: it is likely being put back, and sending in between
  * would send what the key protects. A restart starts without a key.
  *
+ * The key is read again before each send, and on the interval (engram#693).
+ * It used to be read only at start: a key saved while the daemon ran went
+ * unused until a restart, and the secrets of the vault it opens went out as
+ * they were meanwhile. Now a key saved, or put in place of another, is used
+ * from the next send on: the vault is read through it first, and sends wait
+ * for that read, as at a start with a key. A key it replaced is scrubbed
+ * still, as is each way a key may be written. A key file deleted while its
+ * key is in use leaves that key in use, with the secrets read through it: a
+ * restart starts without it, and `engram status` says so. A key file that
+ * can't be read any more holds sends, as at start: the key in it may not be
+ * the one in use.
+ *
  * What it never does: write a value to disk, include one in a log line, or
  * send one anywhere. Values are refreshed from the vault on an interval and
  * dropped on stop. The daemon already runs as the user who owns the 0600
@@ -61,7 +73,7 @@
  */
 
 import { isRefusal } from "./status.js";
-import { asVaultKeyProblem, VaultKeyUnreadable } from "../vault-key.js";
+import { asVaultKeyProblem, sameVaultKey, vaultKeySpellings, VaultKeyUnreadable } from "../vault-key.js";
 
 export interface VaultLike {
   list(): Promise<Array<{ name: string }>>;
@@ -69,10 +81,11 @@ export interface VaultLike {
 }
 
 /**
- * Where the key is read again while it can't be (engram#677). read():
- * the key, undefined when the file isn't there, and throws when it can't
- * be read. vaultWith(): the vault, read with that key, of the account in
- * use now; null when signed out.
+ * Where the key is read again (engram#677, engram#693). read(): the key,
+ * undefined when the file isn't there, and throws when it can't be read.
+ * vaultWith(): the vault, read with that key, of the account in use now;
+ * null when signed out. From then on, the key is the one the vault is read
+ * with, after an account switch too.
  */
 export interface VaultKeySource {
   read(): Promise<string | undefined>;
@@ -153,30 +166,43 @@ export class SecretScrubber {
   private refusalLogged = false;
   private undecryptable = 0;
 
+  /** The vault key in use, trimmed: the one the vault is read with. */
+  private vaultKey: string | undefined = undefined;
+  /**
+   * Each way the key in use, and each key before it, may be written
+   * (engram#693): scrubbed as "vault-key" along with the set. Only in
+   * memory, like the set, and dropped on stop.
+   */
+  private keyForms: string[] = [];
+  /** Where the key is read again: before each send, and on the interval. */
+  private readonly keySource: VaultKeySource | undefined;
   /** Why the vault key can't be read, while sends wait for it (engram#677). */
   private keyProblem: VaultKeyUnreadable | undefined = undefined;
-  private keySource: VaultKeySource | undefined = undefined;
   private keyRetryAt = 0;
   private keyRetryStep = 0;
   /** The read of the key in flight. */
   private keyRead: Promise<void> | null = null;
+  /** The key file went while its key was in use: said once (engram#693). */
+  private keyGone = false;
 
   /**
-   * `pendingKey`: the vault key couldn't be read at start, so sends wait
-   * until it can be, from `source` (engram#677). `vault` is null then, and
+   * `key.source`: where the key is read again, before each send and on the
+   * interval (engram#693). Without one, `vaultKey` is the key for as long
+   * as the scrubber runs. `key.problem`: the key couldn't be read at start,
+   * so sends wait until it can be (engram#677); `vault` is null then, and
    * `vaultKey` undefined.
    */
   constructor(
     private vault: VaultLike | null,
-    private vaultKey: string | undefined,
+    vaultKey: string | undefined,
     private readonly log: (msg: string) => void = () => {},
-    pendingKey?: { problem: unknown; source: VaultKeySource },
+    key?: { source: VaultKeySource; problem?: unknown },
   ) {
     // Known before any read: scrubbed from the first message queued.
-    if (vaultKey && vaultKey.length >= MIN_SCRUB_LENGTH) this.values.set("vault-key", vaultKey);
-    if (pendingKey) {
-      this.keyProblem = asVaultKeyProblem(pendingKey.problem);
-      this.keySource = pendingKey.source;
+    if (vaultKey) this.useKey(vaultKey);
+    this.keySource = key?.source;
+    if (key?.problem !== undefined) {
+      this.keyProblem = asVaultKeyProblem(key.problem);
       // It was read just now.
       this.keyRetryAt = Date.now() + READ_RETRY_MS[0];
       this.keyRetryStep = 1;
@@ -185,7 +211,7 @@ export class SecretScrubber {
 
   /** True when there is anything to scrub against. */
   get active(): boolean {
-    return this.values.size > 0;
+    return this.values.size > 0 || this.keyForms.length > 0;
   }
 
   /** Names currently loaded. Safe to log. */
@@ -236,17 +262,19 @@ export class SecretScrubber {
    * only refreshes it. A released hold doesn't retry either: the interval
    * reads, and the flush loop doesn't add a read every few seconds.
    *
-   * Before any of it, a vault key that can't be read is read again when its
-   * retry is due (engram#677). Until it reads, ready() is false, however
-   * long that takes.
+   * Before any of it, the key is read again (engram#693): one saved, or put
+   * in place of the one in use, since the last send is the one the vault is
+   * read with now, and ready() waits for that read. A key that can't be read
+   * (engram#677) is read again only when its retry is due, and until it
+   * reads, ready() is false, however long that takes.
    */
   async ready(): Promise<boolean> {
     if (this.stopped) return false;
-    if (this.keyProblem !== undefined) {
-      if (Date.now() < this.keyRetryAt) return false;
-      await this.retryKey();
-      if (this.stopped || this.keyProblem !== undefined) return false;
+    if (this.keySource !== undefined && (this.keyProblem === undefined || Date.now() >= this.keyRetryAt)) {
+      await this.checkKey();
+      if (this.stopped) return false;
     }
+    if (this.keyProblem !== undefined) return false;
     if (this.settled()) return true;
     await this.inFlight();
     if (this.settled()) return true;
@@ -285,12 +313,22 @@ export class SecretScrubber {
     return this.refresh();
   }
 
-  /** Read now and on an interval. */
+  /** Read now and on an interval: the key too, on the interval. */
   start(intervalMs = 10 * 60_000): void {
     this.stopped = false;
+    // stop() dropped its spellings.
+    if (this.vaultKey !== undefined) this.useKey(this.vaultKey);
     void this.refresh();
-    this.timer = setInterval(() => void this.refresh(), intervalMs);
+    this.timer = setInterval(() => void this.tick(), intervalMs);
     this.timer.unref?.();
+  }
+
+  /** The interval's read: the key, then the vault (engram#693). */
+  private async tick(): Promise<void> {
+    const vault = this.vault;
+    if (this.keySource !== undefined) await this.checkKey();
+    // Read through another client since, which a new key reads through.
+    if (this.vault === vault) await this.refresh();
   }
 
   stop(): void {
@@ -300,22 +338,32 @@ export class SecretScrubber {
     // Drop plaintext the moment it is no longer needed. A read still in
     // flight finds the scrubber stopped and keeps nothing.
     this.values.clear();
+    this.keyForms = [];
     this.settledFor = undefined;
     this.serverFailingSince = 0;
     this.released = false;
   }
 
   /**
-   * Replace every exact occurrence of a known secret with its token.
-   * Longest values first, so a secret that contains another secret is
-   * replaced whole rather than leaving a readable fragment behind.
+   * Replace every exact occurrence of a known secret with its token, and of
+   * each way a vault key in use, or used before, may be written. Longest
+   * values first, so a secret that contains another secret is replaced
+   * whole rather than leaving a readable fragment behind.
    */
   scrub(text: string): ScrubResult {
-    if (!text || this.values.size === 0) return { text, replaced: [] };
+    if (!text || !this.active) return { text, replaced: [] };
 
-    const ordered = [...this.values.entries()].sort((a, b) => b[1].length - a[1].length);
+    const ordered: Array<[string, string]> = [...this.values.entries()];
+    const known = new Set(this.values.values());
+    for (const form of this.keyForms) {
+      if (known.has(form)) continue;
+      known.add(form);
+      ordered.push(["vault-key", form]);
+    }
+    ordered.sort((a, b) => b[1].length - a[1].length);
     let out = text;
-    const replaced: Array<{ name: string; count: number }> = [];
+    // A name's count, whichever of its values was found.
+    const counts = new Map<string, number>();
 
     for (const [name, value] of ordered) {
       let count = 0;
@@ -327,13 +375,26 @@ export class SecretScrubber {
         count++;
         idx = out.indexOf(value, idx + token.length);
       }
-      replaced.push({ name, count });
+      counts.set(name, (counts.get(name) ?? 0) + count);
     }
-    return { text: out, replaced };
+    return { text: out, replaced: [...counts].map(([name, count]) => ({ name, count })) };
+  }
+
+  /**
+   * Scrub `key` from now on, each way it may be written, and the keys
+   * before it still (engram#693): a key quoted after it was replaced is no
+   * less a leak.
+   */
+  private useKey(key: string): void {
+    const text = key.trim();
+    this.vaultKey = text;
+    const forms = vaultKeySpellings(text).filter((form) => form.length >= MIN_SCRUB_LENGTH);
+    this.keyForms = [...new Set([...forms, ...this.keyForms])];
+    if (text.length >= MIN_SCRUB_LENGTH) this.values.set("vault-key", text);
   }
 
   /** Read the key again: one read at a time. */
-  private retryKey(): Promise<void> {
+  private checkKey(): Promise<void> {
     this.keyRead ??= this.readKey()
       // A log that throws: the hold stays until it has been lifted in full,
       // and ready() mustn't throw.
@@ -345,44 +406,107 @@ export class SecretScrubber {
   }
 
   /**
-   * The key still can't be read: try again on READ_RETRY_MS. It isn't
-   * there: still wait, for the key put back or a restart. It reads: scrub
-   * it from now on, and read the vault with it, which sends wait for.
+   * The key, read again. The one in use, however written: nothing more to
+   * read, and a hold for it is lifted. The first, or another: scrub it from
+   * now on (and the one before it still), and read the vault with it, which
+   * sends wait for. It can't be read: hold sends, and try again on
+   * READ_RETRY_MS. It isn't there: while holding, still wait, for the key
+   * put back or a restart (engram#677); else go on with the key in use.
    */
   private async readKey(): Promise<void> {
     const source = this.keySource;
     if (source === undefined) return;
-    // The next try, should this one fall short in any way.
-    this.keyRetryAt = Date.now() + READ_RETRY_MS[Math.min(this.keyRetryStep, READ_RETRY_MS.length - 1)];
-    this.keyRetryStep++;
-    let read: { key: string } | { problem: VaultKeyUnreadable };
+    if (this.keyProblem !== undefined) {
+      // The next try, should this one fall short in any way.
+      this.keyRetryAt = Date.now() + READ_RETRY_MS[Math.min(this.keyRetryStep, READ_RETRY_MS.length - 1)];
+      this.keyRetryStep++;
+    }
+    let key: string | undefined;
     try {
-      const key = await source.read();
-      read = key === undefined ? { problem: new VaultKeyUnreadable("isn't there any more", "gone") } : { key };
+      key = await source.read();
     } catch (err: unknown) {
-      read = { problem: asVaultKeyProblem(err) };
+      if (!this.stopped) this.holdForKey(asVaultKeyProblem(err));
+      return;
     }
     if (this.stopped) return;
 
-    if ("problem" in read) {
-      const { problem } = read;
-      const changed = problem.message !== this.keyProblem?.message;
-      this.keyProblem = problem;
-      if (changed) this.log(`vault scrubber: still holding sends — ${problem.message}`);
+    if (key === undefined) {
+      if (this.keyProblem !== undefined) {
+        this.holdForKey(new VaultKeyUnreadable("isn't there any more", "gone"));
+      } else if (this.vaultKey !== undefined && !this.keyGone) {
+        this.keyGone = true;
+        this.log(
+          "vault scrubber: ~/.engram/vault-key isn't there any more — still scrubbing with the key " +
+            "read before, and the secrets read with it. A restart starts without a key.",
+        );
+      }
+      return;
+    }
+    this.keyGone = false;
+
+    if (this.vaultKey !== undefined && sameVaultKey(key, this.vaultKey)) {
+      // Written another way, perhaps: that is scrubbed too.
+      this.useKey(key);
+      if (this.keyProblem !== undefined) {
+        this.liftKeyHold();
+        this.log("vault scrubber: the vault key can be read again — sending what was held");
+      }
       return;
     }
 
-    const { key } = read;
-    const vault = source.vaultWith(key);
-    this.vaultKey = key;
-    if (key.length >= MIN_SCRUB_LENGTH) this.values.set("vault-key", key);
+    let vault: VaultLike | null;
+    try {
+      vault = source.vaultWith(key.trim());
+    } catch (err: unknown) {
+      // Nothing to read the vault with: as a key that can't be read.
+      this.holdForKey(this.keyProblem ?? asVaultKeyProblem(err));
+      return;
+    }
+    const held = this.keyProblem !== undefined;
+    const first = this.vaultKey === undefined;
+    this.useKey(key);
     // Lifted, and at once the read through `vault` starts: ready() waits
     // for that read, as after any new client.
-    this.keyProblem = undefined;
-    this.keySource = undefined;
+    this.liftKeyHold();
     const done = this.reconnect(vault);
-    this.log("vault scrubber: the vault key can be read now — reading the vault before sending what was held");
+    this.log(
+      held
+        ? first
+          ? "vault scrubber: the vault key can be read now — reading the vault before sending what was held"
+          : "vault scrubber: the vault key can be read now, and it is another key — reading the vault " +
+            "with it before sending what was held"
+        : first
+          ? "vault scrubber: on — a vault key was saved; reading the vault with it before sending"
+          : "vault scrubber: the vault key was replaced — reading the vault with the new one before " +
+            "sending (the one it replaced is still scrubbed)",
+    );
     await done;
+  }
+
+  /**
+   * Sends wait for the key (engram#677): said when it starts, and again
+   * when why changes.
+   */
+  private holdForKey(problem: VaultKeyUnreadable): void {
+    if (this.keyProblem === undefined) {
+      this.keyProblem = problem;
+      this.keyRetryAt = Date.now() + READ_RETRY_MS[0];
+      this.keyRetryStep = 1;
+      this.log(
+        `vault scrubber: holding sends — ${problem.message}. Capture goes on, and what it ` +
+          "captures is sent once the key can be read.",
+      );
+      return;
+    }
+    const changed = problem.message !== this.keyProblem.message;
+    this.keyProblem = problem;
+    if (changed) this.log(`vault scrubber: still holding sends — ${problem.message}`);
+  }
+
+  private liftKeyHold(): void {
+    this.keyProblem = undefined;
+    this.keyRetryAt = 0;
+    this.keyRetryStep = 0;
   }
 
   private settled(): boolean {

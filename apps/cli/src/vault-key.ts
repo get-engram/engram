@@ -141,6 +141,25 @@ export function sameVaultKey(a: string, b: string): boolean {
 }
 
 /**
+ * The ways `key` may be written (engram#693): as given, trimmed; and, for a
+ * vault key, base64 with its padding and without it, which the CLI and the
+ * SDK take alike. The daemon scrubs each from what it captures. Longest
+ * first is how to replace them: the padded spelling whole, before the
+ * unpadded one, which it holds, could leave its "=" behind.
+ */
+export function vaultKeySpellings(key: string): string[] {
+  const text = key.trim();
+  const spellings = new Set([text]);
+  const bytes = keyBytes(text);
+  if (bytes?.length === 32) {
+    const padded = btoa(bytes);
+    spellings.add(padded);
+    spellings.add(padded.replace(/=+$/, ""));
+  }
+  return [...spellings];
+}
+
+/**
  * ENGRAM_VAULT_KEY, which commands run in a shell use, against
  * ~/.engram/vault-key, which a daemon started at login reads: it may not
  * get a shell's variables (engram#690). "unset": ENGRAM_VAULT_KEY isn't

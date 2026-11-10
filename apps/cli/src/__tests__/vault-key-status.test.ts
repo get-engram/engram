@@ -52,7 +52,7 @@ vi.mock("../daemon/instance.js", async (importOriginal) => {
   const probeDaemon = async (): Promise<Probe> => {
     const a = daemon.answering;
     if (a === null) return { state: "none", stale: false };
-    return { state: "answered", info: { ready: true, stopping: false, stopFile: false, version: real.VERSION, ...a } };
+    return { state: "answered", info: { ready: true, stopping: false, stopFile: false, vaultKeyReread: true, version: real.VERSION, ...a } };
   };
   return { ...real, probeDaemon };
 });
@@ -309,5 +309,72 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("engram status, w
     await daemonStatus();
     expect(vaultLines()).toEqual([]);
     expect(out.join("\n")).not.toContain(VAULT_KEY);
+  });
+
+  /** engram#693: the daemon read its key from the file, which is gone now. */
+  const GONE = [
+    "  WARNING: ~/.engram/vault-key isn't there any more.",
+    "  The daemon still removes your vault's secrets from what it captures, with the",
+    "  key it read before. When it restarts, it starts without one: put the key back",
+    "  if you still use the vault.",
+  ];
+  /** The daemon's status.json, sending, with its key from `vaultKey`. */
+  const sending = (vaultKey: string | null, extra: Record<string, unknown> = {}) =>
+    writeFileSync(
+      STATUS_FILE,
+      JSON.stringify({ health: "healthy", last_sync_at: SINCE, vault_key: vaultKey, ...extra }),
+    );
+
+  it("running, the key it read from the file gone: it goes on with it until it restarts (engram#693)", async () => {
+    sending("file");
+    daemonRunning();
+    await daemonStatus();
+    expect(block(GONE[0])).toEqual(GONE);
+    expect(out.filter((l) => l.includes("WARNING"))).toEqual([GONE[0]]);
+    // Signed out, it still has the key for when it is signed in again.
+    out = [];
+    sending("file", { signed_out_at: SINCE });
+    await daemonStatus();
+    expect(block(GONE[0])).toEqual(GONE);
+  });
+
+  it("the key there, or the daemon's from ENGRAM_VAULT_KEY or none: nothing about a key gone (engram#693)", async () => {
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    sending("file");
+    daemonRunning();
+    await daemonStatus();
+    expect(vaultLines()).toEqual([]);
+    rmSync(KEY_FILE);
+    for (const vaultKey of ["env", null]) {
+      out = [];
+      sending(vaultKey);
+      await daemonStatus();
+      expect(vaultLines(), String(vaultKey)).toEqual([]);
+    }
+  });
+
+  it("holding messages for the key, the file gone: said as before, once (engram#693)", async () => {
+    holding({ vault_key: "file" });
+    daemonRunning();
+    await daemonStatus();
+    expect(out.filter((l) => l.includes("WARNING"))).toEqual([GONE[0]]);
+    expect(out).toContain("  Put your vault key back in it.");
+    expect(out).not.toContain(GONE[1]);
+  });
+
+  it("running on the key it read from the file, now a folder: that is said, not that the file is gone (engram#693)", async () => {
+    keyFolder();
+    sending("file");
+    daemonRunning();
+    await daemonStatus();
+    expect(block(FOLDER[0])).toEqual([...FOLDER, REFUSED]);
+    expect(out).not.toContain(GONE[0]);
+    expect(out).not.toContain(GONE[1]);
+  });
+
+  it("stopped: what the last daemon read says nothing of the next one (engram#693)", async () => {
+    sending("file");
+    await daemonStatus();
+    expect(vaultLines()).toEqual([]);
   });
 });

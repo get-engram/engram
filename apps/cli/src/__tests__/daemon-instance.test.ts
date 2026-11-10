@@ -312,7 +312,17 @@ describe("reading the daemon's answer", () => {
       ready: true,
       stopping: false,
       stopFile: false,
+      vaultKeyReread: false,
     });
+  });
+
+  it("reads whether it reads the vault key again while it runs (engram#693)", () => {
+    expect(parseAnswer(answerLine({ vault_key_reread: true }).trim())?.vaultKeyReread).toBe(true);
+    // A daemon from before then reads it only at start, and says nothing of
+    // it: `engram vault save-key` tells the user to restart that one.
+    for (const value of [undefined, false, "true", 1, null]) {
+      expect(parseAnswer(answerLine({ vault_key_reread: value }).trim())?.vaultKeyReread, String(value)).toBe(false);
+    }
   });
 
   it("reads whether it takes a request to stop from the stop file (engram#613)", () => {
@@ -719,6 +729,7 @@ describe("asking what listens", () => {
         ready: false,
         stopping: false,
         stopFile: false,
+        vaultKeyReread: false,
       },
     });
   });
@@ -784,6 +795,8 @@ describe("taking the endpoint", () => {
         ready: false,
         stopping: false,
         stopFile: false,
+        // This daemon reads the vault key again before it sends (engram#693).
+        vaultKeyReread: true,
       },
     });
   });

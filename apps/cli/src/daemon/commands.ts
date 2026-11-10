@@ -1108,6 +1108,16 @@ function printSyncWarnings(status: SyncStatus, problem: ConfigUnreadable | null,
         ? new VaultKeyUnreadable("isn't there any more", "gone")
         : null;
   if (keyProblem) printVaultKeyWarning(keyProblem, keyHeld ? status : null);
+  // The file is gone, and the daemon had read a key from it (engram#693): it
+  // goes on with that key, and the secrets read with it, until it restarts.
+  if (status.vault_key === "file" && key === "none" && !keyHeld) {
+    console.log("");
+    console.log(red("  WARNING: ~/.engram/vault-key isn't there any more."));
+    console.log(dim("  The daemon still removes your vault's secrets from what it captures, with the"));
+    console.log(dim("  key it read before. When it restarts, it starts without one: put the key back"));
+    console.log(dim("  if you still use the vault."));
+    console.log("");
+  }
 
   // No key saved (engram#594): the daemon runs, but captures and sends
   // nothing until one is. Nothing queued is lost meanwhile.

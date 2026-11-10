@@ -329,20 +329,26 @@ export async function daemonStart(
 }
 
 /**
- * Said when `engram start` finds the daemon running, and launchd isn't
- * running it though it could (engram#641): launchd doesn't start that one
- * again after a crash. A daemon `engram start` spawned before this version,
- * or one launchd's own found running when the agent was loaded. A stop and
- * a start hand it to launchd. Not when the version hint says to do that
- * anyway.
+ * Said when the daemon runs, and launchd isn't running it though it could
+ * (engram#641): launchd doesn't start that one again after a crash. A daemon
+ * `engram start` spawned before this version, or with a key, a server or the
+ * vault key set that launchd's daemon wouldn't have, or one launchd's own
+ * found running when the agent was loaded. A stop and a start hand it to
+ * launchd. Not when the version hint says to do that anyway. `engram start`
+ * and `engram install` say it when they find the daemon running, and
+ * `engram status` under its Auto-start line (engram#692).
+ *
+ * `switchedOn`: the caller asked launchctl already, and launchd hasn't the
+ * job switched off.
  */
-function printOutsideLaunchd(found: DaemonFound): void {
+function printOutsideLaunchd(found: DaemonFound, switchedOn = false): void {
   if (found.state !== "running" || found.older) return;
   if (found.version && VERSION !== "unknown" && found.version !== VERSION) return;
   if (!launchdRunsThisCli()) return;
   const pid = agentPid();
   if (pid === found.pid) return;
-  if ((pid === null && !agentLoaded()) || agentDisabled() === true) return;
+  if (pid === null && !agentLoaded()) return;
+  if (!switchedOn && agentDisabled() === true) return;
   console.log(
     dim(
       `  The running daemon (pid ${found.pid}) wasn't started by launchd, so launchd won't restart it after a crash: run 'engram stop' and then 'engram start' to fix that.`,
@@ -905,7 +911,7 @@ export async function daemonStatus(): Promise<void> {
 
   console.log(`${dim("Log:")} ${LOG_FILE}`);
 
-  if (printAutoStart()) await printLoginVaultKeyWarning();
+  if (printAutoStart(found)) await printLoginVaultKeyWarning();
 }
 
 /**
@@ -913,10 +919,16 @@ export async function daemonStatus(): Promise<void> {
  * work. What it says to run works whether the daemon runs or not: `engram
  * start` finds a running daemon and repairs nothing, and status is mostly
  * read while it runs (engram#651).
+ *
+ * `found`: the daemon that runs. Under the line, when start at login is on
+ * and launchd doesn't run that daemon, though it could: it won't be started
+ * again after a crash (engram#692).
  */
-function printAutoStart(): boolean {
+function printAutoStart(found?: DaemonFound): boolean {
   const { on, line } = autoStart();
   if (line !== null) console.log(line);
+  // On: launchd hasn't the job switched off, as autoStart asked.
+  if (on && found) printOutsideLaunchd(found, true);
   return on;
 }
 
@@ -2026,6 +2038,10 @@ export async function daemonInstall(): Promise<void> {
     return;
   }
   await enableStartAtLogin(running);
+  // A daemon that runs stays the one that runs: one launchd starts as the
+  // agent loads finds it and exits (engram#612). Said when launchd doesn't
+  // run it, as `engram start --install` says it (engram#692).
+  printOutsideLaunchd(found);
 }
 
 /**

@@ -257,7 +257,7 @@ engram vault save-key
 
 `engram install`, `engram status` and `engram vault status` warn when the file doesn't hold the key in `ENGRAM_VAULT_KEY`. Until it does, a daemon started at login doesn't remove your vault's secrets from what it captures.
 
-A daemon already running reads `~/.engram/vault-key` again before each send, and every 10 minutes, so a key saved there, or a new one in its place, is used without a restart: what it has captured waits until the vault has been read with that key, then goes out with your vault's secrets removed. A daemon started with `ENGRAM_VAULT_KEY` set goes on using that key. If the file can't be read (a folder in its place, say), the daemon holds what it captures until it can; nothing is lost. If you delete the file, the daemon goes on with the key it read until it restarts, and `engram status` warns that it will start without one.
+A daemon already running reads `~/.engram/vault-key` again before each send, and every 10 minutes, so a key saved there, or a new one in its place, is used without a restart: what it has captured waits until the vault has been read with that key, then goes out with your vault's secrets removed. A daemon started with `ENGRAM_VAULT_KEY` set goes on using that key. If the file can't be read (a folder in its place, say), the daemon holds what it captures until it can; nothing is lost. That includes a file another user owns, as running the CLI with `sudo` can leave it: `engram status` says so, and how to make it yours. If you delete the file, the daemon goes on with the key it read until it restarts, and `engram status` warns that it will start without one.
 
 #### A key that doesn't match your vault
 

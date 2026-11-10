@@ -275,9 +275,12 @@ async function printSyncBanner(): Promise<void> {
       // minute, and sends what it held. One that is gone holds them only in
       // the daemon that held them: the next starts without a key, and sends
       // them. So with no daemon running, as after 'engram stop' (how to go
-      // on without a key), there is nothing to say.
+      // on without a key), there is nothing to say. One that is another
+      // user's is said with the files that are (engram#695), whose fix
+      // this doesn't give: by the banner after this one, or by start and
+      // install themselves.
       const key = await vaultKeyFileState();
-      if (key === "key" || (key === "none" && !daemonRuns())) return;
+      if (key === "key" || (key === "none" && !daemonRuns()) || foreignKeyHolds()) return;
     }
     const queued =
       s.pending_messages > 0
@@ -288,6 +291,15 @@ async function printSyncBanner(): Promise<void> {
     console.error("");
   } catch {
     // Never let a status-file problem block the command the user asked for.
+  }
+}
+
+/** Another user's vault key holds sends (engram#695). */
+function foreignKeyHolds(): boolean {
+  try {
+    return foreignFiles()?.holdsSends === true;
+  } catch {
+    return false;
   }
 }
 

@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ForeignFiles } from "../daemon/ownership.js";
@@ -42,9 +42,30 @@ vi.mock("../commands/status.js", () => ({
 home.dir = mkdtempSync(join(tmpdir(), "engram-659b-"));
 afterAll(() => rmSync(home.dir, { recursive: true, force: true }));
 
-const DB_IS_ROOTS: ForeignFiles = { dir: false, files: ["daemon.db"], root: true, stopsDaemon: true, stopsStart: false };
+const DB_IS_ROOTS: ForeignFiles = {
+  dir: false,
+  files: ["daemon.db"],
+  root: true,
+  stopsDaemon: true,
+  stopsStart: false,
+  holdsSends: false,
+};
 const BANNER = [
   "engram: daemon.db in ~/.engram belongs to root, not to you, so the daemon can't start.",
+  '  Make it yours with: sudo chown -R "$(id -un)" ~/.engram',
+  "",
+];
+// engram#695: the daemon runs, and holds its sends.
+const KEY_IS_ROOTS: ForeignFiles = {
+  dir: false,
+  files: ["vault-key"],
+  root: true,
+  stopsDaemon: false,
+  stopsStart: false,
+  holdsSends: true,
+};
+const KEY_BANNER = [
+  "engram: vault-key in ~/.engram belongs to root, not to you. Until it is yours, captured messages wait on this machine: nothing is lost.",
   '  Make it yours with: sudo chown -R "$(id -un)" ~/.engram',
   "",
 ];
@@ -104,6 +125,50 @@ describe("the banner before a command (engram#659)", () => {
     expect(ran).toEqual(["stop"]);
     expect(errs).toEqual(BANNER);
   });
+
+  it("says another user's vault key holds sends, and that nothing is lost (engram#695)", async () => {
+    found.value = KEY_IS_ROOTS;
+    await engram("version");
+    expect(errs).toEqual(KEY_BANNER);
+  });
+
+  // POSIX, and not as root: a file mode 000 can't be read then.
+  it.skipIf(process.platform === "win32" || process.geteuid?.() === 0)(
+    "says it once, not again as a vault key the daemon can't read (engram#695)",
+    async () => {
+      const dir = join(home.dir, ".engram");
+      const key = join(dir, "vault-key");
+      mkdirSync(dir, { recursive: true });
+      // What the daemon records while it holds sends for the key.
+      writeFileSync(
+        join(dir, "status.json"),
+        JSON.stringify({ health: "error", error_type: "vault_key", pending_messages: 3 }),
+      );
+      writeFileSync(key, "not read\n");
+      chmodSync(key, 0o000);
+      try {
+        found.value = KEY_IS_ROOTS;
+        await engram("version");
+        expect(errs).toEqual(KEY_BANNER);
+
+        // A key that isn't another user's, or whose can't be told: the
+        // daemon's own words.
+        const daemonSays = [
+          "engram: Your vault key (~/.engram/vault-key) can't be read, so messages wait here rather than be sent with your vault's secrets in them. Nothing is lost. 3 messages waiting locally.",
+          "  (run 'engram status' for details)",
+          "",
+        ];
+        for (const value of [null, "throws"] as const) {
+          errs.length = 0;
+          found.value = value;
+          await engram("version");
+          expect(errs).toEqual(daemonSays);
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("is nothing when everything is the user's, or they can't be looked at", async () => {
     await engram("version");

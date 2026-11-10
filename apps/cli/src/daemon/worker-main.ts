@@ -98,7 +98,8 @@ async function main(): Promise<void> {
   // on the first, exit with an error, and be started again every few
   // seconds, for good. Now it says which, and how to make them the user's,
   // and exits cleanly, which launchd and systemd leave stopped. The rest
-  // only warn.
+  // only warn. A vault key it can't read holds sends while capture goes on
+  // (holdsSends, engram#695): the scrubber below holds them.
   const foreign = foreignFiles();
   if (foreign?.stopsDaemon) {
     log(`daemon exiting: ${foreignFilesProblem(foreign, "stopped")}`);

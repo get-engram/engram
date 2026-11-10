@@ -9,8 +9,8 @@
  * it again a few seconds later, and again, for good, and nothing the user
  * would look at said why.
  *
- * This finds them and says what they stop. It never changes an owner: that
- * takes root, and is the user's to run (OWNERSHIP_FIX).
+ * This finds them and says what they stop, or hold. It never changes an
+ * owner: that takes root, and is the user's to run (OWNERSHIP_FIX).
  *
  * Node built-ins only.
  */
@@ -33,6 +33,11 @@ interface Watched {
    * the access. Not while `unlessEnv` is set.
    */
   stops?: { mode: number | "always"; what: "daemon" | "start"; unlessEnv?: string };
+  /**
+   * Without this access to it, the daemon runs, but sends nothing: what it
+   * captures waits on this machine. Not while `unlessEnv` is set.
+   */
+  holds?: { mode: number; unlessEnv?: string };
   /** Without this access, Engram can't update it: a warning. */
   warns?: number;
 }
@@ -50,9 +55,9 @@ const WATCHED: Watched[] = [
   { name: "config.json", stops: { mode: R_OK, what: "daemon" }, warns: W_OK },
   // The vault key. One that can't be read holds sends, rather than let the
   // values of named secrets go out as they are (engram#677). Another
-  // user's still stops the daemon, which says whose it is and the fix. Not
-  // read at all while ENGRAM_VAULT_KEY is set.
-  { name: "vault-key", stops: { mode: R_OK, what: "daemon", unlessEnv: "ENGRAM_VAULT_KEY" }, warns: W_OK },
+  // user's too (engram#695): it used to stop the daemon, and capture with
+  // it. Not read at all while ENGRAM_VAULT_KEY is set.
+  { name: "vault-key", holds: { mode: R_OK, unlessEnv: "ENGRAM_VAULT_KEY" }, warns: W_OK },
   // `engram start` and the systemd unit open it for the daemon's output.
   { name: "daemon.log", stops: { mode: W_OK, what: "start" } },
   // The daemon replaces these, and the CLI reads them.
@@ -92,6 +97,11 @@ export interface ForeignFiles {
    * daemon.log for its output, and can't. Started some other way, it runs.
    */
   stopsStart: boolean;
+  /**
+   * The daemon runs, but sends nothing until they are the user's: it can't
+   * read the vault key, so what it captures waits here (engram#695).
+   */
+  holdsSends: boolean;
 }
 
 function owner(path: string): number | null {
@@ -134,7 +144,14 @@ export function foreignFiles({
   if (platform === "win32" || euid === null || euid === 0) return null;
   const dirOwner = ownerOf(dir);
   if (dirOwner === null) return null;
-  const found: ForeignFiles = { dir: false, files: [], root: true, stopsDaemon: false, stopsStart: false };
+  const found: ForeignFiles = {
+    dir: false,
+    files: [],
+    root: true,
+    stopsDaemon: false,
+    stopsStart: false,
+    holdsSends: false,
+  };
   const counted = (uid: number): void => {
     if (uid !== 0) found.root = false;
   };
@@ -144,7 +161,7 @@ export function foreignFiles({
     found.stopsDaemon = true;
     counted(dirOwner);
   }
-  for (const { name, stops, warns } of WATCHED) {
+  for (const { name, stops, holds, warns } of WATCHED) {
     const path = join(dir, name);
     const uid = ownerOf(path);
     if (uid === null || uid === euid) continue;
@@ -152,12 +169,14 @@ export function foreignFiles({
       stops !== undefined &&
       !(stops.unlessEnv && env[stops.unlessEnv]) &&
       (stops.mode === "always" || !canAccess(path, stops.mode));
+    const held = holds !== undefined && !(holds.unlessEnv && env[holds.unlessEnv]) && !canAccess(path, holds.mode);
     const warned = warns !== undefined && !canAccess(path, warns);
-    if (!stopped && !warned) continue;
+    if (!stopped && !held && !warned) continue;
     found.files.push(name);
     counted(uid);
     if (stopped && stops.what === "daemon") found.stopsDaemon = true;
     if (stopped && stops.what === "start") found.stopsStart = true;
+    if (held) found.holdsSends = true;
   }
   return found.dir || found.files.length > 0 ? found : null;
 }
@@ -174,17 +193,21 @@ export function foreignAreMany(f: ForeignFiles): boolean {
 }
 
 /**
- * One sentence: what is whose, and what that stops. "daemon.db and
- * config.json in ~/.engram belong to root, not to you, so the daemon can't
- * start, and nothing new is captured." `daemon`: whether the daemon runs
- * now, where that is known. One that runs was started before them, and
- * captures until it stops.
+ * What is whose, and what that stops. "daemon.db and config.json in
+ * ~/.engram belong to root, not to you, so the daemon can't start, and
+ * nothing new is captured." `daemon`: whether the daemon runs now, where
+ * that is known. One that runs was started before them, and captures until
+ * it stops. What stops the daemon is said rather than what holds its sends:
+ * a daemon that doesn't run sends nothing either.
  */
 export function foreignFilesProblem(f: ForeignFiles, daemon?: "running" | "stopped"): string {
   const many = foreignAreMany(f);
   const what = f.dir ? "~/.engram" : `${names(f.files)} in ~/.engram`;
   const whose = `${what} ${many ? "belong" : "belongs"} to ${f.root ? "root" : "another user"}, not to you`;
-  if (!f.stopsDaemon && !f.stopsStart) return `${whose}, so Engram can't update ${many ? "them" : "it"}.`;
+  if (!f.stopsDaemon && !f.stopsStart) {
+    if (f.holdsSends) return `${whose}. Until ${many ? "they are" : "it is"} yours, captured messages wait on this machine: nothing is lost.`;
+    return `${whose}, so Engram can't update ${many ? "them" : "it"}.`;
+  }
   if (daemon === "running") return `${whose}, so the daemon can't start again once it stops.`;
   if (daemon === "stopped") return `${whose}, so the daemon can't start, and nothing new is captured.`;
   return `${whose}, so the daemon can't start.`;

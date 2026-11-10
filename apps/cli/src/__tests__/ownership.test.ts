@@ -95,6 +95,7 @@ describe("foreignFiles (engram#659)", () => {
       root: true,
       stopsDaemon: true,
       stopsStart: false,
+      holdsSends: false,
     });
     // SQLite opens it to write, too.
     expect(check({ ".": mine, [name]: rootsReadable })?.stopsDaemon).toBe(true);
@@ -124,15 +125,63 @@ describe("foreignFiles (engram#659)", () => {
     );
   });
 
-  it("finds an unreadable vault-key stops the daemon, unless ENGRAM_VAULT_KEY is set", () => {
-    expect(check({ ".": mine, "vault-key": roots })).toMatchObject({ files: ["vault-key"], stopsDaemon: true });
-    // Then it isn't read, but still can't be updated.
-    expect(check({ ".": mine, "vault-key": roots }, { env: { ENGRAM_VAULT_KEY: "k" } })).toMatchObject({
+  it("finds an unreadable vault-key holds sends, and doesn't stop the daemon (engram#695)", () => {
+    const found = check({ ".": mine, "vault-key": roots });
+    expect(found).toEqual({
+      dir: false,
       files: ["vault-key"],
+      root: true,
       stopsDaemon: false,
       stopsStart: false,
+      holdsSends: true,
     });
-    expect(check({ ".": mine, "vault-key": rootsReadable })).toMatchObject({ stopsDaemon: false });
+    // Whether the daemon runs or not: one that runs captures, and sends
+    // nothing until then.
+    for (const daemon of ["running", "stopped", undefined] as const) {
+      expect(foreignFilesProblem(found!, daemon)).toBe(
+        "vault-key in ~/.engram belongs to root, not to you. Until it is yours, captured messages wait " +
+          "on this machine: nothing is lost.",
+      );
+    }
+    expect(foreignFilesFix(found!)).toBe(`Make it yours with: ${OWNERSHIP_FIX}`);
+
+    // One it can't read, though it could write it: the hold is what counts.
+    const writable = check({ ".": mine, "vault-key": { uid: ROOT, deny: R_OK } });
+    expect(writable).toMatchObject({ files: ["vault-key"], stopsDaemon: false, holdsSends: true });
+  });
+
+  it("finds a vault-key that holds nothing while ENGRAM_VAULT_KEY is set, or that it can read, a warning", () => {
+    // ENGRAM_VAULT_KEY set: the file isn't read, but still can't be updated.
+    expect(check({ ".": mine, "vault-key": roots }, { env: { ENGRAM_VAULT_KEY: "k" } })).toEqual({
+      dir: false,
+      files: ["vault-key"],
+      root: true,
+      stopsDaemon: false,
+      stopsStart: false,
+      holdsSends: false,
+    });
+    const readable = check({ ".": mine, "vault-key": rootsReadable });
+    expect(readable).toMatchObject({ files: ["vault-key"], stopsDaemon: false, holdsSends: false });
+    expect(foreignFilesProblem(readable!)).toBe(
+      "vault-key in ~/.engram belongs to root, not to you, so Engram can't update it.",
+    );
+  });
+
+  it("says what stops the daemon rather than what holds its sends", () => {
+    const both = check({ ".": mine, "daemon.db": roots, "vault-key": roots });
+    expect(both).toMatchObject({ files: ["daemon.db", "vault-key"], stopsDaemon: true, holdsSends: true });
+    expect(foreignFilesProblem(both!, "stopped")).toBe(
+      "daemon.db and vault-key in ~/.engram belong to root, not to you, so the daemon can't start, " +
+        "and nothing new is captured.",
+    );
+    // A hold, with a file that only warns: both are made the user's.
+    const many = check({ ".": mine, "vault-key": roots, "status.json": roots });
+    expect(many).toMatchObject({ files: ["vault-key", "status.json"], stopsDaemon: false, holdsSends: true });
+    expect(foreignFilesProblem(many!)).toBe(
+      "vault-key and status.json in ~/.engram belong to root, not to you. Until they are yours, captured " +
+        "messages wait on this machine: nothing is lost.",
+    );
+    expect(foreignFilesFix(many!)).toBe(`Make them yours with: ${OWNERSHIP_FIX}`);
   });
 
   it("finds an unwritable daemon.log stops a start in the background, not the daemon", () => {
@@ -152,7 +201,14 @@ describe("foreignFiles (engram#659)", () => {
 
   it("finds another user's socket stops the daemon, whatever its mode (engram#612)", () => {
     const found = check({ ".": mine, "daemon.sock": { uid: OTHER } });
-    expect(found).toEqual({ dir: false, files: ["daemon.sock"], root: false, stopsDaemon: true, stopsStart: false });
+    expect(found).toEqual({
+      dir: false,
+      files: ["daemon.sock"],
+      root: false,
+      stopsDaemon: true,
+      stopsStart: false,
+      holdsSends: false,
+    });
     expect(foreignFilesProblem(found!, "stopped")).toBe(
       "daemon.sock in ~/.engram belongs to another user, not to you, so the daemon can't start, and nothing new is captured.",
     );
@@ -160,7 +216,7 @@ describe("foreignFiles (engram#659)", () => {
 
   it("finds ~/.engram itself, when it is root's and closed to the user", () => {
     const found = check({ ".": roots, "daemon.db": mine });
-    expect(found).toEqual({ dir: true, files: [], root: true, stopsDaemon: true, stopsStart: false });
+    expect(found).toEqual({ dir: true, files: [], root: true, stopsDaemon: true, stopsStart: false, holdsSends: false });
     expect(foreignFilesProblem(found!)).toBe("~/.engram belongs to root, not to you, so the daemon can't start.");
     expect(foreignFilesFix(found!)).toBe(`Make it yours with: ${OWNERSHIP_FIX}`);
     // Open to the user, it is only a folder: what is in it is looked at.
@@ -179,7 +235,7 @@ describe("foreignFiles (engram#659)", () => {
   it("names them in order, and no more than four", () => {
     const every = check(Object.fromEntries([[".", mine], ...ALL.map((name) => [name, roots])]));
     expect(every?.files).toEqual(ALL);
-    expect(every).toMatchObject({ root: true, stopsDaemon: true, stopsStart: true });
+    expect(every).toMatchObject({ root: true, stopsDaemon: true, stopsStart: true, holdsSends: true });
     expect(foreignFilesProblem(every!, "running")).toBe(
       "daemon.db, daemon.db-wal, daemon.db-shm and 6 more in ~/.engram belong to root, not to you, " +
         "so the daemon can't start again once it stops.",

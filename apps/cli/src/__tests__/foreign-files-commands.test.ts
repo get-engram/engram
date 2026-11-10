@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -102,6 +102,8 @@ const NO_BIN = join(home.dir, "no-bin");
 const WORKER = join(home.dir, "cli", "dist", "daemon", "worker.js");
 const ENGRAM_DIR = join(home.dir, ".engram");
 const DB_FILE = join(ENGRAM_DIR, "daemon.db");
+const KEY_FILE = join(ENGRAM_DIR, "vault-key");
+const STATUS_FILE = join(ENGRAM_DIR, "status.json");
 mkdirSync(dirname(WORKER), { recursive: true });
 writeFileSync(WORKER, "");
 mkdirSync(NO_BIN);
@@ -112,6 +114,8 @@ const { generateUnit, unitPath, wantsPath } = await import("../daemon/systemd.js
 
 const FIX = 'sudo chown -R "$(id -un)" ~/.engram';
 const DB_IS_ROOTS = "daemon.db in ~/.engram belongs to root, not to you, so";
+const KEY_IS_ROOTS =
+  "vault-key in ~/.engram belongs to root, not to you. Until it is yours, captured messages wait on this machine: nothing is lost.";
 
 afterAll(() => {
   rmSync(home.dir, { recursive: true, force: true });
@@ -183,6 +187,12 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
   /** A daemon.db SQLite can't open, as one it isn't let read can't be. */
   function unreadableDb(): void {
     writeFileSync(DB_FILE, "not a database\n".repeat(20));
+  }
+
+  /** A vault key it can't read, as one that is root's and 0600 can't be. */
+  function unreadableKey(): void {
+    writeFileSync(KEY_FILE, "not read\n");
+    chmodSync(KEY_FILE, 0o000);
   }
 
   /** Start at login on: a unit of ours for this CLI, enabled. */
@@ -272,6 +282,36 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
       expect(spawn).not.toHaveBeenCalled();
     });
 
+    it("starts the daemon while another user's vault key holds its sends, in the foreground too (engram#695)", async () => {
+      given.roots = ["vault-key"];
+      unreadableKey();
+      startsAWorker();
+      await daemonStart([], {});
+      // Said once: no "Then run 'engram start' again", it starts.
+      expect(errs).toEqual([KEY_IS_ROOTS, `  Make it yours with: ${FIX}`]);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(out[0]).toBe(`Engram daemon started (pid ${process.pid})`);
+      expect(process.exitCode).toBeUndefined();
+
+      daemon.answering = null;
+      errs.length = 0;
+      await daemonStart([], { foreground: "" });
+      expect(errs).toEqual([KEY_IS_ROOTS, `  Make it yours with: ${FIX}`]);
+      expect(imported.worker).toBe(true);
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it("says what another user's vault key holds to a running daemon, and leaves it running (engram#695)", async () => {
+      given.roots = ["vault-key"];
+      unreadableKey();
+      daemonRunning();
+      await daemonStart([], {});
+      expect(out).toEqual([`Daemon already running (pid ${process.pid})`]);
+      expect(errs).toEqual([KEY_IS_ROOTS, `  Make it yours with: ${FIX}`]);
+      expect(process.exitCode).toBeUndefined();
+      expect(spawn).not.toHaveBeenCalled();
+    });
+
     it("says nothing of them when everything is the user's", async () => {
       startsAWorker();
       await daemonStart([], {});
@@ -315,6 +355,15 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
       expect(process.exitCode).toBeUndefined();
     });
 
+    it("turns it on while another user's vault key holds sends (engram#695)", async () => {
+      given.roots = ["vault-key"];
+      unreadableKey();
+      await daemonInstall();
+      expect(errs).toEqual([KEY_IS_ROOTS, `  Make it yours with: ${FIX}`]);
+      expect(out[0]).toBe("Start at login isn't available here: it needs a systemd user session ('systemctl --user').");
+      expect(process.exitCode).toBeUndefined();
+    });
+
     it("turns it on when they only stop updates", async () => {
       given.roots = ["status.json", "daemon.pid"];
       await daemonInstall();
@@ -346,6 +395,18 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
       expect(out).toEqual([]);
       expect(errs).toEqual([]);
       expectNothingStarted();
+    });
+
+    it("starts the daemon while another user's vault key holds sends (engram#695)", async () => {
+      given.roots = ["vault-key"];
+      unreadableKey();
+      startsAWorker();
+      await autoEnableCapture({ after: "login" });
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(out).toContain(
+        "Auto-capture is on — conversations from supported agents on this machine save to your Engram.",
+      );
+      expect(out.join("\n")).not.toContain("wasn't turned on");
     });
 
     it("starts the daemon when they only stop updates", async () => {
@@ -395,6 +456,56 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
         `  The end of its log says why: ${LOG_FILE}`,
         "  Run 'engram start' to start it again.",
       ]);
+    });
+
+    it("says another user's vault key holds sends, and still that a stopped daemon should run (engram#695)", async () => {
+      given.roots = ["vault-key"];
+      unreadableKey();
+      startAtLoginOn();
+      await daemonStatus();
+      expect(out).toEqual([
+        "Status: stopped",
+        "",
+        `  ${KEY_IS_ROOTS}`,
+        `  Make it yours with: ${FIX}`,
+        // Not "Then run: engram start": it doesn't stop the daemon.
+        "",
+        "Auto-start: enabled (systemd)",
+        "  It should be running: start at login is on. It may have stopped after an error.",
+        `  The end of its log says why: ${LOG_FILE}`,
+        "  Run 'engram start' to start it again.",
+      ]);
+      expect(errs).toEqual([]);
+    });
+
+    it("says another user's vault key holds a running daemon's sends, and how many wait (engram#695)", async () => {
+      given.roots = ["vault-key"];
+      unreadableKey();
+      daemonRunning();
+      writeFileSync(
+        STATUS_FILE,
+        JSON.stringify({
+          health: "error",
+          error_type: "vault_key",
+          pending_messages: 3,
+          last_error_at: "2026-11-10T12:00:00.000Z",
+        }),
+      );
+      await daemonStatus();
+      expect(out.slice(0, 5)).toEqual([
+        `Status: running (pid ${process.pid})`,
+        "",
+        `  ${KEY_IS_ROOTS}`,
+        `  Make it yours with: ${FIX}`,
+        "",
+      ]);
+      // Then what the daemon says of it: how many wait, since when.
+      const at = out.indexOf(
+        "  WARNING: Your vault key (~/.engram/vault-key) can't be read, so messages wait here rather than be sent with your vault's secrets in them. Nothing is lost.",
+      );
+      expect(at).toBeGreaterThan(4);
+      expect(out.slice(at + 1, at + 3)).toEqual(["  3 messages waiting to sync", "  Last error: 2026-11-10T12:00:00.000Z"]);
+      expect(errs).toEqual([]);
     });
 
     it("says what they stop once a running daemon stops", async () => {

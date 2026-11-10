@@ -88,7 +88,7 @@ for (const tool of ["launchctl", "systemctl"]) {
   writeFileSync(join(BIN, tool), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
 }
 
-const { autoEnableCapture, daemonInstall, daemonStart, daemonUninstall } = await import("../daemon/commands.js");
+const { autoEnableCapture, daemonInstall, daemonStart, daemonStop, daemonUninstall } = await import("../daemon/commands.js");
 
 afterAll(() => {
   rmSync(home.dir, { recursive: true, force: true });
@@ -257,11 +257,29 @@ describe.skipIf(HOST === "win32")("engram start, install and auto-capture as roo
         expectNothingDone();
       });
 
-      it("engram uninstall still runs: it only takes away", async () => {
+      // Each saves that capture is off: as root, in a config.json root owns,
+      // which the user's own CLI then can't read (engram#682).
+      it("engram uninstall changes nothing, and says to run it as yourself (engram#682)", async () => {
         await daemonUninstall();
-        expect(errs).toEqual([]);
-        expect(out).toEqual([platform === "darwin" ? "Launchd agent not installed." : "Auto-start isn't on."]);
-        expect(process.exitCode).toBeUndefined();
+        expect(process.exitCode).toBe(1);
+        expect(errs).toEqual([
+          "Engram runs as you, and this is running as root.",
+          "  Run 'engram uninstall' as yourself, without sudo.",
+        ]);
+        expect(out).toEqual([]);
+        expectNothingDone();
+      });
+
+      it("engram stop changes nothing with a daemon running, and says to run it as yourself (engram#682)", async () => {
+        daemon.answering = true;
+        await daemonStop();
+        expect(process.exitCode).toBe(1);
+        expect(errs).toEqual([
+          "Engram runs as you, and this is running as root.",
+          "  Run 'engram stop' as yourself, without sudo. For a daemon started with sudo, it says what stops it.",
+        ]);
+        expect(out).toEqual([]);
+        expectNothingDone();
       });
     });
   }
@@ -294,6 +312,13 @@ describe.skipIf(HOST === "win32")("engram start, install and auto-capture as roo
     expect(errs).toEqual([]);
     expect(existsSync(UNIT)).toBe(true);
     expect(execFileSync.mock.calls.map((call) => call[0])).toContain(join(BIN, "systemctl"));
+  });
+
+  userIt("as the user, engram stop and uninstall save that capture is off", async () => {
+    on("linux", false);
+    await daemonStop();
+    await daemonUninstall();
+    expect(saveConfig.mock.calls.map((call) => ((call as unknown[])[0] as { autocapture?: string }).autocapture)).toEqual(["off", "off"]);
   });
 
   // The temp home is the test user's: to root, it is someone else's home.

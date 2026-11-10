@@ -32,6 +32,10 @@
  *     root and exits 0, so launchd doesn't start it again, and it makes no
  *     file. Status says the job is still loaded, and how to unload it; the
  *     user's own daemon starts beside it.
+ *   - Commands run with sudo (engram#682), HOME the user's as macOS sudo
+ *     keeps it: each but help and version says to run it as yourself and
+ *     exits 1. Help and version print only themselves. None of them makes
+ *     or changes a file in ~/.engram, or runs launchctl or systemctl.
  *   - Through all of it, the CLI only looks at launchd and systemd:
  *     `launchctl print`, `list` and `print-disabled`, `systemctl show`.
  *
@@ -253,6 +257,10 @@ const FILES_BOTH = "status.json and daemon.pid in ~/.engram belong to root, not 
 const FILE_STATUS = "status.json in ~/.engram belongs to root, not to you, so Engram can't update it.";
 const CHOWN = `yours with: sudo chown -R "$(id -un)" ~/.engram`;
 const STARTED = /(?:Engram daemon started|Engram daemon is starting) \(pid (\d+)\)/;
+const AS_YOU = "Engram runs as you, and this is running as root.";
+const DAEMON_AS_YOU = "Engram's daemon runs as you, and this is running as root.";
+const PER_USER = "Start at login is per user, and this is running as root.";
+const RUN_AS_YOU = (command) => `Run 'engram ${command}' as yourself, without sudo.`;
 
 // ── Helpers ──
 
@@ -286,6 +294,25 @@ function engram(args, { quiet = false } = {}) {
     for (const line of out.trimEnd().split("\n")) console.log(`  │ ${line}`);
   }
   return { status: r.status, out };
+}
+
+/** `sudo engram …`, with HOME the user's, as macOS sudo keeps it, and the rest of the user's environment. */
+function sudoEngram(args) {
+  const vars = Object.entries(env).map(([name, value]) => `${name}=${value}`);
+  const r = spawnSync(SUDO, ["-n", "/usr/bin/env", ...vars, NODE, CLI, ...args], { cwd: scratch, encoding: "utf-8", timeout: 90_000 });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}${r.error ? r.error.message : ""}`.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+  console.log(`\n$ sudo engram ${args.join(" ")}  (exit ${r.status})`);
+  for (const line of out.trimEnd().split("\n").slice(0, 8)) console.log(`  │ ${line}`);
+  return { status: r.status, out };
+}
+
+/** The calls the stubs logged, one a line. */
+function stubCalls() {
+  try {
+    return readFileSync(STUB_LOG, "utf-8").split("\n").filter(Boolean);
+  } catch {
+    return [];
+  }
 }
 
 // The home has no API key, so `engram status` ends by saying so, and exits
@@ -712,15 +739,47 @@ async function systemJobRunsWorker() {
   saysNot(engram(["status"]), "status says nothing of the job any more", JOB_LEFT);
 }
 
+/**
+ * Commands run with sudo (engram#682). Before, they ran, and wrote the
+ * user's ~/.engram as root: config.json from login, exclude, stop and
+ * uninstall, the vault key from `vault keygen --save`.
+ */
+function sudoCommands() {
+  console.log("\n── Commands run with sudo (engram#682) ──");
+  const before = snapshot();
+  const config = readFileSync(join(ENGRAM_DIR, "config.json"), "utf-8");
+  const calls = stubCalls().length;
+  const vaultKey = join(ENGRAM_DIR, "vault-key");
+  for (const [args, problem, fix] of [
+    [["login", "--key", "eng_test_682_never_sent"], AS_YOU, RUN_AS_YOU("login")],
+    [["exclude", "add", join(scratch, "private")], AS_YOU, RUN_AS_YOU("exclude add")],
+    [["vault", "keygen", "--save"], AS_YOU, RUN_AS_YOU("vault keygen")],
+    [["status"], AS_YOU, RUN_AS_YOU("status")],
+    [["uninstall"], AS_YOU, RUN_AS_YOU("uninstall")],
+    [["stop"], AS_YOU, `${RUN_AS_YOU("stop")} For a daemon started with sudo, it says what stops it.`],
+    [["start"], DAEMON_AS_YOU, RUN_AS_YOU("start")],
+    [["install"], PER_USER, RUN_AS_YOU("install")],
+  ]) {
+    const r = sudoEngram(args);
+    check(r.status === 1, `sudo engram ${args[0]} exits 1`);
+    says(r, `sudo engram ${args[0]} says to run it as yourself`, problem, fix);
+    saysNot(r, `sudo engram ${args[0]} says nothing else`, "engram:", "eng_test_682");
+  }
+  const help = sudoEngram(["help"]);
+  check(help.status === 0 && help.out.includes("USAGE"), "sudo engram help prints the help, and exits 0");
+  saysNot(help, "and nothing else", "engram:", "as root");
+  const version = sudoEngram(["version"]);
+  check(version.status === 0 && /^engram \S+\n$/.test(version.out), `sudo engram version prints only the version (${JSON.stringify(version.out)})`);
+  check(snapshot() === before, `none of them made or changed a file in ~/.engram (${snapshot()})`);
+  check(readFileSync(join(ENGRAM_DIR, "config.json"), "utf-8") === config, "config.json is as it was");
+  check(!existsSync(vaultKey), "no vault key was made");
+  check(stubCalls().length === calls, "none of them ran launchctl or systemctl");
+  check(!existsSync(PLIST) && !existsSync(UNIT), "no plist, and no unit");
+}
+
 /** The CLI only looked: launchctl print, list and print-disabled; systemctl show. */
 function onlyLooked() {
-  let text = "";
-  try {
-    text = readFileSync(STUB_LOG, "utf-8");
-  } catch {
-    // no calls
-  }
-  const lines = text.split("\n").filter(Boolean);
+  const lines = stubCalls();
   const launchd = lines.filter((l) => l.startsWith("launchctl ")).map((l) => l.split(" ")[1]);
   const changedLaunchd = [...new Set(launchd.filter((verb) => !["print", "list", "print-disabled"].includes(verb)))];
   check(
@@ -736,6 +795,7 @@ function onlyLooked() {
 }
 
 async function run() {
+  sudoCommands();
   const tied = await tiedByPidFile();
   if (tied === null) return;
   await stoppedAsTold(tied.status, tied.N);

@@ -36,10 +36,22 @@ const { home, cli, daemon, systemd, spawn, execSync, execFileSync } = vi.hoisted
   // installed with brew runs from a versioned keg (engram#652).
   cli: { worker: null as string | null },
   // What answers on the daemon's socket: a daemon, or nothing.
-  daemon: { answering: null as { pid: number; stopping?: boolean } | null },
+  daemon: { answering: null as { pid: number; stopping?: boolean; version?: string } | null },
   // The fake user service manager: whether it answers, and whether it
-  // refuses to enable the unit.
-  systemd: { reachable: true, enableFails: false },
+  // refuses to enable the unit. The daemon it runs for the unit (MainPID, 0
+  // for none) and the last one it started (ExecMainPID), what it says when
+  // it refuses to start the unit, and what a start does: start a daemon
+  // that answers, ready; one that exits as it starts; or nothing.
+  systemd: {
+    reachable: true,
+    enableFails: false,
+    mainPid: 0,
+    execMainPid: 0,
+    startRefusal: null as string | null,
+    starts: "daemon" as "daemon" | "dies" | "never",
+    // It answers `show` without the PID asked for: none to go by.
+    pidUnreadable: false,
+  },
   spawn: vi.fn(),
   execSync: vi.fn(),
   execFileSync: vi.fn(),
@@ -122,6 +134,7 @@ const {
   daemonStatus,
   daemonUninstall,
   repairSystemdUnitIfStale,
+  waitForAgent,
 } = await import("../daemon/commands.js");
 const {
   UNIT_VERSION,
@@ -201,10 +214,46 @@ function fakeSystemctl(file: string, args: string[]): string {
     case "disable engram.service":
       rmSync(WANTS, { force: true });
       return "";
+    case "start engram.service":
+      // Never a start of a unit the CLI would have spawned the daemon beside.
+      if (!existsSync(UNIT) || !linked()) throw new Error("a start of a unit that isn't enabled");
+      if (systemd.startRefusal !== null) throw failed(command, systemd.startRefusal);
+      if (systemd.mainPid !== 0) return ""; // it runs: left as it is
+      if (systemd.starts === "daemon") systemdRunsDaemon();
+      // Gone as it started: systemd names it until the next.
+      if (systemd.starts === "dies") systemd.execMainPid = DEAD_PID;
+      return "";
+    case "show engram.service --property=MainPID":
+      return systemd.pidUnreadable ? "" : `MainPID=${systemd.mainPid}\n`;
+    case "show engram.service --property=ExecMainPID":
+      return systemd.pidUnreadable ? "" : `ExecMainPID=${systemd.execMainPid}\n`;
     default:
       throw new Error(`unexpected systemctl ${command}`);
   }
 }
+
+/** A PID no process has: fakeKill finds only this process, and those made up, alive. */
+const DEAD_PID = 999_999;
+
+/** Made-up processes, beside this one, that signal 0 finds alive: a daemon that is stopping. */
+const madeUp = new Set<number>();
+/** Timers a test set; cleared after it. */
+const timers: NodeJS.Timeout[] = [];
+
+/** `engram install` turning start at login on: whether a user service manager answers, then the unit, enabled. */
+const ENABLE = ["show --property=Version", "daemon-reload", "enable engram.service"];
+/**
+ * A start through systemd (engram#689): whether the user service manager
+ * answers, the start, and the PID it gave the daemon.
+ */
+const THROUGH_SYSTEMD = ["show --property=Version", "start engram.service", "show engram.service --property=ExecMainPID"];
+
+/** What a start says when systemctl refused to start the unit with `refusal`. */
+const startedDirectly = (refusal: string) =>
+  `systemd couldn't start the daemon (systemctl: ${refusal}), so it is started directly, and won't be restarted after a crash.`;
+
+/** Said when the daemon runs, and systemd could run it but doesn't (engram#689). */
+const OUTSIDE_SYSTEMD = `The running daemon (pid ${process.pid}) wasn't started by systemd, so systemd won't restart it after a crash: run 'engram stop' and then 'engram start' to fix that.`;
 
 /** The fake manager's calls, without the --user every one has. */
 function systemctlCalls(): string[] {
@@ -236,10 +285,39 @@ function daemonRunning(): void {
   daemon.answering = { pid: process.pid };
 }
 
-/** The daemon is gone, as after a restart. */
+/** The daemon runs, and systemd started it: the unit's main process (engram#689). */
+function systemdRunsDaemon(): void {
+  daemonRunning();
+  systemd.mainPid = systemd.execMainPid = process.pid;
+}
+
+/** The daemon is gone, as after a restart, and systemd runs none. */
 function daemonGone(): void {
   daemon.answering = null;
+  systemd.mainPid = 0;
   rmSync(PID_FILE, { force: true });
+}
+
+/** A made-up PID: the daemon systemd runs, stopping. */
+const STOPPING = 4_243;
+
+/**
+ * systemd's daemon is stopping, as `engram stop` leaves it while a send
+ * finishes: it answers that it is stopping, and exits `exitsIn` ms from now,
+ * or never. Then nothing answers, and systemd runs none: the daemon exited
+ * 0, which Restart=on-failure doesn't start again.
+ */
+function daemonStopping(exitsIn?: number): void {
+  systemd.mainPid = systemd.execMainPid = STOPPING;
+  madeUp.add(STOPPING);
+  daemon.answering = { pid: STOPPING, stopping: true };
+  if (exitsIn === undefined) return;
+  timers.push(
+    setTimeout(() => {
+      madeUp.delete(STOPPING);
+      daemonGone();
+    }, exitsIn),
+  );
 }
 
 /**
@@ -257,9 +335,12 @@ function homeWithNewline(): () => void {
   };
 }
 
-/** Signal 0 finds this process alive; any other signal fails the test before it reaches a process. */
+/**
+ * Signal 0 finds this process, and those made up, alive; any other signal
+ * fails the test before it reaches a process.
+ */
 function fakeKill(pid: number, signal: string | number = "SIGTERM"): true {
-  if (signal === 0 && pid === process.pid) return true;
+  if (signal === 0 && (pid === process.pid || madeUp.has(pid))) return true;
   if (signal === 0) throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
   throw new Error(`a test sent ${String(signal)} to pid ${pid}`);
 }
@@ -282,7 +363,13 @@ beforeEach(() => {
   Object.defineProperty(process, "platform", { value: "linux", configurable: true });
   systemd.reachable = true;
   systemd.enableFails = false;
+  systemd.mainPid = 0;
+  systemd.execMainPid = 0;
+  systemd.startRefusal = null;
+  systemd.starts = "daemon";
+  systemd.pidUnreadable = false;
   daemon.answering = null;
+  madeUp.clear();
   cli.worker = null;
   rmSync(CONFIG, { recursive: true, force: true });
   rmSync(PID_FILE, { force: true });
@@ -298,6 +385,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const timer of timers.splice(0)) clearTimeout(timer);
   Object.defineProperty(process, "platform", { value: HOST, configurable: true });
   process.exitCode = undefined;
   vi.unstubAllEnvs();
@@ -446,18 +534,22 @@ describe("systemctl (engram#615)", () => {
 });
 
 describe("engram install on Linux (engram#615)", () => {
-  it("writes the unit, enables it, and starts the daemon now", async () => {
+  it("writes the unit, enables it, and has systemd start the daemon now (engram#689)", async () => {
     await daemonInstall();
     expect(readFileSync(UNIT, "utf-8")).toBe(unitWith());
     expect(readdirSync(UNIT_DIR).sort()).toEqual(["default.target.wants", "engram.service"]);
     expect(linked()).toBe(true);
-    // Enabled, not started: systemd starts it from the next login on.
-    expect(systemctlCalls()).toEqual(["show --property=Version", "daemon-reload", "enable engram.service"]);
-    expect(spawn).toHaveBeenCalledTimes(1);
+    // Enabled, which starts it from the next login on; and started by
+    // systemd now, which starts it again after a crash.
+    expect(systemctlCalls()).toEqual([...ENABLE, ...THROUGH_SYSTEMD]);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(systemd.mainPid).toBe(process.pid);
     const text = output();
-    expect(text).toContain("Auto-start enabled — daemon will start when you log in (systemd)");
+    const enabled = text.indexOf("Auto-start enabled — daemon will start when you log in (systemd)");
+    expect(enabled).toBeGreaterThanOrEqual(0);
     expect(text).toContain(`Unit: ${UNIT}`);
-    expect(text).toContain("Engram daemon started");
+    expect(text.indexOf(`Engram daemon started (pid ${process.pid})`)).toBeGreaterThan(enabled);
+    expect(text).not.toContain("started directly");
     expect(process.exitCode).toBeUndefined();
     expect(readUnit()).toEqual({ kind: "ours", enabled: true, broken: false, version: UNIT_VERSION, outdated: false });
   });
@@ -472,30 +564,54 @@ describe("engram install on Linux (engram#615)", () => {
     expect(statSync(UNIT).mode & 0o777).toBe(0o644);
   });
 
-  it("leaves a running daemon be", async () => {
+  it("leaves a running daemon be, and says systemd won't restart one it didn't start (engram#689)", async () => {
     daemonRunning();
     await daemonInstall();
     expect(spawn).not.toHaveBeenCalled();
-    expect(systemctlCalls()).toEqual(["show --property=Version", "daemon-reload", "enable engram.service"]);
+    // Then which daemon systemd runs: none.
+    expect(systemctlCalls()).toEqual([...ENABLE, "show engram.service --property=MainPID"]);
     expect(linked()).toBe(true);
+    expect(output()).toContain(OUTSIDE_SYSTEMD);
     expect(process.exitCode).toBeUndefined();
   });
 
-  it("starts the daemon at once beside one that is stopping, with no launchd", async () => {
-    // Only macOS waits for it to exit first, where launchd would take it for
-    // the job's daemon (engram#691). The worker started here waits for it to
-    // go itself (engram#612).
-    daemon.answering = { pid: process.pid, stopping: true };
+  it("waits for a daemon that is stopping, as engram start does, then has systemd start one (engram#689)", async () => {
+    // systemd's start finds the unit running while its daemon stops, and
+    // starts none in its place.
+    daemonStopping(300);
     await daemonInstall();
-    expect(systemctlCalls()).toEqual(["show --property=Version", "daemon-reload", "enable engram.service"]);
-    expect(linked()).toBe(true);
-    expect(spawn).toHaveBeenCalledTimes(1);
-    expect(existsSync(join(home.dir, "Library"))).toBe(false);
     const text = output();
-    expect(text).not.toContain("Waiting for the daemon that is stopping");
-    expect(text).not.toContain("still stopping");
-    expect(text).toContain("Engram daemon started");
+    expect(text).toContain(`Waiting for the daemon that is stopping (pid ${STOPPING}) to finish...`);
+    // Nothing asked of systemd while it waits.
+    expect(systemctlCalls()).toEqual([...ENABLE, ...THROUGH_SYSTEMD]);
+    expect(linked()).toBe(true);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(systemd.mainPid).toBe(process.pid);
+    expect(existsSync(join(home.dir, "Library"))).toBe(false);
+    expect(text).toContain(`Engram daemon started (pid ${process.pid})`);
     expect(process.exitCode).toBeUndefined();
+  });
+
+  it("turns start at login on, starts nothing and fails when the daemon stopping hasn't gone in time", async () => {
+    daemonStopping();
+    let now = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => (now += 5_000));
+    try {
+      await daemonInstall();
+    } finally {
+      clock.mockRestore();
+    }
+    // Enabled; no start.
+    expect(systemctlCalls()).toEqual(ENABLE);
+    expect(linked()).toBe(true);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(systemd.mainPid).toBe(STOPPING);
+    const text = output();
+    expect(text).toContain(`Waiting for the daemon that is stopping (pid ${STOPPING}) to finish...`);
+    expect(text).toContain("Auto-start enabled — daemon will start when you log in (systemd)");
+    expect(text).toContain(`The daemon is still stopping (pid ${STOPPING}). Run 'engram start' in a moment.`);
+    expect(text).not.toContain("Engram daemon started");
+    expect(process.exitCode).toBe(1);
   });
 
   it("turns a unit of its own back on, written as this CLI writes it", async () => {
@@ -746,13 +862,15 @@ describe("engram uninstall on Linux (engram#615)", () => {
 describe("engram status on Linux (engram#615)", () => {
   it("says start at login is on", async () => {
     writeUnit(unitWith());
-    daemonRunning();
+    systemdRunsDaemon();
     await daemonStatus();
     const text = output();
     expect(text).toContain("Auto-start: enabled (systemd)");
     expect(text).not.toContain("outdated");
     expect(text).not.toContain("broken");
-    expect(execFileSync).not.toHaveBeenCalled();
+    expect(text).not.toContain("wasn't started by systemd");
+    // Only which daemon systemd runs (engram#689).
+    expect(systemctlCalls()).toEqual(["show engram.service --property=MainPID"]);
   });
 
   it("says it's off when it was disabled with systemctl", async () => {
@@ -797,7 +915,8 @@ describe("engram status on Linux (engram#615)", () => {
   it("points at what repairs or updates it while the daemon runs: engram install (engram#651)", async () => {
     for (const unit of [unitWith({}, 0), unitWith({ node: join(home.dir, "gone", "node") })]) {
       writeUnit(unit);
-      daemonRunning();
+      // systemd started it, from a Node the next upgrade then removed, say.
+      systemdRunsDaemon();
       await daemonStatus();
       expect(said()).toMatch(/^Auto-start: enabled \(systemd\) {2}— (broken|outdated config), run 'engram install' to (repair|update)$/m);
       // engram start finds the daemon running, and repairs nothing.
@@ -843,10 +962,13 @@ describe("engram start on Linux (engram#615)", () => {
     await daemonStart([], {});
     expect(readFileSync(UNIT, "utf-8")).toBe(unitWith());
     expect(linked()).toBe(true);
-    expect(systemctlCalls()).toEqual(["daemon-reload"]);
+    // Then systemd starts the daemon, from the unit as it is now (engram#689).
+    expect(systemctlCalls()).toEqual(["daemon-reload", ...THROUGH_SYSTEMD]);
     const text = output();
     expect(text).toContain(`Updated auto-start configuration (systemd unit v${UNIT_VERSION})`);
-    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(systemd.mainPid).toBe(process.pid);
+    expect(text).toContain(`Engram daemon started (pid ${process.pid})`);
     expect(process.exitCode).toBeUndefined();
   });
 
@@ -874,12 +996,16 @@ describe("engram start on Linux (engram#615)", () => {
     writeUnit(unitWith());
     await daemonStart([], {});
     expect(readFileSync(UNIT, "utf-8")).toBe(unitWith());
+    // Started through it (engram#689): nothing rewritten, nothing reloaded.
+    expect(systemctlCalls()).toEqual(THROUGH_SYSTEMD);
 
     daemonGone();
+    execFileSync.mockClear();
     writeUnit("[Service]\nExecStart=/usr/bin/true\n");
     await daemonStart([], {});
     expect(readFileSync(UNIT, "utf-8")).toBe("[Service]\nExecStart=/usr/bin/true\n");
     expect(execFileSync).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledTimes(1);
     expect(output()).not.toContain("Updated auto-start configuration");
   });
 
@@ -974,9 +1100,13 @@ function signedInAtATerminal(): void {
 describe("auto-capture on Linux (engram#615)", () => {
   signedInAtATerminal();
 
-  it("starts the daemon and turns on start at login after sign-in, then says nothing more", async () => {
+  it("turns on start at login after sign-in, has systemd start the daemon, then says nothing more", async () => {
     await autoEnableCapture({ after: "login" });
-    expect(spawn).toHaveBeenCalledTimes(1);
+    // Start at login first; then systemd starts the daemon, and starts it
+    // again after a crash (engram#689). Nothing waits on it here.
+    expect(systemctlCalls()).toEqual([...ENABLE, "show --property=Version", "start engram.service"]);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(systemd.mainPid).toBe(process.pid);
     const text = said();
     expect(text).toContain("Auto-start enabled — daemon will start when you log in (systemd)");
     expect(text).toContain("Auto-capture is on");
@@ -990,7 +1120,7 @@ describe("auto-capture on Linux (engram#615)", () => {
       expect(said()).toBe("");
     }
     expect(execFileSync).not.toHaveBeenCalled();
-    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn).not.toHaveBeenCalled();
     expect(process.exitCode).toBeUndefined();
   });
 
@@ -1115,6 +1245,395 @@ describe("auto-capture on Linux (engram#615)", () => {
     const text = said();
     expect(text).toContain("Auto-capture is on");
     expect(text).not.toContain("Start at login");
+  });
+});
+
+describe("engram start through systemd (engram#689)", () => {
+  /** What systemctl says when the unit has failed too often to be started again for now. */
+  const START_LIMIT =
+    "Job for engram.service failed because start of the service was attempted too often.\n" +
+    'See "systemctl --user status engram.service" and "journalctl --user -xeu engram.service" for details.\n';
+
+  beforeEach(() => writeUnit(unitWith()));
+
+  it("has systemd start the daemon when the unit is enabled: systemd starts it again after a crash", async () => {
+    await daemonStart([], {});
+    // Whether the user service manager answers; the start; and the PID
+    // systemd gave the daemon.
+    expect(systemctlCalls()).toEqual(THROUGH_SYSTEMD);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(systemd.mainPid).toBe(process.pid);
+    const text = output();
+    expect(text).toContain(`Engram daemon started (pid ${process.pid})`);
+    expect(text).toContain(`Log: ${LOG_FILE}`);
+    expect(text).not.toMatch(/systemd|started directly/);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("leaves the daemon systemd runs as it is, and says nothing of systemd", async () => {
+    systemdRunsDaemon();
+    await daemonStart([], {});
+    // Only which daemon systemd runs: this one.
+    expect(systemctlCalls()).toEqual(["show engram.service --property=MainPID"]);
+    expect(spawn).not.toHaveBeenCalled();
+    const text = output();
+    expect(text).toContain(`Daemon already running (pid ${process.pid})`);
+    expect(text).not.toContain("systemd");
+  });
+
+  it("starts the daemon itself, and says systemd won't restart it, when systemctl won't start it", async () => {
+    systemd.startRefusal = START_LIMIT;
+    await daemonStart([], {});
+    expect(systemctlCalls()).toEqual(THROUGH_SYSTEMD.slice(0, 2));
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const text = output();
+    // What it said, in its first line: not where to look.
+    expect(text).toContain(
+      startedDirectly("Job for engram.service failed because start of the service was attempted too often."),
+    );
+    expect(text).not.toContain("journalctl");
+    expect(text).toContain(`Engram daemon started (pid ${process.pid})`);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("fails when the daemon systemd starts exits as it starts, and starts no other", async () => {
+    systemd.starts = "dies";
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    await daemonStart([], {});
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(spawn).not.toHaveBeenCalled();
+    // Its PID, asked for once systemd started it: systemd names it until the next.
+    expect(systemctlCalls()).toEqual(THROUGH_SYSTEMD);
+    expect(systemd.mainPid).toBe(0);
+    const text = output();
+    expect(text).toContain("Daemon failed to start. Check the log:");
+    expect(text).not.toContain("started directly");
+  });
+
+  it("starts the daemon itself, and says so, when systemd hasn't started one in time", async () => {
+    systemd.starts = "never";
+    let now = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => (now += 1_000));
+    try {
+      await daemonStart([], {});
+    } finally {
+      clock.mockRestore();
+    }
+    const calls = systemctlCalls();
+    expect(calls.slice(0, 3)).toEqual(THROUGH_SYSTEMD);
+    // Then the PID systemd gave the daemon, asked for until it gives up.
+    expect(calls.slice(3).length).toBeGreaterThan(0);
+    expect(new Set(calls.slice(3))).toEqual(new Set(["show engram.service --property=ExecMainPID"]));
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const text = output();
+    expect(text).toContain(
+      "systemd didn't start the daemon in time, so it is started directly, and won't be restarted after a crash.",
+    );
+    expect(text).toContain(`Engram daemon started (pid ${process.pid})`);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("starts the daemon itself with a key, a server or the vault key set here: systemd's wouldn't have them", async () => {
+    for (const [name, value] of [
+      ["ENGRAM_API_KEY", "eng_test_689"],
+      ["ENGRAM_BASE_URL", "http://127.0.0.1:9"],
+      ["ENGRAM_VAULT_KEY", "test-vault-key-689"],
+    ]) {
+      daemonGone();
+      execFileSync.mockClear();
+      spawn.mockClear();
+      vi.stubEnv(name, value);
+      await daemonStart([], {});
+      // Not even whether the user service manager answers.
+      expect(systemctlCalls()).toEqual([]);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(said()).not.toContain("systemd");
+      vi.stubEnv(name, undefined);
+    }
+
+    // A server that is only spaces is none, as the daemon reads it.
+    daemonGone();
+    execFileSync.mockClear();
+    spawn.mockClear();
+    vi.stubEnv("ENGRAM_BASE_URL", "  ");
+    await daemonStart([], {});
+    expect(systemctlCalls()).toEqual(THROUGH_SYSTEMD);
+    expect(spawn).not.toHaveBeenCalled();
+    vi.stubEnv("ENGRAM_BASE_URL", undefined);
+
+    // The vault key, saved where systemd's daemon reads it (engram#690).
+    const vaultKey = join(ENGRAM_DIR, "vault-key");
+    daemonGone();
+    execFileSync.mockClear();
+    vi.stubEnv("ENGRAM_VAULT_KEY", "test-vault-key-689");
+    mkdirSync(ENGRAM_DIR, { recursive: true });
+    writeFileSync(vaultKey, "test-vault-key-689\n", { mode: 0o600 });
+    try {
+      await daemonStart([], {});
+    } finally {
+      rmSync(vaultKey, { force: true });
+    }
+    expect(systemctlCalls()).toEqual(THROUGH_SYSTEMD);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("starts the daemon itself, saying nothing of systemd, where systemd can't run this CLI's", async () => {
+    const otherWorker = join(home.dir, "other-cli", "dist", "daemon", "worker.js");
+    mkdirSync(dirname(otherWorker), { recursive: true });
+    writeFileSync(otherWorker, "");
+    for (const [unit, enabled] of [
+      [unitWith(), false], // disabled with systemctl: left to the user
+      ["[Service]\nExecStart=/usr/bin/true\n", true], // not Engram's
+      [unitWith({}, UNIT_VERSION + 1), true], // a newer CLI's
+      [unitWith({ worker: otherWorker }), true], // another CLI's, still there
+    ] as const) {
+      rmSync(WANTS, { force: true });
+      writeUnit(unit, enabled);
+      daemonGone();
+      execFileSync.mockClear();
+      spawn.mockClear();
+      await daemonStart([], {});
+      expect(readFileSync(UNIT, "utf-8")).toBe(unit);
+      expect(linked()).toBe(enabled);
+      expect(systemctlCalls()).toEqual([]);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const text = said();
+      expect(text).toContain(`Engram daemon started (pid ${process.pid})`);
+      expect(text).not.toContain("systemd");
+    }
+  });
+
+  it("starts the daemon itself, saying nothing of systemd, when the user's service manager doesn't answer, or there is none", async () => {
+    systemd.reachable = false;
+    await daemonStart([], {});
+    expect(systemctlCalls()).toEqual(["show --property=Version"]);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(said()).not.toContain("systemd");
+
+    daemonGone();
+    execFileSync.mockClear();
+    spawn.mockClear();
+    vi.stubEnv("PATH", NO_BIN);
+    await daemonStart([], {});
+    expect(execFileSync).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(said()).not.toContain("systemd");
+  });
+
+  describe("engram start --install", () => {
+    beforeEach(() => rmSync(CONFIG, { recursive: true, force: true }));
+
+    it("turns start at login on first, and then systemd starts the daemon", async () => {
+      await daemonStart([], { install: "" });
+      // Whether there is a user session to turn it on in; the unit, enabled;
+      // the start through it.
+      expect(systemctlCalls()).toEqual(["show --property=Version", ...ENABLE, ...THROUGH_SYSTEMD]);
+      expect(readFileSync(UNIT, "utf-8")).toBe(unitWith());
+      expect(linked()).toBe(true);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(systemd.mainPid).toBe(process.pid);
+      const text = output();
+      expect(text.indexOf("Auto-start enabled")).toBeGreaterThanOrEqual(0);
+      expect(text.indexOf("Auto-start enabled")).toBeLessThan(text.indexOf("Engram daemon started"));
+      expect(text).not.toMatch(/started directly|wasn't started by systemd/);
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it("with a key set here, starts the daemon itself first, as before", async () => {
+      vi.stubEnv("ENGRAM_API_KEY", "eng_test_689");
+      await daemonStart([], { install: "" });
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(systemctlCalls()).toEqual(ENABLE);
+      expect(spawn.mock.invocationCallOrder[0]).toBeLessThan(execFileSync.mock.invocationCallOrder[0]);
+      expect(linked()).toBe(true);
+      const text = output();
+      expect(text.indexOf("Engram daemon started")).toBeGreaterThanOrEqual(0);
+      expect(text.indexOf("Engram daemon started")).toBeLessThan(text.indexOf("Auto-start enabled"));
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it("without a systemd user session, starts the daemon, then says start at login isn't available, as before", async () => {
+      systemd.reachable = false;
+      await daemonStart([], { install: "" });
+      // Whether there is a session: for --install, and again as it turns start at login on.
+      expect(systemctlCalls()).toEqual(["show --property=Version", "show --property=Version"]);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const text = output();
+      expect(text.indexOf("Engram daemon started")).toBeGreaterThanOrEqual(0);
+      expect(text.indexOf("Engram daemon started")).toBeLessThan(text.indexOf("Start at login isn't available here"));
+      expect(existsSync(UNIT_DIR)).toBe(false);
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it("starts the daemon itself, and fails, when systemd won't turn start at login on", async () => {
+      systemd.enableFails = true;
+      await daemonStart([], { install: "" });
+      expect(systemctlCalls()).toEqual(["show --property=Version", ...ENABLE, "daemon-reload"]);
+      expect(existsSync(UNIT)).toBe(false);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const text = output();
+      expect(text).toContain("Couldn't turn on start at login.");
+      expect(text).toContain(`Engram daemon started (pid ${process.pid})`);
+      expect(process.exitCode).toBe(1);
+    });
+
+    it("finds the daemon running: turns start at login on, starts none, and says systemd won't restart that one", async () => {
+      daemonRunning();
+      await daemonStart([], { install: "" });
+      expect(systemctlCalls()).toEqual([...ENABLE, "show engram.service --property=MainPID"]);
+      expect(spawn).not.toHaveBeenCalled();
+      const text = output();
+      expect(text).toContain(`Daemon already running (pid ${process.pid})`);
+      expect(text).toContain("Auto-start enabled");
+      expect(text).toContain(OUTSIDE_SYSTEMD);
+      expect(process.exitCode).toBeUndefined();
+    });
+  });
+
+  describe("auto-capture", () => {
+    signedInAtATerminal();
+
+    it("has systemd start the daemon when the unit is there already", async () => {
+      await autoEnableCapture({ after: "command" });
+      expect(systemctlCalls()).toEqual(["show --property=Version", "start engram.service"]);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(systemd.mainPid).toBe(process.pid);
+      expect(said()).toContain("Auto-capture is on");
+    });
+
+    it("starts the daemon itself when systemctl won't start it", async () => {
+      systemd.startRefusal = START_LIMIT;
+      await autoEnableCapture({ after: "command" });
+      expect(systemctlCalls()).toEqual(["show --property=Version", "start engram.service"]);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(said()).toContain("Auto-capture is on");
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it("starts the daemon itself while one is stopping: systemd would take that one for its own", async () => {
+      daemonStopping();
+      await autoEnableCapture({ after: "command" });
+      expect(systemctlCalls()).toEqual([]);
+      expect(spawn).toHaveBeenCalledTimes(1);
+    });
+
+    it("with a key set here, starts the daemon itself first, then turns start at login on", async () => {
+      rmSync(CONFIG, { recursive: true, force: true });
+      vi.stubEnv("ENGRAM_API_KEY", "eng_test_689");
+      await autoEnableCapture({ after: "login" });
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(systemctlCalls()).toEqual(ENABLE);
+      expect(spawn.mock.invocationCallOrder[0]).toBeLessThan(execFileSync.mock.invocationCallOrder[0]);
+      expect(linked()).toBe(true);
+    });
+  });
+
+  describe("a daemon systemd doesn't run", () => {
+    it("is said when systemd could run it: a stop and a start hand it to systemd", async () => {
+      daemonRunning();
+      await daemonStart([], {});
+      expect(systemctlCalls()).toEqual(["show engram.service --property=MainPID"]);
+      expect(spawn).not.toHaveBeenCalled();
+      const text = output();
+      expect(text).toContain(`Daemon already running (pid ${process.pid})`);
+      expect(text).toContain(OUTSIDE_SYSTEMD);
+    });
+
+    it("is said by engram status, under its Auto-start line", async () => {
+      daemonRunning();
+      await daemonStatus();
+      expect(systemctlCalls()).toEqual(["show engram.service --property=MainPID"]);
+      const text = said();
+      expect(text).toContain(`Status: running (pid ${process.pid})`);
+      expect(text).toContain(`Auto-start: enabled (systemd)\n  ${OUTSIDE_SYSTEMD}`);
+    });
+
+    it("isn't said for systemd's own daemon, or where systemd couldn't run it", async () => {
+      /** What `engram start` and `engram status` said, and the systemctl calls each made. */
+      const startAndStatus = async () => {
+        execFileSync.mockClear();
+        await daemonStart([], {});
+        const started = { text: said(), calls: systemctlCalls() };
+        expect(started.text).toContain("Daemon already running");
+        execFileSync.mockClear();
+        await daemonStatus();
+        const status = { text: said(), calls: systemctlCalls() };
+        for (const { text } of [started, status]) expect(text).not.toContain("wasn't started by systemd");
+        expect(spawn).not.toHaveBeenCalled();
+        return { started, status };
+      };
+
+      // systemd's own.
+      systemdRunsDaemon();
+      let found = await startAndStatus();
+      expect(found.started.calls).toEqual(["show engram.service --property=MainPID"]);
+      expect(found.status.calls).toEqual(["show engram.service --property=MainPID"]);
+      expect(found.status.text).toContain("Auto-start: enabled (systemd)");
+
+      // The user service manager doesn't answer: none to start it.
+      systemd.mainPid = 0;
+      systemd.reachable = false;
+      found = await startAndStatus();
+      expect(found.started.calls).toEqual(["show engram.service --property=MainPID"]);
+      expect(found.status.calls).toEqual(["show engram.service --property=MainPID"]);
+      systemd.reachable = true;
+
+      // It answers, but with no PID that can be read: it isn't taken to run none.
+      systemd.pidUnreadable = true;
+      found = await startAndStatus();
+      expect(found.started.calls).toEqual(["show engram.service --property=MainPID"]);
+      expect(found.status.calls).toEqual(["show engram.service --property=MainPID"]);
+      systemd.pidUnreadable = false;
+
+      // A key set here, which systemd's daemon wouldn't have.
+      vi.stubEnv("ENGRAM_API_KEY", "eng_test_689");
+      found = await startAndStatus();
+      expect(found.started.calls).toEqual([]);
+      expect(found.status.calls).toEqual([]);
+      expect(found.status.text).toContain("Auto-start: enabled (systemd)");
+      vi.stubEnv("ENGRAM_API_KEY", undefined);
+
+      // Disabled with systemctl; outdated, broken, or not Engram's: status says
+      // so, or nothing, and `engram install` sees to it.
+      for (const [unit, enabled, says] of [
+        [unitWith(), false, "Auto-start: off — disabled with systemctl"],
+        [unitWith({}, 0), true, "outdated config"],
+        [unitWith({ node: join(home.dir, "gone", "node") }), true, "broken"],
+        ["[Service]\nExecStart=/usr/bin/true\n", true, null],
+      ] as const) {
+        rmSync(WANTS, { force: true });
+        writeUnit(unit, enabled);
+        found = await startAndStatus();
+        expect(found.started.calls).toEqual([]);
+        expect(found.status.calls).toEqual([]);
+        if (says === null) expect(found.status.text).not.toContain("Auto-start");
+        else expect(found.status.text).toContain(says);
+        // engram start, finding the daemon running, repairs nothing.
+        expect(readFileSync(UNIT, "utf-8")).toBe(unit);
+      }
+    });
+
+    it("isn't said when the daemon is another version's: the version hint says to stop and start it", async () => {
+      daemonRunning();
+      daemon.answering = { pid: process.pid, version: "0.0.1" };
+      await daemonStart([], {});
+      const text = output();
+      expect(text).toContain("It runs version 0.0.1");
+      expect(text).not.toContain("wasn't started by systemd");
+      expect(systemctlCalls()).toEqual([]);
+    });
+  });
+
+  it("waits on the PID it is given for the daemon: systemd's, not launchd's", async () => {
+    // One that exited as it started: failed, at once.
+    expect(await waitForAgent(5_000, 200, () => DEAD_PID)).toEqual({ state: "failed" });
+    // None started yet: given up on, for a spawn, and asked for again meanwhile.
+    const none = vi.fn((): number | null => null);
+    const started = Date.now();
+    expect(await waitForAgent(5_000, 200, none)).toBeNull();
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(none.mock.calls.length).toBeGreaterThan(1);
+    expect(execFileSync).not.toHaveBeenCalled();
   });
 });
 
@@ -1433,16 +1952,16 @@ describe("a CLI and a Node installed with brew (engram#652)", () => {
     await asBrewCli(() => daemonStart([], {}));
     expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(THROUGH_OPT));
     expect(linked()).toBe(true);
-    expect(systemctlCalls()).toEqual(["daemon-reload"]);
+    expect(systemctlCalls()).toEqual(["daemon-reload", ...THROUGH_SYSTEMD]);
     expect(said()).toContain(`Updated auto-start configuration (systemd unit v${UNIT_VERSION})`);
-    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn).not.toHaveBeenCalled();
 
-    // Current from then on.
+    // Current from then on: systemd starts the daemon from it as it is.
     daemonGone();
     execFileSync.mockClear();
     await asBrewCli(() => daemonStart([], {}));
     expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(THROUGH_OPT));
-    expect(execFileSync).not.toHaveBeenCalled();
+    expect(systemctlCalls()).toEqual(THROUGH_SYSTEMD);
     expect(said()).not.toContain("Updated auto-start configuration");
     expect(process.exitCode).toBeUndefined();
   });

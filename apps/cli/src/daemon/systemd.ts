@@ -323,6 +323,42 @@ export function installUnit(file: string, text: string): string | null {
   }
 }
 
+/**
+ * Have the service manager start the daemon now (engram#689): `systemctl
+ * --user start`, which starts the unit when it doesn't run, as after
+ * `engram stop`, whose exit 0 Restart=on-failure doesn't restart, and leaves
+ * one that runs as it is, as `launchctl kickstart` without -k does. The
+ * service manager starts the daemon again after a crash then, as it does
+ * the one it starts at login. With Type=simple, it returns once the
+ * daemon's process is forked. Null when systemd took it; else what
+ * systemctl said: a unit started too often of late (StartLimitBurst) is
+ * refused.
+ */
+export function startUnit(file: string): string | null {
+  try {
+    systemctl(file, ["start", UNIT_NAME]);
+    return null;
+  } catch (err: unknown) {
+    return commandFailure(err);
+  }
+}
+
+/**
+ * A PID the service manager has for the unit: MainPID, the daemon it runs
+ * now, 0 when it runs none; or ExecMainPID, the last one it started, which
+ * it keeps after that one exits. Null when systemctl doesn't answer.
+ */
+export function unitPid(file: string, property: "MainPID" | "ExecMainPID"): number | null {
+  let output: string;
+  try {
+    output = systemctl(file, ["show", UNIT_NAME, `--property=${property}`]);
+  } catch {
+    return null;
+  }
+  const match = new RegExp(`^${property}=(\\d+)[ \\t]*$`, "m").exec(output);
+  return match ? Number(match[1]) : null;
+}
+
 /** Rewrite a unit of ours in place, leaving it enabled or not, as it was. False when it couldn't. */
 export function rewriteUnit(text: string): boolean {
   try {

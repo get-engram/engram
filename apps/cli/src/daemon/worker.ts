@@ -24,6 +24,8 @@ function log(msg: string): void {
 // only after a failure, leaves it at that; 1 when it couldn't be told.
 const claim = await claimDaemonLock({ log });
 if (claim.state === "taken") process.exit(claim.retry ? 1 : 0);
+// Asked to stop while it took the lock: a clean exit, which launchd leaves stopped (engram#669).
+if (claim.state === "stopped") process.exit(0);
 
 // START_FAILED_EXIT, as for every failure before it is ready (engram#613):
 // the Windows supervisor then lets `engram start` report it. launchd starts

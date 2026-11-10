@@ -811,7 +811,12 @@ export type Claim =
   /** Another daemon runs (message), and this one should exit. `retry`: exit as failed, so launchd tries again. */
   | { state: "taken"; message: string; retry: boolean }
   /** No lock can be had here (reason): the daemon runs without one, as before engram#612. */
-  | { state: "unavailable"; reason: string };
+  | { state: "unavailable"; reason: string }
+  /**
+   * Asked to stop (SIGTERM, SIGINT, SIGHUP) before the lock was decided: it
+   * has let go of what it held, and should exit 0 (engram#669).
+   */
+  | { state: "stopped" };
 
 let log: (msg: string) => void = () => {};
 let claim: Promise<Claim> | null = null;
@@ -966,7 +971,9 @@ export function checkStopRequest(): void {
  *
  * Held, the PID file is written, SIGTERM, SIGINT and SIGHUP stop the
  * daemon through setStopHandler, and any exit releases both. On Windows a
- * stop request does too (STOP_FILE), and so does SIGBREAK.
+ * stop request does too (STOP_FILE), and so does SIGBREAK. One of those
+ * signals that comes before the lock is decided stops it once it is: the
+ * claim is then "stopped" (engram#669).
  */
 export function claimDaemonLock(options: ClaimOptions): Promise<Claim> {
   claim ??= claimOnce(options);
@@ -985,11 +992,32 @@ async function claimOnce(options: ClaimOptions): Promise<Claim> {
   log = options.log;
   // Before the socket answers: the answer says whether it does.
   watchStopFile = options.stopFile ?? process.platform === "win32";
+  // Before the socket answers, too: `engram stop` finds the daemon by it,
+  // and it answers from the moment it is bound, a while before the lock is
+  // decided (SETTLE_MS). A signal with no handler ends the process by that
+  // signal, which launchd takes for a crash: it starts the daemon again ten
+  // seconds later (engram#669). One that comes before the lock is decided
+  // is acted on once it is.
+  let deciding = true;
+  let stopAsked = false;
+  const onStop = (): void => {
+    if (deciding) stopAsked = true;
+    else stopHandler();
+  };
+  process.on("SIGTERM", onStop);
+  process.on("SIGINT", onStop);
+  // The terminal or console a daemon runs in the foreground in was closed.
+  // Windows ends the process about ten seconds later.
+  process.on("SIGHUP", onStop);
+  // Ctrl-Break, in a console on Windows.
+  if (process.platform === "win32") process.on("SIGBREAK", onStop);
   const endpoint = options.endpoint ?? daemonEndpoint();
   const result: LockResult =
     "unavailable" in endpoint
       ? { state: "unavailable", reason: endpoint.unavailable }
       : await lockEndpoint(endpoint, { log, settleMs: options.settleMs });
+  // Nothing from here on waits, so no signal comes in before the return.
+  deciding = false;
 
   if (result.state === "taken") {
     const message = takenMessage(result.taken, endpoint as Endpoint);
@@ -1010,16 +1038,16 @@ async function claimOnce(options: ClaimOptions): Promise<Claim> {
     return { state: "taken", message, retry: false };
   }
 
+  if (stopAsked) {
+    // Never the daemon: its own socket goes, and no PID file was written.
+    if (result.state === "held") unlockEndpoint(result.held);
+    log("asked to stop while starting; this one is exiting");
+    return { state: "stopped" };
+  }
+
   if (result.state === "held") held = result.held;
   else log(`running without the single-daemon lock: ${result.reason}`);
   writePidFile();
-  process.on("SIGTERM", () => stopHandler());
-  process.on("SIGINT", () => stopHandler());
-  // The terminal or console a daemon runs in the foreground in was closed.
-  // Windows ends the process about ten seconds later.
-  process.on("SIGHUP", () => stopHandler());
-  // Ctrl-Break, in a console on Windows.
-  if (process.platform === "win32") process.on("SIGBREAK", () => stopHandler());
   process.on("exit", releaseDaemonLock);
   checkTimer = setInterval(() => void checkDaemonLock(), SELF_CHECK_MS);
   checkTimer.unref();

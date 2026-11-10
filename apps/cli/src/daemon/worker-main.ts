@@ -80,6 +80,8 @@ async function main(): Promise<void> {
   // (engram#469): for it, this is the claim. It writes the PID file.
   const claim = await claimDaemonLock({ log });
   if (claim.state === "taken") process.exit(claim.retry ? 1 : 0);
+  // Asked to stop while it took the lock (engram#669).
+  if (claim.state === "stopped") process.exit(0);
 
   // Everything the daemon creates is the user's alone (engram#627): the
   // queue of transcript text, the log and status.json. Set here, after

@@ -17,6 +17,9 @@
  *     daemon started in its place meanwhile takes over: the first stops.
  *   - A daemon from before #612 (no socket, found by its PID file) is
  *     reported as older, not run beside, and `engram stop` stops it.
+ *   - A worker signalled while it is still starting, as `engram stop` can
+ *     find it (its socket answers before the lock is decided), exits 0, not
+ *     by the signal, and leaves no socket or PID file (engram#669).
  *
  * Usage, after `pnpm build`:  node scripts/e2e-daemon-lock.mjs
  *
@@ -537,6 +540,34 @@ try {
     startedDaemons.push(U);
     await stop(U, "stop");
   }
+
+  // ── 9. signalled while it starts: a clean exit (engram#669) ──
+  // `engram stop` finds the daemon by its socket, which answers from the
+  // moment it is bound, before the lock is decided, and sends SIGTERM, as
+  // here. Ended by the signal, launchd would take it for a crash and start
+  // it again ten seconds later.
+  const STOPPED_STARTING = "asked to stop while starting; this one is exiting";
+  const stoppedBefore = logCount(STOPPED_STARTING);
+  for (const n of [1, 2, 3]) {
+    const V = launchdWorker();
+    let first = null;
+    const deadline = Date.now() + 15_000;
+    while (first === null && Date.now() < deadline && V.child.exitCode === null) {
+      const a = await ask();
+      if (a?.pid === V.pid) first = a;
+      else await sleep(2);
+    }
+    check(first?.ready === false, `run ${n}: it answers while still starting (${JSON.stringify(first && { ready: first.ready })})`);
+    process.kill(V.pid, "SIGTERM");
+    ended = await within(V.exit, 15_000);
+    check(ended?.code === 0 && ended.signal === null, `run ${n}: SIGTERM then: it exits 0, not by the signal (${JSON.stringify(ended)})`);
+    check(!isSocket() && pidFile() === null, `run ${n}: no socket or PID file left (${isSocket()}, ${pidFile()})`);
+  }
+  // Each signal lands within milliseconds of the first answer, well inside
+  // the 250 ms before the lock is decided; one later is a stop all the same.
+  const stoppedStarting = logCount(STOPPED_STARTING) - stoppedBefore;
+  check(stoppedStarting >= 1, `daemon.log: asked to stop while starting, said ${stoppedStarting} time(s) of 3`);
+  check(workers().length === 0, "no worker runs");
 } catch (err) {
   check(false, `threw: ${redact(err instanceof Error ? (err.stack ?? err.message) : String(err))}`);
 } finally {

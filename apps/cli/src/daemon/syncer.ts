@@ -1335,6 +1335,12 @@ export class Syncer {
   ): Promise<SendOutcome> {
     let checking = recheck;
     while (true) {
+      // Each batch waits for the vault to be read, not only the flush
+      // (engram#701): `engram vault set` may save a secret while a long
+      // flush is under way, and the batch after it may hold a row captured
+      // since. ready() reads the vault again first. It answers at once
+      // when nothing changed.
+      if (!(await this.vaultReady(run))) return "retry";
       // The key changed or was removed (engram#594): no new batch goes out
       // with this one. What is left stays queued for its account.
       if (this.active !== run) return "retry";

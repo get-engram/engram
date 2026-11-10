@@ -22,11 +22,13 @@ import {
   closeSync,
   constants,
   fchownSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
+  readSync,
   realpathSync,
   renameSync,
   statSync,
@@ -248,8 +250,49 @@ export function writePrivateFileSync(file: string, data: string, options: Privat
   if (durable && posix()) syncDirSync(dir);
 }
 
+export interface SmallFile {
+  data: Buffer;
+  /**
+   * Which write of the file this is: its device, inode, modification time
+   * and size. writePrivateFileSync writes a new file every time, so a new
+   * write almost always differs from the last; a file system can give the
+   * new file the old one's inode, and the same time when its clock is
+   * coarse.
+   */
+  stamp: string;
+}
+
+/**
+ * A small file read without waiting: null when there is none, it can't be
+ * read, or it isn't a regular file of at most `maxBytes`. It is opened
+ * without blocking and checked before it is read: a FIFO put in its place
+ * would otherwise hang the reader. BigInt fstat: a plain stat fills the
+ * buffer Node's module loader reads (see lstatSocketPath in
+ * daemon/instance.ts).
+ */
+export function readSmallFileSync(file: string, maxBytes: number): SmallFile | null {
+  let fd: number;
+  try {
+    // O_NONBLOCK: undefined on Windows, which has no FIFOs in the file system.
+    fd = openSync(file, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+  } catch {
+    return null;
+  }
+  try {
+    const st = fstatSync(fd, { bigint: true });
+    if (!st.isFile() || st.size > BigInt(maxBytes)) return null;
+    const buf = Buffer.alloc(maxBytes + 1);
+    const read = readSync(fd, buf, 0, buf.length, 0);
+    return { data: buf.subarray(0, read), stamp: `${st.dev}:${st.ino}:${st.mtimeNs}:${st.size}` };
+  } catch {
+    return null;
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /** Only these temp files are ever removed: the rest of ~/.engram is left as it is. */
-const TEMP_FILES_FOR = new Set(["config.json", "status.json", "daemon.pid", "daemon.stop"]);
+const TEMP_FILES_FOR = new Set(["config.json", "status.json", "daemon.pid", "daemon.stop", "vault-changed"]);
 
 /**
  * How old a leftover temp file must be before it is removed. A write in
@@ -264,7 +307,7 @@ export interface PrivateDirReport {
   changed: string[];
   /** Files left as they were: another user's, or the change failed. */
   skipped: string[];
-  /** Temp files of config.json, status.json, daemon.pid and daemon.stop that a write cut short left behind. */
+  /** Temp files of config.json, status.json, daemon.pid, daemon.stop and vault-changed that a write cut short left behind. */
   removed: string[];
 }
 
@@ -273,8 +316,8 @@ export interface PrivateDirReport {
  * regular file directly in it set to 0600, so an install from before this
  * fix is covered as well as a new one. Symlinks and subdirectories are left
  * alone, so nothing outside `dir` changes. Temp files that an interrupted
- * write of config.json, status.json, daemon.pid or daemon.stop left behind
- * are removed once they are STALE_TEMP_MS old.
+ * write of config.json, status.json, daemon.pid, daemon.stop or
+ * vault-changed left behind are removed once they are STALE_TEMP_MS old.
  *
  * Throws only when `dir` can't be created or read.
  */

@@ -86,7 +86,7 @@ vi.mock("../daemon/instance.js", async (importOriginal) => {
     if (a === null) return { state: "none", stale: false };
     if (a === "silent") return { state: "silent" };
     if (a === "unavailable") return { state: "unavailable", reason: "no pipe in this test" };
-    return { state: "answered", info: { ready: true, stopping: false, stopFile: false, vaultKeyReread: true, version: real.VERSION, ...a } };
+    return { state: "answered", info: { ready: true, stopping: false, stopFile: false, vaultKeyReread: true, vaultChangeNotice: true, version: real.VERSION, ...a } };
   };
   return { ...real, probeDaemon };
 });

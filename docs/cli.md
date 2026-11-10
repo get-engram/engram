@@ -207,6 +207,8 @@ engram vault set STRIPE_KEY --value "sk_live_..."
 |------|-------------|
 | `--value <val>` | Secret value (alternative to positional arg or stdin) |
 
+The capture daemon (`engram start`) removes your vault's secrets from what it sends, but only those it has read. When you save one, a daemon running on this machine reads the vault again before it sends anything more, so the secret is removed from then on. A daemon started by an older CLI reads the vault only every 10 minutes: `engram vault set` says so, and how to restart it. A secret saved anywhere else (another machine, the SDK) reaches a running daemon at its next 10-minute read.
+
 ### engram vault get
 
 Retrieve a named secret. Decrypted locally with your vault key.
@@ -254,6 +256,8 @@ Delete a named secret permanently.
 ```bash
 engram vault delete DATABASE_URL
 ```
+
+A capture daemon running on this machine reads the vault again before it sends anything more, and no longer removes the secret from what it sends.
 
 ### engram vault status
 

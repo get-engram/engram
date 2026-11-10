@@ -136,7 +136,7 @@ vi.mock("../daemon/instance.js", async (importOriginal) => {
     if (daemon.unavailable) return { state: "unavailable", reason: "no socket here" };
     const a = daemon.answering;
     if (a === null) return { state: "none", stale: false };
-    return { state: "answered", info: { ready: true, stopping: false, stopFile: false, vaultKeyReread: true, version: real.VERSION, ...a } };
+    return { state: "answered", info: { ready: true, stopping: false, stopFile: false, vaultKeyReread: true, vaultChangeNotice: true, version: real.VERSION, ...a } };
   };
   return { ...real, probeDaemon };
 });

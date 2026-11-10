@@ -2,9 +2,10 @@ import { dirname } from "node:path";
 import { Engram, generateVaultKey } from "@getengram/sdk";
 import { bold, dim, plural, red } from "../output.js";
 import { configForUse } from "../config-guard.js";
-import { confirmedDaemonInPidFile, probeDaemon } from "../daemon/instance.js";
+import { confirmedDaemonInPidFile, probeDaemon, type DaemonInfo } from "../daemon/instance.js";
 import { decryptFailed } from "../daemon/scrubber.js";
 import { readStatus } from "../daemon/status.js";
+import { noteVaultChanged } from "../daemon/vault-changed.js";
 import { ensurePrivateDirSync, writePrivateFileSync } from "../private-files.js";
 import { resolveBaseUrl } from "../server-url.js";
 import {
@@ -218,29 +219,36 @@ export async function vaultSaveKey(flags: Record<string, string>): Promise<void>
 }
 
 /**
+ * The daemon running now: what it says of itself; "unknown" when it is
+ * busy and doesn't say, or, from before engram#612, has no socket and only
+ * its PID file names it; null when none runs, or the one running is
+ * stopping.
+ */
+async function runningDaemon(): Promise<DaemonInfo | "unknown" | null> {
+  const probe = await probeDaemon({ timeoutMs: 1_000 });
+  if (probe.state === "answered") return probe.info.stopping ? null : probe.info;
+  return probe.state === "silent" || confirmedDaemonInPidFile() !== null ? "unknown" : null;
+}
+
+/**
  * What the daemon running now does with the key just saved, when one runs.
  * One that reads its key again before sending (engram#693) uses it from
  * its next send on, unless it was started with ENGRAM_VAULT_KEY, which
  * wins over the file. One from before read its key when it started: a
- * restart reads it. So does one that is busy and doesn't say which it is,
- * or, from before engram#612, has no socket and only its PID file names it.
+ * restart reads it. So does one that doesn't say which it is.
  * `fresh`: a key just made, which no daemon can have had.
  */
 async function printDaemonKeyHint(fresh: boolean): Promise<void> {
-  const probe = await probeDaemon({ timeoutMs: 1_000 });
-  if (probe.state === "answered") {
-    if (probe.info.stopping) return;
-    if (probe.info.vaultKeyReread) {
-      console.log(
-        dim(
-          readStatus().vault_key === "env"
-            ? "The daemon running now was started with ENGRAM_VAULT_KEY, which it uses instead of the file."
-            : "The daemon running now reads it before its next send: no restart needed.",
-        ),
-      );
-      return;
-    }
-  } else if (probe.state !== "silent" && confirmedDaemonInPidFile() === null) {
+  const daemon = await runningDaemon();
+  if (daemon === null) return;
+  if (daemon !== "unknown" && daemon.vaultKeyReread) {
+    console.log(
+      dim(
+        readStatus().vault_key === "env"
+          ? "The daemon running now was started with ENGRAM_VAULT_KEY, which it uses instead of the file."
+          : "The daemon running now reads it before its next send: no restart needed.",
+      ),
+    );
     return;
   }
   if (fresh) {
@@ -366,9 +374,35 @@ export async function vaultSet(
     process.exit(1);
   }
 
-  await client.vault.set(name, value);
+  // Tell a running daemon to read the vault before its next send
+  // (engram#701), whether the request went through or not: one cut short
+  // may have saved the secret still.
+  let told = false;
+  try {
+    await client.vault.set(name, value);
+  } finally {
+    told = noteVaultChanged();
+  }
   console.log(`${bold("Secret stored:")} ${name}`);
   console.log(dim("Encrypted client-side. The server never sees the plaintext value."));
+  await printDaemonVaultHint(told);
+}
+
+/**
+ * Whether the daemon running now scrubs the secret just saved from its
+ * next send on (engram#701). One that reads the vault again when told it
+ * changed does, once `told`: the notice was written. One from before, or
+ * one that doesn't say which it is, reads the vault every 10 minutes, and
+ * until then sends the secret as it is: a restart reads it now.
+ */
+async function printDaemonVaultHint(told: boolean): Promise<void> {
+  const daemon = await runningDaemon();
+  if (daemon === null) return;
+  const notices = daemon !== "unknown" && daemon.vaultChangeNotice;
+  if (notices && told) return;
+  if (notices) console.log(dim("Couldn't write ~/.engram/vault-changed to tell the daemon running now."));
+  console.log(dim("The daemon running now reads the vault every 10 minutes, and may send this secret unscrubbed until then."));
+  console.log(dim("To have it scrubbed from now on, run 'engram stop', then 'engram start'."));
 }
 
 /**
@@ -547,7 +581,15 @@ export async function vaultDelete(
     process.exit(1);
   }
 
-  const deleted = await client.vault.delete(name);
+  // A request cut short may have deleted it still.
+  let deleted = true;
+  try {
+    deleted = await client.vault.delete(name);
+  } finally {
+    // A daemon reads the vault before its next send (engram#701): one held
+    // for a secret its key doesn't decrypt can go on once it is deleted.
+    if (deleted) noteVaultChanged();
+  }
   if (!deleted) {
     console.error(`Secret "${name}" not found.`);
     process.exit(1);

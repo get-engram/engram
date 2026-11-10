@@ -13,6 +13,7 @@ import { Pruner } from "./prune.js";
 import { Watcher } from "./watcher.js";
 import { Syncer, type Account, type CaptureControl, type KeySource } from "./syncer.js";
 import { SecretScrubber, type VaultKeySource, type VaultLike } from "./scrubber.js";
+import { readVaultChanged } from "./vault-changed.js";
 import { asVaultKeyProblem, readVaultKey, vaultKeyFix, type VaultKeyUnreadable } from "../vault-key.js";
 import { availableAdapters } from "./adapters.js";
 import { configuredAccount, ownedKeysOf } from "./key-source.js";
@@ -267,6 +268,9 @@ async function main(): Promise<void> {
     recordVaultUndecryptable,
   );
   if (heldBefore) vaultScrubber.continueMismatchHold(heldBefore);
+  // `engram vault set` and `engram vault delete` say when the vault
+  // changed: the next send waits for a read of it (engram#701).
+  vaultScrubber.followChanges(() => readVaultChanged());
   scrubber = vaultScrubber;
   vaultScrubber.start();
   if (vaultKey) {

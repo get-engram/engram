@@ -461,7 +461,7 @@ describe("makeDirPrivateSync: the daemon's start (engram#627)", () => {
     for (const name of FILES) expect(mode(join(engram, name)), name).toBe(0o644);
   });
 
-  it("removes stale temp files of config.json, status.json, daemon.pid and daemon.stop, and nothing else", () => {
+  it("removes stale temp files of config.json, status.json, daemon.pid, daemon.stop and vault-changed, and nothing else", () => {
     const engram = join(dir, ".engram");
     mkdirSync(engram);
     const stale = [
@@ -469,6 +469,7 @@ describe("makeDirPrivateSync: the daemon's start (engram#627)", () => {
       "status.json.45678.0badf00d.tmp",
       "daemon.pid.910.c0ffee00.tmp",
       "daemon.stop.1112.0123abcd.tmp",
+      "vault-changed.1314.89abcdef.tmp", // engram#701
     ];
     const writing = "config.json.123.cafef00d.tmp"; // a write in progress
     const kept = [

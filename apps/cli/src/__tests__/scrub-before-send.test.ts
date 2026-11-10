@@ -38,7 +38,7 @@ import {
   type VaultLike,
 } from "../daemon/scrubber.js";
 import { VaultKeyMismatch, VaultKeyUnreadable } from "../vault-key.js";
-import { recordFailure, recordSuccess } from "../daemon/status.js";
+import { recordFailure, recordNextRetry, recordSuccess } from "../daemon/status.js";
 import type { ParsedMessage, SessionMeta } from "../daemon/types.js";
 
 // engram#588: messages queued before the vault had been read were sent
@@ -1093,6 +1093,8 @@ class FakeServer {
   creates = 0;
   sends: StoreParams[] = [];
   createError: (() => unknown) | null = null;
+  /** Runs while a send is in flight, before the server answers it. */
+  onStore: (() => Promise<void>) | null = null;
   private seq = 0;
 
   client(): Engram {
@@ -1104,6 +1106,7 @@ class FakeServer {
       },
       store: async (p: StoreParams) => {
         this.sends.push(p);
+        await this.onStore?.();
         return { stored: p.messages.length };
       },
       deleteConversation: async () => {},
@@ -1712,6 +1715,7 @@ describe("nothing is sent before the vault has been read (engram#588)", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     vi.mocked(recordSuccess).mockClear();
     vi.mocked(recordFailure).mockClear();
+    vi.mocked(recordNextRetry).mockClear();
   });
 
   afterEach(() => {
@@ -1779,6 +1783,23 @@ describe("nothing is sent before the vault has been read (engram#588)", () => {
     expect(server.received).toEqual(["the PIN is [VAULT:PIN]", "next"]);
     const said = vi.mocked(console.log).mock.calls.filter((c) => String(c[0]).includes("vault read"));
     expect(said).toHaveLength(1);
+  });
+
+  it("a flush held for the vault records the hold once, however many conversations wait", async () => {
+    const vault = new FakeVault({ PIN: "4821" });
+    vault.listError = unavailable;
+    const scrubber = new SecretScrubber(vault, KEY);
+    await scrubber.refresh();
+    const syncer = new Syncer(db, server.client(), scrubber);
+
+    for (const id of ["s1", "s2", "s3"]) await syncer.onMessages(id, meta(id), msgs("the PIN is 4821"));
+    await syncer.flush();
+    expect(server.creates).toBe(3);
+    expect(server.sends).toHaveLength(0);
+    // The flush waits before any conversation starts: one status write for
+    // it, not one for each conversation, every 2 s for as long as it lasts.
+    expect(failures()).toHaveLength(1);
+    expect(recordNextRetry).not.toHaveBeenCalled();
   });
 
   it("a vault read refused with a bare 402 holds as a server failure, not a plan limit", async () => {
@@ -2199,5 +2220,39 @@ describe("nothing is sent before the vault has been read (engram#588)", () => {
     await syncer.flush();
     expect(server.received).toEqual(["the PIN is [VAULT:PIN]", "correct horse"]);
     expect(recordSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  it("a secret saved while a flush sends is scrubbed from its next batch on (engram#701)", async () => {
+    const vault = new FakeVault({ PIN: "4821" });
+    const scrubber = new SecretScrubber(vault, KEY);
+    let notice: string | null = null;
+    scrubber.followChanges(() => notice);
+    await scrubber.refresh();
+    const syncer = new Syncer(db, server.client(), scrubber);
+
+    // A batch's worth queued, as after time offline.
+    const backlog = Array.from({ length: 25 }, (_, i) => `message ${i + 1}`);
+    await syncer.onMessages("s1", meta("s1"), msgs(...backlog));
+    // While it is sent, `engram vault set` saves a secret, and the watcher
+    // captures a message with it in.
+    server.onStore = async () => {
+      server.onStore = null;
+      vault.secrets.TOKEN = "tok-7731-zz";
+      notice = "notice 1";
+      await syncer.onMessages("s1", meta("s1"), msgs("the token is tok-7731-zz"));
+    };
+    await syncer.flush();
+    expect(server.sends).toHaveLength(2);
+    expect(server.sends[0].messages).toHaveLength(25);
+    expect(server.received.at(-1)).toBe("the token is [VAULT:TOKEN]");
+    expect(queued().at(-1)).toBe("the token is [VAULT:TOKEN]");
+    expect(vault.lists).toBe(2);
+
+    // The flushes after it don't read the vault again.
+    await syncer.onMessages("s1", meta("s1"), msgs("next"));
+    later(2_000);
+    await syncer.flush();
+    expect(server.received.at(-1)).toBe("next");
+    expect(vault.lists).toBe(2);
   });
 });

@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { connect, createServer, type Server, type Socket } from "node:net";
+import { connect, createServer, Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Endpoint, Held, LockOptions, LockResult } from "../daemon/instance.js";
@@ -106,6 +106,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   // Closing a server removes the socket file at its path, by name: each
   // test has its own folder, so only that test's files go.
   for (const h of holders.splice(0)) await h.stop();
@@ -130,6 +131,18 @@ async function lock(endpoint: Endpoint, options: LockOptions = {}): Promise<Lock
   const result = await lockEndpoint(endpoint, { settleMs: 20, ...options });
   if (result.state === "held") lockServers.push(result.held.server);
   return result;
+}
+
+/**
+ * The next bind fails with `code`, reported as listen reports it: later,
+ * through "error". The bind itself isn't made.
+ */
+function bindFails(code: string): void {
+  vi.spyOn(Server.prototype, "listen").mockImplementationOnce(function (this: Server) {
+    const err = Object.assign(new Error(`listen ${code}`), { code, syscall: "listen" });
+    process.nextTick(() => this.emit("error", err));
+    return this;
+  });
 }
 
 function heldOf(result: LockResult): Held {
@@ -845,6 +858,32 @@ describe("taking the endpoint", () => {
     expect(result.state).toBe("held");
     expect(Date.now() - started).toBeGreaterThanOrEqual(500);
     expect(await probeDaemon({ endpoint })).toMatchObject({ state: "answered", info: { pid: process.pid } });
+  });
+
+  it("is taken for another's when bind says EEXIST, as macOS does when another start binds it at the same moment (engram#708)", async () => {
+    const endpoint = endpointIn(dir);
+    await holder(endpoint, answerLine({ pid: 4242 }));
+    bindFails("EEXIST");
+    expect(await lock(endpoint)).toEqual({
+      state: "taken",
+      taken: { why: "socket", info: expect.objectContaining({ pid: 4242 }) },
+    });
+  });
+
+  it("is bound again after EEXIST once nothing holds it", async () => {
+    const endpoint = endpointIn(dir);
+    bindFails("EEXIST");
+    const held = heldOf(await lock(endpoint));
+    expect(await probeDaemon({ endpoint })).toMatchObject({ state: "answered", info: { id: held.id } });
+  });
+
+  it("can't be used when bind fails for any other reason, and says why", async () => {
+    const endpoint = endpointIn(dir);
+    bindFails("EACCES");
+    expect(await lock(endpoint)).toEqual({
+      state: "unavailable",
+      reason: `couldn't listen on ${POSIX ? "~/.engram/daemon.sock" : "the daemon's named pipe"} (EACCES)`,
+    });
   });
 
   it("can be taken again once let go", async () => {

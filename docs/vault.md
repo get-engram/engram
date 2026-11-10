@@ -221,13 +221,23 @@ engram vault keygen
 engram vault keygen --save
 ```
 
+Both print the key's fingerprint. With `--save` the key itself is shown nowhere: it is only in the file.
+
 ### Check vault status
 
 ```bash
 engram vault status
 # Vault: configured (key at ~/.engram/vault-key)
-# Key prefix: dGhpcyBp...
+# Key fingerprint: 5e0f13c9
 ```
+
+The fingerprint tells keys apart without showing any of one: it is the first 8 hex characters of the SHA-256 of the key's 32 bytes. Each machine with the same key shows the same fingerprint, so you can check that two machines, or your shell and `~/.engram/vault-key`, hold one key. You can work it out without the CLI:
+
+```bash
+base64 -d < ~/.engram/vault-key | shasum -a 256 | cut -c1-8
+```
+
+(`sha256sum` in place of `shasum -a 256` on Linux.)
 
 ### Environment variable
 

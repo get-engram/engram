@@ -11,6 +11,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -61,9 +62,11 @@ const {
   sameVaultKey,
   VAULT_KEY_FILE,
   vaultKeyFileState,
+  vaultKeyFingerprint,
   VaultKeyUnreadable,
   vaultKeyFix,
   vaultKeySpellings,
+  whyNotVaultKey,
 } = await import("../vault-key.js");
 const { vaultKeygen, vaultSaveKey, vaultStatus } = await import("../commands/vault.js");
 const { daemonEndpoint } = await import("../daemon/instance.js");
@@ -82,6 +85,14 @@ const KEY = Buffer.alloc(32, 7).toString("base64");
 const ENV_KEY = Buffer.alloc(32, 9).toString("base64");
 /** In an error's message, as some carry the path or what was read. */
 const LEAK = "Q7X9-LEAK";
+/** A key no 8 characters of which repeat, so any of them shown would be seen. */
+const VARIED = Buffer.from(Array.from({ length: 32 }, (_, i) => (i * 73 + 41) & 0xff)).toString("base64");
+/** Each 8 characters of `key`: output showing any shows part of it (engram#699). */
+const eightsOf = (key: string) => Array.from({ length: key.length - 7 }, (_, i) => key.slice(i, i + 8));
+/** What of `key` `text` shows, 8 characters at a time: none, to pass. */
+const shown = (text: string, key: string) => eightsOf(key).filter((eight) => text.includes(eight));
+/** The fingerprint, worked out apart: the first 8 hex of SHA-256 over the key's bytes. */
+const sha256Of = (key: string) => createHash("sha256").update(Buffer.from(key, "base64")).digest("hex").slice(0, 8);
 
 const errno = (code: string, message = `${code}: injected ${LEAK}`) => Object.assign(new Error(message), { code });
 
@@ -393,6 +404,7 @@ describe("vault status (engram#677)", () => {
     await vaultStatus();
     expect(out).toEqual([
       "Vault: configured (key in ENGRAM_VAULT_KEY)",
+      `Key fingerprint: ${sha256Of(ENV_KEY)}`,
       "  ~/.engram/vault-key, which the daemon reads, is a folder, not a file. See 'engram status'.",
     ]);
   });
@@ -402,6 +414,7 @@ describe("vault status (engram#677)", () => {
     await vaultStatus();
     expect(out).toEqual([
       "Vault: configured (key in ENGRAM_VAULT_KEY)",
+      `Key fingerprint: ${sha256Of(ENV_KEY)}`,
       "  ~/.engram/vault-key isn't there: a daemon started at login may not have this key.",
       "  To save it there, readable only by you: engram vault save-key",
     ]);
@@ -411,7 +424,7 @@ describe("vault status (engram#677)", () => {
     vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
     writeFileSync(KEY_FILE, `${ENV_KEY}\n`, { mode: 0o600 });
     await vaultStatus();
-    expect(out).toEqual(["Vault: configured (key in ENGRAM_VAULT_KEY)"]);
+    expect(out).toEqual(["Vault: configured (key in ENGRAM_VAULT_KEY)", `Key fingerprint: ${sha256Of(ENV_KEY)}`]);
   });
 
   it("ENGRAM_VAULT_KEY, and another key in the file: which a daemon started at login may use (engram#690)", async () => {
@@ -420,6 +433,7 @@ describe("vault status (engram#677)", () => {
     await vaultStatus();
     expect(out).toEqual([
       "Vault: configured (key in ENGRAM_VAULT_KEY)",
+      `Key fingerprint: ${sha256Of(ENV_KEY)}`,
       "  ~/.engram/vault-key holds a different key: a daemon started at login may use that one.",
       "  If this one is right: engram vault save-key --force (the file's key is backed up first)",
     ]);
@@ -438,10 +452,96 @@ describe("vault status (engram#677)", () => {
     expect(out).toEqual(["Vault: not configured", "Run 'engram vault keygen --save' to generate a key."]);
   });
 
-  it("a key: configured", async () => {
+  it("a key: configured, and its fingerprint (engram#699)", async () => {
     writeFileSync(KEY_FILE, `${KEY}\n`, { mode: 0o600 });
     await vaultStatus();
-    expect(out).toEqual([`Vault: configured (key at ${VAULT_KEY_FILE})`, `Key prefix: ${KEY.slice(0, 8)}...`]);
+    expect(out).toEqual([`Vault: configured (key at ${VAULT_KEY_FILE})`, `Key fingerprint: ${sha256Of(KEY)}`]);
+  });
+});
+
+describe("the vault key's fingerprint, which shows none of the key (engram#699)", () => {
+  it("the first 8 hex of SHA-256 over the key's bytes: one however the key is written, another for another key", () => {
+    expect(vaultKeyFingerprint(VARIED)).toMatch(/^[0-9a-f]{8}$/);
+    expect(vaultKeyFingerprint(VARIED)).toBe(sha256Of(VARIED));
+    const unpadded = VARIED.replace(/=+$/, "");
+    expect(unpadded).not.toBe(VARIED);
+    for (const spelling of [unpadded, `  ${VARIED}\n`, `${unpadded}\r\n`]) {
+      expect(vaultKeyFingerprint(spelling), JSON.stringify(spelling)).toBe(sha256Of(VARIED));
+    }
+    expect(vaultKeyFingerprint(KEY)).toBe(sha256Of(KEY));
+    expect(sha256Of(KEY)).not.toBe(sha256Of(ENV_KEY));
+    expect(vaultKeyFingerprint(ENV_KEY)).toBe(sha256Of(ENV_KEY));
+    // Not a vault key: none.
+    expect(vaultKeyFingerprint(Buffer.alloc(16, 7).toString("base64"))).toBeNull();
+    expect(vaultKeyFingerprint(Buffer.alloc(32, 0xff).toString("base64url"))).toBeNull();
+    expect(vaultKeyFingerprint(LEAK)).toBeNull();
+    expect(vaultKeyFingerprint("")).toBeNull();
+  });
+
+  it("why a key isn't one, as status says it: what the SDK can't read, or how many bytes it holds", () => {
+    expect(whyNotVaultKey(VARIED)).toBeNull();
+    expect(whyNotVaultKey(` ${VARIED.replace(/=+$/, "")}\n`)).toBeNull();
+    expect(whyNotVaultKey(Buffer.alloc(16, 7).toString("base64"))).toBe("expected 32 bytes, got 16");
+    expect(whyNotVaultKey(Buffer.alloc(33, 7).toString("base64"))).toBe("expected 32 bytes, got 33");
+    expect(whyNotVaultKey(Buffer.alloc(32, 0xff).toString("base64url"))).toBe("not base64");
+    expect(whyNotVaultKey(LEAK)).toBe("not base64");
+  });
+
+  it("status: the fingerprint, and no 8 characters of the key, from the file or ENGRAM_VAULT_KEY", async () => {
+    writeFileSync(KEY_FILE, `${VARIED}\n`, { mode: 0o600 });
+    await vaultStatus();
+    expect(out).toEqual([`Vault: configured (key at ${VAULT_KEY_FILE})`, `Key fingerprint: ${sha256Of(VARIED)}`]);
+    expect(shown(out.join("\n"), VARIED)).toEqual([]);
+
+    // The same key written another way: the same fingerprint.
+    out = [];
+    vi.stubEnv("ENGRAM_VAULT_KEY", `${VARIED.replace(/=+$/, "")}\n`);
+    await vaultStatus();
+    expect(out).toEqual(["Vault: configured (key in ENGRAM_VAULT_KEY)", `Key fingerprint: ${sha256Of(VARIED)}`]);
+    expect(shown(out.join("\n"), VARIED)).toEqual([]);
+  });
+
+  it("status: a key the SDK can't read isn't configured, and has no fingerprint", async () => {
+    const urlSafe = Buffer.alloc(32, 0xff).toString("base64url");
+    writeFileSync(KEY_FILE, `${urlSafe}\n`, { mode: 0o600 });
+    await vaultStatus();
+    expect(out).toEqual(["Vault: invalid key (not base64)"]);
+    out = [];
+    vi.stubEnv("ENGRAM_VAULT_KEY", urlSafe);
+    await vaultStatus();
+    expect(out).toEqual(["Vault: invalid key in ENGRAM_VAULT_KEY (not base64)"]);
+    out = [];
+    writeFileSync(KEY_FILE, `${Buffer.alloc(16, 7).toString("base64")}\n`, { mode: 0o600 });
+    vi.stubEnv("ENGRAM_VAULT_KEY", undefined);
+    await vaultStatus();
+    expect(out).toEqual(["Vault: invalid key (expected 32 bytes, got 16)"]);
+  });
+
+  it("keygen --save: the fingerprint status says, and no 8 characters of the key", async () => {
+    rmSync(KEY_FILE, { force: true });
+    await vaultKeygen([], { save: "" });
+    const saved = readFileSync(KEY_FILE, "utf-8").trim();
+    expect(out.slice(0, 3)).toEqual([
+      `Vault key generated and saved to: ${VAULT_KEY_FILE}`,
+      "Permissions set to owner-only (600).",
+      `Key fingerprint: ${sha256Of(saved)}`,
+    ]);
+    expect(out).toContain(`  export ENGRAM_VAULT_KEY="$(cat ~/.engram/vault-key)"`);
+    expect(shown([...out, ...errs].join("\n"), saved)).toEqual([]);
+
+    const made = out[2];
+    out = [];
+    await vaultStatus();
+    expect(out).toEqual([`Vault: configured (key at ${VAULT_KEY_FILE})`, made]);
+  });
+
+  it("keygen: the key, as asked, then its fingerprint; nothing more of it", async () => {
+    await vaultKeygen([], {});
+    const [key, fingerprint, ...rest] = out;
+    expect(Buffer.from(key, "base64")).toHaveLength(32);
+    expect(fingerprint).toBe(`Key fingerprint: ${sha256Of(key)}`);
+    expect(shown(rest.join("\n"), key)).toEqual([]);
+    expect(existsSync(KEY_FILE)).toBe(false);
   });
 });
 
@@ -804,7 +904,8 @@ describe("the daemon running now, after a key is saved (engram#693)", () => {
 
   /**
    * What save-key, then keygen --save, say of the daemon running now: the
-   * lines after the two that say where the key went. `daemon`: what answers.
+   * lines after the two that say where the key went, and keygen's after
+   * the key's fingerprint (engram#699). `daemon`: what answers.
    */
   async function hints(daemon: () => Promise<() => Promise<void>>): Promise<{ saved: string[]; made: string[] }> {
     vi.stubEnv("ENGRAM_VAULT_KEY", ENV_KEY);
@@ -818,7 +919,8 @@ describe("the daemon running now, after a key is saved (engram#693)", () => {
       rmSync(KEY_FILE);
       await vaultKeygen([], { save: "" });
       // Up to the blank line before how to use the key.
-      return { saved, made: out.slice(2, out.indexOf("")) };
+      expect(out[2]).toMatch(/^Key fingerprint: [0-9a-f]{8}$/);
+      return { saved, made: out.slice(3, out.indexOf("")) };
     } finally {
       await stop();
     }
@@ -874,7 +976,7 @@ describe("vault keygen: saving the key for the daemon at login (engram#690)", ()
     await vaultKeygen([], {});
     expect(out.slice(-3)).toEqual([
       "Usage with environment variable:",
-      expect.stringMatching(/^ {2}export ENGRAM_VAULT_KEY=.{8}\.\.\.$/),
+      `  export ENGRAM_VAULT_KEY="<the key above>"`,
       "  Then 'engram vault save-key' saves it for the daemon started at login.",
     ]);
   });

@@ -15,6 +15,7 @@
  * daemon/ownership.js, which are too. The daemon reads the key with this.
  */
 
+import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -154,6 +155,31 @@ function keyBytes(key: string): string | null {
 /** `key` is a vault key: 32 bytes, base64-encoded, as the SDK takes one. */
 export function isVaultKey(key: string): boolean {
   return keyBytes(key)?.length === 32;
+}
+
+/**
+ * Why `key` isn't a vault key, as `vault status` says it, or null when it
+ * is one: it isn't base64 the SDK reads, or it holds too many or too few
+ * bytes.
+ */
+export function whyNotVaultKey(key: string): string | null {
+  const bytes = keyBytes(key);
+  if (bytes === null) return "not base64";
+  return bytes.length === 32 ? null : `expected 32 bytes, got ${bytes.length}`;
+}
+
+/**
+ * A vault key's fingerprint (engram#699): the first 8 hex characters of
+ * SHA-256 over its 32 bytes. It tells two keys apart and shows none of
+ * either. `vault status` and `vault keygen` print it, and what they print
+ * may be captured, as the start of the key was. One key written two ways
+ * (a line's end, padding) has one fingerprint. Null when `key` isn't a
+ * vault key.
+ */
+export function vaultKeyFingerprint(key: string): string | null {
+  const bytes = keyBytes(key);
+  if (bytes?.length !== 32) return null;
+  return createHash("sha256").update(bytes, "latin1").digest("hex").slice(0, 8);
 }
 
 /**

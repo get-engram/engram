@@ -158,6 +158,8 @@ engram vault keygen
 engram vault keygen --save
 ```
 
+It also prints the key's fingerprint, which `engram vault status` shows too. With `--save`, it shows none of the key itself.
+
 With no key saved, `--save` first checks your vault. If it already holds secrets, they were saved with another key, which a new one can't decrypt, and the daemon would hold what it captures (see [the vault guide](./vault.md#a-key-that-doesnt-match-your-vault)). Then it saves nothing, and says how to put that key back, unless you add `--force`.
 
 | Flag | Description |
@@ -260,13 +262,16 @@ Check vault configuration status.
 ```bash
 engram vault status
 # Vault: configured (key at /Users/you/.engram/vault-key)
-# Key prefix: dGhpcyBp...
+# Key fingerprint: 5e0f13c9
 
 # With ENGRAM_VAULT_KEY set, and the file without it:
 # Vault: configured (key in ENGRAM_VAULT_KEY)
+# Key fingerprint: 5e0f13c9
 #   ~/.engram/vault-key isn't there: a daemon started at login may not have this key.
 #   To save it there, readable only by you: engram vault save-key
 ```
+
+The fingerprint is the first 8 hex characters of the SHA-256 of the key's 32 bytes. It shows none of the key, and one key has one fingerprint on every machine, however it is written, so two machines with the same fingerprint have the same key. A key the SDK can't read shows `Vault: invalid key (not base64)`, or `(expected 32 bytes, got N)`, and no fingerprint.
 
 ### engram help
 

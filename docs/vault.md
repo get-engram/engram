@@ -247,6 +247,20 @@ engram vault save-key
 
 A daemon already running reads `~/.engram/vault-key` again before each send, and every 10 minutes, so a key saved there, or a new one in its place, is used without a restart: what it has captured waits until the vault has been read with that key, then goes out with your vault's secrets removed. A daemon started with `ENGRAM_VAULT_KEY` set goes on using that key. If the file can't be read (a folder in its place, say), the daemon holds what it captures until it can; nothing is lost. If you delete the file, the daemon goes on with the key it read until it restarts, and `engram status` warns that it will start without one.
 
+#### A key that doesn't match your vault
+
+Each secret decrypts only with the key it was saved with. If the daemon's key decrypts none of your vault's secrets (they were saved with a key you replaced, or on another machine), it can't remove them from what it captures, so it holds what it captures instead of sending it with them in it. Nothing is lost. `engram status`, the daemon's log and a desktop notification say so. To send what it holds, do one of these:
+
+- Put the key they were saved with back in `~/.engram/vault-key` (or in `ENGRAM_VAULT_KEY`, then `engram stop` and `engram start`).
+- Save each again with this key: `engram vault set <NAME>`.
+- Delete each you no longer use: `engram vault delete <NAME>`. One you still use, save again instead: once it is deleted, the daemon no longer removes it from what it captures.
+
+The daemon checks the vault again within 5 minutes, and sends what it held once none is left that it can't remove. If you save them again one at a time, it holds until the last: before then, what it holds would go out with the others in it. Restarting the daemon doesn't send it either. Only a daemon started with no vault key at all sends it, as it sends everything without a key, with only the built-in patterns removed.
+
+If only some of them don't decrypt, and the daemon wasn't holding for them already, it keeps sending, and `engram status` says how many it can't remove. The fix is the same, except for putting the old key back: the others don't decrypt with it. `engram vault list --check` shows which secrets don't decrypt with your key, without showing any value.
+
+`engram vault keygen --save`, with no key saved, checks the vault first: if it already holds secrets, they were saved with another key, so it doesn't make a new one unless you add `--force`.
+
 ### Automatic protection with CLI
 
 When a vault key is configured, `engram store` automatically encrypts detected secrets:
@@ -406,7 +420,7 @@ const key = await generateVaultKey()
 
 ### Key rotation
 
-Currently, key rotation requires re-encrypting existing vault entries. A built-in rotation command is planned for a future release.
+Currently, key rotation requires re-encrypting existing vault entries. A built-in rotation command is planned for a future release. Until then, a secret saved with the old key doesn't decrypt with the new one: save each again with the new key, or delete each you no longer use. See [A key that doesn't match your vault](#a-key-that-doesnt-match-your-vault).
 
 ### Recovery
 

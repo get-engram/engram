@@ -19,7 +19,7 @@ import { configuredAccount, ownedKeysOf } from "./key-source.js";
 import { makeDirPrivateSync, type PrivateDirReport } from "../private-files.js";
 import { START_FAILED_EXIT } from "./supervise.js";
 import { foreignFiles, foreignFilesFix, foreignFilesProblem, OWNERSHIP_FIX } from "./ownership.js";
-import { notifyDesktopBeforeExit, recordVaultKey } from "./status.js";
+import { heldVaultMismatch, notifyDesktopBeforeExit, recordVaultKey, recordVaultUndecryptable } from "./status.js";
 import {
   claimDaemonLock,
   markReady,
@@ -227,6 +227,13 @@ async function main(): Promise<void> {
   // Where the key in use came from, for `engram status`: a key file deleted
   // since leaves it in use until a restart.
   const keyOrigin = (): "env" | "file" => (process.env.ENGRAM_VAULT_KEY ? "env" : "file");
+  // The daemon before this one held sends for secrets its vault key didn't
+  // decrypt (engram#694): they wait still, and status.json goes on saying
+  // so from this daemon's first write, so a restart before the vault is
+  // read holds them too. Without a key, a restart starts without the hold,
+  // as without a key at all.
+  const heldBefore = vaultKey !== undefined || keyProblem !== undefined ? heldVaultMismatch() : null;
+  if (heldBefore) recordVaultUndecryptable({ ...heldBefore, held: true });
   recordVaultKey(vaultKey ? keyOrigin() : null);
   // The account in use, for the vault read with a key found later.
   let account: Account | undefined = current;
@@ -250,10 +257,16 @@ async function main(): Promise<void> {
       return vault;
     },
   };
-  const vaultScrubber = new SecretScrubber(vaultFor(current), vaultKey, log, {
-    source: keySource,
-    problem: keyProblem,
-  });
+  // What each complete read finds of secrets the key doesn't decrypt
+  // (engram#694), for `engram status`: counts, never a name.
+  const vaultScrubber = new SecretScrubber(
+    vaultFor(current),
+    vaultKey,
+    log,
+    { source: keySource, problem: keyProblem },
+    recordVaultUndecryptable,
+  );
+  if (heldBefore) vaultScrubber.continueMismatchHold(heldBefore);
   scrubber = vaultScrubber;
   vaultScrubber.start();
   if (vaultKey) {

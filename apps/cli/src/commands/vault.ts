@@ -1,9 +1,12 @@
 import { dirname } from "node:path";
-import { generateVaultKey, type Engram } from "@getengram/sdk";
+import { Engram, generateVaultKey } from "@getengram/sdk";
 import { bold, dim, plural, red } from "../output.js";
+import { configForUse } from "../config-guard.js";
 import { confirmedDaemonInPidFile, probeDaemon } from "../daemon/instance.js";
+import { decryptFailed } from "../daemon/scrubber.js";
 import { readStatus } from "../daemon/status.js";
 import { ensurePrivateDirSync, writePrivateFileSync } from "../private-files.js";
+import { resolveBaseUrl } from "../server-url.js";
 import {
   envVaultKeyState,
   isVaultKey,
@@ -34,6 +37,62 @@ async function readKeyToReplace(): Promise<string | undefined> {
     console.error(dim("    mv ~/.engram/vault-key ~/.engram/vault-key.old"));
     process.exit(1);
   }
+}
+
+/**
+ * How many secrets the vault holds, for `keygen --save` with no key saved
+ * (engram#694): each was saved with another key, which a new one can't
+ * decrypt. Listing them decrypts nothing: the new key is the client's only
+ * because the SDK lists with one. "no account": nothing to check, signed
+ * out. "unknown": config.json can't be read, or the vault didn't answer.
+ */
+async function secretsInVault(key: string): Promise<number | "no account" | "unknown"> {
+  const read = await configForUse();
+  if ("problem" in read) return "unknown";
+  const apiKey = process.env.ENGRAM_API_KEY ?? read.config.apiKey;
+  if (!apiKey) return "no account";
+  try {
+    const client = new Engram({
+      apiKey,
+      baseUrl: resolveBaseUrl(read.config),
+      vault: { encryptionKey: key },
+      timeout: 10_000,
+    });
+    return (await client.vault.list()).length;
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * A new key, with none saved, over secrets the vault holds already
+ * (engram#694): none of them decrypt with it, and the daemon holds what it
+ * captures until they do, or are gone. Unless --force, the key isn't saved,
+ * and the command says what to do instead. A vault that can't be checked
+ * doesn't stop it: that is said, and the key is saved.
+ */
+async function refuseOverVaultSecrets(key: string): Promise<void> {
+  const found = await secretsInVault(key);
+  if (found === "no account" || found === 0) return;
+  if (found === "unknown") {
+    console.log(dim("Couldn't check your vault for secrets saved with another key. Any there"));
+    console.log(dim("don't decrypt with this one: 'engram vault list --check' shows which."));
+    return;
+  }
+  const one = found === 1;
+  console.error(bold(`Your vault holds ${plural(found, "secret")}, saved with another vault key.`));
+  console.error(`A new key can't decrypt ${one ? "it" : "them"}, so the daemon would hold what it captures`);
+  console.error(`rather than send it with ${one ? "that secret" : "those secrets"} in it. The key wasn't saved.`);
+  const env = await envVaultKeyState();
+  if (env === "none") {
+    console.error(dim("  ENGRAM_VAULT_KEY holds a key. If it's that one, save it: engram vault save-key"));
+  } else {
+    console.error(dim("  If you have that key, put it in ~/.engram/vault-key."));
+  }
+  console.error(dim("  To make a new key all the same: engram vault keygen --save --force. Then save"));
+  console.error(dim(`  ${one ? "the secret" : "each secret"} again with it (engram vault set <NAME>), or delete ${one ? "it if you no" : "each you no"}`));
+  console.error(dim(`  longer use${one ? " it" : ""} (engram vault delete <NAME>).`));
+  process.exit(1);
 }
 
 /** Back up the key about to be replaced, so a --force by mistake can be undone. */
@@ -70,6 +129,7 @@ export async function vaultKeygen(
       process.exit(1);
     }
     if (existing) backUpKey(existing);
+    else if (flags.force === undefined) await refuseOverVaultSecrets(key);
 
     // 0600, and in one step: a write cut short leaves the old key whole.
     // An overwrite in place also kept an old file's mode.
@@ -351,6 +411,7 @@ export async function vaultGet(
  * Usage:
  *   engram vault list
  *   engram vault list --json
+ *   engram vault list --check   (which decrypt with this vault key)
  */
 export async function vaultList(
   client: Engram,
@@ -358,9 +419,11 @@ export async function vaultList(
   flags: Record<string, string>
 ): Promise<void> {
   const secrets = await client.vault.list();
+  const checked = flags.check !== undefined ? await decrypting(client, secrets.map((s) => s.name)) : undefined;
 
   if (flags.json !== undefined) {
-    console.log(JSON.stringify({ secrets, total: secrets.length }));
+    const listed = checked ? secrets.map((s) => ({ ...s, decrypts: checked.get(s.name) ?? null })) : secrets;
+    console.log(JSON.stringify({ secrets: listed, total: secrets.length }));
     return;
   }
 
@@ -382,15 +445,74 @@ export async function vaultList(
 
   for (const s of secrets) {
     const updated = s.updatedAt.split("T")[0];
+    const check = checked?.get(s.name);
     console.log(
       s.name.padEnd(nameWidth) +
       dim(s.secretType.padEnd(typeWidth)) +
-      dim(updated)
+      dim(updated) +
+      (check === false ? red("  doesn't decrypt") : check === null ? dim("  couldn't check") : "")
     );
   }
 
   console.log();
   console.log(dim(plural(secrets.length, "secret")));
+  if (checked) printDecryptCheck([...checked.values()]);
+}
+
+/**
+ * Whether each secret decrypts with this vault key (engram#694): true,
+ * false, or null when it couldn't be told, a request that failed, or a
+ * secret deleted meanwhile. Each is read, as `vault get` reads one, and its
+ * value is dropped at once: never printed, nor kept.
+ */
+async function decrypting(client: Engram, names: string[]): Promise<Map<string, boolean | null>> {
+  const result = new Map<string, boolean | null>();
+  for (const name of names) {
+    try {
+      result.set(name, typeof (await client.vault.get(name)) === "string" ? true : null);
+    } catch (err: unknown) {
+      result.set(name, decryptFailed(err) ? false : null);
+    }
+  }
+  return result;
+}
+
+/** What `vault list --check` found, and what to do about the ones that don't decrypt. */
+function printDecryptCheck(checks: Array<boolean | null>): void {
+  const failed = checks.filter((c) => c === false).length;
+  const unknown = checks.filter((c) => c === null).length;
+  if (failed === 0 && unknown === 0) {
+    console.log(dim(checks.length === 1 ? "It decrypts with this vault key." : "Each decrypts with this vault key."));
+    return;
+  }
+  if (failed > 0) {
+    const one = failed === 1;
+    console.log(
+      red(
+        checks.length === 1
+          ? "It doesn't decrypt with this vault key: it was saved with another."
+          : `${failed} of them ${one ? "doesn't" : "don't"} decrypt with this vault key: saved with another.`,
+      ),
+    );
+    // Each: the key they were saved with may be the fix. Some: it isn't,
+    // as the others don't decrypt with it. Deleting one still in use stops
+    // the daemon removing it from what it captures: saving it again doesn't.
+    const them = one ? "it" : "each";
+    console.log(
+      dim(
+        failed === checks.length
+          ? `Put that key in ~/.engram/vault-key, or save ${them} again with this one`
+          : `Save ${them} again with this key`,
+      ),
+    );
+    console.log(
+      dim(
+        `(engram vault set <NAME>), or delete ${one ? "it if you no longer use it" : "each you no longer use"} ` +
+          "(engram vault delete <NAME>).",
+      ),
+    );
+  }
+  if (unknown > 0) console.log(dim(`${unknown} couldn't be checked: run this again.`));
 }
 
 /**

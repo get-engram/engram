@@ -618,4 +618,125 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("engram status, w
       "  WARNING: Can't reach Engram — messages queued, will retry.",
     ]);
   });
+
+  /** engram#698: what `engram status` says of a daemon with no vault key, and a vault with secrets. */
+  const missing = (secrets: number, envKey: boolean) => [
+    `  WARNING: The daemon has no vault key, and your vault has ${secrets === 1 ? "1 secret" : `${secrets} secrets`}.`,
+    `  Without the key, it can't remove ${secrets === 1 ? "its value" : "their values"} from what it captures before`,
+    "  sending it.",
+    ...(envKey
+      ? ["  To save ENGRAM_VAULT_KEY's key for it: engram vault save-key"]
+      : [
+          "  Put your vault key in ~/.engram/vault-key, or run 'engram vault save-key'",
+          "  from a shell where ENGRAM_VAULT_KEY holds it.",
+        ]),
+    "  The daemon reads it before its next send: no restart needed.",
+  ];
+  const noKeyLines = () => out.filter((l) => l.includes("has no vault key"));
+
+  it("running with no vault key, the vault holding secrets: how many, and how to give it the key (engram#698)", async () => {
+    sending(null, { vault_key_missing: { secrets: 2 } });
+    daemonRunning();
+    await daemonStatus();
+    const lines = missing(2, false);
+    expect(block(lines[0])).toEqual(lines);
+    expect(out.filter((l) => l.includes("WARNING"))).toEqual([lines[0]]);
+    expect(out).toContain(`Last sync:        ${SINCE}`);
+    // One: its value.
+    out = [];
+    sending(null, { vault_key_missing: { secrets: 1 } });
+    await daemonStatus();
+    expect(block(missing(1, false)[0])).toEqual(missing(1, false));
+  });
+
+  it("ENGRAM_VAULT_KEY set here, and no key file: save that key for it (engram#698)", async () => {
+    vi.stubEnv("ENGRAM_VAULT_KEY", ENV_VAULT_KEY);
+    sending(null, { vault_key_missing: { secrets: 2 } });
+    daemonRunning();
+    await daemonStatus();
+    expect(block(missing(2, true)[0])).toEqual(missing(2, true));
+    expect(out.join("\n")).not.toContain(ENV_VAULT_KEY);
+    // One that holds no key: not that one, then.
+    out = [];
+    vi.stubEnv("ENGRAM_VAULT_KEY", "not a vault key");
+    await daemonStatus();
+    expect(block(missing(2, false)[0])).toEqual(missing(2, false));
+  });
+
+  it("~/.engram/vault-key there: the daemon reads it before its next send, or holds sends while it can't, so not said (engram#698)", async () => {
+    writeFileSync(KEY_FILE, `${VAULT_KEY}\n`);
+    sending(null, { vault_key_missing: { secrets: 2 } });
+    daemonRunning();
+    await daemonStatus();
+    expect(noKeyLines()).toEqual([]);
+    // A folder: that is said instead.
+    rmSync(KEY_FILE);
+    keyFolder();
+    out = [];
+    await daemonStatus();
+    expect(noKeyLines()).toEqual([]);
+    expect(block(FOLDER[0])).toEqual([...FOLDER, REFUSED]);
+  });
+
+  it("a daemon with a key, one holding sends for one, or one signed out: not said (engram#698)", async () => {
+    daemonRunning();
+    for (const extra of [{ vault_key: "file" }, { vault_key: "env" }, { signed_out_at: SINCE }]) {
+      out = [];
+      sending(null, { vault_key_missing: { secrets: 2 }, ...extra });
+      await daemonStatus();
+      expect(noKeyLines()).toEqual([]);
+    }
+    // Holding sends for a key gone since: said as that.
+    out = [];
+    holding({ vault_key_missing: { secrets: 2 } });
+    await daemonStatus();
+    expect(noKeyLines()).toEqual([]);
+    expect(out).toContain(held(false)[0]);
+  });
+
+  it("stopped: what the last daemon counted says nothing of the next one (engram#698)", async () => {
+    sending(null, { vault_key_missing: { secrets: 2 } });
+    await daemonStatus();
+    expect(out[0]).toBe("Status: stopped");
+    expect(noKeyLines()).toEqual([]);
+  });
+
+  it("a count that isn't one: not said (engram#698)", async () => {
+    daemonRunning();
+    for (const found of [
+      { secrets: true },
+      { secrets: "2" },
+      { secrets: -1 },
+      { secrets: 0 },
+      { secrets: 1.5 },
+      { secrets: 2 ** 53 },
+      {},
+      null,
+      2,
+      "2",
+      [2],
+    ]) {
+      out = [];
+      sending(null, { vault_key_missing: found });
+      await daemonStatus();
+      expect(noKeyLines(), JSON.stringify(found)).toEqual([]);
+    }
+  });
+
+  it("failing for another reason as well: both said, this first (engram#698)", async () => {
+    sending(null, {
+      health: "warning",
+      error_type: "network",
+      last_error: "fetch failed",
+      last_error_at: SINCE,
+      pending_messages: 4,
+      vault_key_missing: { secrets: 2 },
+    });
+    daemonRunning();
+    await daemonStatus();
+    expect(out.filter((l) => l.includes("WARNING"))).toEqual([
+      missing(2, false)[0],
+      "  WARNING: Can't reach Engram — messages queued, will retry.",
+    ]);
+  });
 });

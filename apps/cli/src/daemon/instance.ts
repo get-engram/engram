@@ -179,12 +179,20 @@ export interface DaemonInfo {
    * before reads it every 10 minutes.
    */
   vaultChangeNotice: boolean;
+  /**
+   * Whether it has a vault key (engram#698). false: it has none, so only
+   * the built-in patterns are removed from what it sends. true: it has one,
+   * or holds sends for one it can't read. Undefined: one from before, or
+   * one that hasn't read it yet.
+   */
+  vaultKey?: boolean;
 }
 
 const self = {
   ready: false,
   stopping: false,
   startedAt: new Date().toISOString(),
+  vaultKey: undefined as boolean | undefined,
 };
 
 function answer(id: string): string {
@@ -200,6 +208,7 @@ function answer(id: string): string {
     stop_file: watchStopFile,
     vault_key_reread: true,
     vault_change_notice: true,
+    ...(self.vaultKey === undefined ? {} : { vault_key: self.vaultKey }),
   })}\n`;
 }
 
@@ -231,6 +240,7 @@ export function parseAnswer(line: string): DaemonInfo | null {
     stopFile: a.stop_file === true,
     vaultKeyReread: a.vault_key_reread === true,
     vaultChangeNotice: a.vault_change_notice === true,
+    vaultKey: typeof a.vault_key === "boolean" ? a.vault_key : undefined,
   };
 }
 
@@ -856,6 +866,15 @@ export function markReady(): void {
 /** Answer as stopping, so a start waits for this one to finish. */
 export function markStopping(): void {
   self.stopping = true;
+}
+
+/**
+ * Answer whether it has a vault key (engram#698), once it has read it: see
+ * DaemonInfo.vaultKey. It never goes back to none: a key read before is
+ * used until a restart, and one that can't be read holds sends.
+ */
+export function markVaultKey(has: boolean): void {
+  self.vaultKey = has;
 }
 
 function takenMessage(taken: Taken, endpoint: Endpoint): string {

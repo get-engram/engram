@@ -1794,6 +1794,51 @@ describe("the vault key a daemon started at login reads (engram#690)", () => {
       expect(text).toContain("Auto-start: enabled (systemd)");
       noWarning(text);
     });
+
+    it("the daemon running has no key, and the vault has secrets: said once, as that (engram#698)", async () => {
+      const status = join(ENGRAM_DIR, "status.json");
+      writeUnit(unitWith());
+      daemonRunning();
+      mkdirSync(ENGRAM_DIR, { recursive: true });
+      writeFileSync(status, JSON.stringify({ health: "healthy", vault_key: null, vault_key_missing: { secrets: 2 } }));
+      try {
+        await daemonStatus();
+      } finally {
+        rmSync(status, { force: true });
+      }
+      const text = output();
+      expect(text).toContain("Auto-start: enabled (systemd)");
+      expect(text).toContain("  WARNING: The daemon has no vault key, and your vault has 2 secrets.");
+      expect(warnedAt(text, NONE)).toBe(-1);
+      expect(text.split("\n").filter((line) => line.includes("save-key"))).toEqual([
+        "  To save ENGRAM_VAULT_KEY's key for it: engram vault save-key",
+      ]);
+    });
+
+    it("signed out, with a count left in status.json: not said, and the warning for start at login stays (engram#698)", async () => {
+      const status = join(ENGRAM_DIR, "status.json");
+      writeUnit(unitWith());
+      daemonRunning();
+      mkdirSync(ENGRAM_DIR, { recursive: true });
+      writeFileSync(
+        status,
+        JSON.stringify({
+          health: "healthy",
+          vault_key: null,
+          vault_key_missing: { secrets: 2 },
+          signed_out_at: "2026-11-10T00:00:00.000Z",
+        }),
+      );
+      try {
+        await daemonStatus();
+      } finally {
+        rmSync(status, { force: true });
+      }
+      const text = output();
+      expect(text).toContain("  Signed out — capture is paused and nothing is sent.");
+      expect(text).not.toContain("The daemon has no vault key");
+      expect(warnedAt(text, NONE)).toBeGreaterThan(-1);
+    });
   });
 
   describe("auto-capture", () => {

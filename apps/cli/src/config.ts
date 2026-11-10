@@ -1,8 +1,9 @@
+import { lstatSync, statSync, type Stats } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ensurePrivateDirSync, writePrivateFileSync } from "./private-files.js";
-import { isMissing, parseConfigText, readFailure } from "./config-file.js";
+import { isMissing, parseConfigText, readFailure, writeProblem } from "./config-file.js";
 
 // Where it always was, for the commands that import it from here.
 export { resolveBaseUrl } from "./server-url.js";
@@ -55,6 +56,46 @@ export async function loadConfigStrict(): Promise<Config> {
 export async function saveConfig(config: Config): Promise<void> {
   ensurePrivateDirSync(CONFIG_DIR);
   writePrivateFileSync(CONFIG_FILE, JSON.stringify(config, null, 2) + "\n");
+}
+
+/**
+ * Why saveConfig failed, as "~/.engram/config.json can't be written: …",
+ * and the command that fixes it, if there is one (engram#681): there is
+ * when ~/.engram or config.json is the user's and only lacks its write
+ * permission. Files that are another user's are said before the command,
+ * with their chown (engram#659). A full or read-only disk, a file locked
+ * some other way (EPERM: chmod can't change a locked file), or a
+ * config.json that is a link has none. The error's message, which names
+ * the path, is never quoted.
+ */
+export function saveFailure(err: unknown): { problem: string; fix: string | null } {
+  return { problem: `~/.engram/config.json ${writeProblem(err)}`, fix: writableFix(err) };
+}
+
+/** `chmod u+w` for what lacks its write permission, when that is all that's wrong. */
+function writableFix(err: unknown): string | null {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  if (code !== "EACCES" || process.platform === "win32") return null;
+  const uid = process.geteuid?.();
+  const unwritable: string[] = [];
+  const looked: [string, string][] = [
+    [CONFIG_DIR, "~/.engram"],
+    [CONFIG_FILE, "~/.engram/config.json"],
+  ];
+  for (const [path, shown] of looked) {
+    let st: Stats;
+    try {
+      // Through a link, the file and the folder its new copy is made in are
+      // elsewhere.
+      if (path === CONFIG_FILE && lstatSync(path).isSymbolicLink()) return null;
+      st = statSync(path);
+    } catch {
+      continue; // not there, so nothing to make writable
+    }
+    if (st.uid !== uid) return null;
+    if ((st.mode & 0o200) === 0) unwritable.push(shown);
+  }
+  return unwritable.length > 0 ? `chmod u+w ${unwritable.join(" ")}` : null;
 }
 
 export function getApiKey(): string {

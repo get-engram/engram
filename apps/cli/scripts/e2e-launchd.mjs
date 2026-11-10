@@ -22,8 +22,10 @@
  *     again after it was killed, and a start right after a stop is the
  *     job's too. With a server set in its environment, which launchd's
  *     daemon wouldn't have, start starts the daemon itself, and a start
- *     after that says launchd doesn't run it. `engram start --install`
- *     turns start at login on first, and launchd starts the daemon.
+ *     after that says launchd doesn't run it, as `engram status` does
+ *     under its Auto-start line (engram#692), which says nothing of it
+ *     while launchd runs the daemon. `engram start --install` turns start
+ *     at login on first, and launchd starts the daemon.
  *   - `engram install` after `engram stop`, the job loaded already, has
  *     launchd start the daemon too (engram#691): a job launchd has loaded
  *     isn't loaded again, which is what starts one at login. Installed
@@ -506,6 +508,13 @@ async function run() {
     job()?.pid === kicked && isDeepStrictEqual(ourWorkers(), [kicked]),
     `start again: the same daemon, and only it (${ourWorkers().join(", ")})`,
   );
+  // Nor does engram status (engram#692).
+  const kickedStatus = engram(["status"], { env: launchdEnv });
+  check(
+    autoStartLine(kickedStatus.out) === "Auto-start: enabled (launchd)",
+    `status: start at login is on (${autoStartLine(kickedStatus.out)})`,
+  );
+  check(!kickedStatus.out.includes("wasn't started by launchd"), "status: says nothing of launchd, which runs the daemon");
 
   // Killed outright: launchd starts it again, as it does the one it starts at login.
   process.kill(kicked, "SIGKILL");
@@ -559,6 +568,13 @@ async function run() {
   check(
     outside.out.includes(`The running daemon (pid ${directPid}) wasn't started by launchd`),
     "start: says launchd won't restart it after a crash",
+  );
+  const outsideStatus = engram(["status"], { env: launchdEnv });
+  check(
+    outsideStatus.out.includes(
+      `Auto-start: enabled (launchd)\n  The running daemon (pid ${directPid}) wasn't started by launchd`,
+    ),
+    "status: says it too, under its Auto-start line (engram#692)",
   );
   check(job()?.state !== "running", "start: leaves it running, and launchd's job stopped");
   engram(["stop"]);

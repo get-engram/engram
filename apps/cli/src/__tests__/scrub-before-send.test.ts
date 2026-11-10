@@ -32,6 +32,8 @@ import {
   READ_RETRY_MS,
   MAX_SERVER_HOLD_MS,
   MISMATCH_RETRY_MS,
+  FULL_READ_MS,
+  SAME_LIST_MS,
   decryptFailed,
   type Undecryptable,
   type VaultKeySource,
@@ -1676,6 +1678,291 @@ describe("a vault key that decrypts none of the vault's secrets holds sends (eng
     for (const err of [offline(), timedOut(), unavailable(), busy(), noReadScope(), new SyntaxError("Unexpected token")]) {
       expect(decryptFailed(err), String(err)).toBe(false);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// engram#704: each vault_list and vault_get is an audit row on the server.
+// While sends go, the interval lists the vault, and reads each secret again
+// only when the list says something changed, or FULL_READ_MS has passed.
+
+/** The daemon's interval. */
+const TICK = 10 * 60_000;
+
+/** A vault whose list dates each secret, as the server's does. */
+const dated = (secrets: Record<string, string>): FakeVault => {
+  const vault = new FakeVault(secrets);
+  for (const name of Object.keys(secrets)) vault.saved[name] = "2026-11-07T12:00:00Z";
+  return vault;
+};
+
+describe("the interval reads each secret again only when the list has changed (engram#704)", () => {
+  /** Started on the interval, as worker-main starts it, with the first read settled. */
+  async function started(s: SecretScrubber): Promise<SecretScrubber> {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.setSystemTime(new Date("2026-11-08T00:00:00Z"));
+    s.start(TICK);
+    await settle();
+    expect(await s.ready()).toBe(true);
+    return s;
+  }
+
+  async function tick(n = 1): Promise<void> {
+    for (let i = 0; i < n; i++) {
+      await vi.advanceTimersByTimeAsync(TICK);
+      await settle();
+    }
+  }
+
+  /** Lists, and secrets read. */
+  const reads = (vault: FakeVault) => [vault.lists, vault.gets.length];
+
+  it("the same list: one list a tick and no secret read, until FULL_READ_MS has passed", async () => {
+    const vault = dated({ PIN: "4821", TOKEN: "tok-value-1234" });
+    const s = await started(new SecretScrubber(vault, KEY));
+    expect(reads(vault)).toEqual([1, 2]);
+    // The list the first read found hadn't been found before it: the next
+    // tick reads each secret again.
+    await tick();
+    expect(reads(vault)).toEqual([2, 4]);
+    // Then the list only, for FULL_READ_MS since that read.
+    const ticks = FULL_READ_MS / TICK;
+    await tick(ticks - 1);
+    expect(reads(vault)).toEqual([1 + ticks, 4]);
+    await tick();
+    expect(reads(vault)).toEqual([2 + ticks, 6]);
+    // That read found the list the ticks before it did: the list only again.
+    await tick(3);
+    expect(reads(vault)).toEqual([5 + ticks, 6]);
+    // Scrubbed all along, and sends never waited for a tick.
+    expect(s.scrub("4821 tok-value-1234").text).toBe("[VAULT:PIN] [VAULT:TOKEN]");
+    expect(await s.ready()).toBe(true);
+    expect(reads(vault)).toEqual([5 + ticks, 6]);
+    s.stop();
+  });
+
+  it("stopped and started again: as at first", async () => {
+    const vault = dated({ PIN: "4821" });
+    const s = await started(new SecretScrubber(vault, KEY));
+    await tick(3);
+    expect(reads(vault)).toEqual([4, 2]);
+    s.stop();
+    s.start(TICK);
+    await settle();
+    expect(await s.ready()).toBe(true);
+    expect(reads(vault)).toEqual([5, 3]);
+    await tick();
+    expect(reads(vault)).toEqual([6, 4]);
+    await tick();
+    expect(reads(vault)).toEqual([7, 4]);
+    s.stop();
+  });
+
+  it("a secret saved again: each is read at the next tick, its new value scrubbed, and read again at the one after", async () => {
+    const vault = dated({ PIN: "4821", TOKEN: "tok-value-1234" });
+    const s = await started(new SecretScrubber(vault, KEY));
+    await tick(2);
+    expect(reads(vault)).toEqual([3, 4]);
+    // Saved again on another machine: a new value, and a new updatedAt.
+    vault.secrets.PIN = "9930";
+    vault.saved.PIN = "2026-11-08T00:25:00Z";
+    await tick();
+    expect(reads(vault)).toEqual([4, 6]);
+    expect(s.scrub("PIN 9930").text).toBe("PIN [VAULT:PIN]");
+    // Saved again within the second that read found it: the list is the
+    // same, and the next tick reads each secret all the same.
+    vault.secrets.PIN = "7716";
+    await tick();
+    expect(reads(vault)).toEqual([5, 8]);
+    expect(s.scrub("PIN 7716").text).toBe("PIN [VAULT:PIN]");
+    await tick(2);
+    expect(reads(vault)).toEqual([7, 8]);
+    s.stop();
+  });
+
+  it("a secret added, or deleted: each is read at the next tick", async () => {
+    const vault = dated({ PIN: "4821" });
+    const s = await started(new SecretScrubber(vault, KEY));
+    await tick(2);
+    expect(reads(vault)).toEqual([3, 2]);
+    vault.secrets.NEW = "new-secret-value";
+    vault.saved.NEW = "2026-11-08T00:25:00Z";
+    await tick();
+    expect(vault.gets.slice(2)).toEqual(["PIN", "NEW"]);
+    expect(s.scrub("new-secret-value").text).toBe("[VAULT:NEW]");
+    await tick(2);
+    expect(reads(vault)).toEqual([6, 6]);
+
+    delete vault.secrets.NEW;
+    delete vault.saved.NEW;
+    await tick();
+    expect(reads(vault)).toEqual([7, 7]);
+    expect(s.scrub("new-secret-value").text).toBe("new-secret-value");
+    s.stop();
+  });
+
+  it("a list that doesn't date each secret: each is read at every tick, as before", async () => {
+    const undated = new FakeVault({ PIN: "4821" });
+    const s = await started(new SecretScrubber(undated, KEY));
+    await tick(3);
+    expect(reads(undated)).toEqual([4, 4]);
+    s.stop();
+
+    const some = dated({ PIN: "4821", TOKEN: "tok-value-1234" });
+    delete some.saved.TOKEN;
+    const t = await started(new SecretScrubber(some, KEY));
+    await tick(3);
+    expect(reads(some)).toEqual([4, 8]);
+    t.stop();
+  });
+
+  it("a list that fails: nothing changes, and the next tick reads each secret", async () => {
+    const vault = dated({ PIN: "4821", TOKEN: "tok-value-1234" });
+    const s = await started(new SecretScrubber(vault, KEY));
+    await tick(2);
+    expect(reads(vault)).toEqual([3, 4]);
+    for (const fail of [offline, busy]) {
+      vault.listError = fail;
+      await tick();
+      vault.listError = null;
+      const [lists, gets] = reads(vault);
+      await tick();
+      expect(reads(vault)).toEqual([lists + 1, gets + 2]);
+      await tick();
+      expect(reads(vault)).toEqual([lists + 2, gets + 2]);
+    }
+    expect(s.scrub("4821 tok-value-1234").text).toBe("[VAULT:PIN] [VAULT:TOKEN]");
+    s.stop();
+  });
+
+  it("a secret that can't be read, or is gone, or is refused: the next tick reads each secret again", async () => {
+    for (const fail of [offline, timedOut, unavailable, busy, noReadScope, null]) {
+      const vault = dated({ PIN: "4821", TOKEN: "tok-value-1234" });
+      const s = await started(new SecretScrubber(vault, KEY));
+      // The read at the first tick finds the list found at start: it would
+      // stand for that list, but for TOKEN, which it can't read (null: gone
+      // between the list and the read).
+      if (fail) vault.getErrors.TOKEN = fail;
+      else (vault.secrets as Record<string, string | undefined>).TOKEN = undefined;
+      await tick();
+      expect(reads(vault), String(fail)).toEqual([2, 4]);
+      delete vault.getErrors.TOKEN;
+      vault.secrets.TOKEN = "tok-value-1234";
+      await tick();
+      expect(reads(vault), String(fail)).toEqual([3, 6]);
+      expect(s.scrub("tok-value-1234").text).toBe("[VAULT:TOKEN]");
+      // Read in full with the list found before: the list only from then on.
+      await tick();
+      expect(reads(vault), String(fail)).toEqual([4, 6]);
+      s.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("told the vault changed: each secret is read before the next send, though the list is the same", async () => {
+    let notice: string | null = null;
+    const vault = dated({ PIN: "4821" });
+    const s = new SecretScrubber(vault, KEY);
+    s.followChanges(() => notice);
+    await started(s);
+    await tick(3);
+    expect(reads(vault)).toEqual([4, 2]);
+    notice = "2026-11-08T00:35:00.000Z 1";
+    expect(await s.ready()).toBe(true);
+    expect(reads(vault)).toEqual([5, 3]);
+    // It found the list the ticks before it did.
+    await tick();
+    expect(reads(vault)).toEqual([6, 3]);
+    s.stop();
+  });
+
+  it("another client, or another vault key: each secret is read through it, and at the tick after", async () => {
+    const before = dated({ PIN: "4821" });
+    const s = await started(new SecretScrubber(before, KEY));
+    await tick(2);
+    expect(reads(before)).toEqual([3, 2]);
+    // The API key changed (engram#587): the same list, through another client.
+    const other = dated({ PIN: "4821" });
+    await s.reconnect(other);
+    expect(reads(other)).toEqual([1, 1]);
+    await tick();
+    expect(reads(other)).toEqual([2, 2]);
+    await tick();
+    expect(reads(other)).toEqual([3, 2]);
+    expect(reads(before)).toEqual([3, 2]);
+    s.stop();
+
+    // A vault key put in place of the one in use (engram#693).
+    const withA = dated({ PIN: "4821" });
+    const withB = dated({ PIN: "4821" });
+    const source = new FakeKeyFile(withB);
+    source.finds = () => KEY_A;
+    const t = await started(reading(source, withA, KEY_A));
+    await tick(2);
+    expect(reads(withA)).toEqual([3, 2]);
+    source.finds = () => KEY_B;
+    expect(await t.ready()).toBe(true);
+    expect(reads(withB)).toEqual([1, 1]);
+    await tick();
+    expect(reads(withB)).toEqual([2, 2]);
+    await tick();
+    expect(reads(withB)).toEqual([3, 2]);
+    t.stop();
+  });
+
+  it("a key that decrypts some of the secrets: what it found stands, and is told once, until a secret is saved again (engram#694)", async () => {
+    const vault = dated({ PIN: "4821", OLD: "old-value" });
+    vault.getErrors.OLD = wrongKey;
+    const found: Undecryptable[] = [];
+    const s = await started(new SecretScrubber(vault, KEY, undefined, undefined, (f) => found.push(f)));
+    await tick(4);
+    expect(reads(vault)).toEqual([5, 4]);
+    expect(found).toEqual([
+      { secrets: 1, unscrubbed: 1, decrypted: 1, held: false },
+      { secrets: 1, unscrubbed: 1, decrypted: 1, held: false },
+    ]);
+    expect(s.failure).toBeUndefined();
+    expect(await s.ready()).toBe(true);
+
+    // Saved again with the key in use: it decrypts now.
+    delete vault.getErrors.OLD;
+    vault.saved.OLD = "2026-11-08T00:45:00Z";
+    await tick();
+    expect(reads(vault)).toEqual([6, 6]);
+    expect(found.at(-1)).toEqual({ secrets: 0, unscrubbed: 0, decrypted: 2, held: false });
+    expect(s.scrub("old-value").text).toBe("[VAULT:OLD]");
+    s.stop();
+  });
+
+  it("SAME_LIST_MS: a read stands for the list only once that list had been found SAME_LIST_MS before it", async () => {
+    let notice: string | null = null;
+    const vault = dated({ PIN: "4821" });
+    const s = new SecretScrubber(vault, KEY);
+    s.followChanges(() => notice);
+    await started(s);
+    // Told the vault changed just short of SAME_LIST_MS after the first
+    // list: that read doesn't stand for the list either.
+    vi.setSystemTime(Date.now() + SAME_LIST_MS - 1);
+    notice = "1";
+    expect(await s.ready()).toBe(true);
+    expect(reads(vault)).toEqual([2, 2]);
+    await tick();
+    expect(reads(vault)).toEqual([3, 3]);
+    await tick();
+    expect(reads(vault)).toEqual([4, 3]);
+
+    // Saved again, found at a tick, and told the vault changed SAME_LIST_MS
+    // after: that read stands for the list.
+    vault.saved.PIN = "2026-11-08T00:25:00Z";
+    await tick();
+    expect(reads(vault)).toEqual([5, 4]);
+    vi.setSystemTime(Date.now() + SAME_LIST_MS);
+    notice = "2";
+    expect(await s.ready()).toBe(true);
+    expect(reads(vault)).toEqual([6, 5]);
+    await tick();
+    expect(reads(vault)).toEqual([7, 5]);
+    s.stop();
   });
 });
 

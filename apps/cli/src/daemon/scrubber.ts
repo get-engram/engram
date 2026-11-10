@@ -169,6 +169,24 @@ export const MISMATCH_RETRY_MS = [10_000, 30_000, 60_000, 120_000, 300_000];
 /** …and read each secret again at least this often, though the list is the same. */
 export const MISMATCH_REREAD_MS = 10 * 60_000;
 
+/**
+ * While sends go, each secret is read again at least this often (engram#704).
+ * Between those reads, the interval lists the vault and reads no secret while
+ * the list is the same as at the last of them: a secret isn't saved again
+ * without its updatedAt changing. This covers what a list can't tell.
+ */
+export const FULL_READ_MS = 6 * 60 * 60_000;
+
+/**
+ * A read of each secret stands for a list the same as its own only when
+ * that list had been found this long before it (engram#704). updatedAt is
+ * to the second: a secret saved twice within the second it was read lists
+ * the same after as before. Once a second has passed since the list was
+ * first found, a secret saved again lists another updatedAt. The margin is
+ * for the time a request takes, and the clock.
+ */
+export const SAME_LIST_MS = 60_000;
+
 /** What a list says of each secret: its name, and when it was last saved. */
 function fingerprint(entries: Array<{ name: string; updatedAt?: string }>): string {
   return JSON.stringify(
@@ -243,6 +261,21 @@ export class SecretScrubber {
    * a read through it settles.
    */
   private settledFor: VaultLike | null | undefined = undefined;
+  /**
+   * The list that, found again by a re-read, stands for the value of each
+   * secret the read that settled read, and when that read was (engram#704).
+   * Set with settledFor, so a read through another client never finds it.
+   * Undefined: each secret is read next time.
+   */
+  private settledPrint: string | undefined = undefined;
+  private settledAt = 0;
+  /**
+   * The list the reads through the current client have found each time
+   * since it first did, and when that was: after the list that first found
+   * it came back (engram#704).
+   */
+  private seenPrint: string | undefined = undefined;
+  private seenAt = 0;
   /** Why the last read through the current client fell short. */
   private lastFailure: unknown = undefined;
   private retryAt = 0;
@@ -457,6 +490,7 @@ export class SecretScrubber {
     this.vault = vault;
     this.mismatchPrint = undefined;
     this.settledFor = undefined;
+    this.seenPrint = undefined;
     this.lastFailure = undefined;
     this.retryAt = 0;
     this.retryStep = 0;
@@ -562,6 +596,7 @@ export class SecretScrubber {
     this.keyForms = [];
     this.own = new Map();
     this.settledFor = undefined;
+    this.seenPrint = undefined;
     this.serverFailingSince = 0;
     this.released = false;
     this.mismatch = undefined;
@@ -805,12 +840,18 @@ export class SecretScrubber {
     let undecryptable = 0;
     let unknown = 0;
     let counted = true;
+    // Whether a list the same as this one stands for this read until
+    // FULL_READ_MS has passed (engram#704): the list dates each secret, each
+    // read says what its value is, and the list had been found SAME_LIST_MS
+    // before this one was asked for.
+    let reusable = true;
     const own = new Map<string, string | undefined>();
     let print: string | undefined;
 
     if (vault) {
       let entries: Array<{ name: string; updatedAt?: string }> = [];
       let listed = false;
+      const asked = Date.now();
       try {
         entries = await vault.list();
         listed = true;
@@ -834,6 +875,11 @@ export class SecretScrubber {
 
       if (listed) {
         print = fingerprint(entries);
+        if (vault === this.vault && print !== this.seenPrint) {
+          this.seenPrint = print;
+          this.seenAt = Date.now();
+        }
+        if (this.seenPrint !== print || asked - this.seenAt < SAME_LIST_MS) reusable = false;
         if (
           this.mismatch !== undefined &&
           print === this.mismatchPrint &&
@@ -846,6 +892,12 @@ export class SecretScrubber {
           this.mismatchRetry();
           return;
         }
+        // The set was read in full through this client, and nothing listed
+        // has changed since (engram#704): each secret would read as it did
+        // then, and each read writes an audit row on the server. What was
+        // found of the key against the vault stands too.
+        if (rereading && print === this.settledPrint && Date.now() - this.settledAt < FULL_READ_MS) return;
+        if (!entries.every((e) => typeof e.updatedAt === "string")) reusable = false;
       }
 
       // After a request that got no answer, the rest would only wait out the
@@ -859,7 +911,10 @@ export class SecretScrubber {
           try {
             const value = await vault.get(name);
             // Deleted since it was listed: nothing to scrub, nor to count.
-            if (typeof value !== "string") continue;
+            if (typeof value !== "string") {
+              reusable = false;
+              continue;
+            }
             decrypted++;
             own.set(name, updatedAt);
             if (value.length >= MIN_SCRUB_LENGTH) next.set(name, value);
@@ -933,6 +988,8 @@ export class SecretScrubber {
     }
 
     this.settledFor = vault;
+    this.settledPrint = reusable && counted && refused === undefined ? print : undefined;
+    this.settledAt = Date.now();
     this.lastFailure = undefined;
     this.retryAt = 0;
     this.retryStep = 0;

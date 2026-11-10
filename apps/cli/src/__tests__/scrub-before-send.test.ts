@@ -26,6 +26,7 @@ vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
 
 import { DaemonDb } from "../daemon/db.js";
 import { Syncer, type KeySource } from "../daemon/syncer.js";
+import { DEFAULT_BASE_URL } from "../server-url.js";
 import {
   SecretScrubber,
   READ_RETRY_MS,
@@ -789,15 +790,15 @@ describe("nothing is sent before the vault has been read (engram#588)", () => {
     await scrubber.refresh();
     let configured = "key-old";
     const keys: KeySource = {
-      current: "key-old",
-      read: async () => configured,
-      connect: (key) => {
-        void scrubber.reconnect(vaults[key]);
+      current: { key: "key-old", server: DEFAULT_BASE_URL },
+      read: async () => ({ key: configured, server: DEFAULT_BASE_URL }),
+      connect: (account) => {
+        void scrubber.reconnect(vaults[account.key]);
         return server.client();
       },
       // The new key is a re-issued key of the same account, so what the old
       // one queued is sent with it (engram#594).
-      ownedKeys: async (_key, hashes) => hashes,
+      ownedKeys: async (_account, hashes) => hashes,
     };
     const syncer = new Syncer(db, server.client(), scrubber, keys);
 

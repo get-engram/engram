@@ -35,7 +35,8 @@ vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
 }));
 
 import { DaemonDb } from "../daemon/db.js";
-import { Syncer, keyFingerprint, type CaptureControl } from "../daemon/syncer.js";
+import { Syncer, keyFingerprint, type Account, type CaptureControl } from "../daemon/syncer.js";
+import { DEFAULT_BASE_URL } from "../server-url.js";
 import { Watcher } from "../daemon/watcher.js";
 import { Parser } from "../daemon/parser.js";
 import { QueueWriteError } from "../daemon/queue-error.js";
@@ -174,10 +175,13 @@ class FakeCapture implements CaptureControl {
   }
 }
 
-/** The key the daemon finds configured, as worker-main reads it. */
+/** The key the daemon finds configured, as worker-main reads it, on the
+ *  default server: the one FakeServer stands in for. */
 function keySource(initial?: string) {
+  const on = (key: string | undefined): Account | undefined =>
+    key === undefined ? undefined : { key, server: DEFAULT_BASE_URL };
   const keys = {
-    current: initial,
+    current: on(initial),
     configured: initial,
     readError: null as Error | null,
     /** Thrown by connect() while set: a key whose client can't be made yet. */
@@ -185,21 +189,21 @@ function keySource(initial?: string) {
     reads: 0,
     connected: [] as string[],
     disconnects: 0,
-    async read(): Promise<string | undefined> {
+    async read(): Promise<Account | undefined> {
       keys.reads++;
       if (keys.readError) throw keys.readError;
-      return keys.configured;
+      return on(keys.configured);
     },
-    connect(key: string): Engram {
+    connect(account: Account): Engram {
       if (keys.connectError) throw keys.connectError;
-      keys.connected.push(key);
-      return server.client(key);
+      keys.connected.push(account.key);
+      return server.client(account.key);
     },
     disconnect(): void {
       keys.disconnects++;
     },
-    ownedKeys(key: string, hashes: string[]): Promise<string[]> {
-      return server.ownedKeys(key, hashes);
+    ownedKeys(account: Account, hashes: string[]): Promise<string[]> {
+      return server.ownedKeys(account.key, hashes);
     },
   };
   return keys;
@@ -403,7 +407,7 @@ describe("capture and sending follow the configured key (engram#594)", () => {
     // was sent.
     expect(server.requests.slice(before)).toEqual([{ op: "owned", key: "key-b" }]);
     expect(db.getPendingCount(fp("key-a1"))).toBe(1);
-    expect(linesWith("[engram] 1 queued message(s) wait for another API key's account")).toHaveLength(1);
+    expect(linesWith("[engram] 1 queued message(s) wait for another account")).toHaveLength(1);
 
     // The session goes on in account B, in a conversation of its own.
     await syncer.onMessages("s1", meta("s1"), msgs("B:m3"));
@@ -697,7 +701,7 @@ describe("a key of the same account sends what an earlier key queued (engram#594
       expect(errors()).toContain(
         `[engram] couldn't check which earlier API keys are this account's: ${refusal}`,
       );
-      expect(linesWith("[engram] 1 queued message(s) wait for another API key's account")).toHaveLength(1);
+      expect(linesWith("[engram] 1 queued message(s) wait for another account")).toHaveLength(1);
 
       // New captures go on, in a conversation under this key.
       await syncer.onMessages("s1", meta("s1"), msgs("A:m3"));
@@ -884,8 +888,8 @@ describe("an opt-out reaches the copy in every account (engram#594)", () => {
     // count used to include sent rows and said 2).
     expect(linesWith("[engram] session s1 excluded (in-chat opt-out)")).toEqual([
       "[engram] session s1 excluded (in-chat opt-out) — 0 queued messages dropped, " +
-        "deleting synced copy; 1 copy synced under another API key will be deleted " +
-        "when that key's account signs in again",
+        "deleting synced copy; 1 copy synced under another account (another API key, or " +
+        "another server) will be deleted when it signs in again",
     ]);
 
     // Nothing more of the session is captured, under either key.
@@ -923,10 +927,12 @@ describe("daemon.db schema version 1 (engram#594)", () => {
 
     new DaemonDb(path).close();
     const after = inspect();
-    expect(after.version).toBe(3); // version 1, then 2 (engram#598), then 3 (engram#593)
+    // version 1, then 2 (engram#598), 3 (engram#593) and 4 (engram#685)
+    expect(after.version).toBe(4);
     expect(after.tables).toContain("remote_deletes");
     expect(after.tables).toContain("gone_conversations");
     expect(after.queueColumns).toContain("key_fp");
+    expect(after.queueColumns).toContain("server_known");
     expect(after.sessionKey).toEqual(["conversation_id"]);
     expect(after.rows).toEqual(before.rows);
 

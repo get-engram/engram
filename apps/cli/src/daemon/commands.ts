@@ -653,12 +653,21 @@ async function printDbStats(foreign: ForeignFiles | null, config: Config | null)
   if (!existsSync(DB_FILE)) return;
   try {
     const { DaemonDb } = await import("./db.js");
-    const { keyFingerprint } = await import("./syncer.js");
+    const { accountFingerprint, keyFingerprint } = await import("./syncer.js");
+    const { resolveBaseUrl } = await import("../server-url.js");
     const key = process.env.ENGRAM_API_KEY || config?.apiKey;
+    // The account the daemon sends for, its key and server read together
+    // (engram#685). With config.json unreadable and no ENGRAM_BASE_URL,
+    // which server is unknown, and the daemon sends nothing.
+    const server =
+      config !== null || process.env.ENGRAM_BASE_URL?.trim() ? resolveBaseUrl(config ?? {}) : undefined;
+    const mine = key && server ? accountFingerprint({ key, server }) : null;
     const db = new DaemonDb(DB_FILE, { readonly: true });
     let stats: ReturnType<typeof db.getStats>;
     try {
-      stats = db.getStats(key ? keyFingerprint(key) : null);
+      // What the key queued before its server was recorded is sent too,
+      // once the server confirms the key (see ownershipCandidates).
+      stats = db.getStats(mine, key ? keyFingerprint(key) : undefined);
     } finally {
       db.close();
     }
@@ -667,7 +676,7 @@ async function printDbStats(foreign: ForeignFiles | null, config: Config | null)
     if (stats.heldMessages > 0) {
       console.log(
         `${dim("Held:")}              ${plural(stats.heldMessages, "message")} ` +
-          dim(key ? "(another account's — sent when it signs in again)" : "(sent when their account signs in)"),
+          dim(mine ? "(another account's — sent when it signs in again)" : "(sent when their account signs in)"),
       );
     }
     // engram#593: Engram doesn't have their conversation any more.

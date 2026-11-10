@@ -25,7 +25,8 @@ vi.mock("../daemon/exclusions.js", async (importOriginal) => ({
 }));
 
 import { DaemonDb } from "../daemon/db.js";
-import { FIXED_KEY_FP, Syncer, keyFingerprint } from "../daemon/syncer.js";
+import { FIXED_KEY_FP, Syncer, keyFingerprint, type Account } from "../daemon/syncer.js";
+import { DEFAULT_BASE_URL } from "../server-url.js";
 import { RETRY_BASE_MS } from "../daemon/backoff.js";
 import {
   recordFailure,
@@ -384,22 +385,22 @@ describe("a failed send is not a successful sync (engram#580)", () => {
  *  last saved to config.json, and a client for each key. */
 function keySource(initial: string) {
   const keys = {
-    current: initial,
+    current: { key: initial, server: DEFAULT_BASE_URL } as Account | undefined,
     configured: initial as string | undefined,
     readError: null as Error | null,
     reads: 0,
     connected: [] as string[],
-    async read(): Promise<string | undefined> {
+    async read(): Promise<Account | undefined> {
       keys.reads++;
       if (keys.readError) throw keys.readError;
-      return keys.configured;
+      return keys.configured === undefined ? undefined : { key: keys.configured, server: DEFAULT_BASE_URL };
     },
-    connect(key: string): Engram {
-      keys.connected.push(key);
-      return server.client(key);
+    connect(account: Account): Engram {
+      keys.connected.push(account.key);
+      return server.client(account.key);
     },
-    ownedKeys(key: string, hashes: string[]): Promise<string[]> {
-      return server.ownedKeys(key, hashes);
+    ownedKeys(account: Account, hashes: string[]): Promise<string[]> {
+      return server.ownedKeys(account.key, hashes);
     },
   };
   return keys;

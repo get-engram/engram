@@ -197,6 +197,11 @@ function releaseHeld() {
   }
 }
 const baseUrl = `http://127.0.0.1:${srv.address().port}`;
+// On a server other than the default, the daemon queues each message under
+// the key and the server together: the key's fingerprint, "@", then a tag of
+// the server (engram#685). The owned-keys route still gets key fingerprints.
+const SERVER_TAG = createHash("sha256").update(baseUrl).digest("hex").slice(0, 32);
+const accountFp = (k) => `${fp(k)}@${SERVER_TAG}`;
 
 // ── The temporary home, the stubs, the CLI ──────────────────────────────────
 const root = mkdtempSync(join(tmpdir(), "engram-e2e-594-"));
@@ -296,11 +301,11 @@ const savedKey = () => {
     return null;
   }
 };
-/** Unsent rows in daemon.db queued under `key`. */
+/** Unsent rows in daemon.db queued under `key` on this server. */
 function queuedUnder(key) {
   const db = new Database(join(ENGRAM_DIR, "daemon.db"), { readonly: true, fileMustExist: true });
   try {
-    return db.prepare("SELECT COUNT(*) AS n FROM pending_messages WHERE sent_at IS NULL AND key_fp = ?").get(fp(key)).n;
+    return db.prepare("SELECT COUNT(*) AS n FROM pending_messages WHERE sent_at IS NULL AND key_fp = ?").get(accountFp(key)).n;
   } finally {
     db.close();
   }

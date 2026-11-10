@@ -103,6 +103,17 @@ describe("resolveBaseUrl: one order for every command (engram#625)", () => {
       expect(resolveBaseUrl({ baseUrl })).toBe(DEFAULT);
     }
   });
+
+  it("an empty ENGRAM_BASE_URL names no server: config.json's is used (engram#685)", async () => {
+    const { resolveBaseUrl } = await import("../config.js");
+    for (const env of ["", "   "]) {
+      process.env.ENGRAM_BASE_URL = env;
+      expect(resolveBaseUrl({ baseUrl: "http://staging.example.test" })).toBe("http://staging.example.test");
+      expect(resolveBaseUrl({})).toBe(DEFAULT);
+    }
+    process.env.ENGRAM_BASE_URL = "  http://127.0.0.1:8788/  ";
+    expect(resolveBaseUrl({ baseUrl: "http://staging.example.test" })).toBe("http://127.0.0.1:8788");
+  });
 });
 
 describe("engram auth login checks the key where it will be used (engram#625)", () => {

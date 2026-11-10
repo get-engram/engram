@@ -7,16 +7,15 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Engram } from "@getengram/sdk";
-import { loadConfigStrict, resolveBaseUrl } from "../config.js";
 import { ConfigUnreadable } from "../config-file.js";
 import { DaemonDb } from "./db.js";
 import { Pruner } from "./prune.js";
 import { Watcher } from "./watcher.js";
-import { Syncer, type CaptureControl, type KeySource } from "./syncer.js";
+import { Syncer, type Account, type CaptureControl, type KeySource } from "./syncer.js";
 import { SecretScrubber, type VaultLike } from "./scrubber.js";
 import { loadVaultKey } from "../commands/vault.js";
 import { availableAdapters } from "./adapters.js";
-import { configuredKey, ownedKeysAt } from "./key-source.js";
+import { configuredAccount, ownedKeysOf } from "./key-source.js";
 import { makeDirPrivateSync, type PrivateDirReport } from "../private-files.js";
 import { START_FAILED_EXIT } from "./supervise.js";
 import { foreignFiles, foreignFilesFix, foreignFilesProblem, OWNERSHIP_FIX } from "./ownership.js";
@@ -168,31 +167,32 @@ async function main(): Promise<void> {
     void shutdown({ flush: false });
   });
 
-  // The API key: ENGRAM_API_KEY, fixed for this process, else config.json.
-  // No key is not an error (engram#595): the daemon starts signed out,
-  // reads config.json every few seconds, and starts capturing as soon as
-  // `engram auth login` saves a key. It used to exit, and launchd started
-  // it again every 10 seconds, logging the same error each time.
+  // The account: the API key and its server, read together (engram#685) —
+  // ENGRAM_API_KEY and ENGRAM_BASE_URL, fixed for this process, else
+  // config.json. No key is not an error (engram#595): the daemon starts
+  // signed out, reads config.json every few seconds, and starts capturing
+  // as soon as `engram auth login` saves a key. It used to exit, and
+  // launchd started it again every 10 seconds, logging the same error each
+  // time. A config.json that can't be read is neither no key nor the
+  // default server: nothing is captured or sent until it has been read.
   const envKey = process.env.ENGRAM_API_KEY || undefined;
-  let configBaseUrl: string | undefined;
-  let apiKey = envKey;
+  let current: Account | undefined;
+  let unread = false;
   try {
-    const config = await loadConfigStrict();
-    configBaseUrl = typeof config.baseUrl === "string" ? config.baseUrl : undefined;
-    if (!apiKey) apiKey = await configuredKey();
+    current = await configuredAccount();
   } catch (err: unknown) {
+    unread = true;
     // Never the file's text, which holds the key (engram#673).
     log(
       `${err instanceof ConfigUnreadable ? err.message : `couldn't read ~/.engram/config.json (${errorText(err)})`}` +
-        " — will keep trying",
+        " — nothing is captured or sent until it can be read; will keep trying",
     );
   }
 
-  const baseUrl = resolveBaseUrl({ baseUrl: configBaseUrl });
-  const connect = (key: string): Engram =>
+  const connect = (account: Account): Engram =>
     new Engram({
-      apiKey: key,
-      baseUrl,
+      apiKey: account.key,
+      baseUrl: account.server,
       // Appends of large transcript batches do real work server-side (per-
       // message R2 writes, chunking, embedding, indexing) — the SDK's default
       // 30s timeout aborted them mid-flight and wedged the queue in a retry
@@ -209,16 +209,16 @@ async function main(): Promise<void> {
   // behaviour change in its own right. This one exists only to read the
   // vault so the scrubber can match exact values.
   const vaultKey = await loadVaultKey();
-  let vaultFor: ((key: string) => VaultLike | null) | null = null;
+  let vaultFor: ((account: Account) => VaultLike | null) | null = null;
   if (vaultKey) {
-    vaultFor = (key) =>
+    vaultFor = (account) =>
       new Engram({
-        apiKey: key,
-        baseUrl,
+        apiKey: account.key,
+        baseUrl: account.server,
         vault: { encryptionKey: vaultKey },
         timeout: 30_000,
       }).vault;
-    scrubber = new SecretScrubber(apiKey ? vaultFor(apiKey) : null, vaultKey, log);
+    scrubber = new SecretScrubber(current ? vaultFor(current) : null, vaultKey, log);
     scrubber.start();
     log("vault scrubber: on (exact-match redaction of named secrets and the vault key)");
   } else {
@@ -226,21 +226,23 @@ async function main(): Promise<void> {
   }
   const vaultScrubber = scrubber;
 
-  // The syncer reads the configured key every few seconds (engram#587,
-  // engram#594): `engram auth login` saves a new key without restarting
-  // this process, and `engram auth logout` removes it. An ENGRAM_API_KEY
-  // set for the daemon is fixed for its lifetime and is never replaced
-  // from config.json.
+  // The syncer reads the configured account every few seconds (engram#587,
+  // engram#594, engram#685): `engram auth login` saves a new key without
+  // restarting this process, `engram auth logout` removes it, and a new
+  // baseUrl in config.json is a new account like a new key is. An
+  // ENGRAM_API_KEY or ENGRAM_BASE_URL set for the daemon is fixed for its
+  // lifetime and is never replaced from config.json.
   const keys: KeySource = {
-    current: apiKey,
-    read: async () => envKey ?? (await configuredKey()),
-    connect: (key) => {
+    current,
+    unread,
+    read: configuredAccount,
+    connect: (account) => {
       if (vaultScrubber && vaultFor) {
-        vaultScrubber.reconnect(vaultFor(key)).catch((err: unknown) => {
+        vaultScrubber.reconnect(vaultFor(account)).catch((err: unknown) => {
           log(`vault scrubber: reconnect failed (${errorText(err)})`);
         });
       }
-      return connect(key);
+      return connect(account);
     },
     // Signed out: nothing is captured or sent, so the vault read through
     // the last key isn't kept in memory. The next key's is read when it
@@ -248,11 +250,12 @@ async function main(): Promise<void> {
     disconnect: () => {
       vaultScrubber?.reconnect(null).catch(() => {});
     },
-    // Only key fingerprints go to the server (see ownedKeysAt).
-    ownedKeys: ownedKeysAt(baseUrl),
+    // Only key fingerprints go to the server, and only to the account's
+    // own (see ownedKeysAt).
+    ownedKeys: ownedKeysOf(),
   };
 
-  const sync = new Syncer(queue, apiKey ? connect(apiKey) : null, vaultScrubber, keys);
+  const sync = new Syncer(queue, current ? connect(current) : null, vaultScrubber, keys);
   syncer = sync;
 
   // syncer.onMessages queues the messages before it returns, and throws
@@ -312,6 +315,12 @@ async function main(): Promise<void> {
     envKey
       ? "API key: ENGRAM_API_KEY (fixed for this process; 'engram auth login' and 'logout' don't change it)"
       : "API key: ~/.engram/config.json (read again every few seconds)",
+  );
+  // Never the address itself, which can carry credentials.
+  log(
+    process.env.ENGRAM_BASE_URL?.trim()
+      ? "server: ENGRAM_BASE_URL (fixed for this process)"
+      : "server: baseUrl in ~/.engram/config.json, else the default (read with the key)",
   );
 
   // Start

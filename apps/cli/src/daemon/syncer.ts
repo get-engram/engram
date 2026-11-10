@@ -18,6 +18,7 @@ import { parseStorageFullError } from "../storage-error.js";
 import { isPathExcluded, detectOptOut } from "./exclusions.js";
 import { queueing } from "./queue-error.js";
 import { plural } from "../output.js";
+import { isDefaultServer, normalizeServer, sameServer } from "../server-url.js";
 import type { SecretScrubber } from "./scrubber.js";
 import type { ParsedMessage, SessionMeta, PendingRow } from "./types.js";
 
@@ -92,9 +93,12 @@ export const FIXED_KEY_FP = "fixed";
 /** What a real key's fingerprint looks like (keyFingerprint). */
 const KEY_HASH = /^[0-9a-f]{64}$/;
 
+/** An account on a server other than the default (accountFingerprint):
+ *  its key's hash, then its server's tag. */
+const SERVER_ACCOUNT = /^([0-9a-f]{64})@([0-9a-f]{32})$/;
+
 /**
- * What daemon.db records about the key a message was captured under: the
- * key's SHA-256 as lowercase hex (engram#594). It is the hash the server
+ * The key's SHA-256 as lowercase hex (engram#594). It is the hash the server
  * keeps of the key, so the server can say which earlier keys are the same
  * account's. The key itself is never written to daemon.db.
  */
@@ -102,34 +106,124 @@ export function keyFingerprint(key: string): string {
   return createHash("sha256").update(key).digest("hex");
 }
 
+/**
+ * An account the daemon captures and sends for: an API key, and the server
+ * it is a key of (engram#685). The two are read from config.json together,
+ * and a change to either is a change of account.
+ */
+export interface Account {
+  key: string;
+  /** The server's base URL (resolveBaseUrl). */
+  server: string;
+}
+
+/**
+ * What daemon.db records about the account a message was captured for
+ * (engram#594, engram#685). On the default server, the key's fingerprint
+ * (keyFingerprint), as before servers were recorded, so nothing recorded
+ * then changes. On any other server, the key's fingerprint followed by
+ * "@" and a tag of the server's address, so what is queued for one server
+ * is never sent to another. Neither the key nor the address is written.
+ */
+export function accountFingerprint(account: Account): string {
+  const keyHash = keyFingerprint(account.key);
+  if (isDefaultServer(account.server)) return keyHash;
+  const tag = createHash("sha256").update(normalizeServer(account.server)).digest("hex").slice(0, 32);
+  return `${keyHash}@${tag}`;
+}
+
+/** Whether `a` and `b` are the same account: the same key, for the same
+ *  server. */
+export function sameAccount(a: Account | undefined, b: Account | undefined): boolean {
+  if (!a || !b) return a === b;
+  return a.key === b.key && sameServer(a.server, b.server);
+}
+
+/** What a server may be asked about in checkOwnership (ownershipCandidates). */
+export interface OwnershipCandidate {
+  /** The account fingerprint the rows are under. */
+  fp: string;
+  /** The key hash the server is asked about. */
+  keyHash: string;
+  /** Only the rows without a record of their server may move (adoptKeys). */
+  unknownServerOnly: boolean;
+}
+
+/**
+ * Which of `others` (other account fingerprints in daemon.db) the server of
+ * the account `runFp` may be asked about, each with the key hash to ask
+ * with (checkOwnership). What it confirms is its account's is sent with
+ * that account (engram#685):
+ *
+ * - The default server: what was queued under another key for it, or
+ *   before servers were recorded, as before. Never what was queued for
+ *   another server.
+ * - Any other server: what was queued for that same server under another
+ *   key. And, under any key in `unknownServer` (its own included), what
+ *   was queued before servers were recorded (daemon.db version 4): then a
+ *   key's fingerprint alone stood for whatever server was configured, so
+ *   it may be this server's, and the server confirms the key is its
+ *   account's before it moves. Never what was recorded for the default
+ *   server: an answer from another server doesn't make it that server's.
+ */
+export function ownershipCandidates(
+  runFp: string,
+  others: readonly string[],
+  unknownServer: ReadonlySet<string>,
+): OwnershipCandidate[] {
+  const run = SERVER_ACCOUNT.exec(runFp);
+  const candidates: OwnershipCandidate[] = [];
+  for (const fp of others) {
+    if (!run) {
+      if (KEY_HASH.test(fp)) candidates.push({ fp, keyHash: fp, unknownServerOnly: false });
+      continue;
+    }
+    const other = SERVER_ACCOUNT.exec(fp);
+    if (other) {
+      if (other[2] === run[2]) candidates.push({ fp, keyHash: other[1], unknownServerOnly: false });
+    } else if (KEY_HASH.test(fp) && unknownServer.has(fp)) {
+      candidates.push({ fp, keyHash: fp, unknownServerOnly: true });
+    }
+  }
+  return candidates;
+}
+
 /** A settled promise, for the paths of onMessages that have nothing left to do. */
 const DONE: Promise<void> = Promise.resolve();
 
 /**
- * Where the daemon's API key comes from (engram#587, engram#594). The key
- * is read again every KEY_POLL_MS: a new key is used without a restart, and
- * no key stops capture and sending.
+ * Where the daemon's account, its API key and server, comes from
+ * (engram#587, engram#594, engram#685). It is read again every
+ * KEY_POLL_MS: a new key or server is used without a restart, and no key
+ * stops capture and sending.
  */
 export interface KeySource {
-  /** The key configured at start, if any. */
-  current?: string;
+  /** The account configured at start, if any. */
+  current?: Account;
   /**
-   * The key configured now: ENGRAM_API_KEY, else ~/.engram/config.json.
-   * Throws when config.json can't be read or parsed. That is not a logout:
-   * the key in use stays until the file can be read.
+   * config.json couldn't be read at start, so which account is configured
+   * isn't known: nothing is captured or sent until it has been read.
    */
-  read(): Promise<string | undefined>;
-  /** A client for a key. */
-  connect(key: string): Engram;
+  unread?: boolean;
+  /**
+   * The account configured now: its key from ENGRAM_API_KEY, else
+   * ~/.engram/config.json, and its server from ENGRAM_BASE_URL, else
+   * config.json, else the default, read together. Throws when config.json
+   * is needed and can't be read or parsed. That is not a logout: the
+   * account in use stays until the file can be read.
+   */
+  read(): Promise<Account | undefined>;
+  /** A client for an account. */
+  connect(account: Account): Engram;
   /** No key is configured any more: let go of what was built for the last
    *  one (the vault read through it). Called after capture has stopped. */
   disconnect?(): void;
   /**
-   * Which of `keyHashes` (key fingerprints) are keys of the account `key`
-   * belongs to. Throws when the server doesn't answer; an Error with a
+   * Which of `keyHashes` (key fingerprints) are keys of `account`, asked
+   * of its server. Throws when the server doesn't answer; an Error with a
    * numeric `status` when it refused.
    */
-  ownedKeys?(key: string, keyHashes: string[]): Promise<string[]>;
+  ownedKeys?(account: Account, keyHashes: string[]): Promise<string[]>;
 }
 
 /**
@@ -145,15 +239,15 @@ export interface CaptureControl {
 }
 
 /**
- * One key in use: its fingerprint and client. A flush works with one Run
- * from start to end, and once the key changes a Run that is no longer
- * `active` starts no new request.
+ * One account in use: its fingerprint and client. A flush works with one
+ * Run from start to end, and once the account changes a Run that is no
+ * longer `active` starts no new request.
  */
 interface Run {
   fp: string;
   client: Engram;
-  /** The key itself, in memory only (absent for a fixed client). */
-  key?: string;
+  /** The key and server, in memory only (absent for a fixed client). */
+  account?: Account;
 }
 
 /** What the server has said about which earlier keys are the current key's
@@ -262,8 +356,11 @@ export class Syncer {
    *  pauses in a row without a request going through. */
   private authHeldUntil = 0;
   private authHoldStep = 0;
-  /** The key configured when it was last read (undefined: none). */
-  private currentKey: string | undefined;
+  /** The account configured when it was last read (undefined: none). */
+  private currentAccount: Account | undefined;
+  /** config.json hasn't been read since start (KeySource.unread): which
+   *  account is configured isn't known yet. */
+  private unread = false;
   /** The fingerprint rows that belonged to no key were last handed to. */
   private claimedFor: string | null = null;
   private ownership: Ownership = freshOwnership();
@@ -327,8 +424,9 @@ export class Syncer {
 
   /**
    * With `keys`, `client` is the client for `keys.current` (built from it
-   * when null), and no `keys.current` starts the Syncer signed out. Without
-   * `keys`, `client` sends everything, under FIXED_KEY_FP.
+   * when null), and no `keys.current` starts the Syncer signed out, or
+   * waiting for config.json (`keys.unread`). Without `keys`, `client`
+   * sends everything, under FIXED_KEY_FP.
    */
   constructor(
     db: DaemonDb,
@@ -341,11 +439,16 @@ export class Syncer {
       if (!client) throw new Error("Syncer needs a client or a KeySource");
       this.active = { fp: FIXED_KEY_FP, client };
     } else if (keys.current) {
-      const key = keys.current;
-      this.active = { fp: keyFingerprint(key), client: client ?? keys.connect(key), key };
-      this.currentKey = key;
+      const account = keys.current;
+      this.active = {
+        fp: accountFingerprint(account),
+        client: client ?? keys.connect(account),
+        account,
+      };
+      this.currentAccount = account;
     } else {
       this.active = null;
+      this.unread = keys.unread === true;
     }
     this.captureFp = this.active?.fp ?? null;
     if (this.active) this.claim(this.active);
@@ -365,7 +468,8 @@ export class Syncer {
       this.startCapture();
     } else {
       recordSignedOut();
-      this.logSignedOut();
+      // Waiting for config.json was said when it couldn't be read.
+      if (!this.unread) this.logSignedOut();
     }
     // flush() and checkKey() handle their own errors; the catch only keeps
     // a failure in that handling from becoming an unhandled rejection.
@@ -417,9 +521,10 @@ export class Syncer {
   }
 
   /**
-   * Read the configured key and act on a change (engram#594): no key stops
-   * capture and sending at once, and a new key is used from the next
-   * request on. Calls made while a read is in progress share it.
+   * Read the configured account and act on a change (engram#594,
+   * engram#685): no key stops capture and sending at once, and a new key or
+   * server is used from the next request on. Calls made while a read is in
+   * progress share it.
    */
   checkKey(): Promise<void> {
     const keys = this.keys;
@@ -431,59 +536,71 @@ export class Syncer {
   }
 
   private async readKey(keys: KeySource): Promise<void> {
-    let key: string | undefined;
+    let account: Account | undefined;
     try {
-      key = (await keys.read()) || undefined;
+      account = (await keys.read()) ?? undefined;
     } catch (err: unknown) {
       this.logProblem("key", `[engram] reading the API key failed (will retry): ${errorText(err)}`);
       return;
     }
-    if (key === this.currentKey) {
+    if (account && !account.key) account = undefined;
+    // config.json has been read: from now on no key is a signed-out daemon.
+    const firstRead = this.unread;
+    this.unread = false;
+    if (sameAccount(account, this.currentAccount)) {
       this.problems.delete("key");
+      if (firstRead && !this.stopped) this.logSignedOut();
       return;
     }
     if (this.stopped) {
-      // Shutting down, and the key changed since it was last read: nothing
-      // more is sent with a key that is no longer configured, and capture
-      // doesn't start again.
+      // Shutting down, and the account changed since it was last read:
+      // nothing more is sent for an account that is no longer configured,
+      // and capture doesn't start again.
       this.active = null;
       this.captureFp = null;
-      this.currentKey = undefined;
+      this.currentAccount = undefined;
       return;
     }
-    if (key === undefined) this.signOut();
-    else this.signIn(keys, key);
+    if (account === undefined) this.signOut();
+    else this.signIn(keys, account);
   }
 
-  /** A key is configured that isn't the one in use: a sign-in, or a change
-   *  of key or account. */
-  private signIn(keys: KeySource, key: string): void {
-    const switching = this.active !== null;
-    // What was written under the key in use is read and queued under it
+  /** An account is configured that isn't the one in use: a sign-in, or a
+   *  change of key, server or account. */
+  private signIn(keys: KeySource, account: Account): void {
+    const previous = this.active ? this.currentAccount : undefined;
+    // What was written for the account in use is read and queued for it
     // first, scrubbed against the vault read through it.
     this.stopCapture(true);
     let run: Run;
     try {
-      run = { fp: keyFingerprint(key), client: keys.connect(key), key };
+      run = { fp: accountFingerprint(account), client: keys.connect(account), account };
     } catch (err: unknown) {
-      // Another key is configured: nothing more is captured or sent under
-      // the one in use.
+      // Another account is configured: nothing more is captured or sent
+      // for the one in use.
       if (this.active) this.deactivate();
       this.logProblem("key", `[engram] the new API key can't be used yet (will retry): ${errorText(err)}`);
       return;
     }
     this.active = run;
     this.captureFp = run.fp;
-    this.currentKey = key;
+    this.currentAccount = account;
     this.resetForNewKey();
     this.problems.delete("key");
     this.claim(run);
     recordSignedIn();
     this.startCapture();
+    // Never the server's address, which can carry credentials. What was
+    // queued for the previous account is said once the server has been
+    // asked about it (checkOwnership, logHeld).
     console.log(
-      switching
-        ? "[engram] new API key found — capturing and sending with it (messages queued under the previous key are sent only if it's the same account's)"
-        : "[engram] signed in — capture and sync resumed",
+      !previous
+        ? "[engram] signed in — capture and sync resumed"
+        : previous.key === account.key
+          ? "[engram] the server in ~/.engram/config.json changed — capturing and sending to the new one from now on"
+          : sameServer(previous.server, account.server)
+            ? "[engram] new API key found — capturing and sending with it (messages queued under the previous key are sent only if it's the same account's)"
+            : "[engram] new API key and server found — capturing and sending with them from now on",
     );
   }
 
@@ -496,7 +613,7 @@ export class Syncer {
     this.stopCapture(true);
     this.active = null;
     this.captureFp = null;
-    this.currentKey = undefined;
+    this.currentAccount = undefined;
     this.resetForNewKey();
     try {
       this.keys?.disconnect?.();
@@ -686,8 +803,8 @@ export class Syncer {
             : ", deleting synced copy"
           : "") +
         (elsewhere > 0
-          ? `; ${plural(elsewhere, "copy", "copies")} synced under another API key ` +
-            `will be deleted when that key's account signs in again`
+          ? `; ${plural(elsewhere, "copy", "copies")} synced under another account ` +
+            `(another API key, or another server) will be deleted when it signs in again`
           : ""),
     );
 
@@ -917,24 +1034,33 @@ export class Syncer {
   }
 
   /**
-   * Ask the server, once per key, which of the other keys something here is
-   * queued or mapped under are keys of this key's account (engram#594): a
-   * rotated or re-issued key. Theirs is handed to this key, so it is sent
-   * with this key, and a session continues in the conversation it already
-   * has. The rest keep waiting for their own account. Only fingerprints go
-   * to the server, never a key. When the server can't answer, it is asked
-   * again on OWNERSHIP_RETRY_MS.
+   * Ask the server, once per account, which of the other keys something
+   * here is queued or mapped under are keys of this account (engram#594): a
+   * rotated or re-issued key. Theirs is handed to this account, so it is
+   * sent with this key, and a session continues in the conversation it
+   * already has. The rest keep waiting for their own account. Only what was
+   * queued for this account's server is asked about (ownershipCandidates,
+   * engram#685), and only key fingerprints go to the server, never a key.
+   * When the server can't answer, it is asked again on OWNERSHIP_RETRY_MS.
    */
   private async checkOwnership(run: Run): Promise<void> {
     const own = this.ownership;
     if (own.answered || Date.now() < own.retryAt) return;
-    const others = this.db.otherKeyFps(run.fp).filter((fp) => KEY_HASH.test(fp));
-    if (others.length === 0) {
+    const others = this.db.otherKeyFps(run.fp);
+    // Only a server other than the default is asked about what doesn't
+    // record its server; the default server's own key hashes cover it.
+    const unknownServer = SERVER_ACCOUNT.test(run.fp)
+      ? new Set(this.db.unknownServerFps())
+      : new Set<string>();
+    const candidates = ownershipCandidates(run.fp, others, unknownServer);
+    if (candidates.length === 0) {
       own.answered = true;
+      // What another server's account queued waits for it.
+      if (others.length > 0) this.logHeld(run);
       return;
     }
     const keys = this.keys;
-    if (!keys?.ownedKeys || !run.key) {
+    if (!keys?.ownedKeys || !run.account) {
       own.answered = true;
       this.logHeld(run);
       return;
@@ -943,7 +1069,7 @@ export class Syncer {
 
     let owned: string[];
     try {
-      owned = await keys.ownedKeys(run.key, others);
+      owned = await keys.ownedKeys(run.account, [...new Set(candidates.map((c) => c.keyHash))]);
     } catch (err: unknown) {
       // The key changed while the server was asked: the answer is about a
       // key no longer in use.
@@ -968,19 +1094,34 @@ export class Syncer {
     if (this.active !== run || this.ownership !== own) return;
 
     const mine = new Set(owned);
-    const adopted = others.filter((fp) => mine.has(fp));
-    if (adopted.length > 0) {
-      let moved: { messages: number };
-      try {
-        moved = this.db.adoptKeys(adopted, run.fp);
-      } catch (err: unknown) {
-        this.retryOwnership(own, errorText(err));
-        return;
+    const adopted = candidates.filter((c) => mine.has(c.keyHash));
+    // The key in use, queued before servers were recorded (see
+    // ownershipCandidates), apart from the earlier keys.
+    const runKeyHash = run.fp.split("@")[0];
+    const earlier = adopted.filter((c) => c.keyHash !== runKeyHash);
+    const sameKey = adopted.filter((c) => c.keyHash === runKeyHash);
+    try {
+      // Each its own transaction: one that moved stays moved, and the
+      // next check no longer finds it.
+      if (earlier.length > 0) {
+        const moved = this.db.adoptKeys(earlier, run.fp);
+        console.log(
+          `[engram] ${new Set(earlier.map((c) => c.keyHash)).size} earlier API key(s) are this ` +
+            `account's — sending their ${moved.messages} queued message(s) with this key`,
+        );
       }
-      console.log(
-        `[engram] ${adopted.length} earlier API key(s) are this account's — ` +
-          `sending their ${moved.messages} queued message(s) with this key`,
-      );
+      if (sameKey.length > 0) {
+        const moved = this.db.adoptKeys(sameKey, run.fp);
+        if (moved.messages > 0) {
+          console.log(
+            `[engram] the server confirmed this API key — sending it the ${moved.messages} ` +
+              `message(s) an earlier version of Engram queued with the key`,
+          );
+        }
+      }
+    } catch (err: unknown) {
+      this.retryOwnership(own, errorText(err));
+      return;
     }
     own.answered = true;
     this.logHeld(run);
@@ -1003,7 +1144,8 @@ export class Syncer {
     return !own.answered && (own.firstAskedAt === 0 || now - own.firstAskedAt < OWNERSHIP_GATE_MS);
   }
 
-  /** Say how many queued messages wait for another account's key. */
+  /** Say how many queued messages wait for another account: another API
+   *  key's, or the same key's on another server (engram#685). */
   private logHeld(run: Run): void {
     let held = 0;
     try {
@@ -1013,8 +1155,8 @@ export class Syncer {
     }
     if (held > 0) {
       console.log(
-        `[engram] ${held} queued message(s) wait for another API key's account — they stay ` +
-          `on this machine and are sent only with a key of that account`,
+        `[engram] ${held} queued message(s) wait for another account (another API key, or ` +
+          `another server) — they stay on this machine and are sent only to that account`,
       );
     }
   }

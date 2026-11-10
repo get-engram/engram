@@ -98,6 +98,13 @@ export interface SyncStatus {
    * sending: such a key still saves.
    */
   delete_refused: DeleteRefused | null;
+  /**
+   * Where the running daemon's vault key came from (engram#693): the key
+   * file, or ENGRAM_VAULT_KEY. Null when it has none. It reads the key
+   * again before each send, but a key file deleted meanwhile leaves the key
+   * it had in use: `engram status` says a restart starts without one.
+   */
+  vault_key: "file" | "env" | null;
   updated_at: string;
 }
 
@@ -114,6 +121,7 @@ const DEFAULT_STATUS: SyncStatus = {
   signed_out_at: null,
   next_retry_at: null,
   delete_refused: null,
+  vault_key: null,
   updated_at: new Date().toISOString(),
 };
 
@@ -247,6 +255,13 @@ export function recordNextRetry(retryAt: number | null): void {
   const next = retryAt === null ? null : new Date(retryAt).toISOString();
   if (next === currentStatus.next_retry_at) return;
   currentStatus.next_retry_at = next;
+  writeStatus();
+}
+
+/** Where the vault key in use came from (engram#693). Written only when it changes. */
+export function recordVaultKey(source: "file" | "env" | null): void {
+  if (currentStatus.vault_key === source) return;
+  currentStatus.vault_key = source;
   writeStatus();
 }
 

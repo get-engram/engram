@@ -12,14 +12,14 @@ import { DaemonDb } from "./db.js";
 import { Pruner } from "./prune.js";
 import { Watcher } from "./watcher.js";
 import { Syncer, type Account, type CaptureControl, type KeySource } from "./syncer.js";
-import { SecretScrubber, type VaultLike } from "./scrubber.js";
+import { SecretScrubber, type VaultKeySource, type VaultLike } from "./scrubber.js";
 import { asVaultKeyProblem, readVaultKey, vaultKeyFix, type VaultKeyUnreadable } from "../vault-key.js";
 import { availableAdapters } from "./adapters.js";
 import { configuredAccount, ownedKeysOf } from "./key-source.js";
 import { makeDirPrivateSync, type PrivateDirReport } from "../private-files.js";
 import { START_FAILED_EXIT } from "./supervise.js";
 import { foreignFiles, foreignFilesFix, foreignFilesProblem, OWNERSHIP_FIX } from "./ownership.js";
-import { notifyDesktopBeforeExit } from "./status.js";
+import { notifyDesktopBeforeExit, recordVaultKey } from "./status.js";
 import {
   claimDaemonLock,
   markReady,
@@ -212,6 +212,11 @@ async function main(): Promise<void> {
   // Only a key file that isn't there means no key (engram#677). One that
   // can't be read holds sends until it can be: the scrubber reads it again,
   // and captures keep queueing meanwhile. Never the key in a log line.
+  //
+  // The scrubber reads the key again before each send, and on its interval
+  // (engram#693): a key saved, or put in place of another, while this runs
+  // is used from the next send on, without a restart. So there is one even
+  // with no key yet.
   let vaultKey: string | undefined;
   let keyProblem: VaultKeyUnreadable | undefined;
   try {
@@ -219,41 +224,51 @@ async function main(): Promise<void> {
   } catch (err: unknown) {
     keyProblem = asVaultKeyProblem(err);
   }
+  // Where the key in use came from, for `engram status`: a key file deleted
+  // since leaves it in use until a restart.
+  const keyOrigin = (): "env" | "file" => (process.env.ENGRAM_VAULT_KEY ? "env" : "file");
+  recordVaultKey(vaultKey ? keyOrigin() : null);
   // The account in use, for the vault read with a key found later.
   let account: Account | undefined = current;
-  const vaultFor = (a: Account | undefined): VaultLike | null =>
-    a && vaultKey
+  const vaultFor = (a: Account | undefined, key = vaultKey): VaultLike | null =>
+    a && key
       ? new Engram({
           apiKey: a.key,
           baseUrl: a.server,
-          vault: { encryptionKey: vaultKey },
+          vault: { encryptionKey: key },
           timeout: 30_000,
         }).vault
       : null;
+  const keySource: VaultKeySource = {
+    read: readVaultKey,
+    // The key the vault is read with from now on, after an account switch
+    // too.
+    vaultWith: (key) => {
+      const vault = vaultFor(account, key);
+      vaultKey = key;
+      recordVaultKey(keyOrigin());
+      return vault;
+    },
+  };
+  const vaultScrubber = new SecretScrubber(vaultFor(current), vaultKey, log, {
+    source: keySource,
+    problem: keyProblem,
+  });
+  scrubber = vaultScrubber;
+  vaultScrubber.start();
   if (vaultKey) {
-    scrubber = new SecretScrubber(vaultFor(current), vaultKey, log);
-    scrubber.start();
     log("vault scrubber: on (exact-match redaction of named secrets and the vault key)");
   } else if (keyProblem) {
-    scrubber = new SecretScrubber(null, undefined, log, {
-      problem: keyProblem,
-      source: {
-        read: readVaultKey,
-        vaultWith: (key) => {
-          vaultKey = key;
-          return vaultFor(account);
-        },
-      },
-    });
-    scrubber.start();
     log(
       `vault scrubber: holding sends — ${keyProblem.message}. Capture goes on, and what it ` +
         `captures is sent once the key can be read. ${vaultKeyFix(keyProblem)}`,
     );
   } else {
-    log("vault scrubber: off (no vault key configured — only pattern redaction applies)");
+    log(
+      "vault scrubber: off until a vault key is saved (no vault key configured — only pattern " +
+        "redaction applies)",
+    );
   }
-  const vaultScrubber = scrubber;
 
   // The syncer reads the configured account every few seconds (engram#587,
   // engram#594, engram#685): `engram auth login` saves a new key without
@@ -267,11 +282,9 @@ async function main(): Promise<void> {
     read: configuredAccount,
     connect: (next) => {
       account = next;
-      if (vaultScrubber) {
-        vaultScrubber.reconnect(vaultFor(next)).catch((err: unknown) => {
-          log(`vault scrubber: reconnect failed (${errorText(err)})`);
-        });
-      }
+      vaultScrubber.reconnect(vaultFor(next)).catch((err: unknown) => {
+        log(`vault scrubber: reconnect failed (${errorText(err)})`);
+      });
       return connect(next);
     },
     // Signed out: nothing is captured or sent, so the vault read through
@@ -279,7 +292,7 @@ async function main(): Promise<void> {
     // signs in, and nothing is sent before that read.
     disconnect: () => {
       account = undefined;
-      vaultScrubber?.reconnect(null).catch(() => {});
+      vaultScrubber.reconnect(null).catch(() => {});
     },
     // Only key fingerprints go to the server, and only to the account's
     // own (see ownedKeysAt).

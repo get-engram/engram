@@ -788,6 +788,295 @@ describe("a vault key that can't be read holds sends until it can be (engram#677
   });
 });
 
+/** Two vault keys, as `engram vault keygen` makes them: 32 bytes, base64, padded. */
+const KEY_A = Buffer.alloc(32, 7).toString("base64");
+const KEY_B = Buffer.alloc(32, 9).toString("base64");
+
+/** A scrubber as worker-main makes it (engram#693): the key read at start, or none, and a source to read it again. */
+const reading = (source: FakeKeyFile, vault: VaultLike | null, key: string | undefined, log?: (msg: string) => void) =>
+  new SecretScrubber(vault, key, log, { source });
+
+/** What the scrubber says about the key: not the count of secrets each read finds. */
+const keyLog =
+  (into: string[]) =>
+  (m: string): void => {
+    if (!m.startsWith("vault scrubber: protecting ")) into.push(m);
+  };
+
+describe("the vault key is read again while the daemon runs (engram#693)", () => {
+  it("no key at start, then one saved: the vault is read with it, and the next send waits for that read", async () => {
+    const vault = new FakeVault({ PIN: "4821" });
+    vault.hold();
+    const source = new FakeKeyFile(vault);
+    source.finds = () => undefined;
+    const log: string[] = [];
+    const s = reading(source, null, undefined, keyLog(log));
+    await s.refresh(); // as start() does: no vault yet
+    // No key: nothing to wait for. The file is read before each send.
+    for (let i = 0; i < 3; i++) {
+      later(2_000);
+      expect(await s.ready()).toBe(true);
+    }
+    expect(source.reads).toBe(3);
+    expect(s.active).toBe(false);
+    expect(log).toEqual([]);
+
+    source.finds = () => `${KEY_A}\n`;
+    let ready: boolean | undefined;
+    void s.ready().then((r) => (ready = r));
+    await settle();
+    expect(source.keys).toEqual([KEY_A]);
+    expect(vault.lists).toBe(1);
+    expect(ready).toBeUndefined(); // the read through the key is in flight
+    // The key is scrubbed from then on, before the read lands.
+    expect(s.scrub(`key=${KEY_A}`).text).toBe("key=[VAULT:vault-key]");
+    expect(log).toEqual(["vault scrubber: on — a vault key was saved; reading the vault with it before sending"]);
+
+    vault.release();
+    await settle();
+    expect(ready).toBe(true);
+    expect(s.scrub("the PIN is 4821").text).toBe("the PIN is [VAULT:PIN]");
+    // The same key at the next send: nothing more to read.
+    expect(await s.ready()).toBe(true);
+    expect(source.keys).toEqual([KEY_A]);
+    expect(vault.lists).toBe(1);
+    expect(log.join("\n")).not.toContain(KEY_A);
+  });
+
+  it("another key in its place: the vault is read through it before the next send, and the key it replaced is still scrubbed", async () => {
+    const before = new FakeVault({ PIN: "4821" });
+    const source = new FakeKeyFile(null);
+    source.finds = () => KEY_A;
+    const log: string[] = [];
+    const s = reading(source, before, KEY_A, keyLog(log));
+    await s.refresh();
+    expect(await s.ready()).toBe(true);
+
+    // The same vault, read with another key: the PIN was encrypted with the
+    // first, and a secret saved since with this one.
+    const after = new FakeVault({ PIN: "not this", PASSPHRASE: "correct horse" });
+    after.getErrors.PIN = wrongKey;
+    after.hold();
+    source.vault = after;
+    source.finds = () => KEY_B;
+    let ready: boolean | undefined;
+    void s.ready().then((r) => (ready = r));
+    await settle();
+    expect(source.keys).toEqual([KEY_B]);
+    expect(ready).toBeUndefined(); // waits for the read through the new key
+    expect(s.scrub(`${KEY_A} ${KEY_B}`).text).toBe("[VAULT:vault-key] [VAULT:vault-key]");
+    expect(log).toEqual([
+      "vault scrubber: the vault key was replaced — reading the vault with the new one before sending " +
+        "(the one it replaced is still scrubbed)",
+    ]);
+
+    after.release();
+    await settle();
+    expect(ready).toBe(true);
+    // The PIN, which the new key can't decrypt, keeps the value read with the old one.
+    const r = s.scrub(`${KEY_A} 4821 ${KEY_B} correct horse`);
+    expect(r.text).toBe("[VAULT:vault-key] [VAULT:PIN] [VAULT:vault-key] [VAULT:PASSPHRASE]");
+    expect(r.replaced).toEqual(
+      expect.arrayContaining([
+        { name: "vault-key", count: 2 },
+        { name: "PIN", count: 1 },
+        { name: "PASSPHRASE", count: 1 },
+      ]),
+    );
+    expect(r.replaced).toHaveLength(3);
+    // And still, once the interval reads the vault again.
+    await s.refresh();
+    expect(s.scrub(`${KEY_A} 4821`).text).toBe("[VAULT:vault-key] [VAULT:PIN]");
+    for (const key of [KEY_A, KEY_B]) expect(log.join("\n")).not.toContain(key);
+  });
+
+  it("the same key written another way: no new read, and that way is scrubbed too", async () => {
+    const vault = new FakeVault({ PIN: "4821" });
+    const source = new FakeKeyFile(vault);
+    const log: string[] = [];
+    const s = reading(source, vault, KEY_A, keyLog(log));
+    await s.refresh();
+    // Without its padding, and broken over two lines: the bytes are the same.
+    const unpadded = KEY_A.replace(/=+$/, "");
+    const split = `${KEY_A.slice(0, 22)}\n${KEY_A.slice(22)}`;
+    for (const written of [unpadded, `  ${KEY_A}\n`, split]) {
+      source.finds = () => written;
+      later(2_000);
+      expect(await s.ready(), JSON.stringify(written)).toBe(true);
+    }
+    expect(source.reads).toBe(3);
+    expect(source.keys).toEqual([]);
+    expect(vault.lists).toBe(1);
+    expect(log).toEqual([]);
+    expect(s.scrub(`[${split}]`).text).toBe("[[VAULT:vault-key]]");
+  });
+
+  it("each way a vault key may be written is scrubbed whole: padded and not, counted as one", () => {
+    const unpadded = KEY_A.replace(/=+$/, "");
+    expect(unpadded).not.toBe(KEY_A);
+    // Given without its padding, as the CLI and the SDK take it.
+    for (const given of [unpadded, KEY_A]) {
+      const s = new SecretScrubber(null, given);
+      const r = s.scrub(`a ${KEY_A} b ${unpadded} c`);
+      expect(r.text, given).toBe("a [VAULT:vault-key] b [VAULT:vault-key] c");
+      expect(r.replaced).toEqual([{ name: "vault-key", count: 2 }]);
+    }
+    // A key that isn't base64 is scrubbed as it is written.
+    expect(new SecretScrubber(null, KEY).scrub(`${KEY}=`).text).toBe("[VAULT:vault-key]=");
+  });
+
+  it("stopped: the key goes with the secrets, each way it is written; started again, it is scrubbed again", () => {
+    const unpadded = KEY_A.replace(/=+$/, "");
+    const s = new SecretScrubber(new FakeVault({ PIN: "4821" }), KEY_A);
+    s.start();
+    s.stop();
+    // No plaintext held once stopped: not the key, nor any spelling of it.
+    expect(s.active).toBe(false);
+    expect(s.scrub(`a ${KEY_A} b ${unpadded}`).replaced).toEqual([]);
+    s.start();
+    try {
+      // Known again before any read, each way it may be written.
+      expect(s.scrub(`a ${KEY_A} b ${unpadded}`).text).toBe("a [VAULT:vault-key] b [VAULT:vault-key]");
+    } finally {
+      s.stop();
+    }
+  });
+
+  it("the key file gone while its key is in use: still scrubbing with it and the secrets read with it, said once", async () => {
+    const vault = new FakeVault({ PIN: "4821" });
+    const source = new FakeKeyFile(vault);
+    const log: string[] = [];
+    const s = reading(source, vault, KEY_A, keyLog(log));
+    await s.refresh();
+    source.finds = () => undefined;
+    for (let i = 0; i < 5; i++) {
+      later(2_000);
+      expect(await s.ready()).toBe(true);
+    }
+    expect(s.failure).toBeUndefined();
+    const gone =
+      "vault scrubber: ~/.engram/vault-key isn't there any more — still scrubbing with the key read before, " +
+      "and the secrets read with it. A restart starts without a key.";
+    expect(log).toEqual([gone]);
+    // The interval reads the vault with it still.
+    await s.refresh();
+    expect(vault.lists).toBe(2);
+    expect(s.scrub(`${KEY_A} 4821`).text).toBe("[VAULT:vault-key] [VAULT:PIN]");
+
+    // Put back: nothing more to read or say. Gone again: said again.
+    source.finds = () => KEY_A;
+    expect(await s.ready()).toBe(true);
+    source.finds = () => undefined;
+    expect(await s.ready()).toBe(true);
+    expect(source.keys).toEqual([]);
+    expect(log).toEqual([gone, gone]);
+  });
+
+  it("a key file that can't be read any more holds sends; the same key back lifts the hold without a new read", async () => {
+    const vault = new FakeVault({ PIN: "4821" });
+    const source = new FakeKeyFile(vault);
+    source.finds = () => KEY_A;
+    const log: string[] = [];
+    const s = reading(source, vault, KEY_A, keyLog(log));
+    await s.refresh();
+    expect(await s.ready()).toBe(true);
+
+    source.finds = () => {
+      throw new VaultKeyUnreadable("can't be read: permission denied", "permission");
+    };
+    expect(await s.ready()).toBe(false);
+    expect(s.failure).toMatchObject({ name: "VaultKeyUnreadable", kind: "permission" });
+    expect(log).toEqual([
+      "vault scrubber: holding sends — ~/.engram/vault-key can't be read: permission denied. Capture goes on, " +
+        "and what it captures is sent once the key can be read.",
+    ]);
+    // What it knows is still scrubbed, and the file is read again on the
+    // schedule, not on every flush.
+    expect(s.scrub(`${KEY_A} 4821`).text).toBe("[VAULT:vault-key] [VAULT:PIN]");
+    later(2_000);
+    expect(await s.ready()).toBe(false);
+    expect(source.reads).toBe(2);
+
+    source.finds = () => KEY_A;
+    later(READ_RETRY_MS[0]);
+    expect(await s.ready()).toBe(true);
+    expect(source.reads).toBe(3);
+    expect(source.keys).toEqual([]); // the vault read with it stands
+    expect(vault.lists).toBe(1);
+    expect(log.at(-1)).toBe("vault scrubber: the vault key can be read again — sending what was held");
+  });
+
+  it("a key file that can't be read any more, then another key in it: the vault is read with that one before sending what was held", async () => {
+    const before = new FakeVault({ PIN: "4821" });
+    const source = new FakeKeyFile(null);
+    source.finds = () => {
+      throw new VaultKeyUnreadable("is empty", "empty");
+    };
+    const log: string[] = [];
+    const s = reading(source, before, KEY_A, keyLog(log));
+    await s.refresh();
+    expect(await s.ready()).toBe(false);
+
+    const after = new FakeVault({ PIN: "4821", PASSPHRASE: "correct horse" });
+    source.vault = after;
+    source.finds = () => KEY_B;
+    later(READ_RETRY_MS[0]);
+    expect(await s.ready()).toBe(true);
+    expect(source.keys).toEqual([KEY_B]);
+    expect(after.lists).toBe(1);
+    expect(s.scrub(`${KEY_A} ${KEY_B} correct horse`).text).toBe("[VAULT:vault-key] [VAULT:vault-key] [VAULT:PASSPHRASE]");
+    expect(log.at(-1)).toBe(
+      "vault scrubber: the vault key can be read now, and it is another key — reading the vault with it " +
+        "before sending what was held",
+    );
+  });
+
+  it("a key that makes no vault, in place of the one in use: sends wait, and it is tried again on the schedule", async () => {
+    const vault = new FakeVault({ PIN: "4821" });
+    const source = new FakeKeyFile(vault);
+    source.finds = () => KEY_B;
+    source.vaultError = () => new Error("no vault");
+    const s = reading(source, vault, KEY_A);
+    await s.refresh();
+    expect(await s.ready()).toBe(false);
+    expect(s.failure).toBeInstanceOf(VaultKeyUnreadable);
+    expect(s.scrub("4821").text).toBe("[VAULT:PIN]");
+
+    source.vaultError = null;
+    later(READ_RETRY_MS[0]);
+    expect(await s.ready()).toBe(true);
+    expect(source.keys).toEqual([KEY_B, KEY_B]);
+  });
+
+  it("the interval reads the key too, then the vault through a new one, once", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    const vault = new FakeVault({ PIN: "4821" });
+    const source = new FakeKeyFile(vault);
+    source.finds = () => undefined;
+    const s = reading(source, null, undefined);
+    s.start(60_000);
+    await settle();
+    // worker-main read it just before: start() reads the vault, not the key.
+    expect(source.reads).toBe(0);
+
+    source.finds = () => KEY_A;
+    await vi.advanceTimersByTimeAsync(60_000);
+    await settle();
+    expect(source.reads).toBe(1);
+    expect(source.keys).toEqual([KEY_A]);
+    expect(vault.lists).toBe(1); // through the new client, and not again
+    expect(s.scrub(`${KEY_A} 4821`).text).toBe("[VAULT:vault-key] [VAULT:PIN]");
+
+    // The next: the same key, and the vault read again.
+    await vi.advanceTimersByTimeAsync(60_000);
+    await settle();
+    expect(source.reads).toBe(2);
+    expect(vault.lists).toBe(2);
+    s.stop();
+    expect(s.active).toBe(false);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // The syncer: the hold and the second scrub, against a real daemon.db.
 
@@ -1187,5 +1476,35 @@ describe("nothing is sent before the vault has been read (engram#588)", () => {
     later(READ_RETRY_MS[0]);
     await syncer.flush();
     expect(server.received).toEqual(["the PIN is [VAULT:PIN]"]);
+  });
+
+  it("a vault key saved while the daemon runs: the next send waits for the vault read with it, and is scrubbed (engram#693)", async () => {
+    const vault = new FakeVault({ PIN: "4821" });
+    vault.hold();
+    const source = new FakeKeyFile(vault);
+    source.finds = () => undefined;
+    const scrubber = new SecretScrubber(null, undefined, undefined, { source });
+    await scrubber.refresh(); // as start() does
+    const syncer = new Syncer(db, server.client(), scrubber);
+
+    // No key: nothing waits.
+    await syncer.onMessages("s1", meta("s1"), msgs("hello"));
+    await syncer.flush();
+    expect(server.received).toEqual(["hello"]);
+
+    // Captured before the key is read: queued as it was.
+    source.finds = () => KEY_A;
+    await syncer.onMessages("s1", meta("s1"), msgs("the PIN is 4821", `key ${KEY_A}`));
+    expect(queued()).toEqual(["hello", "the PIN is 4821", `key ${KEY_A}`]);
+    later(2_000);
+    const flushing = syncer.flush();
+    await settle();
+    expect(server.received).toEqual(["hello"]); // waits for the vault read
+
+    vault.release();
+    await flushing;
+    const scrubbed = ["the PIN is [VAULT:PIN]", "key [VAULT:vault-key]"];
+    expect(server.received).toEqual(["hello", ...scrubbed]);
+    expect(queued()).toEqual(["hello", ...scrubbed]);
   });
 });

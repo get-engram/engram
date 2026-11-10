@@ -1515,6 +1515,106 @@ describe("auto-capture after sign-in to Engram, on Windows (engram#614)", () => 
   });
 });
 
+describe("the vault key a daemon started at sign-in reads, on Windows (engram#690)", () => {
+  signedInAtATerminal();
+
+  const VAULT_KEY = join(ENGRAM_DIR, "vault-key");
+  const KEY = Buffer.alloc(32, 7).toString("base64");
+  /** The first line of what is said when the file isn't there. */
+  const NONE = "  WARNING: ENGRAM_VAULT_KEY is set here, but ~/.engram/vault-key isn't there.";
+
+  beforeEach(() => {
+    vi.stubEnv("NO_COLOR", "1");
+    vi.stubEnv("ENGRAM_VAULT_KEY", KEY);
+    rmSync(VAULT_KEY, { force: true });
+  });
+
+  afterEach(() => rmSync(VAULT_KEY, { force: true }));
+
+  function lines(): string[] {
+    return output().split("\n");
+  }
+
+  function clear(): void {
+    (console.log as Mock).mockClear();
+    (console.error as Mock).mockClear();
+  }
+
+  it("engram install warns, after the entry, when ~/.engram/vault-key isn't there", async () => {
+    onWindows();
+    daemonRunning();
+    await daemonInstall();
+    const shown = lines();
+    const at = shown.indexOf(NONE);
+    expect(at).toBeGreaterThan(shown.findIndex((line) => line.startsWith("Startup entry: ")));
+    expect(shown[at - 1]).toBe("");
+    expect(process.exitCode).toBeUndefined();
+
+    clear();
+    mkdirSync(ENGRAM_DIR, { recursive: true });
+    writeFileSync(VAULT_KEY, `${KEY}\r\n`);
+    await daemonInstall();
+    expect(output()).toContain("Startup entry: ");
+    expect(output()).not.toContain("ENGRAM_VAULT_KEY");
+  });
+
+  it("engram status warns with the entry on, and not with it switched off in Startup apps", async () => {
+    onWindows();
+    daemonRunning();
+    registry.value = ENTRY;
+    await daemonStatus();
+    expect(lines()).toContain(NONE);
+
+    clear();
+    registry.approved = SWITCHED_OFF;
+    await daemonStatus();
+    expect(output()).toContain("off — switched off in Windows Startup apps");
+    expect(output()).not.toContain("ENGRAM_VAULT_KEY");
+  });
+
+  it("engram status says nothing of the key with no entry, or one whose programs are gone, running or stopped", async () => {
+    onWindows();
+    for (const entry of [null, BROKEN_ENTRY]) {
+      for (const running of [true, false]) {
+        registry.value = entry;
+        if (running) {
+          daemonRunning();
+        } else {
+          daemon.answering = null;
+          rmSync(PID_FILE, { force: true });
+        }
+        clear();
+        await daemonStatus();
+        const text = output();
+        expect(text).toContain(running ? "Status: running" : "Status: stopped");
+        expect(text).not.toContain("It should be running");
+        expect(text).not.toContain("ENGRAM_VAULT_KEY");
+      }
+    }
+  });
+
+  it("auto-capture warns when it turns on start at sign-in, and not when the entry is switched off", async () => {
+    onWindows();
+    daemonRunning();
+    await autoEnableCapture({ after: "login" });
+    expect(registry.value).toBe(ENTRY);
+    const shown = lines();
+    expect(shown.indexOf(NONE)).toBeGreaterThan(shown.indexOf("  Turn off anytime: engram stop && engram uninstall"));
+
+    // An entry the user switched off before it was there, as after
+    // 'engram uninstall': it is added, and stays off.
+    clear();
+    registry.value = null;
+    registry.approved = SWITCHED_OFF;
+    await autoEnableCapture({ after: "login" });
+    expect(registry.value).toBe(ENTRY);
+    const text = output();
+    expect(text).toContain("Start at login is switched off");
+    expect(text).toContain("Auto-capture is on");
+    expect(text).not.toContain("ENGRAM_VAULT_KEY");
+  });
+});
+
 describe("auto-capture after any other command (engram#644)", () => {
   signedInAtATerminal();
 

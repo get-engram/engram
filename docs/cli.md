@@ -162,6 +162,25 @@ engram vault keygen --save
 |------|-------------|
 | `--save` | Save key to `~/.engram/vault-key` |
 
+### engram vault save-key
+
+Save the key in `ENGRAM_VAULT_KEY` to `~/.engram/vault-key` (permissions 600), where the daemon started at login reads it.
+
+```bash
+engram vault save-key
+
+# The file holds a different key: replace it (the file's key is backed up first)
+engram vault save-key --force
+```
+
+The daemon that `engram install` starts at login may not get your shell's variables: launchd never passes them on macOS, and systemd and Windows may not. With the key only in `ENGRAM_VAULT_KEY`, that daemon has no vault key, and your vault's secrets aren't removed from what it captures. `engram install`, `engram status` and `engram vault status` say so when `~/.engram/vault-key` doesn't hold the key in `ENGRAM_VAULT_KEY`.
+
+It saves only a vault key (32 bytes, base64-encoded), and never replaces a different key without `--force`, nor a file it can't read.
+
+| Flag | Description |
+|------|-------------|
+| `--force` | Replace a different key in the file, after backing it up to `~/.engram/vault-key.bak-<time>` |
+
 ### engram vault set
 
 Store a named secret. Value is encrypted client-side before transmission.
@@ -233,6 +252,11 @@ Check vault configuration status.
 engram vault status
 # Vault: configured (key at /Users/you/.engram/vault-key)
 # Key prefix: dGhpcyBp...
+
+# With ENGRAM_VAULT_KEY set, and the file without it:
+# Vault: configured (key in ENGRAM_VAULT_KEY)
+#   ~/.engram/vault-key isn't there: a daemon started at login may not have this key.
+#   To save it there, readable only by you: engram vault save-key
 ```
 
 ### engram help
@@ -256,7 +280,7 @@ engram version
 |----------|-------------|---------|
 | `ENGRAM_API_KEY` | API key (overrides `~/.engram/config.json`) | — |
 | `ENGRAM_BASE_URL` | Custom Engram endpoint | `https://mcp.getengram.app` |
-| `ENGRAM_VAULT_KEY` | Vault encryption key (base64, 32 bytes) | — |
+| `ENGRAM_VAULT_KEY` | Vault encryption key (base64, 32 bytes). Used over `~/.engram/vault-key`, but the daemon started at login reads the file: see `engram vault save-key` | — |
 
 ## Configuration File
 

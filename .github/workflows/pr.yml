@@ -87,6 +87,15 @@ jobs:
         working-directory: apps/cli
         run: node scripts/e2e-daemon-lock.mjs
 
+      # A daemon left running as root by `sudo engram start` from before
+      # engram#653, really running as root (engram#680): status, start, stop,
+      # install and the banner say so and how to stop it, no daemon of the
+      # user's starts beside it, the worker won't run as root, and the
+      # commands they're given work.
+      - name: Daemon left running as root test
+        working-directory: apps/cli
+        run: ENGRAM_E2E_ROOT=1 node scripts/e2e-root-daemon.mjs
+
       # Start at login under the real systemd (engram#615): the unit `engram
       # install` writes, started when the user's service manager starts, as
       # at login, started again after a crash and not after `engram stop`.
@@ -221,3 +230,13 @@ jobs:
           TMPDIR: ${{ runner.temp }}
           ENGRAM_E2E_LAUNCHD: "1"
         run: node scripts/e2e-launchd.mjs
+
+      # The root daemon test above, here with the job `sudo engram install`
+      # loaded into launchd's system domain before engram#653, running a
+      # daemon from then and this build's worker (engram#680).
+      - name: Daemon left running as root test
+        working-directory: apps/cli
+        env:
+          TMPDIR: ${{ runner.temp }}
+          ENGRAM_E2E_ROOT: "1"
+        run: node scripts/e2e-root-daemon.mjs

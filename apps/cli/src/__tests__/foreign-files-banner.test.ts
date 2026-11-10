@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ForeignFiles } from "../daemon/ownership.js";
+import type { RootDaemon } from "../daemon/root-daemon.js";
 
 /**
  * engram#659 — the lines before a command that say files in ~/.engram are
@@ -11,10 +12,12 @@ import type { ForeignFiles } from "../daemon/ownership.js";
  * stops or looks for a daemon, and the home directory is a temp dir.
  */
 
-const { home, found, ran } = vi.hoisted(() => ({
+const { home, found, ran, rootDaemon } = vi.hoisted(() => ({
   home: { dir: "" },
   found: { value: null as ForeignFiles | null | "throws" },
   ran: [] as string[],
+  // engram#680: the daemon running as root that made them, if one runs.
+  rootDaemon: { value: null as RootDaemon | null, looks: 0 },
 }));
 
 vi.mock("node:os", async (importOriginal) => ({
@@ -26,6 +29,13 @@ vi.mock("../daemon/ownership.js", async (importOriginal) => ({
   foreignFiles: () => {
     if (found.value === "throws") throw new Error("EACCES: permission denied");
     return found.value;
+  },
+}));
+vi.mock("../daemon/root-daemon.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../daemon/root-daemon.js")>()),
+  findRootDaemon: () => {
+    rootDaemon.looks++;
+    return rootDaemon.value;
   },
 }));
 vi.mock("../daemon/index.js", () => ({
@@ -80,6 +90,8 @@ describe("the banner before a command (engram#659)", () => {
     errs = [];
     ran.length = 0;
     found.value = null;
+    rootDaemon.value = null;
+    rootDaemon.looks = 0;
     vi.stubEnv("NO_COLOR", "1");
     vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => void out.push(args.join(" ")));
     vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => void errs.push(args.join(" ")));
@@ -124,6 +136,71 @@ describe("the banner before a command (engram#659)", () => {
     await engram("stop");
     expect(ran).toEqual(["stop"]);
     expect(errs).toEqual(BANNER);
+    // It looked for a daemon running as root, and none runs.
+    expect(rootDaemon.looks).toBe(1);
+  });
+
+  describe("with the daemon that made them still running as root (engram#680)", () => {
+    const ROOT_BANNER = [
+      "engram: A daemon started with sudo is still running as root (pid 4242).",
+      "  Stop it with: sudo kill 4242",
+      "engram: daemon.db in ~/.engram belongs to root, not to you, so the daemon can't start.",
+      '  Then make it yours with: sudo chown -R "$(id -un)" ~/.engram',
+      "",
+    ];
+
+    it("says to stop it first, then to make the files the user's", async () => {
+      found.value = DB_IS_ROOTS;
+      rootDaemon.value = { pid: 4242, job: null };
+      await engram("version");
+      expect(errs).toEqual(ROOT_BANNER);
+      expect(out).toEqual([expect.stringMatching(/^engram \S+$/)]);
+    });
+
+    it("says to unload the job in launchd's system domain that runs it", async () => {
+      found.value = DB_IS_ROOTS;
+      rootDaemon.value = { pid: 4242, job: { pid: 4242 } };
+      await engram("version");
+      expect(errs).toEqual([
+        ROOT_BANNER[0],
+        "  Stop it with: sudo launchctl bootout system/app.getengram.daemon",
+        ...ROOT_BANNER.slice(2),
+      ]);
+    });
+
+    it("says to unload a job that would run another, besides stopping it", async () => {
+      found.value = DB_IS_ROOTS;
+      rootDaemon.value = { pid: 4242, job: { pid: null } };
+      await engram("version");
+      expect(errs).toEqual([
+        ...ROOT_BANNER.slice(0, 2),
+        "  Also unload the job 'sudo engram install' loaded into launchd's system domain: sudo launchctl bootout system/app.getengram.daemon",
+        ...ROOT_BANNER.slice(2),
+      ]);
+    });
+
+    it("isn't looked for when the files are another user's, not root's", async () => {
+      found.value = { ...DB_IS_ROOTS, root: false };
+      rootDaemon.value = { pid: 4242, job: null };
+      await engram("version");
+      expect(rootDaemon.looks).toBe(0);
+      expect(errs).toEqual([
+        "engram: daemon.db in ~/.engram belongs to another user, not to you, so the daemon can't start.",
+        BANNER[1],
+        "",
+      ]);
+    });
+
+    it("isn't shown before stop, which says both itself", async () => {
+      found.value = DB_IS_ROOTS;
+      rootDaemon.value = { pid: 4242, job: null };
+      for (const words of [["stop"], ["daemon", "stop"]]) {
+        ran.length = 0;
+        await engram(...words);
+        expect(ran).toEqual(["stop"]);
+      }
+      expect(errs).toEqual([]);
+    });
   });
 
   it("says another user's vault key holds sends, and that nothing is lost (engram#695)", async () => {

@@ -88,6 +88,14 @@ const { home, cli, daemon, launchd, spawn, execSync, execFileSync } = vi.hoisted
      * moment later, here until the next look at the socket.
      */
     reaping: false,
+    /**
+     * Engram's job in launchd's system domain, where `sudo engram install`
+     * loaded it before engram#653 (engram#680): the plist it was loaded
+     * from, and the daemon it runs as root, if any. null: none there.
+     */
+    system: null as { plist: string; pid: number | null } | null,
+    /** Daemons running as root, which ps lists and the user can't signal (engram#680). */
+    rootWorkers: [] as number[],
     /** Calls the fake didn't expect; each fails the test. */
     unexpected: [] as string[],
   },
@@ -176,6 +184,7 @@ const {
   daemonInstall,
   daemonStart,
   daemonStatus,
+  daemonStop,
   daemonUninstall,
   repairLaunchdIfStale,
   waitForAgent,
@@ -312,9 +321,68 @@ function startJob(): void {
   daemonRunning();
 }
 
+/** What ps says a daemon running as root runs (engram#680). */
+const ROOT_WORKER_ARGS = `/usr/local/bin/node ${WORKER}`;
+
+/** ps, as the CLI asks it: the daemons running as root, and what one process runs (engram#680). */
+function fakePs(args: string[]): string {
+  const command = args.join(" ");
+  if (command === "-A -ww -o pid=,uid=,args=") {
+    const lines = [
+      "    1     0 /sbin/launchd",
+      `${process.pid} ${process.getuid?.() ?? 501} node vitest`,
+      ...launchd.rootWorkers.map((pid) => `${pid}     0 ${ROOT_WORKER_ARGS}`),
+    ];
+    return `${lines.join("\n")}\n`;
+  }
+  const one = /^-ww -o uid=,args= -p (\d+)$/.exec(command);
+  if (one !== null) {
+    if (launchd.rootWorkers.includes(Number(one[1]))) return `    0 ${ROOT_WORKER_ARGS}\n`;
+    // ps exits 1 when there is no such process.
+    throw failed(`ps ${command}`, "");
+  }
+  launchd.unexpected.push(`/bin/ps ${command}`);
+  throw new Error(`unexpected ps ${command}`);
+}
+
+/** What `launchctl print system/<label>` prints for the job a sudo install loaded (engram#680). */
+function systemPrint(job: { plist: string; pid: number | null }): string {
+  const lines = [
+    `system/${LABEL} = {`,
+    `\tactive count = ${job.pid === null ? 0 : 1}`,
+    `\tpath = ${job.plist}`,
+    "\ttype = LaunchDaemon",
+    `\tstate = ${job.pid === null ? "not running" : "running"}`,
+    "",
+    `\tprogram = ${NODE}`,
+    "\targuments = {",
+    `\t\t${NODE}`,
+    `\t\t${WORKER}`,
+    "\t}",
+    "",
+    "\tenvironment = {",
+    `\t\tHOME => ${home.dir}`,
+    "\t}",
+    "",
+    "\tdomain = system",
+    "\truns = 1",
+    ...(job.pid === null ? [] : [`\tpid = ${job.pid}`]),
+    "\tlast exit code = (never exited)",
+    "\tproperties = keepalive | runatload | inferred program",
+    "}",
+  ];
+  return `${lines.join("\n")}\n`;
+}
+
+/** Whether these are launchctl's arguments for a look at Engram's job in launchd's system domain (engram#680). */
+function isSystemLook(args: readonly string[]): boolean {
+  return args.length === 2 && args[0] === "print" && args[1] === `system/${LABEL}`;
+}
+
 /** launchctl, against the fake launchd above: what the real one does with it. */
 function fakeLaunchctl(file: string, args: string[]): string {
   const command = args.join(" ");
+  if (file === "/bin/ps") return fakePs(args);
   if (file !== LAUNCHCTL) {
     launchd.unexpected.push(`${file} ${command}`);
     throw new Error(`unexpected program ${file}`);
@@ -348,6 +416,12 @@ function fakeLaunchctl(file: string, args: string[]): string {
     }
     load(plist);
     return "";
+  }
+  if (isSystemLook(args)) {
+    if (launchd.system === null) {
+      throw Object.assign(failed(command, `Could not find service "${LABEL}" in domain for system\n`), { status: 113 });
+    }
+    return systemPrint(launchd.system);
   }
   if (is("print-disabled", DOMAIN)) {
     if (launchd.printDisabledFails) throw failed(command, "Could not find domain for port\n");
@@ -384,9 +458,32 @@ function fakeLaunchctl(file: string, args: string[]): string {
   throw new Error(`unexpected launchctl ${command}`);
 }
 
-/** The fake launchctl's calls, by their first word. */
+/**
+ * The fake launchctl's calls, as their arguments: launchctl's only, and
+ * not the looks into launchd's system domain (engram#680), which
+ * systemLooks() counts.
+ */
+function launchctlArgs(): string[][] {
+  return execFileSync.mock.calls
+    .filter(([file, args]) => file === LAUNCHCTL && !isSystemLook(args as string[]))
+    .map(([, args]) => args as string[]);
+}
+
+/** The fake launchctl's calls, by their first word (see launchctlArgs). */
 function launchctlCalls(): string[] {
-  return execFileSync.mock.calls.map(([, args]) => (args as string[])[0]);
+  return launchctlArgs().map((args) => args[0]);
+}
+
+/** When launchctl was first called, but for the looks launchctlArgs leaves out. */
+function firstLaunchctlOrder(): number {
+  const first = execFileSync.mock.calls.findIndex(([file, args]) => file === LAUNCHCTL && !isSystemLook(args as string[]));
+  if (first === -1) throw new Error("launchctl wasn't called");
+  return execFileSync.mock.invocationCallOrder[first];
+}
+
+/** How many times the CLI looked into launchd's system domain (engram#680). */
+function systemLooks(): number {
+  return execFileSync.mock.calls.filter(([file, args]) => file === LAUNCHCTL && isSystemLook(args as string[])).length;
 }
 
 /** The fake launchctl's loads, as their arguments: never -w but for `engram install` (engram#654). */
@@ -438,6 +535,8 @@ const timers: NodeJS.Timeout[] = [];
  * fails the test before it reaches a process.
  */
 function fakeKill(pid: number, signal: string | number = "SIGTERM"): true {
+  // One running as root: alive, and the user can't signal it (engram#680).
+  if (signal === 0 && launchd.rootWorkers.includes(pid)) throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
   if (signal === 0 && (pid === process.pid || madeUp.has(pid))) return true;
   if (signal === 0) throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
   throw new Error(`a test sent ${String(signal)} to pid ${pid}`);
@@ -499,6 +598,8 @@ beforeEach(() => {
     kickstarts: "ready",
     kickstartFails: false,
     reaping: false,
+    system: null,
+    rootWorkers: [],
     unexpected: [],
   });
   daemon.answering = null;
@@ -943,7 +1044,7 @@ describe("engram install on macOS (engram#616)", () => {
     await daemonInstall();
     expect(existsSync(PLIST)).toBe(false);
     expect(output()).toContain(`Can't turn on start at login: ${WORKER} is missing.`);
-    expect(execFileSync).not.toHaveBeenCalled();
+    expect(launchctlCalls()).toEqual([]);
     expect(spawn).not.toHaveBeenCalled();
     expect(process.exitCode).toBe(1);
   });
@@ -961,7 +1062,7 @@ describe("engram install on macOS (engram#616)", () => {
     // The worker's path as JSON: never a raw control character on the terminal.
     expect(text).toContain(JSON.stringify(join(home.dir, "new\nline", "cli", "dist", "daemon", "worker.js")));
     expect(text).not.toContain("new\nline");
-    expect(execFileSync).not.toHaveBeenCalled();
+    expect(launchctlCalls()).toEqual([]);
     expect(process.exitCode).toBe(1);
   });
 
@@ -977,7 +1078,7 @@ describe("engram install on macOS (engram#616)", () => {
     const text = output();
     expect(text).toContain("Couldn't turn on start at login.");
     expect(text).toContain("EACCES");
-    expect(execFileSync).not.toHaveBeenCalled();
+    expect(launchctlCalls()).toEqual([]);
     expect(process.exitCode).toBe(1);
   });
 
@@ -1215,7 +1316,7 @@ describe("engram start through launchd (engram#641)", () => {
     // on; the kickstart; and the PID launchd gives the daemon.
     expect(launchctlCalls()).toEqual(["list", "list", "print-disabled", "kickstart", "list"]);
     // Never -k, which would stop the daemon launchd runs, and never -p.
-    expect(execFileSync.mock.calls[3][1]).toEqual(KICKSTART);
+    expect(launchctlArgs()[3]).toEqual(KICKSTART);
     expect(spawn).not.toHaveBeenCalled();
     expect(launchd.pid).toBe(process.pid);
     const text = output();
@@ -1253,7 +1354,7 @@ describe("engram start through launchd (engram#641)", () => {
     await daemonStart([], { install: "" });
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(launchctlCalls()).toEqual(["print-disabled", "bootout", "unload", "list", "bootstrap"]);
-    expect(spawn.mock.invocationCallOrder[0]).toBeLessThan(execFileSync.mock.invocationCallOrder[0]);
+    expect(spawn.mock.invocationCallOrder[0]).toBeLessThan(firstLaunchctlOrder());
     const text = output();
     expect(text.indexOf("Engram daemon started")).toBeGreaterThanOrEqual(0);
     expect(text.indexOf("Engram daemon started")).toBeLessThan(text.indexOf("Auto-start enabled"));
@@ -1641,7 +1742,7 @@ describe("engram start through launchd (engram#641)", () => {
       jobLoaded();
       await autoEnableCapture({ after: "command" });
       expect(launchctlCalls()).toEqual(["list", "list", "print-disabled", "kickstart"]);
-      expect(execFileSync.mock.calls[3][1]).toEqual(KICKSTART);
+      expect(launchctlArgs()[3]).toEqual(KICKSTART);
       expect(spawn).not.toHaveBeenCalled();
       expect(launchd.pid).toBe(process.pid);
       expect(said()).toContain("Auto-capture is on");
@@ -1663,7 +1764,7 @@ describe("engram start through launchd (engram#641)", () => {
       await autoEnableCapture({ after: "login" });
       expect(spawn).toHaveBeenCalledTimes(1);
       expect(launchctlCalls()).toEqual(["print-disabled", "bootstrap"]);
-      expect(spawn.mock.invocationCallOrder[0]).toBeLessThan(execFileSync.mock.invocationCallOrder[0]);
+      expect(spawn.mock.invocationCallOrder[0]).toBeLessThan(firstLaunchctlOrder());
       expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
       expect(said()).toContain("Auto-start enabled — daemon will start on login");
     });
@@ -1708,7 +1809,7 @@ describe("engram install after engram stop on macOS (engram#691)", () => {
     await daemonInstall();
     expect(launchctlCalls()).toEqual(THROUGH_LAUNCHD);
     // Never -k, which would stop the daemon launchd runs, and never -p.
-    expect(execFileSync.mock.calls[5][1]).toEqual(KICKSTART);
+    expect(launchctlArgs()[5]).toEqual(KICKSTART);
     expect(spawn).not.toHaveBeenCalled();
     expect(launchd.pid).toBe(process.pid);
     const text = output();
@@ -1935,7 +2036,7 @@ describe("engram status on macOS (engram#616)", () => {
     daemonRunning();
     await daemonStatus();
     expect(output()).not.toContain("Auto-start");
-    expect(execFileSync).not.toHaveBeenCalled();
+    expect(launchctlCalls()).toEqual([]);
   });
 
   it("says the daemon should be running when start at login is on and it isn't", async () => {
@@ -2145,7 +2246,7 @@ describe("auto-capture on macOS (engram#616)", () => {
     const text = said();
     expect(text).toContain("Couldn't turn on start at login. Run 'engram install' to try again.");
     expect(text).toContain("Auto-capture is on");
-    expect(execFileSync).not.toHaveBeenCalled();
+    expect(launchctlCalls()).toEqual([]);
     expect(process.exitCode).toBeUndefined();
   });
 
@@ -2161,7 +2262,7 @@ describe("auto-capture on macOS (engram#616)", () => {
     expect(text).toContain("Auto-capture is on");
     expect(text).not.toContain("new\nline");
     expect(existsSync(join(home.dir, "new\nline", "Library"))).toBe(false);
-    expect(execFileSync).not.toHaveBeenCalled();
+    expect(launchctlCalls()).toEqual([]);
     expect(process.exitCode).toBeUndefined();
   });
 
@@ -2307,7 +2408,7 @@ describe("a job switched off in launchd (engram#654)", () => {
   it("engram install switches it back on, then loads it", async () => {
     await daemonInstall();
     expect(launchctlCalls()).toEqual(["print-disabled", "enable", "bootout", "unload", "list", "bootstrap"]);
-    expect(execFileSync.mock.calls[1][1]).toEqual(["enable", `${DOMAIN}/${LABEL}`]);
+    expect(launchctlArgs()[1]).toEqual(["enable", `${DOMAIN}/${LABEL}`]);
     expect(loads()).toEqual([]);
     expect(launchd.switchedOff).toBe(false);
     expect(launchd.loadedText).toBe(plistWith());
@@ -2822,6 +2923,227 @@ describe("a CLI and a Node installed with brew (engram#652)", () => {
       }
       expect(execFileSync).not.toHaveBeenCalled();
       expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(THROUGH_OPT));
+    });
+  });
+});
+
+describe("a daemon left running as root (engram#680)", () => {
+  // Root's is another user's only for a user who isn't root, and Windows
+  // has no uid to tell them apart by.
+  const me = process.geteuid?.();
+  const rootIt = me === undefined || me === 0 ? it.skip : it;
+  /** The daemon `sudo engram start` or `sudo engram install` left running as root. */
+  const ROOT = 40_301;
+  /** The user's own daemon. */
+  const OWN = 40_302;
+  /** Another daemon running as root. */
+  const OTHER_ROOT = 40_303;
+  const PROBLEM = `A daemon started with sudo is still running as root (pid ${ROOT}).`;
+  const UNLOAD = "sudo launchctl bootout system/app.getengram.daemon";
+  const KILL = `Stop it with: sudo kill ${ROOT}`;
+  const BOOTOUT = `Stop it with: ${UNLOAD}`;
+  const ALSO_UNLOAD = `Also unload the job 'sudo engram install' loaded into launchd's system domain: ${UNLOAD}`;
+  const JOB_LEFT = `The job 'sudo engram install' loaded into launchd's system domain is still there, and would run the daemon as root. Unload it with: ${UNLOAD}`;
+
+  beforeEach(() => {
+    vi.stubEnv("NO_COLOR", "1");
+  });
+
+  /** `sudo engram install` before engram#653: its job in launchd's system domain, and the daemon it runs as root. */
+  function inSystemDomain(pid: number | null = ROOT): void {
+    launchd.system = { plist: PLIST, pid };
+    if (pid !== null) launchd.rootWorkers.push(pid);
+  }
+
+  /** `sudo engram start` before engram#653: the daemon running as root, and its PID file. */
+  function startedWithSudo(): void {
+    mkdirSync(ENGRAM_DIR, { recursive: true });
+    writeFileSync(PID_FILE, String(ROOT));
+    launchd.rootWorkers.push(ROOT);
+  }
+
+  /** The user's own daemon, running beside it. */
+  function ownRunning(): void {
+    madeUp.add(OWN);
+    mkdirSync(ENGRAM_DIR, { recursive: true });
+    writeFileSync(PID_FILE, String(OWN));
+    daemon.answering = { pid: OWN };
+  }
+
+  /** Signals sent, but signal 0, which only looks. */
+  function signalsSent(): unknown[][] {
+    return vi.mocked(process.kill).mock.calls.filter(([, signal]) => signal !== 0);
+  }
+
+  /** No daemon was started, and start at login wasn't turned on. */
+  function nothingStarted(): void {
+    expect(spawn).not.toHaveBeenCalled();
+    expect(launchctlCalls()).toEqual([]);
+    expect(existsSync(PLIST)).toBe(false);
+  }
+
+  rootIt("status says it runs as root, and to stop it through launchd, which runs it", async () => {
+    inSystemDomain();
+    await daemonStatus();
+    const text = said();
+    expect(text).toContain(`Status: running as root (pid ${ROOT}), started with sudo`);
+    expect(text).toContain(
+      `\n\n  ${PROBLEM} 'engram stop' can't stop it, and no daemon of yours starts while it runs.\n  ${BOOTOUT}\n  Then run: engram start\n\n`,
+    );
+    expect(text).not.toMatch(/sudo kill|Also unload|most likely/);
+    expect(signalsSent()).toEqual([]);
+    expect(launchctlCalls()).toEqual([]);
+  });
+
+  rootIt("start, start --install, install and stop leave it, change nothing, and say what to run", async () => {
+    inSystemDomain();
+    await daemonStart([], {});
+    expect(said()).toBe(
+      [`${PROBLEM} No daemon of yours starts while it runs.`, `  ${BOOTOUT}`, "  Then run 'engram start' again."].join("\n"),
+    );
+    expect(process.exitCode).toBe(1);
+
+    process.exitCode = undefined;
+    await daemonStart([], { install: "" });
+    expect(said()).toBe(
+      [
+        `${PROBLEM} No daemon of yours starts while it runs.`,
+        `  ${BOOTOUT}`,
+        "  Then run 'engram start --install' again.",
+      ].join("\n"),
+    );
+    expect(process.exitCode).toBe(1);
+
+    process.exitCode = undefined;
+    await daemonInstall();
+    expect(said()).toBe(
+      [
+        `${PROBLEM} Start at login wasn't turned on: no daemon of yours starts while it runs.`,
+        `  ${BOOTOUT}`,
+        "  Then run 'engram install' again.",
+      ].join("\n"),
+    );
+    expect(process.exitCode).toBe(1);
+
+    process.exitCode = undefined;
+    await daemonStop();
+    expect(said()).toBe([`${PROBLEM} 'engram stop' can't stop it.`, `  ${BOOTOUT}`].join("\n"));
+    expect(process.exitCode).toBe(1);
+
+    nothingStarted();
+    expect(signalsSent()).toEqual([]);
+    expect(launchd.system).toEqual({ plist: PLIST, pid: ROOT });
+  });
+
+  rootIt("keeps the PID file of one started with sudo, and says to kill it", async () => {
+    startedWithSudo();
+    await daemonStatus();
+    const text = said();
+    expect(text).toContain(`Status: running as root (pid ${ROOT}), started with sudo`);
+    expect(text).toContain(`\n  ${PROBLEM} 'engram stop' can't stop it, and no daemon of yours starts while it runs.\n  ${KILL}\n  Then run: engram start\n`);
+
+    await daemonStart([], {});
+    expect(said()).toBe(
+      [`${PROBLEM} No daemon of yours starts while it runs.`, `  ${KILL}`, "  Then run 'engram start' again."].join("\n"),
+    );
+    process.exitCode = undefined;
+    await daemonStop();
+    expect(said()).toBe([`${PROBLEM} 'engram stop' can't stop it.`, `  ${KILL}`].join("\n"));
+    expect(process.exitCode).toBe(1);
+
+    expect(readFileSync(PID_FILE, "utf-8")).toBe(String(ROOT));
+    nothingStarted();
+    expect(signalsSent()).toEqual([]);
+  });
+
+  rootIt("says to unload a job left in launchd's system domain too, when it doesn't run that one", async () => {
+    startedWithSudo();
+    for (const job of [null, OTHER_ROOT]) {
+      launchd.rootWorkers = [ROOT];
+      inSystemDomain(job);
+      await daemonStatus();
+      const text = said();
+      expect(text).toContain(`\n  ${KILL}\n  ${ALSO_UNLOAD}\n  Then run: engram start\n`);
+      // The job's daemon is said with the job.
+      expect(text).not.toContain("most likely");
+      process.exitCode = undefined;
+      await daemonStop();
+      expect(said()).toBe([`${PROBLEM} 'engram stop' can't stop it.`, `  ${KILL}`, `  ${ALSO_UNLOAD}`].join("\n"));
+    }
+    expect(signalsSent()).toEqual([]);
+  });
+
+  rootIt("status says a job left in launchd's system domain would run one; start goes ahead", async () => {
+    inSystemDomain(null);
+    await daemonStatus();
+    const text = said();
+    expect(text).toBe(`Status: stopped\n\n  ${JOB_LEFT}\n`);
+    expect(text).not.toContain(PROBLEM);
+
+    await daemonStart([], {});
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(said()).not.toContain("root");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  rootIt("status and stop say one running as root beside the user's; stop stops theirs and exits 1", async () => {
+    inSystemDomain();
+    ownRunning();
+    await daemonStatus();
+    const text = said();
+    expect(text).toContain(`Status: running (pid ${OWN})`);
+    expect(text).toContain(`\n\n  ${PROBLEM} It runs beside yours, and only one should.\n  ${BOOTOUT}\n\n`);
+    expect(text).not.toMatch(/Then run|most likely/);
+
+    // Theirs stops as a daemon does.
+    vi.mocked(process.kill).mockImplementation((pid: number, signal?: string | number) => {
+      if (pid === OWN && signal === "SIGTERM") {
+        madeUp.delete(OWN);
+        daemon.answering = null;
+        return true;
+      }
+      return fakeKill(pid, signal);
+    });
+    await daemonStop();
+    expect(said()).toBe([`Daemon stopped (pid ${OWN})`, `${PROBLEM} 'engram stop' can't stop it.`, `  ${BOOTOUT}`].join("\n"));
+    expect(process.exitCode).toBe(1);
+    expect(signalsSent()).toEqual([[OWN, "SIGTERM"]]);
+    expect(existsSync(PID_FILE)).toBe(false);
+  });
+
+  rootIt("says one running as root that nothing ties to the user, and starts theirs all the same", async () => {
+    launchd.rootWorkers = [ROOT];
+    const untied = `A daemon is running as root (pid ${ROOT}), most likely started with sudo. Stop it with: sudo kill ${ROOT}`;
+    await daemonStatus();
+    const text = said();
+    expect(text).toBe(`Status: stopped\n\n  ${untied}\n`);
+    expect(text).not.toContain(PROBLEM);
+
+    await daemonStop();
+    expect(said()).toBe(["Daemon is not running.", untied].join("\n"));
+    expect(process.exitCode).toBeUndefined();
+
+    await daemonStart([], {});
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(said()).toContain(untied);
+    expect(process.exitCode).toBeUndefined();
+    expect(signalsSent()).toEqual([]);
+  });
+
+  describe("auto-capture", () => {
+    signedInAtATerminal();
+
+    rootIt("isn't turned on while one runs: after sign-in it says why, after a command nothing", async () => {
+      inSystemDomain();
+      await autoEnableCapture({ after: "login" });
+      expect(said()).toBe(
+        [`  Auto-capture wasn't turned on. ${PROBLEM}`, `  ${BOOTOUT}`, "  Then run: engram start"].join("\n"),
+      );
+      await autoEnableCapture({ after: "command" });
+      expect(said()).toBe("");
+      nothingStarted();
+      expect(signalsSent()).toEqual([]);
+      expect(process.exitCode).toBeUndefined();
     });
   });
 });

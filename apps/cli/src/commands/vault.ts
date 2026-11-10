@@ -14,8 +14,10 @@ import {
   sameVaultKey,
   VAULT_KEY_FILE,
   vaultKeyFileState,
+  vaultKeyFingerprint,
   VaultKeyUnreadable,
   vaultKeyFix,
+  whyNotVaultKey,
 } from "../vault-key.js";
 
 /**
@@ -136,24 +138,31 @@ export async function vaultKeygen(
     writePrivateFileSync(VAULT_KEY_FILE, key + "\n");
     console.log(`${bold("Vault key generated and saved to:")} ${VAULT_KEY_FILE}`);
     console.log(dim("Permissions set to owner-only (600)."));
+    console.log(fingerprintLine(key));
     await printDaemonKeyHint(true);
   } else {
     console.log(key);
+    console.log(fingerprintLine(key));
   }
 
   console.log();
   console.log(dim("Store this key securely — Engram never sees it."));
   console.log(dim("If you lose it, vaulted secrets cannot be recovered."));
   console.log();
+  // None of the key here (engram#699): saved, it isn't shown at all.
   console.log(`${bold("Usage with SDK:")}`);
   console.log(
-    dim(
-      `  const engram = new Engram({ apiKey: "...", vault: { encryptionKey: "${key.slice(0, 8)}..." } })`
-    )
+    dim(`  const engram = new Engram({ apiKey: "...", vault: { encryptionKey: process.env.ENGRAM_VAULT_KEY! } })`)
   );
   console.log();
   console.log(`${bold("Usage with environment variable:")}`);
-  console.log(dim("  export ENGRAM_VAULT_KEY=" + key.slice(0, 8) + "..."));
+  console.log(
+    dim(
+      flags.save !== undefined
+        ? `  export ENGRAM_VAULT_KEY="$(cat ~/.engram/vault-key)"`
+        : `  export ENGRAM_VAULT_KEY="<the key above>"`
+    )
+  );
   // A daemon started at login may not get a shell's variables: it reads
   // the file (engram#690).
   if (flags.save === undefined) {
@@ -247,12 +256,13 @@ export async function vaultStatus(): Promise<void> {
   // The key every command uses: ENGRAM_VAULT_KEY wins over the file.
   const envKey = process.env.ENGRAM_VAULT_KEY;
   if (envKey) {
-    const bytes = Buffer.from(envKey.trim(), "base64");
-    console.log(
-      bytes.length === 32
-        ? `${bold("Vault:")} configured (key in ENGRAM_VAULT_KEY)`
-        : `${bold("Vault:")} invalid key in ENGRAM_VAULT_KEY (expected 32 bytes, got ${bytes.length})`
-    );
+    const problem = whyNotVaultKey(envKey);
+    if (problem === null) {
+      console.log(`${bold("Vault:")} configured (key in ENGRAM_VAULT_KEY)`);
+      console.log(fingerprintLine(envKey));
+    } else {
+      console.log(`${bold("Vault:")} invalid key in ENGRAM_VAULT_KEY (${problem})`);
+    }
     // The daemon reads the file when started without it, as at login.
     const file = await vaultKeyFileState();
     if (file instanceof VaultKeyUnreadable) {
@@ -289,17 +299,22 @@ export async function vaultStatus(): Promise<void> {
     console.log(dim("Run 'engram vault keygen --save' to generate a key."));
     return;
   }
-  const bytes = Buffer.from(key, "base64");
-  if (bytes.length === 32) {
-    console.log(
-      `${bold("Vault:")} configured (key at ${VAULT_KEY_FILE})`
-    );
-    console.log(dim(`Key prefix: ${key.slice(0, 8)}...`));
+  const problem = whyNotVaultKey(key);
+  if (problem === null) {
+    console.log(`${bold("Vault:")} configured (key at ${VAULT_KEY_FILE})`);
+    console.log(fingerprintLine(key));
   } else {
-    console.log(
-      `${bold("Vault:")} invalid key (expected 32 bytes, got ${bytes.length})`
-    );
+    console.log(`${bold("Vault:")} invalid key (${problem})`);
   }
+}
+
+/**
+ * What tells this key from another, and shows none of it (engram#699):
+ * `vault status` printed its first 8 characters, and what it prints may be
+ * captured. Only for a vault key.
+ */
+function fingerprintLine(key: string): string {
+  return dim(`Key fingerprint: ${vaultKeyFingerprint(key)}`);
 }
 
 /**

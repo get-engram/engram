@@ -14,6 +14,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { commandFailure, commandPath } from "./command-path.js";
+import { pinnedToKeg } from "./homebrew.js";
 
 // Start at login on macOS: a launchd agent,
 // ~/Library/LaunchAgents/app.getengram.daemon.plist. launchd loads the
@@ -223,6 +224,12 @@ export type PlistState =
       broken: boolean;
       /** Its version; 1 for a plist from before the stamp. */
       version: number;
+      /**
+       * An older CLI wrote it: an older version, or one that names Node or
+       * the worker in a Homebrew version, which the next `brew upgrade`
+       * removes (engram#652). `engram start` and auto-capture rewrite it.
+       */
+      outdated: boolean;
     };
 
 /**
@@ -240,17 +247,20 @@ export function readPlist(): PlistState {
   } catch (err: unknown) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") return { kind: "none" };
-    return { kind: "ours", broken: true, version: 1 }; // unreadable, or not UTF-8 as every plist of ours is
+    // Unreadable, or not UTF-8 as every plist of ours is.
+    return { kind: "ours", broken: true, version: 1, outdated: true };
   }
   const version = stampIn(text);
   let broken = refusedByLaunchd(st);
+  let outdated = version < PLIST_VERSION;
   // An older version's is rewritten anyway, by `engram start`, and a newer
   // one's is a later CLI's to judge, not this one's.
   if (version === PLIST_VERSION) {
     const paths = pathsIn(text);
     broken ||= paths === null || !existsSync(paths.node) || !existsSync(paths.worker);
+    outdated = paths !== null && (pinnedToKeg(paths.node) || pinnedToKeg(paths.worker));
   }
-  return { kind: "ours", broken, version };
+  return { kind: "ours", broken, version, outdated };
 }
 
 /**

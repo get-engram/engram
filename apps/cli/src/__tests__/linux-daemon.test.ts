@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, afterAll, vi, type Mock } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi, type Mock } from "vitest";
 import {
   chmodSync,
   existsSync,
@@ -30,8 +30,11 @@ import type { UnitPaths } from "../daemon/systemd.js";
  * runs in CI, in scripts/e2e-systemd.mjs.
  */
 
-const { home, daemon, systemd, spawn, execSync, execFileSync } = vi.hoisted(() => ({
+const { home, cli, daemon, systemd, spawn, execSync, execFileSync } = vi.hoisted(() => ({
   home: { dir: "" },
+  // This build's worker, when it isn't the one in the test's home: a CLI
+  // installed with brew runs from a versioned keg (engram#652).
+  cli: { worker: null as string | null },
   // What answers on the daemon's socket: a daemon, or nothing.
   daemon: { answering: null as { pid: number } | null },
   // The fake user service manager: whether it answers, and whether it
@@ -65,7 +68,7 @@ vi.mock("../daemon/launch.js", async (importOriginal) => {
   const path = await import("node:path");
   return {
     ...(await importOriginal<typeof import("../daemon/launch.js")>()),
-    workerPath: () => path.join(home.dir, "cli", "dist", "daemon", "worker.js"),
+    workerPath: () => cli.worker ?? path.join(home.dir, "cli", "dist", "daemon", "worker.js"),
   };
 });
 // The probe answers from `daemon.answering`; the rest is the real module.
@@ -128,8 +131,10 @@ const {
   systemctlPath,
   unitPath,
 } = await import("../daemon/systemd.js");
+const { throughOptLink } = await import("../daemon/homebrew.js");
 
-const NODE = realpathSync.native(process.execPath);
+/** Node as start at login names it: through Homebrew's opt link, when it runs from a keg (engram#652). */
+const NODE = throughOptLink(realpathSync.native(process.execPath));
 /** The unit's paths for this CLI, as `engram install` writes them. */
 const THIS_CLI: UnitPaths = {
   node: NODE,
@@ -276,6 +281,7 @@ beforeEach(() => {
   systemd.reachable = true;
   systemd.enableFails = false;
   daemon.answering = null;
+  cli.worker = null;
   rmSync(CONFIG, { recursive: true, force: true });
   rmSync(PID_FILE, { force: true });
   writeFileSync(WORKER, "");
@@ -451,7 +457,7 @@ describe("engram install on Linux (engram#615)", () => {
     expect(text).toContain(`Unit: ${UNIT}`);
     expect(text).toContain("Engram daemon started");
     expect(process.exitCode).toBeUndefined();
-    expect(readUnit()).toEqual({ kind: "ours", enabled: true, broken: false, version: UNIT_VERSION });
+    expect(readUnit()).toEqual({ kind: "ours", enabled: true, broken: false, version: UNIT_VERSION, outdated: false });
   });
 
   posixIt("writes it 0644 whatever the umask, as systemd expects of a unit", async () => {
@@ -924,12 +930,16 @@ describe("engram start on Linux (engram#615)", () => {
   });
 });
 
-describe("auto-capture on Linux (engram#615)", () => {
+/**
+ * Auto-capture runs, in the describe this is called in: signed in, at a
+ * terminal, without what the test run itself sets to keep auto-capture out
+ * of other tests.
+ */
+function signedInAtATerminal(): void {
   const realIsTTY = process.stdin.isTTY;
   const config = vi.mocked(loadConfig);
 
   beforeEach(() => {
-    // What the test run itself sets to keep auto-capture out of other tests.
     vi.stubEnv("ENGRAM_NO_AUTOCAPTURE", "");
     vi.stubEnv("ENGRAM_API_KEY", undefined);
     Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
@@ -940,6 +950,10 @@ describe("auto-capture on Linux (engram#615)", () => {
     Object.defineProperty(process.stdin, "isTTY", { value: realIsTTY, configurable: true });
     config.mockReset().mockImplementation(async () => ({}) as never);
   });
+}
+
+describe("auto-capture on Linux (engram#615)", () => {
+  signedInAtATerminal();
 
   it("starts the daemon and turns on start at login after sign-in, then says nothing more", async () => {
     await autoEnableCapture({ after: "login" });
@@ -1082,5 +1096,171 @@ describe("auto-capture on Linux (engram#615)", () => {
     const text = said();
     expect(text).toContain("Auto-capture is on");
     expect(text).not.toContain("Start at login");
+  });
+});
+
+describe("a CLI and a Node installed with brew (engram#652)", () => {
+  // Homebrew on Linux keeps the layout it has on a Mac, under its own prefix:
+  // each version in its keg under Cellar/, and opt/<formula> a link to the
+  // current one. Its Node gives its keg as process.execPath, and a CLI
+  // installed with brew runs from its own: the next `brew upgrade` removes
+  // both. Links: Windows makes them only with a privilege.
+  const BREW = join(realpathSync.native(home.dir), "brew");
+  const IN_KEG = ["libexec", "lib", "node_modules", "@getengram", "cli", "dist", "daemon", "worker.js"];
+  const KEG = {
+    node: join(BREW, "Cellar", "node", "25.1.0", "bin", "node"),
+    worker: join(BREW, "Cellar", "engram", "0.7.0", ...IN_KEG),
+  };
+  /** A version brew keeps until its cleanup, which opt/node no longer leads to. */
+  const OLDER_NODE = join(BREW, "Cellar", "node", "25.0.0", "bin", "node");
+  const OPT = {
+    node: join(BREW, "opt", "node", "bin", "node"),
+    worker: join(BREW, "opt", "engram", ...IN_KEG),
+  };
+  /** The unit the CLI brew installed writes: Node and the worker through the opt links. */
+  const THROUGH_OPT: Partial<UnitPaths> = { ...OPT, path: `${dirname(OPT.node)}:/usr/local/bin:/usr/bin:/bin` };
+  /** The one the same CLI wrote before engram#652: the kegs themselves. */
+  const IN_KEGS: Partial<UnitPaths> = { ...KEG, path: `${dirname(KEG.node)}:/usr/local/bin:/usr/bin:/bin` };
+
+  beforeAll(() => {
+    if (HOST === "win32") return;
+    for (const file of [KEG.node, KEG.worker, OLDER_NODE]) {
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, "");
+    }
+    mkdirSync(join(BREW, "opt"));
+    symlinkSync("../Cellar/node/25.1.0", join(BREW, "opt", "node"));
+    symlinkSync("../Cellar/engram/0.7.0", join(BREW, "opt", "engram"));
+  });
+
+  /** Run as the CLI brew installed does: on Homebrew's Node, with this build in its keg. */
+  async function asBrewCli(run: () => unknown, node = KEG.node): Promise<void> {
+    const execPath = process.execPath;
+    process.execPath = node;
+    cli.worker = KEG.worker;
+    try {
+      await run();
+    } finally {
+      process.execPath = execPath;
+      cli.worker = null;
+    }
+  }
+
+  posixIt("engram install names Node and the worker through the opt links, which outlast the next upgrade", async () => {
+    await asBrewCli(() => daemonInstall());
+    expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(THROUGH_OPT));
+    expect(readUnit()).toEqual({ kind: "ours", enabled: true, broken: false, version: UNIT_VERSION, outdated: false });
+    expect(said()).toContain("Auto-start enabled — daemon will start when you log in (systemd)");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  posixIt("finds a unit naming either keg outdated, not broken: it works only until the next upgrade", () => {
+    for (const pinned of [IN_KEGS, { node: KEG.node }, { worker: KEG.worker }]) {
+      writeUnit(unitWith(pinned));
+      expect(readUnit()).toEqual({ kind: "ours", enabled: true, broken: false, version: UNIT_VERSION, outdated: true });
+    }
+    writeUnit(unitWith(THROUGH_OPT));
+    expect(readUnit()).toEqual({ kind: "ours", enabled: true, broken: false, version: UNIT_VERSION, outdated: false });
+  });
+
+  posixIt("finds one naming a version the upgrade removed broken, as before; leaves a newer CLI's to it", () => {
+    writeUnit(unitWith({ node: join(BREW, "Cellar", "node", "24.0.0", "bin", "node") }));
+    expect(readUnit()).toEqual({ kind: "ours", enabled: true, broken: true, version: UNIT_VERSION, outdated: false });
+    writeUnit(unitWith(IN_KEGS, UNIT_VERSION + 1));
+    expect(readUnit()).toEqual({
+      kind: "ours",
+      enabled: true,
+      broken: false,
+      version: UNIT_VERSION + 1,
+      outdated: false,
+    });
+  });
+
+  posixIt("engram status says one naming the kegs is outdated, until engram install rewrites it", async () => {
+    writeUnit(unitWith(IN_KEGS));
+    daemonRunning();
+    await daemonStatus();
+    expect(said()).toContain("Auto-start: enabled (systemd)  — outdated config, run 'engram install' to update");
+    await asBrewCli(() => daemonInstall());
+    expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(THROUGH_OPT));
+    said();
+    await daemonStatus();
+    const after = said();
+    expect(after).toContain("Auto-start: enabled (systemd)");
+    expect(after).not.toMatch(/broken|outdated/);
+  });
+
+  posixIt("engram start rewrites one naming the kegs, once, and leaves it enabled", async () => {
+    writeUnit(unitWith(IN_KEGS));
+    await asBrewCli(() => daemonStart([], {}));
+    expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(THROUGH_OPT));
+    expect(linked()).toBe(true);
+    expect(systemctlCalls()).toEqual(["daemon-reload"]);
+    expect(said()).toContain(`Updated auto-start configuration (systemd unit v${UNIT_VERSION})`);
+    expect(spawn).toHaveBeenCalledTimes(1);
+
+    // Current from then on.
+    daemonGone();
+    execFileSync.mockClear();
+    await asBrewCli(() => daemonStart([], {}));
+    expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(THROUGH_OPT));
+    expect(execFileSync).not.toHaveBeenCalled();
+    expect(said()).not.toContain("Updated auto-start configuration");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  posixIt("engram start from a CLI brew didn't install points the unit at that CLI, as with an older unit", async () => {
+    writeUnit(unitWith(IN_KEGS));
+    await daemonStart([], {});
+    expect(readFileSync(UNIT, "utf-8")).toBe(unitWith());
+    expect(said()).toContain("Updated auto-start configuration");
+  });
+
+  posixIt("leaves one the user disabled as it is", async () => {
+    writeUnit(unitWith(IN_KEGS), false);
+    await asBrewCli(() => daemonStart([], {}));
+    expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(IN_KEGS));
+    expect(linked()).toBe(false);
+    expect(execFileSync).not.toHaveBeenCalled();
+    expect(said()).not.toContain("Updated auto-start configuration");
+  });
+
+  posixIt("names a Node version opt/node no longer leads to as it is, and leaves that unit be", async () => {
+    const ownPath: Partial<UnitPaths> = {
+      node: OLDER_NODE,
+      worker: OPT.worker,
+      path: `${dirname(OLDER_NODE)}:/usr/local/bin:/usr/bin:/bin`,
+    };
+    await asBrewCli(() => daemonInstall(), OLDER_NODE);
+    expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(ownPath));
+    expect(readUnit()).toEqual({ kind: "ours", enabled: true, broken: false, version: UNIT_VERSION, outdated: false });
+    // Never rewritten again and again: what it writes reads as current.
+    daemonGone();
+    said();
+    await asBrewCli(() => daemonStart([], {}), OLDER_NODE);
+    expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(ownPath));
+    expect(said()).not.toContain("Updated auto-start configuration");
+  });
+
+  describe("auto-capture", () => {
+    signedInAtATerminal();
+
+    posixIt("rewrites one naming the kegs after a command, says so once, then nothing", async () => {
+      writeUnit(unitWith(IN_KEGS));
+      daemonRunning();
+      await asBrewCli(() => autoEnableCapture({ after: "command" }));
+      expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(THROUGH_OPT));
+      const text = said();
+      expect(text).toContain("Updated auto-start configuration");
+      expect(text).toContain("Auto-capture is on");
+
+      execFileSync.mockClear();
+      for (let command = 0; command < 3; command++) {
+        await asBrewCli(() => autoEnableCapture({ after: "command" }));
+        expect(said()).toBe("");
+      }
+      expect(execFileSync).not.toHaveBeenCalled();
+      expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(THROUGH_OPT));
+    });
   });
 });

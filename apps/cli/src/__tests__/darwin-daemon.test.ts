@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, afterAll, vi, type Mock } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi, type Mock } from "vitest";
 import {
   chmodSync,
   existsSync,
@@ -30,8 +30,11 @@ import type { PlistPaths } from "../daemon/launchd.js";
  * plists back too (read-only, temp files).
  */
 
-const { home, daemon, launchd, spawn, execSync, execFileSync } = vi.hoisted(() => ({
+const { home, cli, daemon, launchd, spawn, execSync, execFileSync } = vi.hoisted(() => ({
   home: { dir: "" },
+  // This build's worker, when it isn't the one in the test's home: a CLI
+  // installed with brew runs from a versioned keg (engram#652).
+  cli: { worker: null as string | null },
   // What answers on the daemon's socket: a daemon, or nothing. `silent`:
   // something holds it and doesn't answer, as a daemon busy starting does.
   daemon: { answering: null as { pid: number } | null, silent: false },
@@ -99,7 +102,7 @@ vi.mock("../daemon/launch.js", async (importOriginal) => {
   const path = await import("node:path");
   return {
     ...(await importOriginal<typeof import("../daemon/launch.js")>()),
-    workerPath: () => path.join(home.dir, "cli", "dist", "daemon", "worker.js"),
+    workerPath: () => cli.worker ?? path.join(home.dir, "cli", "dist", "daemon", "worker.js"),
   };
 });
 // The probe answers from `daemon.answering`; the rest is the real module.
@@ -166,8 +169,10 @@ const {
   xmlText,
 } = await import("../daemon/launchd.js");
 const { commandFailure } = await import("../daemon/command-path.js");
+const { throughOptLink } = await import("../daemon/homebrew.js");
 
-const NODE = realpathSync.native(process.execPath);
+/** Node as start at login names it: through Homebrew's opt link, when it runs from a keg (engram#652). */
+const NODE = throughOptLink(realpathSync.native(process.execPath));
 /** The plist's paths for this CLI, as `engram install` writes them. */
 const THIS_CLI: PlistPaths = {
   node: NODE,
@@ -434,6 +439,7 @@ beforeEach(() => {
   });
   daemon.answering = null;
   daemon.silent = false;
+  cli.worker = null;
   rmSync(join(home.dir, "Library"), { recursive: true, force: true });
   rmSync(PID_FILE, { force: true });
   writeFileSync(WORKER, "");
@@ -599,46 +605,46 @@ describe("reading the plist (engram#616)", () => {
 
   it("finds a current one", () => {
     writePlist(plistWith());
-    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION });
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: false });
   });
 
   it("finds one whose Node or worker is gone broken", () => {
     for (const gone of [{ node: join(home.dir, "gone", "node") }, { worker: join(home.dir, "gone", "worker.js") }]) {
       writePlist(plistWith(gone));
-      expect(readPlist()).toEqual({ kind: "ours", broken: true, version: PLIST_VERSION });
+      expect(readPlist()).toEqual({ kind: "ours", broken: true, version: PLIST_VERSION, outdated: false });
     }
   });
 
   it("finds one with a raw < in it broken, as CLIs before engram#616 wrote one: launchd can't load it", () => {
     writePlist(plistWith({ home: "/Users/a<b" }).replace("&lt;", () => "<"));
-    expect(readPlist()).toEqual({ kind: "ours", broken: true, version: PLIST_VERSION });
+    expect(readPlist()).toEqual({ kind: "ours", broken: true, version: PLIST_VERSION, outdated: false });
   });
 
   it("finds one that isn't UTF-8, or isn't a file, broken", () => {
     writePlist(Buffer.concat([Buffer.from(plistWith()), Buffer.from([0xff])]));
-    expect(readPlist()).toEqual({ kind: "ours", broken: true, version: 1 });
+    expect(readPlist()).toEqual({ kind: "ours", broken: true, version: 1, outdated: true });
     rmSync(PLIST);
     mkdirSync(PLIST);
-    expect(readPlist()).toEqual({ kind: "ours", broken: true, version: 1 });
+    expect(readPlist()).toEqual({ kind: "ours", broken: true, version: 1, outdated: true });
   });
 
   permissionsIt("finds one others can write broken: launchd won't load it", () => {
     for (const mode of [0o664, 0o646]) {
       writePlist(plistWith(), mode);
-      expect(readPlist()).toEqual({ kind: "ours", broken: true, version: PLIST_VERSION });
+      expect(readPlist()).toEqual({ kind: "ours", broken: true, version: PLIST_VERSION, outdated: false });
     }
     writePlist(v1Plist(), 0o664);
-    expect(readPlist()).toEqual({ kind: "ours", broken: true, version: 1 });
+    expect(readPlist()).toEqual({ kind: "ours", broken: true, version: 1, outdated: true });
   });
 
   permissionsIt("finds one it can't read broken", () => {
     writePlist(plistWith(), 0o000);
-    expect(readPlist()).toEqual({ kind: "ours", broken: true, version: 1 });
+    expect(readPlist()).toEqual({ kind: "ours", broken: true, version: 1, outdated: true });
   });
 
   it("reads past a byte order mark, as launchd does", () => {
     writePlist(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(plistWith())]));
-    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION });
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: false });
   });
 
   posixIt("knows which launchd won't load: one others can write, or one someone else owns, unless root", () => {
@@ -655,12 +661,12 @@ describe("reading the plist (engram#616)", () => {
 
   it("finds an older one outdated, not broken: start rewrites it all the same", () => {
     writePlist(v1Plist());
-    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: 1 });
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: 1, outdated: true });
   });
 
   it("leaves a newer one to the CLI that wrote it", () => {
     writePlist(plistWith({ node: join(home.dir, "gone", "node") }, PLIST_VERSION + 1));
-    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION + 1 });
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION + 1, outdated: false });
   });
 });
 
@@ -744,7 +750,7 @@ describe("engram install on macOS (engram#616)", () => {
     expect(text).toContain("Auto-start enabled — daemon will start on login");
     expect(text).toContain(`Plist: ${PLIST}`);
     expect(process.exitCode).toBeUndefined();
-    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION });
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: false });
   });
 
   posixIt("writes it 0644 whatever the umask: launchd won't load one others can write", async () => {
@@ -768,7 +774,7 @@ describe("engram install on macOS (engram#616)", () => {
       const text = readFileSync(plistPath(), "utf-8");
       expect(text).toContain("A&amp;B &lt;C&gt;");
       expect(pathsIn(text)).toMatchObject({ home: home.dir, worker: join(home.dir, "cli", "dist", "daemon", "worker.js") });
-      expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION });
+      expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: false });
       expect(launchd.loadedText).toBe(text);
     } finally {
       restore();
@@ -949,7 +955,7 @@ describe("engram start on macOS (engram#616)", () => {
     writePlist(plistWith(), 0o664);
     await daemonStart([], {});
     expect(statSync(PLIST).mode & 0o777).toBe(0o644);
-    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION });
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: false });
     expect(launchd.loaded).toBe(true);
   });
 
@@ -1646,6 +1652,169 @@ describe("a job switched off in launchd (engram#654)", () => {
           expect(launchd.loaded).toBe(false);
         }
       }
+    });
+  });
+});
+
+describe("a CLI and a Node installed with brew (engram#652)", () => {
+  // A Homebrew prefix as `brew install node engram` leaves one: each version
+  // in its keg under Cellar/, and opt/<formula> a link to the current one.
+  // Homebrew's Node gives its keg as process.execPath, and a CLI installed
+  // with brew runs from its own: the next `brew upgrade` removes both.
+  // Links: Windows makes them only with a privilege.
+  const BREW = join(realpathSync.native(home.dir), "brew");
+  const IN_KEG = ["libexec", "lib", "node_modules", "@getengram", "cli", "dist", "daemon", "worker.js"];
+  const KEG = {
+    node: join(BREW, "Cellar", "node", "25.1.0", "bin", "node"),
+    worker: join(BREW, "Cellar", "engram", "0.7.0", ...IN_KEG),
+  };
+  /** A version brew keeps until its cleanup, which opt/node no longer leads to. */
+  const OLDER_NODE = join(BREW, "Cellar", "node", "25.0.0", "bin", "node");
+  const OPT = {
+    node: join(BREW, "opt", "node", "bin", "node"),
+    worker: join(BREW, "opt", "engram", ...IN_KEG),
+  };
+  /** The plist the CLI brew installed writes: Node and the worker through the opt links. */
+  const THROUGH_OPT: Partial<PlistPaths> = {
+    ...OPT,
+    path: `${dirname(OPT.node)}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
+  };
+  /** The one the same CLI wrote before engram#652: the kegs themselves. */
+  const IN_KEGS: Partial<PlistPaths> = {
+    ...KEG,
+    path: `${dirname(KEG.node)}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
+  };
+
+  beforeAll(() => {
+    if (HOST === "win32") return;
+    for (const file of [KEG.node, KEG.worker, OLDER_NODE]) {
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, "");
+    }
+    mkdirSync(join(BREW, "opt"));
+    symlinkSync("../Cellar/node/25.1.0", join(BREW, "opt", "node"));
+    symlinkSync("../Cellar/engram/0.7.0", join(BREW, "opt", "engram"));
+  });
+
+  /** Run as the CLI brew installed does: on Homebrew's Node, with this build in its keg. */
+  async function asBrewCli(run: () => unknown, node = KEG.node): Promise<void> {
+    const execPath = process.execPath;
+    process.execPath = node;
+    cli.worker = KEG.worker;
+    try {
+      await run();
+    } finally {
+      process.execPath = execPath;
+      cli.worker = null;
+    }
+  }
+
+  posixIt("engram install names Node and the worker through the opt links, which outlast the next upgrade", async () => {
+    await asBrewCli(() => daemonInstall());
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(THROUGH_OPT));
+    expect(launchd.loadedText).toBe(plistWith(THROUGH_OPT));
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: false });
+    expect(said()).toContain("Auto-start enabled — daemon will start on login");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  posixIt("finds a plist naming either keg outdated, not broken: it works only until the next upgrade", () => {
+    for (const pinned of [IN_KEGS, { node: KEG.node }, { worker: KEG.worker }]) {
+      writePlist(plistWith(pinned));
+      expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: true });
+    }
+    writePlist(plistWith(THROUGH_OPT));
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: false });
+  });
+
+  posixIt("finds one naming a version the upgrade removed broken, as before; leaves a newer CLI's to it", () => {
+    writePlist(plistWith({ node: join(BREW, "Cellar", "node", "24.0.0", "bin", "node") }));
+    expect(readPlist()).toEqual({ kind: "ours", broken: true, version: PLIST_VERSION, outdated: false });
+    writePlist(plistWith(IN_KEGS, PLIST_VERSION + 1));
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION + 1, outdated: false });
+  });
+
+  posixIt("engram status says one naming the kegs is outdated, until engram install rewrites it", async () => {
+    writePlist(plistWith(IN_KEGS));
+    daemonRunning();
+    await daemonStatus();
+    expect(said()).toContain("Auto-start: enabled (launchd)  — outdated config, run 'engram install' to update");
+    await asBrewCli(() => daemonInstall());
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(THROUGH_OPT));
+    said();
+    await daemonStatus();
+    const after = said();
+    expect(after).toContain("Auto-start: enabled (launchd)");
+    expect(after).not.toMatch(/broken|outdated/);
+  });
+
+  posixIt("engram start rewrites one naming the kegs, once, and launchd loads it in its place", async () => {
+    writePlist(plistWith(IN_KEGS));
+    launchd.loaded = true;
+    launchd.loadedText = plistWith(IN_KEGS);
+    await asBrewCli(() => daemonStart([], {}));
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(THROUGH_OPT));
+    expect(launchd.loadedText).toBe(plistWith(THROUGH_OPT));
+    expect(launchctlCalls()).toEqual(["list", "print-disabled", "bootout", "list", "bootstrap"]);
+    expect(said()).toContain(`Updated auto-start configuration (plist v${PLIST_VERSION})`);
+    expect(spawn).toHaveBeenCalledTimes(1);
+
+    // Current from then on.
+    daemonGone();
+    execFileSync.mockClear();
+    await asBrewCli(() => daemonStart([], {}));
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(THROUGH_OPT));
+    expect(launchctlCalls()).toEqual(["list"]);
+    expect(said()).not.toContain("Updated auto-start configuration");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  posixIt("engram start from a CLI brew didn't install points the plist at that CLI, as with an older plist", async () => {
+    writePlist(plistWith(IN_KEGS));
+    await daemonStart([], {});
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+    expect(said()).toContain("Updated auto-start configuration");
+  });
+
+  posixIt("names a Node version opt/node no longer leads to as it is, and leaves that plist be", async () => {
+    const ownPath: Partial<PlistPaths> = {
+      node: OLDER_NODE,
+      worker: OPT.worker,
+      path: `${dirname(OLDER_NODE)}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
+    };
+    await asBrewCli(() => daemonInstall(), OLDER_NODE);
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(ownPath));
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: false });
+    // Never rewritten again and again: what it writes reads as current.
+    daemonGone();
+    said();
+    await asBrewCli(() => daemonStart([], {}), OLDER_NODE);
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(ownPath));
+    expect(said()).not.toContain("Updated auto-start configuration");
+  });
+
+  describe("auto-capture", () => {
+    signedInAtATerminal();
+
+    posixIt("rewrites one naming the kegs after a command, says so once, then nothing", async () => {
+      writePlist(plistWith(IN_KEGS));
+      launchd.loaded = true;
+      launchd.loadedText = plistWith(IN_KEGS);
+      daemonRunning();
+      await asBrewCli(() => autoEnableCapture({ after: "command" }));
+      expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(THROUGH_OPT));
+      expect(launchd.loadedText).toBe(plistWith(THROUGH_OPT));
+      const text = said();
+      expect(text).toContain("Updated auto-start configuration");
+      expect(text).toContain("Auto-capture is on");
+
+      execFileSync.mockClear();
+      for (let command = 0; command < 3; command++) {
+        await asBrewCli(() => autoEnableCapture({ after: "command" }));
+        expect(said()).toBe("");
+      }
+      expect(execFileSync).not.toHaveBeenCalled();
+      expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(THROUGH_OPT));
     });
   });
 });

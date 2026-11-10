@@ -17,7 +17,7 @@ import {
 } from "./status.js";
 import { formatWait } from "./backoff.js";
 import { ALL_ADAPTERS } from "./adapters.js";
-import { rootForAnotherUser } from "./as-root.js";
+import { asRootRefusal, rootForAnotherUser } from "./as-root.js";
 import { commandFailure } from "./command-path.js";
 import { throughOptLink } from "./homebrew.js";
 import {
@@ -267,18 +267,16 @@ function readLaunchdPid(): number | null {
 
 /**
  * `sudo engram start` or `sudo engram install` would set capture up for
- * root, not for the user (engram#653): say so, and change nothing.
+ * root, not for the user (engram#653), and `sudo engram stop` or
+ * `uninstall` would save the setting as root's (engram#682): say so, and
+ * change nothing. The CLI's entry refuses them first; this is for any
+ * other caller.
  */
-function refusedAsRoot(command: "start" | "install"): boolean {
+function refusedAsRoot(command: "start" | "stop" | "install" | "uninstall"): boolean {
   if (!rootForAnotherUser()) return false;
-  console.error(
-    red(
-      command === "install"
-        ? "Start at login is per user, and this is running as root."
-        : "Engram's daemon runs as you, and this is running as root.",
-    ),
-  );
-  console.error(dim(`  Run 'engram ${command}' as yourself, without sudo.`));
+  const { problem, fix } = asRootRefusal(command);
+  console.error(red(problem));
+  console.error(dim(fix));
   process.exitCode = 1;
   return true;
 }
@@ -805,6 +803,8 @@ export const STOP_PICKUP_MS = 10_000;
  * (engram#640).
  */
 export async function daemonStop(): Promise<void> {
+  // Run as root, it would save the setting as root's (engram#682).
+  if (refusedAsRoot("stop")) return;
   await recordCaptureIntent("off", "stop");
   const found = await findDaemon();
   if (found.state === "stopped") {
@@ -2455,6 +2455,8 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
 }
 
 export async function daemonUninstall(): Promise<void> {
+  // Run as root, it would save the setting as root's (engram#682).
+  if (refusedAsRoot("uninstall")) return;
   await recordCaptureIntent("off", "uninstall");
   await disableStartAtLogin();
 }

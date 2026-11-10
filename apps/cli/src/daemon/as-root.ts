@@ -58,3 +58,32 @@ export function rootForAnotherUser({
   const uid = ownerOf(home);
   return uid !== null && uid !== 0;
 }
+
+/**
+ * What a command run as root for someone else says (engram#682): only
+ * `engram help` and `engram version` run. On macOS, sudo keeps HOME, so
+ * a command run with sudo wrote the user's ~/.engram as root, leaving
+ * files there they can't read or change: config.json from login, signup,
+ * auth, exclude, stop and uninstall, the vault key from `vault keygen
+ * --save` and `vault save-key`, and the notice from `vault set` and
+ * `vault delete` that the vault changed.
+ * On Linux it set Engram up for root instead. `cmd`: the command's words,
+ * as the CLI parsed them, without its arguments.
+ */
+export function asRootRefusal(cmd: string): { problem: string; fix: string } {
+  const fix = `  Run '${cmd === "" ? "engram" : `engram ${cmd}`}' as yourself, without sudo.`;
+  switch (cmd.replace(/^daemon /, "")) {
+    case "install":
+      return { problem: "Start at login is per user, and this is running as root.", fix };
+    case "start":
+      return { problem: "Engram's daemon runs as you, and this is running as root.", fix };
+    case "stop":
+      // One started with sudo is root's: it says what stops that (engram#680).
+      return {
+        problem: "Engram runs as you, and this is running as root.",
+        fix: `${fix} For a daemon started with sudo, it says what stops it.`,
+      };
+    default:
+      return { problem: "Engram runs as you, and this is running as root.", fix };
+  }
+}

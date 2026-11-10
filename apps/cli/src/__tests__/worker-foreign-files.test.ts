@@ -106,7 +106,14 @@ afterAll(() => rmSync(home.dir, { recursive: true, force: true }));
 
 describe("a daemon that finds files in ~/.engram it can't run with (engram#659)", () => {
   it("says which, and the fix, waits for the notification, and exits 0", async () => {
-    found.value = { dir: false, files: ["daemon.db"], root: true, stopsDaemon: true, stopsStart: false };
+    found.value = {
+      dir: false,
+      files: ["daemon.db"],
+      root: true,
+      stopsDaemon: true,
+      stopsStart: false,
+      holdsSends: false,
+    };
     const { exit, log } = await runWorker();
     await vi.waitFor(() => expect(shown.calls).toHaveLength(1));
     expect(shown.calls[0]).toEqual([
@@ -130,7 +137,14 @@ describe("a daemon that finds files in ~/.engram it can't run with (engram#659)"
   });
 
   it("says another user, when the files aren't all root's", async () => {
-    found.value = { dir: false, files: ["daemon.sock"], root: false, stopsDaemon: true, stopsStart: false };
+    found.value = {
+      dir: false,
+      files: ["daemon.sock"],
+      root: false,
+      stopsDaemon: true,
+      stopsStart: false,
+      holdsSends: false,
+    };
     const { exit, log } = await runWorker();
     await vi.waitFor(() => expect(shown.calls).toHaveLength(1));
     expect(shown.calls[0][1]).toBe(`Files in ~/.engram belong to another user, not to you. To fix it, run: ${OWNERSHIP_FIX}`);
@@ -147,6 +161,7 @@ describe("a daemon that finds files in ~/.engram it can't run with (engram#659)"
       root: true,
       stopsDaemon: false,
       stopsStart: true,
+      holdsSends: false,
     };
     const { exit, log } = await runWorker();
     await vi.waitFor(() => expect(exit).toHaveBeenCalled());
@@ -158,6 +173,33 @@ describe("a daemon that finds files in ~/.engram it can't run with (engram#659)"
         `once it stops. Make them yours with: ${OWNERSHIP_FIX}\n`,
     );
     expect(log()).toContain("daemon started");
+    expect(shown.calls).toEqual([]);
+  });
+
+  it("runs on with a vault key it can't read, which holds sends, and says so in the log (engram#695)", async () => {
+    // What the check finds of a vault key that is root's, and 0600.
+    const { foreignFiles } = await vi.importActual<typeof import("../daemon/ownership.js")>("../daemon/ownership.js");
+    const dir = join(home.dir, ".engram");
+    const isKey = (path: string) => path === join(dir, "vault-key");
+    found.value = foreignFiles({
+      platform: "linux",
+      euid: 1000,
+      env: {},
+      dir,
+      ownerOf: (path) => (isKey(path) ? 0 : path === dir ? 1000 : null),
+      canAccess: (path) => !isKey(path),
+    });
+    expect(found.value).toMatchObject({ stopsDaemon: false, holdsSends: true });
+    const { exit, log } = await runWorker();
+    await vi.waitFor(() => expect(exit).toHaveBeenCalled());
+    // It went on to open the queue, which this test doesn't let it.
+    expect(exit.mock.calls[0]).toEqual([START_FAILED_EXIT]);
+    expect(log()).toContain(
+      "warning: vault-key in ~/.engram belongs to root, not to you. Until it is yours, captured messages wait " +
+        `on this machine: nothing is lost. Make it yours with: ${OWNERSHIP_FIX}\n`,
+    );
+    expect(log()).toContain("daemon started");
+    expect(log()).not.toContain("daemon exiting");
     expect(shown.calls).toEqual([]);
   });
 

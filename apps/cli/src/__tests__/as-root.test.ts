@@ -65,7 +65,7 @@ vi.mock("../daemon/instance.js", async (importOriginal) => {
   const real = await importOriginal<typeof import("../daemon/instance.js")>();
   const probeDaemon = async (): Promise<Probe> =>
     daemon.answering
-      ? { state: "answered", info: { pid: 4242, ready: true, stopping: false, stopFile: false, vaultKeyReread: true, version: real.VERSION } }
+      ? { state: "answered", info: { pid: 4242, ready: true, stopping: false, stopFile: false, vaultKeyReread: true, vaultChangeNotice: true, version: real.VERSION } }
       : { state: "none", stale: false };
   return { ...real, probeDaemon };
 });

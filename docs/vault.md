@@ -178,6 +178,8 @@ Claude Code will then use `engram vault get` to retrieve secrets on demand, keep
 
 A note on "out of the conversation history": the value *is* printed into the session when the agent runs `engram vault get`, because that is what the command is for. If the capture daemon (`engram start`) is running, it withholds the output of `engram vault get` and `engram vault keygen` from capture, and — when a vault key is configured — replaces any exact occurrence of a named secret elsewhere in the transcript with `[VAULT:name]` before anything is queued. That is what keeps the value out of your memory. Pattern-based redaction on the server would not: a password or a PIN has no shape to match.
 
+The daemon removes only the secrets it has read, so save a secret to the vault before you paste it into a session: what was sent before you saved it stays as it was sent. A daemon reads the vault when it starts and every 10 minutes. After `engram vault set` or `engram vault delete` on the same machine, it also reads the vault again before it sends anything more. A secret saved anywhere else (another machine, the SDK) reaches it at its next 10-minute read; to have it removed sooner, run `engram stop`, then `engram start`.
+
 ### MCP tools for agents
 
 Agents can also manage secrets via MCP tools:
@@ -265,7 +267,7 @@ Each secret decrypts only with the key it was saved with. If the daemon's key de
 - Save each again with this key: `engram vault set <NAME>`.
 - Delete each you no longer use: `engram vault delete <NAME>`. One you still use, save again instead: once it is deleted, the daemon no longer removes it from what it captures.
 
-The daemon checks the vault again within 5 minutes, and sends what it held once none is left that it can't remove. If you save them again one at a time, it holds until the last: before then, what it holds would go out with the others in it. Restarting the daemon doesn't send it either. Only a daemon started with no vault key at all sends it, as it sends everything without a key, with only the built-in patterns removed.
+The daemon checks the vault again within 5 minutes, or within seconds of `engram vault set` or `engram vault delete` on this machine, and sends what it held once none is left that it can't remove. If you save them again one at a time, it holds until the last: before then, what it holds would go out with the others in it. Restarting the daemon doesn't send it either. Only a daemon started with no vault key at all sends it, as it sends everything without a key, with only the built-in patterns removed.
 
 If only some of them don't decrypt, and the daemon wasn't holding for them already, it keeps sending, and `engram status` says how many it can't remove. The fix is the same, except for putting the old key back: the others don't decrypt with it. `engram vault list --check` shows which secrets don't decrypt with your key, without showing any value.
 

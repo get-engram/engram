@@ -30,24 +30,13 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import {
-  closeSync,
-  constants as fsConstants,
-  fstatSync,
-  lstatSync,
-  openSync,
-  readFileSync,
-  readSync,
-  statSync,
-  unlinkSync,
-  type BigIntStats,
-} from "node:fs";
+import { lstatSync, readFileSync, statSync, unlinkSync, type BigIntStats } from "node:fs";
 import { createRequire } from "node:module";
 import { connect, createServer, type Server } from "node:net";
 import { dirname, join } from "node:path";
 import { ENGRAM_DIR, PID_FILE } from "./launch.js";
 import { powerShellArgs, windowsPowerShellPath } from "./powershell.js";
-import { ensurePrivateDirSync, writePrivateFileSync } from "../private-files.js";
+import { ensurePrivateDirSync, readSmallFileSync, writePrivateFileSync } from "../private-files.js";
 
 /** This package's version, which the daemon gives when it answers. */
 export const VERSION: string = (() => {
@@ -184,6 +173,12 @@ export interface DaemonInfo {
    * at start.
    */
   vaultKeyReread: boolean;
+  /**
+   * It reads the vault again before its next send when `engram vault set`
+   * or `engram vault delete` says the vault changed (engram#701). One from
+   * before reads it every 10 minutes.
+   */
+  vaultChangeNotice: boolean;
 }
 
 const self = {
@@ -204,6 +199,7 @@ function answer(id: string): string {
     stopping: self.stopping,
     stop_file: watchStopFile,
     vault_key_reread: true,
+    vault_change_notice: true,
   })}\n`;
 }
 
@@ -234,6 +230,7 @@ export function parseAnswer(line: string): DaemonInfo | null {
     stopping: a.stopping === true,
     stopFile: a.stop_file === true,
     vaultKeyReread: a.vault_key_reread === true,
+    vaultChangeNotice: a.vault_change_notice === true,
   };
 }
 
@@ -767,41 +764,25 @@ export interface StopRequest {
 }
 
 /**
- * The stop request in STOP_FILE, or null when there is none. It is opened
- * without waiting and must be a small regular file before it is read: a
- * FIFO put there would otherwise hang the daemon on the read. BigInt fstat,
- * for the reason given at lstatSocketPath.
+ * The stop request in STOP_FILE, or null when there is none. It must be a
+ * small regular file, read without waiting (see readSmallFileSync): a FIFO
+ * put there would otherwise hang the daemon on the read.
  */
 export function readStopFile(file: string = STOP_FILE): StopRequest | null {
-  let fd: number;
+  const found = readSmallFileSync(file, MAX_STOP_BYTES);
+  if (found === null) return null;
+  let value: unknown = null;
   try {
-    // O_NONBLOCK: undefined on Windows, which has no FIFOs in the file system.
-    fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+    value = JSON.parse(found.data.toString("utf-8"));
   } catch {
-    return null;
+    // not a request this version wrote: it still counts as one, for no daemon
   }
-  try {
-    const st = fstatSync(fd, { bigint: true });
-    if (!st.isFile() || st.size > BigInt(MAX_STOP_BYTES)) return null;
-    const buf = Buffer.alloc(MAX_STOP_BYTES + 1);
-    const read = readSync(fd, buf, 0, buf.length, 0);
-    let value: unknown = null;
-    try {
-      value = JSON.parse(buf.subarray(0, read).toString("utf-8"));
-    } catch {
-      // not a request this version wrote: it still counts as one, for no daemon
-    }
-    const r = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
-    return {
-      pid: typeof r.pid === "number" && Number.isSafeInteger(r.pid) && r.pid > 0 ? r.pid : null,
-      id: typeof r.id === "string" && /^[0-9a-f]{32}$/.test(r.id) ? r.id : null,
-      stamp: `${st.dev}:${st.ino}:${st.mtimeNs}:${st.size}`,
-    };
-  } catch {
-    return null;
-  } finally {
-    closeSync(fd);
-  }
+  const r = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+  return {
+    pid: typeof r.pid === "number" && Number.isSafeInteger(r.pid) && r.pid > 0 ? r.pid : null,
+    id: typeof r.id === "string" && /^[0-9a-f]{32}$/.test(r.id) ? r.id : null,
+    stamp: found.stamp,
+  };
 }
 
 /** Remove STOP_FILE when the request in it is one `matches` takes. */

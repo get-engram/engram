@@ -107,6 +107,21 @@ export function lifecycleMail(env: Env): LifecycleMail | null {
 }
 
 /**
+ * The emails that carry an unsubscribe link, by the type engram-web logs
+ * each one under in email_log: the weekly digest, the nudges and the
+ * plan-changed notice. An unsubscribe is credited only to one of these
+ * (index.ts). A welcome email or a team invite has no link to click.
+ */
+export const UNSUBSCRIBE_LINK_EMAILS: readonly string[] = [
+  "weekly-digest",
+  "activation-nudge",
+  "import-nudge",
+  "maxout-nudge",
+  "recall-nudge",
+  "plan-changed",
+];
+
+/**
  * Whether `sig` signs an unsubscribe link for `orgId`, with the signing key
  * or UNSUBSCRIBE_HMAC_KEY_PREVIOUS. WebCrypto's verify compares in constant
  * time. ADMIN_SECRET checks a link only while it is the signing key.

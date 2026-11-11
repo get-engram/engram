@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createHmac } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { basename, join, relative, sep } from "node:path";
 import { Hono } from "hono";
 import app from "../index.js";
 import {
   lifecycleMail,
+  UNSUBSCRIBE_LINK_EMAILS,
   unsubscribeSig,
   unsubscribeSigValid,
   websiteBearer,
@@ -364,6 +365,20 @@ describe("every cron send to engram-web", () => {
     if (sender.signs) expect(posts[0].body.unsubscribe_url).toBe(link(ORG, hmac(KEY, ORG)));
     else expect(posts[0].body).not.toHaveProperty("unsubscribe_url");
     expect(errors).not.toHaveBeenCalled();
+  });
+
+  it.each(SENDERS.filter((s) => s.signs))(
+    "$name names the org it is for, so engram-web logs it with that org (engram#745)",
+    async (sender) => {
+      const { posts } = web();
+      await sender.send(cronEnv(oneOrgDb().db, ALL));
+      expect(posts[0].body.org_id).toBe(ORG);
+    },
+  );
+
+  it.each(SENDERS)("$name can be credited with an unsubscribe only if it carries the link (engram#745)", (sender) => {
+    // index.ts credits an unsubscribe to the org's latest email of these types.
+    expect(UNSUBSCRIBE_LINK_EMAILS.includes(basename(sender.route))).toBe(sender.signs);
   });
 
   it.each(SENDERS.filter((s) => s.signs))(

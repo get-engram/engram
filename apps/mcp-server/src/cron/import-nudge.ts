@@ -41,6 +41,7 @@ export async function sendImportNudges(env: Env): Promise<number> {
         body: JSON.stringify({
           to: org.email,
           name: org.name,
+          org_id: org.id,
           unsubscribe_url: unsubscribeUrl,
         }),
       });

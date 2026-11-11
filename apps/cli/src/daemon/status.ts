@@ -21,6 +21,11 @@ export type SyncErrorType =
   | "rate_limit"
   | "network"
   | "server"
+  /** Refused as too large to accept (HTTP 413, engram#750). Every message
+   *  is bounded far inside Engram's limit before it is sent, so this is
+   *  something on the way with a smaller one. A batch is halved at once; a
+   *  single message stays queued, in its place, and is tried again. */
+  | "too_large"
   /** Engram paused saving for scheduled maintenance (`writes_paused`). It
    *  passes on its own, and nothing queued here is lost meanwhile. */
   | "paused"
@@ -615,6 +620,7 @@ export function classifyError(err: unknown): SyncErrorType {
 
   if (status === 429) return "rate_limit";
   if (status === 402) return "billing";
+  if (status === 413) return "too_large";
   if (status !== undefined && status >= 500) return "server";
 
   const head = body === null ? message : message.slice(0, message.indexOf("{"));
@@ -622,6 +628,14 @@ export function classifyError(err: unknown): SyncErrorType {
   // a 402, but it is a different situation — backing off and retrying can
   // never clear it, so it gets its own state and its own copy.
   if (message.includes("storage_full")) return "storage_full";
+  // A 413 comes with no JSON-RPC body, so the SDK throws "Unexpected
+  // response format: Payload Too Large" (Engram's own limit) with no status,
+  // or a proxy's page, "413 Request Entity Too Large" (engram#750). It used
+  // to read as a network error and be retried unchanged forever. Read from
+  // outside a JSON body only: inside one it is data.
+  if (/\b413\b|payload too large|request entity too large|content too large/i.test(head)) {
+    return "too_large";
+  }
   if (/\b429\b/.test(head) || /rate[ _-]?limit|too many requests/i.test(message)) return "rate_limit";
   if (/\b402\b/.test(head) || /(?:limit|quota)_exceeded|\bbilling\b/i.test(message)) return "billing";
   if (/\b40[13]\b/.test(head) || AUTH_PHRASE.test(message)) return "auth";
@@ -728,6 +742,11 @@ export function syncErrorSummary(
       return "Rate limited — messages queued, will retry.";
     case "server":
       return "Server error — messages queued, will retry.";
+    case "too_large":
+      return (
+        "A message was refused as too large to accept — it stays queued here, " +
+        "in order, and is retried. Nothing is lost."
+      );
     case "paused":
       return "Engram is paused for scheduled maintenance — messages queued, will retry.";
     case "vault_key":

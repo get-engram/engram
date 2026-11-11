@@ -5,6 +5,7 @@ import { resolveBaseUrl } from "../config.js";
 import { configForUse } from "../config-guard.js";
 import { engramCommand } from "../daemon/package-runner.js";
 import { green, dim, bold, plural } from "../output.js";
+import { boundContent } from "../message-bounds.js";
 
 import { parseStorageFullError } from "../storage-error.js";
 // Re-exported for backwards compatibility: this parser moved to a shared module
@@ -80,6 +81,42 @@ export interface NormalizedConversation {
 }
 
 const STORE_BATCH = 100;
+
+/**
+ * Most encoded content one store request carries, in bytes (engram#750):
+ * far inside the worker's 8 MB request limit, which 100 long messages of
+ * pasted documents could pass.
+ */
+export const STORE_BATCH_BYTES = 2 * 1024 * 1024;
+
+/**
+ * A conversation's messages as store requests (engram#750). Each body is
+ * bounded the way Engram bounds it on arrival (file payloads replaced with
+ * a note, then clipped), so Engram stores the same text, or in one case
+ * less (see message-bounds.ts), and each request carries at most
+ * STORE_BATCH messages and STORE_BATCH_BYTES of content as sent. A request
+ * always carries at least one message; bounded, one is far inside the
+ * limit.
+ */
+export function storeBatches(messages: readonly MessageInput[]): MessageInput[][] {
+  const batches: MessageInput[][] = [];
+  let batch: MessageInput[] = [];
+  let bytes = 0;
+  for (const m of messages) {
+    const content = boundContent(m.content);
+    const message = content === m.content ? m : { ...m, content };
+    const size = Buffer.byteLength(JSON.stringify(content));
+    if (batch.length > 0 && (batch.length >= STORE_BATCH || bytes + size > STORE_BATCH_BYTES)) {
+      batches.push(batch);
+      batch = [];
+      bytes = 0;
+    }
+    batch.push(message);
+    bytes += size;
+  }
+  if (batch.length > 0) batches.push(batch);
+  return batches;
+}
 
 /** Walk a ChatGPT export's node tree (current_node → root) into a chronological list. */
 export function linearize(convo: ChatConversation): MessageInput[] {
@@ -519,11 +556,8 @@ export async function importHistory(
         skipped++;
         continue;
       }
-      for (let b = 0; b < convo.messages.length; b += STORE_BATCH) {
-        await engram.store({
-          conversationId,
-          messages: convo.messages.slice(b, b + STORE_BATCH),
-        });
+      for (const messages of storeBatches(convo.messages)) {
+        await engram.store({ conversationId, messages });
       }
       console.log(`  ${green("✓")} ${label}`);
       imported++;

@@ -71,6 +71,21 @@ export async function unsubscribeSig(orgId: string, key: string): Promise<string
   return Array.from(new Uint8Array(mac), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/** An org's unsubscribe link, signed with `key`. */
+async function signedLink(orgId: string, key: string): Promise<string> {
+  return `${UNSUBSCRIBE_URL}?org=${encodeURIComponent(orgId)}&sig=${await unsubscribeSig(orgId, key)}`;
+}
+
+/**
+ * An org's unsubscribe link, signed with the signing key, for an email sent
+ * outside the crons (GET /admin/unsubscribe-link, engram#735). The same
+ * link the crons put in their emails. Null when no signing key is set.
+ */
+export async function unsubscribeUrl(env: Env, orgId: string): Promise<string | null> {
+  const key = signingKey(env);
+  return key === null ? null : signedLink(orgId, key);
+}
+
 /** What the worker needs to ask engram-web for a lifecycle email. */
 export interface LifecycleMail {
   /** For the Authorization header. */
@@ -88,11 +103,7 @@ export function lifecycleMail(env: Env): LifecycleMail | null {
   const bearer = websiteBearer(env);
   const key = signingKey(env);
   if (bearer === null || key === null) return null;
-  return {
-    bearer,
-    unsubscribeUrl: async (orgId) =>
-      `${UNSUBSCRIBE_URL}?org=${encodeURIComponent(orgId)}&sig=${await unsubscribeSig(orgId, key)}`,
-  };
+  return { bearer, unsubscribeUrl: (orgId) => signedLink(orgId, key) };
 }
 
 /**

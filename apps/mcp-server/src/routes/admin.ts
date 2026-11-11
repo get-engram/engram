@@ -25,6 +25,7 @@ import { sendRecallNudges } from "../cron/recall-nudge.js";
 import { sendImportNudges } from "../cron/import-nudge.js";
 import type { Env } from "../types.js";
 import { sendDailyReport } from "../services/daily-report.js";
+import { unsubscribeUrl } from "../services/secrets.js";
 import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
 import { priceToTier } from "../services/stripe.js";
 import { findPriceByLookupKey, createRecurringPrice, reconcileProduct } from "../services/stripe.js";
@@ -876,6 +877,36 @@ admin.get("/email-log", async (c) => {
     unsubscribed_orgs: unsubCount?.n ?? 0,
     recent_unsubscribes: unsub.results ?? [],
   });
+});
+
+// GET /admin/unsubscribe-link?org=<org id> — the org's signed unsubscribe
+// link (engram#735), for a lifecycle email sent outside the crons, such as a
+// one-off notice through engram-web's email routes. The crons' own links come
+// from the same code. Without this, the only way to make one is to sign it by
+// hand with ADMIN_SECRET, and after the engram#456 rollout that link answers
+// "Invalid link." once ADMIN_SECRET is rotated. The signing key stays here.
+//
+// A deleted org gets no link: it gets no lifecycle email. `opted_out` says
+// the org already unsubscribed, so it gets none of these emails either.
+// The link opts the org out with no login, so no cache keeps a copy.
+admin.get("/unsubscribe-link", async (c) => {
+  c.header("Cache-Control", "no-store");
+  const orgId = c.req.query("org");
+  if (!orgId) return c.json({ error: "missing_org", message: "Pass ?org=<org id>." }, 400);
+  const org = await c.env.DB.prepare(
+    "SELECT digest_opt_out, deleted_at FROM organizations WHERE id = ?",
+  )
+    .bind(orgId)
+    .first<{ digest_opt_out: number; deleted_at: string | null }>();
+  if (!org) return c.json({ error: "not_found", message: "No such organization." }, 404);
+  if (org.deleted_at !== null) {
+    return c.json({ error: "deleted", message: "This organization is deleted, so it gets no lifecycle email." }, 404);
+  }
+  const url = await unsubscribeUrl(c.env, orgId);
+  if (url === null) {
+    return c.json({ error: "no_signing_key", message: "No key to sign unsubscribe links is set." }, 503);
+  }
+  return c.json({ org_id: orgId, url, opted_out: org.digest_opt_out === 1 });
 });
 
 // GET /admin/stripe-customer/:customerId — read-only Stripe peek for

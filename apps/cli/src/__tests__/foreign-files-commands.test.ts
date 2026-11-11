@@ -19,9 +19,10 @@ import type { Probe } from "../daemon/instance.js";
 
 const { home, daemon, given, imported, spawn, execSync, execFileSync, execFile, saveConfig } = vi.hoisted(() => ({
   home: { dir: "" },
-  // What answers on the daemon's socket: a daemon, or nothing. And a
-  // daemon running as root for the user, if one runs (engram#680).
-  daemon: { answering: null as { pid: number } | null, root: null as number | null },
+  // What answers on the daemon's socket: a daemon, something that holds it
+  // and doesn't answer, or nothing. And a daemon running as root for the
+  // user, if one runs (engram#680).
+  daemon: { answering: null as { pid: number } | "silent" | null, root: null as number | null },
   // What in ~/.engram is root's and 0600, by name; ".engram" for the folder.
   given: { roots: [] as string[] },
   imported: { worker: false },
@@ -75,6 +76,7 @@ vi.mock("../daemon/instance.js", async (importOriginal) => {
   const probeDaemon = async (): Promise<Probe> => {
     const a = daemon.answering;
     if (a === null) return { state: "none", stale: false };
+    if (a === "silent") return { state: "silent" };
     return { state: "answered", info: { ready: true, stopping: false, stopFile: false, vaultKeyReread: true, vaultChangeNotice: true, version: real.VERSION, ...a } };
   };
   return {
@@ -317,6 +319,23 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
       expect(statSync(LOG_FILE).mode & 0o777).toBe(0o400);
     });
 
+    it("points at the log of a daemon that isn't answering only while it can be written (engram#679)", async () => {
+      daemon.answering = "silent";
+      await daemonStart([], {});
+      expect(out).toEqual([
+        "Daemon already running, but it isn't answering right now",
+        `  It may be busy, or still starting. Its log: ${LOG_FILE}`,
+      ]);
+
+      // Nothing in it would say why: the daemon runs without it.
+      unwritableLog(0o400);
+      out.length = 0;
+      await daemonStart([], {});
+      expect(out).toEqual(["Daemon already running, but it isn't answering right now", "  It may be busy, or still starting."]);
+      expect(errs).toEqual([]);
+      expect(spawn).not.toHaveBeenCalled();
+    });
+
     it("starts nothing while ~/.engram itself is closed to the user", async () => {
       given.roots = [".engram"];
       await daemonStart([], {});
@@ -554,6 +573,33 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
       expect(errs).toEqual([]);
     });
 
+    it("gives no chmod that wouldn't make the log writable (engram#679)", async () => {
+      daemonRunning();
+      // A folder in its place: one made writable would still be a folder.
+      mkdirSync(LOG_FILE, { mode: 0o500 });
+      try {
+        await daemonStatus();
+      } finally {
+        chmodSync(LOG_FILE, 0o700);
+      }
+      let at = out.findIndex((line) => line.startsWith("Log: "));
+      expect(out.slice(at)).toEqual([`Log: ${LOG_FILE} can't be written (EISDIR), so the daemon runs without it.`, RESTART]);
+
+      // ~/.engram can be written in, but not searched: the log's own mode
+      // lets the user write it, and the folder's write bit is set already.
+      rmSync(LOG_FILE, { recursive: true });
+      writeFileSync(LOG_FILE, "", { mode: 0o600 });
+      chmodSync(ENGRAM_DIR, 0o600);
+      try {
+        out.length = 0;
+        await daemonStatus();
+      } finally {
+        chmodSync(ENGRAM_DIR, 0o700);
+      }
+      at = out.findIndex((line) => line.startsWith("Log: "));
+      expect(out.slice(at, at + 2)).toEqual([`Log: ${LOG_FILE} can't be written (EACCES), so the daemon runs without it.`, RESTART]);
+    });
+
     it("says only where the log is while it can be written, made or not (engram#679)", async () => {
       daemonRunning();
       await daemonStatus();
@@ -711,6 +757,24 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
         "  It runs as another user (root, if it was started with sudo). Stop it with: sudo kill 4242",
       ]);
       expect(process.exitCode).toBe(1);
+    });
+
+    it("points at the log of a daemon that isn't answering only while it can be written (engram#679)", async () => {
+      daemon.answering = "silent";
+      await daemonStop();
+      expect(errs).toEqual([
+        "The daemon isn't answering, and no process could be confirmed as it, so nothing was stopped.",
+        `  It may be busy, or still starting: try again in a minute. Its log: ${LOG_FILE}`,
+      ]);
+      expect(process.exitCode).toBe(1);
+
+      unwritableLog(0o400);
+      errs.length = 0;
+      await daemonStop();
+      expect(errs).toEqual([
+        "The daemon isn't answering, and no process could be confirmed as it, so nothing was stopped.",
+        "  It may be busy, or still starting: try again in a minute.",
+      ]);
     });
 
     it("says only that it failed for any other reason", async () => {

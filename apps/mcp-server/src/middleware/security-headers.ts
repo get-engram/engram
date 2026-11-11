@@ -27,8 +27,10 @@ import { createMiddleware } from "hono/factory";
  * 'none'), runs no script at all (no script-src, so scripts fall to
  * default-src 'none'), lets the page talk only to its own origin, and forbids
  * framing, form submission and base-URL rewriting. style-src 'unsafe-inline'
- * remains for the unsubscribe page: a one-line template with a couple of
- * fixed style attributes and nothing dynamic inside them. The admin console,
+ * remains for the unsubscribe pages: one-line templates with a few fixed
+ * style attributes and nothing dynamic inside them. The unsubscribe page
+ * with the button sets UNSUBSCRIBE_PAGE_SECURITY_POLICY, so its form can
+ * post (engram#736). The admin console,
  * the one page that does run script, sets its own policy that allows its
  * inline <script> and <style> by hash (adminConsoleSecurityPolicy,
  * engram#514), so 'unsafe-inline' for script is gone everywhere.
@@ -44,7 +46,7 @@ export const BASE_SECURITY_HEADERS: Readonly<Record<string, string>> = {
   "X-Permitted-Cross-Domain-Policies": "none",
 };
 
-export const HTML_CONTENT_SECURITY_POLICY = [
+const HTML_POLICY_DIRECTIVES = [
   "default-src 'none'",
   "style-src 'unsafe-inline'",
   "connect-src 'self'",
@@ -52,7 +54,18 @@ export const HTML_CONTENT_SECURITY_POLICY = [
   "base-uri 'none'",
   "form-action 'none'",
   "frame-ancestors 'none'",
-].join("; ");
+];
+
+export const HTML_CONTENT_SECURITY_POLICY = HTML_POLICY_DIRECTIVES.join("; ");
+
+/**
+ * The unsubscribe page's policy (engram#736): the HTML policy, except that
+ * the page's one form may post back to this origin. Its Unsubscribe button is
+ * how the opt-out happens, since opening the link changes nothing.
+ */
+export const UNSUBSCRIBE_PAGE_SECURITY_POLICY = HTML_POLICY_DIRECTIVES.map((directive) =>
+  directive === "form-action 'none'" ? "form-action 'self'" : directive,
+).join("; ");
 
 export const securityHeaders = createMiddleware(async (c, next) => {
   await next();

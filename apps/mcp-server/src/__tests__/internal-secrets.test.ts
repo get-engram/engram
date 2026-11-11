@@ -222,22 +222,35 @@ function optOutDb() {
   return { db, optedOut };
 }
 
-async function unsubscribe(url: string, s: Secrets) {
+/**
+ * Follows an unsubscribe link. A POST unless told otherwise: what the
+ * page's button and a mail client's one-click unsubscribe send, and the
+ * only method that opts out (engram#736).
+ */
+async function unsubscribe(url: string, s: Secrets, method: "GET" | "POST" = "POST") {
   const { db, optedOut } = optOutDb();
-  const res = await app.fetch(new Request(url), { ...createMockEnv(db), ...s }, ctx);
+  const res = await app.fetch(new Request(url, { method }), { ...createMockEnv(db), ...s }, ctx);
   return { status: res.status, optedOut };
 }
 
-describe("GET /email/unsubscribe", () => {
-  it("opts the org out for a link signed with the signing key or the key before it", async () => {
+describe("/email/unsubscribe", () => {
+  it("opts the org out on a POST to a link signed with the signing key or the key before it", async () => {
     for (const key of [KEY, PREVIOUS]) {
       expect(await unsubscribe(link(ORG, hmac(key, ORG)), ALL)).toEqual({ status: 200, optedOut: [ORG] });
     }
   });
 
+  it("opts no one out on a GET, which only shows the page with the button (engram#736)", async () => {
+    for (const key of [KEY, PREVIOUS]) {
+      expect(await unsubscribe(link(ORG, hmac(key, ORG)), ALL, "GET")).toEqual({ status: 200, optedOut: [] });
+    }
+  });
+
   it("refuses a link signed with either bearer, and opts no one out", async () => {
-    for (const key of [ADMIN, INTERNAL]) {
-      expect(await unsubscribe(link(ORG, hmac(key, ORG)), ALL)).toEqual({ status: 400, optedOut: [] });
+    for (const method of ["GET", "POST"] as const) {
+      for (const key of [ADMIN, INTERNAL]) {
+        expect(await unsubscribe(link(ORG, hmac(key, ORG)), ALL, method)).toEqual({ status: 400, optedOut: [] });
+      }
     }
   });
 });

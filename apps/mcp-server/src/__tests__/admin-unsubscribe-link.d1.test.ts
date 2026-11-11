@@ -101,7 +101,8 @@ describe("GET /admin/unsubscribe-link (engram#735), against real SQLite", () => 
     });
 
     expect(await optedOut(LIVE)).toBe(0);
-    const unsubscribed = await app.fetch(new Request(String(res.body.url)), env(ALL), ctx);
+    // A POST, as the link's button and a mail client's one-click unsubscribe send it (engram#736).
+    const unsubscribed = await app.fetch(new Request(String(res.body.url), { method: "POST" }), env(ALL), ctx);
     expect(unsubscribed.status).toBe(200);
     expect(await optedOut(LIVE)).toBe(1);
     await db.prepare("UPDATE organizations SET digest_opt_out = 0, digest_opt_out_at = NULL WHERE id = ?").bind(LIVE).run();
@@ -117,7 +118,7 @@ describe("GET /admin/unsubscribe-link (engram#735), against real SQLite", () => 
   it("makes a link that still works after ADMIN_SECRET is rotated", async () => {
     const url = String((await get(`?org=${LIVE}`)).body.url);
     const rotated = { ...ALL, ADMIN_SECRET: "rotated-admin-735-test" };
-    const res = await app.fetch(new Request(url), env(rotated), ctx);
+    const res = await app.fetch(new Request(url, { method: "POST" }), env(rotated), ctx);
     expect(res.status).toBe(200);
     expect(await optedOut(LIVE)).toBe(1);
     await db.prepare("UPDATE organizations SET digest_opt_out = 0, digest_opt_out_at = NULL WHERE id = ?").bind(LIVE).run();

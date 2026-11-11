@@ -7,6 +7,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { EventEmitter } from "node:events";
@@ -125,7 +126,7 @@ const {
 const { claudeProjectDir } = await import("../daemon/parser.js");
 const { recoveredSessionMeta } = await import("../daemon/db.js");
 const { openUrlCommand } = await import("../commands/upgrade.js");
-const { throughOptLink } = await import("../daemon/homebrew.js");
+const { throughScoopCurrent } = await import("../daemon/scoop.js");
 
 const REG_EXE = "C:\\Windows\\System32\\reg.exe";
 const RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -135,8 +136,8 @@ const APPROVED_EXPORTED = "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\Curr
 // the time it was switched off.
 const SWITCHED_OFF = "hex:03,00,00,00,d0,7a,1b,9c,2f,4e,dc,01";
 const SWITCHED_ON = "hex:02,00,00,00,00,00,00,00,00,00,00,00";
-// Through Homebrew's opt link where the tests run on a Mac with Homebrew's Node (engram#652).
-const ENTRY = `"${throughOptLink(realpathSync.native(process.execPath))}" "${LOGIN_START}"`;
+// Through Scoop's current junction where the tests run on Windows with Scoop's Node (engram#664).
+const ENTRY = `"${throughScoopCurrent(realpathSync.native(process.execPath))}" "${LOGIN_START}"`;
 const BROKEN_ENTRY = '"C:\\old\\node.exe" "C:\\old\\cli\\dist\\daemon\\login-start.js"';
 
 /** A string value as a .reg file writes it. */
@@ -1788,7 +1789,7 @@ describe("a CLI run from npx's cache, on Windows (engram#665)", () => {
     "daemon",
     "login-start.js",
   );
-  const NODE = throughOptLink(realpathSync.native(process.execPath));
+  const NODE = throughScoopCurrent(realpathSync.native(process.execPath));
   /** The entry an npx run added before engram#665: it works until npm clears its cache. */
   const FROM_NPX = `"${NODE}" "${NPX_LOGIN_START}"`;
   /** One npm cleared since: the script it names is gone. */
@@ -2104,6 +2105,233 @@ describe("a CLI run from npx's cache, on Windows (engram#665)", () => {
       }
       expect(regCalls("add")).toHaveLength(0);
       expect(registry.value).toBe(ENTRY);
+    });
+  });
+});
+
+describe("a Node installed with Scoop, on Windows (engram#664)", () => {
+  // `scoop update nodejs` moves the app's current junction to the new
+  // version, and `scoop cleanup` removes the old one: an entry naming the
+  // version would then stop starting the daemon at sign-in, without a word.
+  // Scoop's layout under the temp home, by its real path as Node's own is
+  // (the Windows runner's temp dir is an 8.3 short name). There, `current`
+  // is a junction, as Scoop makes it; elsewhere a directory symlink stands
+  // in for one.
+  const APP = join(realpathSync.native(home.dir), "scoop", "apps", "nodejs");
+  const nodeIn = (version: string) => join(APP, version, "node.exe");
+  const CURRENT = nodeIn("current");
+  /** The entry Scoop's Node writes: by the junction, which outlasts each version. */
+  const BY_CURRENT = `"${CURRENT}" "${LOGIN_START}"`;
+  /** One naming a version: what a CLI from before engram#664 wrote. */
+  const pinned = (version: string) => `"${nodeIn(version)}" "${LOGIN_START}"`;
+
+  function addVersion(version: string): void {
+    mkdirSync(join(APP, version), { recursive: true });
+    writeFileSync(nodeIn(version), "");
+  }
+
+  /** Point current at the version, as `scoop update` and `scoop reset` do. */
+  function pointCurrent(version: string): void {
+    rmSync(join(APP, "current"), { force: true });
+    symlinkSync(join(APP, version), join(APP, "current"), realPlatform === "win32" ? "junction" : "dir");
+  }
+
+  beforeEach(() => {
+    // 22.11.0 is current; 22.10.0, from before the last update, is still
+    // there until `scoop cleanup`.
+    rmSync(APP, { recursive: true, force: true });
+    addVersion("22.10.0");
+    addVersion("22.11.0");
+    pointCurrent("22.11.0");
+  });
+
+  /** What was said since the last call. */
+  function said(): string {
+    const text = output();
+    vi.mocked(console.log).mockClear();
+    vi.mocked(console.error).mockClear();
+    return text;
+  }
+
+  /** The daemon is gone, as after a restart. */
+  function daemonGone(): void {
+    daemon.answering = null;
+    rmSync(PID_FILE, { force: true });
+  }
+
+  /** Run on Scoop's Node, by the path Scoop's shim runs it by. */
+  async function onScoopNode(run: () => unknown, node = CURRENT): Promise<void> {
+    const execPath = process.execPath;
+    process.execPath = node;
+    try {
+      await run();
+    } finally {
+      process.execPath = execPath;
+    }
+  }
+
+  it("engram install names Node by the app's current junction, however Node was run", async () => {
+    onWindows();
+    for (const node of [CURRENT, nodeIn("22.11.0")]) {
+      registry.value = null;
+      await onScoopNode(() => daemonInstall(), node);
+      expect(registry.value).toBe(BY_CURRENT);
+    }
+    expect(regCalls("add")).toHaveLength(2);
+  });
+
+  it("an update and a cleanup leave that entry working: nothing broken or outdated, nothing rewritten", async () => {
+    onWindows();
+    await onScoopNode(() => daemonInstall());
+    expect(registry.value).toBe(BY_CURRENT);
+
+    // scoop update nodejs; scoop cleanup nodejs
+    addVersion("23.1.0");
+    pointCurrent("23.1.0");
+    rmSync(join(APP, "22.10.0"), { recursive: true, force: true });
+    rmSync(join(APP, "22.11.0"), { recursive: true, force: true });
+    expect(existsSync(CURRENT)).toBe(true);
+
+    said();
+    await onScoopNode(() => daemonStatus());
+    const text = said();
+    expect(text).toContain("Auto-start: enabled (Windows sign-in)");
+    expect(text).not.toMatch(/broken|outdated/);
+
+    daemonGone();
+    execFileSync.mockClear();
+    await onScoopNode(() => daemonStart([], {}));
+    expect(registry.value).toBe(BY_CURRENT);
+    expect(regCalls("add")).toHaveLength(0);
+    expect(said()).not.toContain("Updated the start-at-login entry");
+  });
+
+  it("engram status says an entry naming a version is outdated, however Node was run, until engram install names current", async () => {
+    onWindows();
+    daemonRunning();
+    // By current, or by the version it leads to: either way, Node goes by current.
+    for (const node of [CURRENT, nodeIn("22.11.0")]) {
+      // The version current leads to, and one from before the last update.
+      for (const version of ["22.11.0", "22.10.0"]) {
+        registry.value = pinned(version);
+        await onScoopNode(() => daemonStatus(), node);
+        expect(said()).toContain(
+          "Auto-start: enabled (Windows sign-in)  — outdated config, run 'engram install' to update",
+        );
+      }
+    }
+    await onScoopNode(() => daemonInstall());
+    expect(registry.value).toBe(BY_CURRENT);
+    said();
+    await onScoopNode(() => daemonStatus());
+    const after = said();
+    expect(after).toContain("Auto-start: enabled (Windows sign-in)");
+    expect(after).not.toMatch(/broken|outdated/);
+  });
+
+  it("engram start points an entry naming a version at current, once, however Node was run, and leaves the Startup apps switch", async () => {
+    onWindows();
+    for (const node of [CURRENT, nodeIn("22.11.0")]) {
+      for (const version of ["22.11.0", "22.10.0"]) {
+        registry.value = pinned(version);
+        registry.approved = SWITCHED_OFF;
+        daemonGone();
+        execFileSync.mockClear();
+        await onScoopNode(() => daemonStart([], {}), node);
+        expect(registry.value).toBe(BY_CURRENT);
+        expect(registry.approved).toBe(SWITCHED_OFF);
+        expect(regCalls("add")).toHaveLength(1);
+        expect(said()).toContain("Updated the start-at-login entry");
+
+        daemonGone();
+        execFileSync.mockClear();
+        await onScoopNode(() => daemonStart([], {}), node);
+        expect(registry.value).toBe(BY_CURRENT);
+        expect(regCalls("add")).toHaveLength(0);
+        expect(said()).not.toContain("Updated the start-at-login entry");
+      }
+    }
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("engram start repairs an entry whose version cleanup removed, by current", async () => {
+    onWindows();
+    registry.value = pinned("21.7.3");
+    await onScoopNode(() => daemonStart([], {}));
+    expect(registry.value).toBe(BY_CURRENT);
+    expect(said()).toContain("Updated the start-at-login entry");
+  });
+
+  it("a CLI run on a version that isn't current names that version, and trades no working entry for it", async () => {
+    onWindows();
+    const older = nodeIn("22.10.0");
+    await onScoopNode(() => daemonInstall(), older);
+    expect(registry.value).toBe(pinned("22.10.0"));
+    said();
+
+    // The entry it wrote is up to date to it: never rewritten.
+    daemonGone();
+    execFileSync.mockClear();
+    await onScoopNode(() => daemonStart([], {}), older);
+    expect(regCalls("add")).toHaveLength(0);
+    expect(said()).not.toContain("Updated the start-at-login entry");
+    await onScoopNode(() => daemonStatus(), older);
+    expect(said()).not.toMatch(/broken|outdated/);
+
+    // Nor one by current, or naming the version current leads to: both work.
+    for (const entry of [BY_CURRENT, pinned("22.11.0")]) {
+      registry.value = entry;
+      daemonGone();
+      execFileSync.mockClear();
+      await onScoopNode(() => daemonStart([], {}), older);
+      expect(registry.value).toBe(entry);
+      expect(regCalls("add")).toHaveLength(0);
+      expect(said()).not.toContain("Updated the start-at-login entry");
+    }
+
+    // Run on current again, the CLI points the version's entry at current.
+    registry.value = pinned("22.10.0");
+    daemonGone();
+    await onScoopNode(() => daemonStart([], {}));
+    expect(registry.value).toBe(BY_CURRENT);
+  });
+
+  it("an nvm-windows Node keeps its version: `nvm use` moves its link to whichever Node the user works with", async () => {
+    onWindows();
+    const root = realpathSync.native(home.dir);
+    const version = join(root, "nvm", "v22.11.0");
+    mkdirSync(version, { recursive: true });
+    writeFileSync(join(version, "node.exe"), "");
+    const link = join(root, "nodejs");
+    rmSync(link, { force: true });
+    symlinkSync(version, link, realPlatform === "win32" ? "junction" : "dir");
+    try {
+      await onScoopNode(() => daemonInstall(), join(link, "node.exe"));
+      expect(registry.value).toBe(`"${join(version, "node.exe")}" "${LOGIN_START}"`);
+    } finally {
+      rmSync(link, { force: true });
+      rmSync(join(root, "nvm"), { recursive: true, force: true });
+    }
+  });
+
+  describe("auto-capture", () => {
+    signedInAtATerminal();
+
+    it("after any command, points an entry naming a version at current, says so once, then nothing", async () => {
+      onWindows();
+      registry.value = pinned("22.11.0");
+      daemonRunning();
+      await onScoopNode(() => autoEnableCapture({ after: "command" }));
+      expect(registry.value).toBe(BY_CURRENT);
+      expect(said()).toContain("Updated the start-at-login entry");
+
+      execFileSync.mockClear();
+      for (let command = 0; command < 3; command++) {
+        await onScoopNode(() => autoEnableCapture({ after: "command" }));
+        expect(said()).toBe("");
+      }
+      expect(regCalls("add")).toHaveLength(0);
+      expect(registry.value).toBe(BY_CURRENT);
     });
   });
 });

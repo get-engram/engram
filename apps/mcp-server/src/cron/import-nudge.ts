@@ -46,7 +46,7 @@ export async function sendImportNudges(env: Env): Promise<number> {
       });
       if (res.ok) sent++;
     } catch (err) {
-      console.error(`[import-nudge] Failed for ${org.email}:`, err);
+      console.error(`[import-nudge] Failed for org ${org.id}:`, err);
     }
   }
   return sent;

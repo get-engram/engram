@@ -137,6 +137,10 @@ const LOG_IS_ROOTS = "daemon.log in ~/.engram belongs to root, not to you, so th
 const OTHER_UID = (process.geteuid?.() ?? 0) + 1000;
 /** What `engram start` and `engram status` say once the log can be written again (engram#679). */
 const RESTART = "  Once it can be written, 'engram stop' and then 'engram start' have the daemon write to it again.";
+/** What a ~/.engram nothing can be made in stops, and what fixes it (engram#723). */
+const CANT_MAKE =
+  "~/.engram is yours, but its permissions keep you from making files in it, so the daemon can't start, and nothing new is captured.";
+const FIX_WRITE = "  To fix it, run: chmod u+w ~/.engram";
 
 afterAll(() => {
   rmSync(home.dir, { recursive: true, force: true });
@@ -247,6 +251,16 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
     expect(existsSync(join(CONFIG, "systemd"))).toBe(false);
   }
 
+  /** Run `run` with ~/.engram at `mode`, as the user left it (engram#723), and put back after. */
+  async function inFolder(mode: number, run: () => Promise<unknown>): Promise<void> {
+    chmodSync(ENGRAM_DIR, mode);
+    try {
+      await run();
+    } finally {
+      chmodSync(ENGRAM_DIR, 0o700);
+    }
+  }
+
   describe("engram start", () => {
     it("starts nothing while they stop the daemon, in the foreground or with --install either", async () => {
       given.roots = ["daemon.db"];
@@ -260,6 +274,28 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
           `${DB_IS_ROOTS} the daemon can't start, and nothing new is captured.`,
           `  Make it yours with: ${FIX}`,
           "  Then run 'engram start' again.",
+        ]);
+      }
+      expect(out).toEqual([]);
+      expectNothingStarted();
+    });
+
+    it("says what to run again once, after both fixes, while ~/.engram keeps them out too (engram#723)", async () => {
+      given.roots = ["daemon.db"];
+      for (const [flags, again] of [
+        [{}, "engram start"],
+        [{ install: "" }, "engram start --install"],
+      ] as Array<[Record<string, string>, string]>) {
+        errs.length = 0;
+        process.exitCode = undefined;
+        await inFolder(0o500, () => daemonStart([], flags));
+        expect(process.exitCode).toBe(1);
+        expect(errs).toEqual([
+          `${DB_IS_ROOTS} the daemon can't start, and nothing new is captured.`,
+          `  Make it yours with: ${FIX}`,
+          CANT_MAKE,
+          FIX_WRITE,
+          `  Then run '${again}' again.`,
         ]);
       }
       expect(out).toEqual([]);
@@ -424,6 +460,21 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
       expectNothingStarted();
     });
 
+    it("says what to run again once, after both fixes, while ~/.engram keeps them out too (engram#723)", async () => {
+      given.roots = ["daemon.db"];
+      await inFolder(0o500, daemonInstall);
+      expect(process.exitCode).toBe(1);
+      expect(errs).toEqual([
+        `${DB_IS_ROOTS} the daemon can't start, and nothing new is captured.`,
+        `  Make it yours with: ${FIX}`,
+        CANT_MAKE,
+        FIX_WRITE,
+        "  Then run 'engram install' again.",
+      ]);
+      expect(out).toEqual([]);
+      expectNothingStarted();
+    });
+
     it("turns it on while the daemon's log is another user's: that only costs the log (engram#679)", async () => {
       given.roots = ["daemon.log"];
       await daemonInstall();
@@ -565,11 +616,11 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
       } finally {
         chmodSync(ENGRAM_DIR, 0o700);
       }
+      // What fixes it is said above it, of the folder (engram#723), and
+      // not again with the log.
       at = out.findIndex((line) => line.startsWith("Log: "));
-      expect(out.slice(at, at + 2)).toEqual([
-        `Log: ${LOG_FILE} can't be written (EACCES), so the daemon runs without it.`,
-        "  To fix it, run: chmod u+w ~/.engram",
-      ]);
+      expect(out.slice(at)).toEqual([`Log: ${LOG_FILE} can't be written (EACCES), so the daemon runs without it.`, RESTART]);
+      expect(out.filter((line) => line === "  To fix it, run: chmod u+w ~/.engram")).toHaveLength(1);
       expect(errs).toEqual([]);
     });
 
@@ -587,6 +638,9 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
 
       // ~/.engram can be written in, but not searched: the log's own mode
       // lets the user write it, and the folder's write bit is set already.
+      // What fixes it is said of the folder (engram#723), and the log line
+      // only says where the log is: the folder hides whether it can be
+      // written, and the daemon's own was opened when it started.
       rmSync(LOG_FILE, { recursive: true });
       writeFileSync(LOG_FILE, "", { mode: 0o600 });
       chmodSync(ENGRAM_DIR, 0o600);
@@ -596,8 +650,10 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
       } finally {
         chmodSync(ENGRAM_DIR, 0o700);
       }
+      expect(out.join("\n")).toContain("  To fix it, run: chmod u+x ~/.engram");
+      expect(out.join("\n")).not.toContain("chmod u+w");
       at = out.findIndex((line) => line.startsWith("Log: "));
-      expect(out.slice(at, at + 2)).toEqual([`Log: ${LOG_FILE} can't be written (EACCES), so the daemon runs without it.`, RESTART]);
+      expect(out.slice(at)).toEqual([`Log: ${LOG_FILE}`]);
     });
 
     it("says only where the log is while it can be written, made or not (engram#679)", async () => {
@@ -640,6 +696,45 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
         "",
         // Not "It should be running …, it may have stopped after an error":
         // what it says above is why.
+        "Auto-start: enabled (systemd)",
+      ]);
+      expect(errs).toEqual([]);
+    });
+
+    it("says to start it once, after both fixes, while ~/.engram keeps them out too (engram#723)", async () => {
+      given.roots = ["daemon.db"];
+      unreadableDb();
+      startAtLoginOn();
+      await inFolder(0o500, daemonStatus);
+      expect(out).toEqual([
+        "Status: stopped",
+        "Local capture DB unreadable: it isn't yours, see below.",
+        "",
+        `  ${DB_IS_ROOTS} the daemon can't start, and nothing new is captured.`,
+        `  Make it yours with: ${FIX}`,
+        "",
+        `  ${CANT_MAKE}`,
+        FIX_WRITE,
+        "  Then run: engram start",
+        "",
+        "Auto-start: enabled (systemd)",
+      ]);
+      expect(errs).toEqual([]);
+      // It can be searched: whether a daemon runs is known.
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it("doesn't say a stopped daemon should be running while ~/.engram keeps it from starting (engram#723)", async () => {
+      startAtLoginOn();
+      await inFolder(0o500, daemonStatus);
+      expect(out).toEqual([
+        "Status: stopped",
+        "",
+        `  ${CANT_MAKE}`,
+        FIX_WRITE,
+        "  Then run: engram start",
+        "",
+        // What it says above is why it's stopped.
         "Auto-start: enabled (systemd)",
       ]);
       expect(errs).toEqual([]);

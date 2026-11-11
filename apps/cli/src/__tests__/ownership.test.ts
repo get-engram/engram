@@ -6,8 +6,13 @@ import {
   foreignFiles,
   foreignFilesFix,
   foreignFilesProblem,
+  lockedDir,
+  lockedDirFix,
+  lockedDirProblem,
+  lockedDirReason,
   OWNERSHIP_FIX,
   type ForeignFiles,
+  type LockedDir,
   type OwnershipCheck,
 } from "../daemon/ownership.js";
 
@@ -319,4 +324,139 @@ describe("foreignFiles (engram#659)", () => {
       chmodSync(db, 0o600);
     }
   });
+});
+
+/**
+ * engram#723 — a ~/.engram that is the user's, and that its own permissions
+ * keep them out of, as `chmod -R 600 ~/.engram` leaves it.
+ */
+describe("lockedDir (engram#723)", () => {
+  /**
+   * lockedDir on a ~/.engram of the user's with permission bits `mode`:
+   * what this user can do to it goes by the owner's bits, unless `options`
+   * says otherwise.
+   */
+  function lockedAt(mode: number | null, options: OwnershipCheck = {}): LockedDir | null {
+    return lockedDir({
+      platform: "darwin",
+      euid: ME,
+      dir: DIR,
+      ownerOf: () => ME,
+      modeOf: () => mode,
+      canAccess: (_path, want) => mode !== null && (mode & (want << 6)) === want << 6,
+      ...options,
+    });
+  }
+
+  const SEARCH: LockedDir = { search: true, write: false, command: "chmod u+x ~/.engram" };
+  const WRITE: LockedDir = { search: false, write: true, command: "chmod u+w ~/.engram" };
+
+  it("finds nothing when the user can open and make files in ~/.engram", () => {
+    for (const mode of [0o700, 0o755, 0o711, 0o777]) expect(lockedAt(mode), mode.toString(8)).toBeNull();
+  });
+
+  it("doesn't count a folder that only can't be listed: nothing needs that but the daemon's tidy-up", () => {
+    expect(lockedAt(0o300)).toBeNull();
+    expect(lockedAt(0o311)).toBeNull();
+  });
+
+  it("finds a folder that can't be searched, and gives back only the bits that are missing", () => {
+    expect(lockedAt(0o600)).toEqual(SEARCH);
+    expect(lockedAt(0o644)).toEqual(SEARCH);
+    expect(lockedAt(0o200)).toEqual({ search: true, write: false, command: "chmod u+rx ~/.engram" });
+    // Neither: the search lock is the one that says what fails.
+    expect(lockedAt(0o400)).toEqual({ search: true, write: true, command: "chmod u+wx ~/.engram" });
+    expect(lockedAt(0o000)).toEqual({ search: true, write: true, command: "chmod u+rwx ~/.engram" });
+  });
+
+  it("finds a folder nothing can be made in", () => {
+    expect(lockedAt(0o500)).toEqual(WRITE);
+    expect(lockedAt(0o555)).toEqual(WRITE);
+    expect(lockedAt(0o100)).toEqual({ search: false, write: true, command: "chmod u+rw ~/.engram" });
+  });
+
+  it("never looks on Windows, as root, or with no effective uid", () => {
+    expect(lockedAt(0o000, { platform: "win32" })).toBeNull();
+    expect(lockedAt(0o000, { euid: ROOT })).toBeNull();
+    // Nor in one root owns, whatever access says: no mode keeps root out.
+    expect(lockedAt(0o000, { euid: ROOT, ownerOf: () => ROOT })).toBeNull();
+    expect(lockedAt(0o000, { euid: null })).toBeNull();
+  });
+
+  it("leaves a folder that isn't the user's, or isn't there, to foreignFiles", () => {
+    expect(lockedAt(0o000, { ownerOf: () => ROOT })).toBeNull();
+    expect(lockedAt(0o000, { ownerOf: () => OTHER })).toBeNull();
+    expect(lockedAt(0o000, { ownerOf: () => null })).toBeNull();
+    expect(lockedAt(null)).toBeNull();
+  });
+
+  it("counts only what the owner's bits keep from the user, which a chmod of the folder fixes", () => {
+    // An ACL that gives the user what the bits don't: nothing is in the way.
+    expect(lockedAt(0o600, { canAccess: () => true })).toBeNull();
+    expect(lockedAt(0o500, { canAccess: () => true })).toBeNull();
+    // Kept out with every bit set (an ACL, a read-only disk): no chmod fixes that.
+    expect(lockedAt(0o700, { canAccess: () => false })).toBeNull();
+  });
+
+  it("says what the permissions keep the user from, and what that stops, by whether the daemon runs", () => {
+    const opening = "~/.engram is yours, but its permissions keep you from opening the files in it";
+    const making = "~/.engram is yours, but its permissions keep you from making files in it";
+    expect(lockedDirProblem(SEARCH)).toBe(`${opening}, so the daemon can't start.`);
+    expect(lockedDirProblem(SEARCH, "stopped")).toBe(`${opening}, so the daemon can't start, and nothing new is captured.`);
+    expect(lockedDirProblem(SEARCH, "running")).toBe(
+      `${opening}, so capture is paused, and the daemon can't start again once it stops.`,
+    );
+    expect(lockedDirProblem(WRITE)).toBe(`${making}, so the daemon can't start.`);
+    expect(lockedDirProblem(WRITE, "stopped")).toBe(`${making}, so the daemon can't start, and nothing new is captured.`);
+    expect(lockedDirProblem(WRITE, "running")).toBe(`${making}, so the daemon can't start again once it stops.`);
+    expect(lockedDirProblem({ search: true, write: true, command: "chmod u+wx ~/.engram" }, "stopped")).toBe(
+      `${opening}, so the daemon can't start, and nothing new is captured.`,
+    );
+  });
+
+  it("gives the fix as the command, and says why a file couldn't be opened", () => {
+    expect(lockedDirFix(SEARCH)).toBe("To fix it, run: chmod u+x ~/.engram");
+    expect(lockedDirFix(WRITE)).toBe("To fix it, run: chmod u+w ~/.engram");
+    expect(lockedDirReason("opening config.json")).toBe("~/.engram's permissions keep you from opening config.json in it");
+  });
+
+  // Root can open any folder, whatever its mode; Windows has no such bits.
+  it.skipIf(process.platform === "win32" || process.geteuid?.() === 0)(
+    "looks at a real folder, by its mode and by access",
+    () => {
+      const dir = join(tmp, "locked", ".engram");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "config.json"), "{}");
+      const cases: [number, LockedDir | null][] = [
+        [0o700, null],
+        [0o300, null],
+        [0o600, SEARCH],
+        [0o500, WRITE],
+        [0o400, { search: true, write: true, command: "chmod u+wx ~/.engram" }],
+        [0o000, { search: true, write: true, command: "chmod u+rwx ~/.engram" }],
+      ];
+      try {
+        for (const [mode, expected] of cases) {
+          chmodSync(dir, mode);
+          expect(lockedDir({ dir, platform: "linux" }), mode.toString(8)).toEqual(expected);
+        }
+      } finally {
+        chmodSync(dir, 0o700);
+      }
+      // Each command, run, leaves nothing in the way.
+      const BITS = { r: 0o400, w: 0o200, x: 0o100 } as const;
+      for (const [mode, expected] of cases) {
+        if (expected === null) continue;
+        const letters = /^chmod u\+([rwx]+) ~\/\.engram$/.exec(expected.command)?.[1] ?? "";
+        const added = [...letters].reduce((bits, letter) => bits | BITS[letter as keyof typeof BITS], 0);
+        chmodSync(dir, mode | added);
+        try {
+          expect(statSync(dir).mode & 0o700, mode.toString(8)).toBe(0o700);
+          expect(lockedDir({ dir, platform: "linux" }), mode.toString(8)).toBeNull();
+        } finally {
+          chmodSync(dir, 0o700);
+        }
+      }
+    },
+  );
 });

@@ -130,6 +130,8 @@ beforeEach(() => {
 
 afterEach(() => {
   Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
+  // A ~/.engram left locked by a test that failed (engram#723): open again first.
+  if (existsSync(ENGRAM)) chmodSync(ENGRAM, 0o700);
   // A file left mode 000 by a test that failed: readable again, to clean up.
   if (existsSync(KEY_FILE) && !lstatSync(KEY_FILE).isSymbolicLink()) chmodSync(KEY_FILE, 0o700);
   vi.mocked(readFile).mockClear();
@@ -306,6 +308,42 @@ describe("vaultKeyFix: what fixes it", () => {
   posixIt("permission denied on the user's own file: chmod", () => {
     writeFileSync(KEY_FILE, `${KEY}\n`, { mode: 0o600 });
     expect(vaultKeyFix(problem("permission"))).toBe("Make it readable with: chmod 600 ~/.engram/vault-key");
+  });
+
+  // engram#723: a ~/.engram the user can't search hides the file, whose
+  // own bits are fine: a chmod of it can't reach it, and the folder is
+  // what's wrong.
+  unreadableIt.each([
+    ["600", 0o600, "chmod u+x ~/.engram"],
+    ["400", 0o400, "chmod u+wx ~/.engram"],
+    ["000", 0o000, "chmod u+rwx ~/.engram"],
+  ] as const)("in a ~/.engram of mode %s: the folder, and its chmod", async (_label, mode, command) => {
+    writeFileSync(KEY_FILE, `${KEY}\n`, { mode: 0o600 });
+    chmodSync(ENGRAM, mode);
+    try {
+      const err = await rejection(readVaultKeyFile());
+      expect(err.kind).toBe("permission");
+      expect(vaultKeyFix(err)).toBe(
+        `~/.engram's permissions keep you from opening the files in it. To fix it, run: ${command}`,
+      );
+    } finally {
+      chmodSync(ENGRAM, 0o700);
+    }
+    // The key is there as it was.
+    expect(readFileSync(KEY_FILE, "utf8")).toBe(`${KEY}\n`);
+  });
+
+  unreadableIt("in a ~/.engram that only can't be written: the file's own chmod, as before", async () => {
+    writeFileSync(KEY_FILE, `${KEY}\n`, { mode: 0o600 });
+    chmodSync(KEY_FILE, 0o000);
+    chmodSync(ENGRAM, 0o500);
+    try {
+      const err = await rejection(readVaultKeyFile());
+      expect(err.kind).toBe("permission");
+      expect(vaultKeyFix(err)).toBe("Make it readable with: chmod 600 ~/.engram/vault-key");
+    } finally {
+      chmodSync(ENGRAM, 0o700);
+    }
   });
 });
 

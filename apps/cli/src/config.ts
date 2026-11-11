@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { checkWritableSync, ensurePrivateDirSync, writePrivateFileSync } from "./private-files.js";
 import { isMissing, parseConfigText, readFailure, writeProblem } from "./config-file.js";
+import { lockedDir, lockedDirReason } from "./daemon/ownership.js";
 
 // Where it always was, for the commands that import it from here.
 export { resolveBaseUrl } from "./server-url.js";
@@ -67,8 +68,14 @@ export async function saveConfig(config: Config): Promise<void> {
  * some other way (EPERM: chmod can't change a locked file), or a
  * config.json that is a link has none. The error's message, which names
  * the path, is never quoted.
+ *
+ * A ~/.engram the user can't search is said as that (engram#723): nothing
+ * is wrong with the file, and a chmod of it can't reach it. Its command
+ * gives the folder back all its owner's permissions that are missing.
  */
 export function saveFailure(err: unknown): { problem: string; fix: string | null } {
+  const locked = (err as NodeJS.ErrnoException | null)?.code === "EACCES" ? lockedDir({ dir: CONFIG_DIR }) : null;
+  if (locked?.search) return { problem: lockedDirReason("saving config.json"), fix: locked.command };
   return { problem: `~/.engram/config.json ${writeProblem(err)}`, fix: writableFix(err) };
 }
 

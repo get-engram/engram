@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ForeignFiles } from "../daemon/ownership.js";
@@ -209,3 +209,36 @@ describe("a daemon that finds files in ~/.engram it can't run with (engram#659)"
     expect(shown.calls).toEqual([]);
   });
 });
+
+// engram#723 — a ~/.engram that can be searched and written, but not
+// listed, as `chmod u-r ~/.engram` leaves it. The daemon needs to open its
+// files, not to list them: it starts, and the tidy-up that lists them to
+// make them private is what is left undone, said in the log.
+describe.skipIf(process.platform === "win32" || process.geteuid?.() === 0)(
+  "a daemon in a ~/.engram it can't list (engram#723)",
+  () => {
+    it("starts, leaves the files in it as they are, and says why in the log", async () => {
+      const dir = join(home.dir, ".engram");
+      mkdirSync(dir, { mode: 0o700 });
+      // What the tidy-up would make private, were the folder listed.
+      const status = join(dir, "status.json");
+      writeFileSync(status, "{}");
+      chmodSync(status, 0o644);
+      chmodSync(dir, 0o300);
+      try {
+        const { exit, log } = await runWorker();
+        await vi.waitFor(() => expect(exit).toHaveBeenCalled());
+        // It went on to open the queue, which this test doesn't let it.
+        expect(exit.mock.calls[0]).toEqual([START_FAILED_EXIT]);
+        expect(log()).toContain("fatal: no queue in this test");
+        expect(log()).toContain("daemon started");
+        expect(log()).toContain("couldn't list ~/.engram (EACCES), so the files in it were left as they are\n");
+        expect(log()).not.toContain("made ~/.engram private");
+        expect(shown.calls).toEqual([]);
+      } finally {
+        chmodSync(dir, 0o700);
+      }
+      expect(statSync(status).mode & 0o777).toBe(0o644);
+    });
+  },
+);

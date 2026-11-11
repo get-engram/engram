@@ -250,6 +250,37 @@ export function writePrivateFileSync(file: string, data: string, options: Privat
   if (durable && posix()) syncDirSync(dir);
 }
 
+/**
+ * Throw what writePrivateFileSync(file, …) would for a file, or a folder,
+ * this process can't write, but write nothing (engram#717). For a command
+ * that does what can't be undone before it saves: `engram login` makes a
+ * new API key, and a save that then fails loses it. A full disk is found
+ * only by writing.
+ */
+export function checkWritableSync(file: string): void {
+  let target = file;
+  try {
+    target = realpathSync(file);
+  } catch (err) {
+    if (errCode(err) !== "ENOENT") throw err;
+  }
+  try {
+    accessSync(target, constants.W_OK);
+  } catch (err) {
+    if (errCode(err) !== "ENOENT") throw err;
+  }
+  // The new file is made in its folder, and a folder that isn't there yet
+  // in the nearest one that is (ensurePrivateDirSync).
+  for (let dir = dirname(target); ; dir = dirname(dir)) {
+    try {
+      accessSync(dir, constants.W_OK | constants.X_OK);
+      return;
+    } catch (err) {
+      if (errCode(err) !== "ENOENT" || dirname(dir) === dir) throw err;
+    }
+  }
+}
+
 export interface SmallFile {
   data: Buffer;
   /**

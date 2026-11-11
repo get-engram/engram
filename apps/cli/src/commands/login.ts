@@ -1,7 +1,7 @@
 import { createInterface } from "node:readline";
-import { saveConfig, loadConfigStrict, resolveBaseUrl, type Config } from "../config.js";
+import { loadConfigStrict, resolveBaseUrl, type Config } from "../config.js";
 import { ConfigUnreadable } from "../config-file.js";
-import { loadConfigForUpdate, loadConfigForUse } from "../config-guard.js";
+import { loadConfigForUpdate, loadConfigForUse, requireWritableConfig, saveConfigOrExit } from "../config-guard.js";
 import { green, red, dim, bold } from "../output.js";
 import { Engram } from "@getengram/sdk";
 import { autoEnableCapture } from "../daemon/commands.js";
@@ -17,9 +17,11 @@ const apiUrl = async (): Promise<string> => resolveBaseUrl(await loadConfigForUs
  * Save `key`, just made for this machine, into config.json with what else
  * is in it. Read again, as it may have changed while the server answered,
  * and not saved over when it can't be read now (engram#673). `command`:
- * the one to run again once it's fixed.
+ * the one to run again once it's fixed. `lost`: what a save that fails
+ * means, said with why it failed (engram#717). It was checked before the
+ * key was made, but a disk can fill up in between.
  */
-async function saveNewKey(key: string, command: string): Promise<void> {
+async function saveNewKey(key: string, command: string, lost: string[]): Promise<void> {
   let config: Config;
   try {
     config = await loadConfigStrict();
@@ -34,7 +36,7 @@ async function saveNewKey(key: string, command: string): Promise<void> {
     config = {};
   }
   config.apiKey = key;
-  await saveConfig(config);
+  await saveConfigOrExit(config, lost, command);
 }
 
 /** Prompt for input (hides input for passwords). */
@@ -99,6 +101,11 @@ export async function signup(): Promise<void> {
     process.exit(1);
   }
 
+  // Before the account is made (engram#717): its key is saved in
+  // config.json, and a key that couldn't be saved left an account no one
+  // could use. Each try made another.
+  requireWritableConfig(["A new account's API key is saved there, so no account was made."], "signup");
+
   console.log("Creating account...");
 
   const res = await fetch(`${resolveBaseUrl(existing)}/signup/anonymous`, {
@@ -117,7 +124,9 @@ export async function signup(): Promise<void> {
     api_key: string;
   };
 
-  await saveNewKey(data.api_key, "signup");
+  await saveNewKey(data.api_key, "signup", [
+    "An account was made, but its API key couldn't be saved, so it can't be used.",
+  ]);
 
   console.log(green("✓ Account created"));
   console.log(`  Organization: ${data.organization_id}`);
@@ -326,6 +335,10 @@ export async function login(args: string[] = [], flags: Record<string, string> =
   // that couldn't be read named no server, so the password went to the
   // default one, and the key it got was saved over the file.
   const existing = await loadConfigForUpdate();
+  // Before the password is asked for (engram#717): signing in makes a new
+  // API key, saved in config.json. One that couldn't be saved stayed in the
+  // account, unused, and each try made another.
+  requireWritableConfig(["Signing in saves a new API key there, so it wasn't tried."], "login");
   const email = flags.email || await prompt("Email: ");
   const password = flags.password || await prompt("Password: ", true);
 
@@ -375,7 +388,10 @@ export async function login(args: string[] = [], flags: Record<string, string> =
     api_key: string;
   };
 
-  await saveNewKey(data.api_key, "login");
+  await saveNewKey(data.api_key, "login", [
+    "A new API key was made for this machine, but it couldn't be saved.",
+    "It's listed at getengram.app/dashboard as \"CLI login\": delete it there.",
+  ]);
 
   console.log(green(`✓ Signed in as ${email.trim()}`));
   console.log(`  API key saved to ~/.engram/config.json`);

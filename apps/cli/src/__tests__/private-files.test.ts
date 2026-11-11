@@ -89,6 +89,7 @@ const ENGRAM = join(home.dir, ".engram");
 
 // After the temp home is set: these take their paths from it when imported.
 const {
+  checkWritableSync,
   createPrivateFileSync,
   ensurePrivateDirSync,
   makeDirPrivateSync,
@@ -355,6 +356,117 @@ describe("writePrivateFileSync: 0600, replaced in one step (engram#627)", () => 
   it("not as root, never changes an owner", () => {
     writePrivateFileSync(join(dir, "config.json"), "{}");
     expect(fchownSync).not.toHaveBeenCalled();
+  });
+});
+
+describe("checkWritableSync: what writePrivateFileSync would refuse, found without writing (engram#717)", () => {
+  /** Folders a test made read-only, made writable again so they can be removed. */
+  const locked: string[] = [];
+  afterEach(() => {
+    for (const path of locked.splice(0)) chmodSync(path, 0o700);
+  });
+  const lock = (path: string, mode: number) => {
+    chmodSync(path, mode);
+    locked.push(path);
+  };
+
+  it("passes for a file that isn't there yet, in a folder it can write, and makes nothing", () => {
+    checkWritableSync(join(dir, "config.json"));
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it("passes for a folder that isn't there yet, under one it can write, and makes neither", () => {
+    checkWritableSync(join(dir, ".engram", "config.json"));
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it("passes for a file it can write, and leaves it as it was", () => {
+    const file = join(dir, "config.json");
+    writeFileSync(file, "old");
+    utimesSync(file, 1_000_000, 1_000_000);
+    if (posix) chmodSync(file, 0o600);
+    checkWritableSync(file);
+    expect(readFileSync(file, "utf-8")).toBe("old");
+    expect(statSync(file).mtimeMs).toBe(1_000_000_000);
+    if (posix) expect(mode(file)).toBe(0o600);
+    expect(readdirSync(dir)).toEqual(["config.json"]);
+  });
+
+  it.skipIf(!posix || root)("a read-only file: EACCES, as writePrivateFileSync gives", () => {
+    const file = join(dir, "config.json");
+    writeFileSync(file, "old");
+    chmodSync(file, 0o400);
+    expect(codeOf(() => checkWritableSync(file))).toBe("EACCES");
+    expect(codeOf(() => writePrivateFileSync(file, "new"))).toBe("EACCES");
+    expect(readFileSync(file, "utf-8")).toBe("old");
+    expect(mode(file)).toBe(0o400);
+    expect(readdirSync(dir)).toEqual(["config.json"]);
+  });
+
+  it.skipIf(!posix || root)("a file it can write, in a folder it can't: EACCES, as the new copy is made in the folder", () => {
+    const folder = join(dir, ".engram");
+    mkdirSync(folder);
+    const file = join(folder, "config.json");
+    writeFileSync(file, "old");
+    lock(folder, 0o500);
+    expect(codeOf(() => checkWritableSync(file))).toBe("EACCES");
+    expect(codeOf(() => writePrivateFileSync(file, "new"))).toBe("EACCES");
+    expect(readFileSync(file, "utf-8")).toBe("old");
+    expect(readdirSync(folder)).toEqual(["config.json"]);
+  });
+
+  it.skipIf(!posix || root)("no file yet, in a folder it can't write: EACCES", () => {
+    const folder = join(dir, ".engram");
+    mkdirSync(folder);
+    lock(folder, 0o500);
+    expect(codeOf(() => checkWritableSync(join(folder, "config.json")))).toBe("EACCES");
+    expect(codeOf(() => writePrivateFileSync(join(folder, "config.json"), "new"))).toBe("EACCES");
+    expect(readdirSync(folder)).toEqual([]);
+  });
+
+  it.skipIf(!posix || root)("no folder yet, under one it can't write: EACCES, as ensurePrivateDirSync would give", () => {
+    const home = join(dir, "home");
+    mkdirSync(home);
+    lock(home, 0o500);
+    expect(codeOf(() => checkWritableSync(join(home, ".engram", "config.json")))).toBe("EACCES");
+    expect(codeOf(() => ensurePrivateDirSync(join(home, ".engram")))).toBe("EACCES");
+    expect(readdirSync(home)).toEqual([]);
+  });
+
+  it.skipIf(!posix || root)("folders that aren't there yet, two deep, under one it can't write: EACCES", () => {
+    const home = join(dir, "home");
+    mkdirSync(home);
+    lock(home, 0o500);
+    expect(codeOf(() => checkWritableSync(join(home, "a", "b", "config.json")))).toBe("EACCES");
+  });
+
+  it.skipIf(!posix || root)("a link to a file in a folder it can't write: EACCES, though the link's own folder can be", () => {
+    const elsewhere = join(dir, "elsewhere");
+    mkdirSync(elsewhere);
+    const target = join(elsewhere, "config.json");
+    writeFileSync(target, "old");
+    lock(elsewhere, 0o500);
+    const link = join(dir, "config.json");
+    symlinkSync(target, link);
+    expect(codeOf(() => checkWritableSync(link))).toBe("EACCES");
+    expect(codeOf(() => writePrivateFileSync(link, "new"))).toBe("EACCES");
+    expect(readFileSync(target, "utf-8")).toBe("old");
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+  });
+
+  posixIt("a link to a file in a folder it can write passes, wherever the link is", () => {
+    const elsewhere = join(dir, "elsewhere");
+    mkdirSync(elsewhere);
+    const target = join(elsewhere, "config.json");
+    writeFileSync(target, "old");
+    const linkDir = join(dir, "links");
+    mkdirSync(linkDir);
+    const link = join(linkDir, "config.json");
+    symlinkSync(target, link);
+    if (!root) lock(linkDir, 0o500);
+    checkWritableSync(link);
+    writePrivateFileSync(link, "new");
+    expect(readFileSync(target, "utf-8")).toBe("new");
   });
 });
 

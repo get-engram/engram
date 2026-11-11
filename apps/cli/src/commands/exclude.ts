@@ -1,6 +1,6 @@
-import { loadConfigStrict, saveConfig, type Config } from "../config.js";
+import { loadConfigStrict, type Config } from "../config.js";
 import { ConfigUnreadable, excludePathsOf } from "../config-file.js";
-import { loadConfigForUpdate } from "../config-guard.js";
+import { loadConfigForUpdate, saveConfigOrExit } from "../config-guard.js";
 import { normalizeExcludePath, samePath, IGNORE_MARKER } from "../daemon/exclusions.js";
 import { bold, dim, red } from "../output.js";
 
@@ -41,7 +41,7 @@ export async function excludeAdd(args: string[]): Promise<void> {
     return;
   }
   config.excludePaths = [...paths, target].sort();
-  await saveConfig(config);
+  await saveConfigOrExit(config, [`Not excluded: sessions in ${target} are still captured.`]);
   console.log(`${bold("Excluded from capture:")} ${target}`);
   console.log(dim("Sessions in this directory (and below) will not be saved to Engram."));
   console.log(dim("Applies immediately — no daemon restart needed. Already-captured"));
@@ -58,7 +58,7 @@ export async function excludeRemove(args: string[]): Promise<void> {
     process.exit(1);
   }
   config.excludePaths = paths.filter((p) => !samePath(p, target));
-  await saveConfig(config);
+  await saveConfigOrExit(config, [`Still excluded from capture: ${removed.join(", ")}`]);
   console.log(`${bold("Removed from exclusions:")} ${removed.join(", ")}`);
   console.log(dim("New sessions in this directory will be captured again."));
 }

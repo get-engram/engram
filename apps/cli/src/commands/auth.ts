@@ -1,5 +1,5 @@
-import { saveConfig, resolveBaseUrl } from "../config.js";
-import { loadConfigForUpdate, loadConfigForUse } from "../config-guard.js";
+import { resolveBaseUrl } from "../config.js";
+import { loadConfigForUpdate, loadConfigForUse, requireWritableConfig, saveConfigOrExit } from "../config-guard.js";
 import { green, red } from "../output.js";
 import { Engram } from "@getengram/sdk";
 import { autoEnableCapture } from "../daemon/commands.js";
@@ -23,6 +23,8 @@ export async function authLogin(args: string[]): Promise<void> {
   // a file that couldn't be read named no server, so the key went to the
   // default one, and was then saved over the file and what was in it.
   const config = await loadConfigForUpdate();
+  // Before the key is sent to be checked (engram#717).
+  requireWritableConfig(["So the key wasn't checked or saved."]);
 
   // Check the key against the server it will be used with, the one every
   // other command and the daemon use (engram#625). This used the SDK's
@@ -37,7 +39,7 @@ export async function authLogin(args: string[]): Promise<void> {
   }
 
   config.apiKey = key;
-  await saveConfig(config);
+  await saveConfigOrExit(config, ["So the key wasn't saved."]);
 
   console.log(green("✓ Authenticated successfully"));
   console.log(`  Key saved to ~/.engram/config.json`);
@@ -50,8 +52,16 @@ export async function authLogout(): Promise<void> {
     "To sign out anyway: run 'engram stop', then remove the file. The folders you",
     "excluded from capture go with it.",
   ]);
-  delete config.apiKey;
-  await saveConfig(config);
+  // With no key saved there's nothing to remove, so nothing is written: a
+  // config.json that can't be written isn't a reason to stop (engram#717).
+  if (config.apiKey !== undefined) {
+    delete config.apiKey;
+    await saveConfigOrExit(
+      config,
+      ["You're still signed in, and auto-capture keeps using the key saved there."],
+      "auth logout",
+    );
+  }
   console.log(green("✓ Logged out"));
   // The daemon reads config.json every few seconds (engram#594).
   console.log("  Auto-capture stops sending within a few seconds.");

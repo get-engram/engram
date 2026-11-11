@@ -123,9 +123,18 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
         "SELECT COUNT(*) AS n FROM conversations WHERE created_at >= datetime('now','-1 day')",
       )
       .first<{ n: number }>(),
+    // Orgs that stored a message in the last 24 h. INDEXED BY is load-bearing
+    // (engram#740). With no planner statistics, SQLite answers the DISTINCT by
+    // walking idx_messages_org, every message in the database, and checks
+    // created_at row by row: 3.88M rows and 7.6 s per run on production on
+    // 2026-11-11. D1 runs one statement at a time, so every user query waited
+    // behind it; the database tripped D1's 10-second resource limit and all
+    // three report attempts failed. The hint makes it a range read of one
+    // day's entries in idx_messages_created; daily-report-plans.d1.test.ts
+    // pins it.
     db
       .prepare(
-        "SELECT COUNT(DISTINCT organization_id) AS n FROM messages WHERE created_at >= datetime('now','-1 day')",
+        "SELECT COUNT(DISTINCT organization_id) AS n FROM messages INDEXED BY idx_messages_created WHERE created_at >= datetime('now','-1 day')",
       )
       .first<{ n: number }>(),
     db

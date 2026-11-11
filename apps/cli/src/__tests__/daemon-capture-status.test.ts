@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -216,6 +216,94 @@ describe("capture held for config.json (engram#673)", () => {
     recordCaptureResumed("/t/b.jsonl");
   });
 });
+
+// engram#723: config.json can't be read because ~/.engram can't be
+// searched any more, as `chmod -R 600 ~/.engram` leaves it. Nothing is
+// wrong with the file: the warning in daemon.log, which the daemon opened
+// before, and the desktop notice say the folder and the chmod that fixes
+// it. status.json can't be written while it lasts.
+describe.skipIf(process.platform === "win32" || process.geteuid?.() === 0)(
+  "capture held for a ~/.engram that can't be searched (engram#723)",
+  () => {
+    const ENGRAM = join(home.dir, ".engram");
+    const DENIED = "~/.engram/config.json can't be read: permission denied";
+
+    afterEach(() => chmodSync(ENGRAM, 0o700));
+
+    it.each([
+      ["600", 0o600, "chmod u+x ~/.engram"],
+      ["000", 0o000, "chmod u+rwx ~/.engram"],
+    ] as const)("at mode %s: the folder and its chmod, in the log and the notice", (_label, mode, command) => {
+      chmodSync(ENGRAM, mode);
+      try {
+        recordCaptureStall("/t/a.jsonl", DENIED, "config");
+        recordCaptureStall("/t/b.jsonl", DENIED, "config");
+      } finally {
+        chmodSync(ENGRAM, 0o700);
+      }
+      expect(logged()).toEqual([
+        "[engram] WARNING: Engram can't read the folders you excluded from capture: ~/.engram's " +
+          `permissions keep you from opening the files in it, so 1 transcript is waiting. To fix it, run: ${command}. ` +
+          "Capture then picks up where it stopped: nothing is skipped, and nothing from an excluded folder is captured.",
+        "[engram] Run 'engram status' for details.",
+      ]);
+      expect(execFile).toHaveBeenCalledTimes(1);
+      expect(execFile).toHaveBeenCalledWith(
+        "notify-send",
+        [
+          "Engram paused capture",
+          "~/.engram's permissions keep you from opening the files in it, so capture is paused. " +
+            `To fix it, run: ${command}. Capture then resumes where it stopped.`,
+        ],
+        expect.objectContaining({ windowsHide: true, timeout: 30_000 }),
+        expect.any(Function),
+      );
+      recordCaptureResumed("/t/a.jsonl");
+      recordCaptureResumed("/t/b.jsonl");
+    });
+
+    it("one that only can't be written: the file's own words, as before", () => {
+      const BAD = "~/.engram/config.json isn't valid JSON";
+      chmodSync(ENGRAM, 0o500);
+      try {
+        recordCaptureStall("/t/a.jsonl", BAD, "config");
+      } finally {
+        chmodSync(ENGRAM, 0o700);
+      }
+      expect(logged()[0]).toBe(
+        `[engram] WARNING: Engram can't read the folders you excluded from capture (${BAD}), so 1 ` +
+          "transcript is waiting. Fix the file, and capture picks up where it stopped: nothing is " +
+          "skipped, and nothing from an excluded folder is captured.",
+      );
+      expect(execFile).toHaveBeenCalledWith(
+        "notify-send",
+        [
+          "Engram paused capture",
+          `${BAD}, so Engram can't tell which folders you excluded. Fix it, and capture resumes ` +
+            "where it stopped.",
+        ],
+        expect.anything(),
+        expect.any(Function),
+      );
+      recordCaptureResumed("/t/a.jsonl");
+    });
+
+    it("a stall queueing into daemon.db: its own words, whatever the folder", () => {
+      chmodSync(ENGRAM, 0o600);
+      try {
+        recordCaptureStall("/t/a.jsonl", FULL);
+      } finally {
+        chmodSync(ENGRAM, 0o700);
+      }
+      expect(logged()[0]).toMatch(/^\[engram\] WARNING: Engram can't queue new messages on this machine \(/);
+      expect(execFile).toHaveBeenCalledWith("notify-send", [
+        "Engram can't capture",
+        expect.stringContaining("Free up disk space"),
+      ], expect.anything(), expect.any(Function));
+      recordCaptureResumed("/t/a.jsonl");
+    });
+  },
+);
 
 describe("captureErrorSummary", () => {
   it("says when config.json is what is wrong, not the disk", () => {

@@ -1762,7 +1762,7 @@ describe("the Windows sign-in launcher (engram#602)", () => {
    * import nothing at all: a module that seems to import nothing otherwise
    * means the pattern has stopped matching.
    */
-  const NO_IMPORTS = new Set(["supervise.ts"]);
+  const NO_IMPORTS = new Set(["output.ts", "supervise.ts"]);
   function modulesLoaded(entries: string[], dynamic: boolean): string[] {
     const imports = dynamic ? /\b(?:from|import)\s*\(?\s*["']([^"']+)["']/g : /\b(?:from|import)\s+["']([^"']+)["']/g;
     const seen = new Set<string>();
@@ -1798,7 +1798,9 @@ describe("the Windows sign-in launcher (engram#602)", () => {
     // worker.ts takes the single-daemon lock (instance.ts, engram#612) and
     // then preflights better-sqlite3: neither may load it. The daemon's
     // body comes after, through import(). The lock looks for a daemon
-    // running as root, in launchd's system domain too (engram#680).
+    // running as root, in launchd's system domain too (engram#680), and
+    // says, with a desktop notice, when ~/.engram's own permissions keep
+    // the daemon out of it (engram#723).
     expect(modulesLoaded(["worker.ts"], false)).toEqual([
       "as-root.ts",
       "command-path.ts",
@@ -1806,9 +1808,12 @@ describe("the Windows sign-in launcher (engram#602)", () => {
       "instance.ts",
       "launch.ts",
       "launchd.ts",
+      "output.ts",
+      "ownership.ts",
       "powershell.ts",
       "preflight.ts",
       "private-files.ts",
+      "status.ts",
       "supervise.ts",
       "worker.ts",
     ]);
@@ -1826,8 +1831,11 @@ describe("the Windows sign-in launcher (engram#602)", () => {
       "instance.ts",
       "launch.ts",
       "launchd.ts",
+      "output.ts",
+      "ownership.ts",
       "powershell.ts",
       "private-files.ts",
+      "status.ts",
       "supervise.ts",
       "supervisor.ts",
     ]);

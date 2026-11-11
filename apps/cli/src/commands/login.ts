@@ -1,7 +1,14 @@
 import { createInterface } from "node:readline";
 import { loadConfigStrict, resolveBaseUrl, type Config } from "../config.js";
 import { ConfigUnreadable } from "../config-file.js";
-import { loadConfigForUpdate, loadConfigForUse, requireWritableConfig, saveConfigOrExit } from "../config-guard.js";
+import {
+  loadConfigForUpdate,
+  loadConfigForUse,
+  lockedConfigDir,
+  requireWritableConfig,
+  saveConfigOrExit,
+} from "../config-guard.js";
+import { lockedDirFix, lockedDirReason } from "../daemon/ownership.js";
 import { green, red, dim, bold } from "../output.js";
 import { Engram } from "@getengram/sdk";
 import { autoEnableCapture } from "../daemon/commands.js";
@@ -19,7 +26,10 @@ const apiUrl = async (): Promise<string> => resolveBaseUrl(await loadConfigForUs
  * and not saved over when it can't be read now (engram#673). `command`:
  * the one to run again once it's fixed. `lost`: what a save that fails
  * means, said with why it failed (engram#717). It was checked before the
- * key was made, but a disk can fill up in between.
+ * key was made, but a disk can fill up in between. A file that can't be
+ * read by then is a save that failed, said the same way, and so is a
+ * ~/.engram that keeps it from being opened (engram#723), which no fix to
+ * the file can mend.
  */
 async function saveNewKey(key: string, command: string, lost: string[]): Promise<void> {
   let config: Config;
@@ -27,9 +37,20 @@ async function saveNewKey(key: string, command: string, lost: string[]): Promise
     config = await loadConfigStrict();
   } catch (err: unknown) {
     if (!(err instanceof ConfigUnreadable && err.empty)) {
-      const why = err instanceof ConfigUnreadable ? err.message : "~/.engram/config.json can't be read";
+      const locked = err instanceof ConfigUnreadable ? lockedConfigDir(err) : null;
+      const why = locked
+        ? lockedDirReason("opening config.json")
+        : err instanceof ConfigUnreadable
+          ? err.message
+          : "~/.engram/config.json can't be read";
       console.error(red(`Error: ${why}, so the new API key wasn't saved.`));
-      console.error(`  Fix the file, then run 'engram ${command}' again.`);
+      for (const line of lost) console.error(`  ${line}`);
+      if (locked) {
+        console.error(`  ${lockedDirFix(locked)}`);
+        console.error(`  Then run 'engram ${command}' again.`);
+      } else {
+        console.error(`  Fix the file, then run 'engram ${command}' again.`);
+      }
       process.exit(1);
     }
     // Empty: said by loadConfigForUpdate, before the key was made.

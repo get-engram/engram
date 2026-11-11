@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -393,18 +394,29 @@ describe("no config.json (engram#673)", () => {
   });
 });
 
+/** What a new key that wasn't saved leaves behind (engram#717), said whatever stopped the save. */
+const LOST: Record<string, string[]> = {
+  signup: ["  An account was made, but its API key couldn't be saved, so it can't be used."],
+  login: [
+    "  A new API key was made for this machine, but it couldn't be saved.",
+    "  It's listed at getengram.app/dashboard as \"CLI login\": delete it there.",
+  ],
+};
+const SAVES_KEY = [
+  { command: "signup", run: async () => (await account()).signup() },
+  {
+    command: "login",
+    run: async () => (await account()).login([], { email: "a@example.com", password: "pw-for-tests-only" }),
+  },
+];
+
 describe("config.json changed while the server answers (engram#673)", () => {
-  it.each([
-    { command: "signup", run: async () => (await account()).signup() },
-    {
-      command: "login",
-      run: async () => (await account()).login([], { email: "a@example.com", password: "pw-for-tests-only" }),
-    },
-  ])("broken: engram $command doesn't save the new key over it, or say the key", async ({ command, run }) => {
+  it.each(SAVES_KEY)("broken: engram $command doesn't save the new key over it, or say the key", async ({ command, run }) => {
     whileAnswering = () => writeConfig(BROKEN);
     expect(await exitCode(run)).toBe(1);
     expect(errors).toEqual([
       "Error: ~/.engram/config.json isn't valid JSON, so the new API key wasn't saved.",
+      ...LOST[command],
       `  Fix the file, then run 'engram ${command}' again.`,
     ]);
     expect(readFileSync(CONFIG, "utf-8")).toBe(BROKEN);
@@ -418,6 +430,145 @@ describe("config.json changed while the server answers (engram#673)", () => {
     expect(await exitCode(signup)).toBeNull();
     expect(readConfig()).toEqual({ excludePaths: [WORK], apiKey: NEW_KEY });
   });
+});
+
+// engram#723: a ~/.engram whose own permissions keep the user from opening
+// the files in it, as `chmod -R 600 ~/.engram` leaves it. Nothing in
+// config.json needs fixing: the folder is what's wrong, and what fixes it
+// is said, not "Fix the file". POSIX only, and not as root, whom no mode
+// keeps out.
+const POSIX_USER = process.platform !== "win32" && process.geteuid?.() !== 0;
+const LOCKED_WHY = "~/.engram's permissions keep you from opening config.json in it";
+const LOCKED_FIX = "  To fix it, run: chmod u+x ~/.engram";
+
+/** Run `run` with ~/.engram at `mode`, put back after: the exit code it stopped with, or null. */
+async function inLockedFolder(mode: number, run: () => Promise<unknown>): Promise<number | null> {
+  chmodSync(ENGRAM, mode);
+  try {
+    return await exitCode(run);
+  } finally {
+    chmodSync(ENGRAM, 0o700);
+  }
+}
+
+describe.skipIf(!POSIX_USER)("a ~/.engram that keeps them from opening config.json (engram#723)", () => {
+  const SETTINGS = JSON.stringify({ apiKey: SAVED_KEY, excludePaths: [WORK] });
+  const LOCKED: Record<Kind, string[]> = {
+    // Not another way around the file, such as removing it: that reaches
+    // into the folder too, and once it's fixed, the command does what was
+    // asked.
+    save: [`Error: ${LOCKED_WHY}, so nothing was changed.`, LOCKED_FIX, "  Then run this again."],
+    use: [`Error: ${LOCKED_WHY}, so Engram can't tell which account or server to use.`, LOCKED_FIX, "  Then run this again."],
+    list: [`Error: ${LOCKED_WHY}, so the folders excluded from capture can't be listed.`, LOCKED_FIX, "  Then run this again."],
+  };
+
+  afterEach(() => {
+    // Before the next test removes it.
+    if (existsSync(ENGRAM)) chmodSync(ENGRAM, 0o700);
+  });
+
+  it.each(COMMANDS)("engram $name stops, says it's the folder, and changes and sends nothing", async ({ kind, run }) => {
+    writeConfig(SETTINGS);
+    expect(await inLockedFolder(0o600, run)).toBe(1);
+    expect(errors).toEqual(LOCKED[kind]);
+    expect(logs).toEqual([]);
+    expect(readFileSync(CONFIG, "utf-8")).toBe(SETTINGS);
+    expect(readdirSync(ENGRAM)).toEqual(["config.json"]);
+    expect(requests).toEqual([]);
+    expect(clients).toEqual([]);
+    expect(autoEnable).not.toHaveBeenCalled();
+    expectNoKeyInOutput();
+  });
+
+  it("with no config.json in it, says the same: whether there is one can't be told", async () => {
+    mkdirSync(ENGRAM, { mode: 0o700 });
+    const { authStatus } = await auth();
+    expect(await inLockedFolder(0o600, authStatus)).toBe(1);
+    expect(errors).toEqual(LOCKED.use);
+    expect(readdirSync(ENGRAM)).toEqual([]);
+  });
+
+  it("all of its permissions gone: the chmod gives back all three", async () => {
+    writeConfig(SETTINGS);
+    const { excludeAdd } = await exclude();
+    expect(await inLockedFolder(0o000, () => excludeAdd([WORK]))).toBe(1);
+    expect(errors).toEqual([`Error: ${LOCKED_WHY}, so nothing was changed.`, "  To fix it, run: chmod u+rwx ~/.engram", "  Then run this again."]);
+    expect(readFileSync(CONFIG, "utf-8")).toBe(SETTINGS);
+  });
+
+  it("one that only can't be listed is no lock: engram exclude add saves", async () => {
+    writeConfig(SETTINGS);
+    const elsewhere = join(home.dir, "work", "other");
+    const { excludeAdd } = await exclude();
+    expect(await inLockedFolder(0o300, () => excludeAdd([elsewhere]))).toBeNull();
+    expect(errors).toEqual([]);
+    expect(readConfig()).toEqual({ apiKey: SAVED_KEY, excludePaths: [WORK, elsewhere] });
+  });
+
+  // One that can be searched but not written into still opens config.json:
+  // what keeps it from being read is in the file, so that is what's said.
+  it.each(COMMANDS)(
+    "one that only can't be written into: engram $name says what is wrong with the file itself",
+    async ({ kind, run, hints }) => {
+      writeConfig(BROKEN);
+      expect(await inLockedFolder(0o500, run)).toBe(1);
+      expect(errors).toEqual(refusal(kind, "isn't valid JSON", hints));
+      expect(logs).toEqual([]);
+      expect(readFileSync(CONFIG, "utf-8")).toBe(BROKEN);
+      expect(requests).toEqual([]);
+      expect(clients).toEqual([]);
+      expectNoKeyInOutput();
+    },
+  );
+
+  it("an empty config.json was read, so it is never put down to the folder", async () => {
+    const { lockedConfigDir } = await import("../config-guard.js");
+    const { ConfigUnreadable } = await import("../config-file.js");
+    mkdirSync(ENGRAM, { mode: 0o700 });
+    chmodSync(ENGRAM, 0o600);
+    try {
+      // Locked since: the file it read is what's said, empty.
+      expect(lockedConfigDir(new ConfigUnreadable("is empty", { empty: true }))).toBeNull();
+      expect(lockedConfigDir(new ConfigUnreadable("can't be read"))).toEqual({
+        search: true,
+        write: false,
+        command: "chmod u+x ~/.engram",
+      });
+    } finally {
+      chmodSync(ENGRAM, 0o700);
+    }
+  });
+
+  it("with ENGRAM_API_KEY and ENGRAM_BASE_URL both set, commands that only use them run", async () => {
+    writeConfig(SETTINGS);
+    process.env.ENGRAM_API_KEY = ENV_KEY;
+    process.env.ENGRAM_BASE_URL = "http://127.0.0.1:8788";
+    const { authStatus } = await auth();
+    expect(await inLockedFolder(0o600, authStatus)).toBeNull();
+    expect(logs).toEqual(["Authenticated via ENGRAM_API_KEY env var", `  Key prefix: ${ENV_KEY.slice(0, 20)}...`]);
+    expect(errors).toEqual([]);
+    expect(readFileSync(CONFIG, "utf-8")).toBe(SETTINGS);
+  });
+
+  it.each(SAVES_KEY)(
+    "locked while the server answers: engram $command says it's the folder, and what the new key left",
+    async ({ command, run }) => {
+      // No key in it yet, so signup makes one.
+      const before = JSON.stringify({ excludePaths: [WORK] });
+      writeConfig(before);
+      whileAnswering = () => chmodSync(ENGRAM, 0o600);
+      expect(await inLockedFolder(0o700, run)).toBe(1);
+      expect(errors).toEqual([
+        `Error: ${LOCKED_WHY}, so the new API key wasn't saved.`,
+        ...LOST[command],
+        LOCKED_FIX,
+        `  Then run 'engram ${command}' again.`,
+      ]);
+      expect(readFileSync(CONFIG, "utf-8")).toBe(before);
+      expect(autoEnable).not.toHaveBeenCalled();
+      expectNoKeyInOutput();
+    },
+  );
 });
 
 describe("the usage check before an import (engram#673)", () => {

@@ -21,7 +21,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMissing, readProblem } from "./config-file.js";
-import { OWNERSHIP_FIX } from "./daemon/ownership.js";
+import { lockedDir, lockedDirFix, lockedDirReason, OWNERSHIP_FIX } from "./daemon/ownership.js";
 
 export const VAULT_KEY_FILE = join(homedir(), ".engram", "vault-key");
 
@@ -257,11 +257,16 @@ export function envVaultKeySaved(): boolean {
 /** How to fix it, in a line. */
 export function vaultKeyFix(problem: VaultKeyUnreadable): string {
   switch (problem.kind) {
-    case "permission":
+    case "permission": {
+      // In a ~/.engram the user can't search (engram#723), the folder is
+      // what's wrong: a chmod of the file can't reach it.
+      const locked = lockedDir();
+      if (locked?.search) return `${lockedDirReason("opening the files")}. ${lockedDirFix(locked)}`;
       if (ownedByAnother()) return `It isn't yours: make it yours with: ${OWNERSHIP_FIX}`;
       return process.platform === "win32"
         ? "Give your account permission to read it."
         : "Make it readable with: chmod 600 ~/.engram/vault-key";
+    }
     case "folder":
       return "Move the folder aside, and put your vault key back in ~/.engram/vault-key.";
     case "link":

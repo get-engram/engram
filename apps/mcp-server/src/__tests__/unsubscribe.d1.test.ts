@@ -15,6 +15,9 @@ import type { Env } from "../types.js";
  * never saw the email, and the unsubscribe counts counted the scanners. Now
  * GET only shows a page with one button, and a POST to the same URL does the
  * opt-out: the button, and a mail client's RFC 8058 one-click unsubscribe.
+ *
+ * The unsubscribe is credited to the latest email to the org that carried
+ * the link, never to one without it, such as a welcome email (engram#745).
  */
 
 const KEY = "unsubscribe-key-736-test";
@@ -52,16 +55,22 @@ describe("/email/unsubscribe (engram#736), against real SQLite", () => {
     await mf?.dispose();
   });
 
+  /** A row in email_log: an email of `type` sent to `org` at `at`. */
+  function logged(id: string, org: string, type: string, at: string) {
+    return db
+      .prepare("INSERT INTO email_log (id, org_id, recipient, type, sent_at) VALUES (?, ?, 'someone@example.test', ?, ?)")
+      .bind(id, org, type, at);
+  }
+
   /** Two subscribed orgs: two emails sent to ORG, and a later one to OTHER. */
   async function reset() {
-    const sent = "INSERT INTO email_log (id, org_id, recipient, type, sent_at) VALUES (?, ?, 'someone@example.test', ?, ?)";
     await db.batch([
       db.prepare("DELETE FROM email_log"),
       db.prepare("DELETE FROM organizations"),
       db.prepare("INSERT INTO organizations (id, name) VALUES (?, 'Org'), (?, 'Other')").bind(ORG, OTHER),
-      db.prepare(sent).bind("e_old", ORG, "weekly-digest", "2026-11-01 09:00:00"),
-      db.prepare(sent).bind("e_new", ORG, "recall-nudge", "2026-11-08 09:00:00"),
-      db.prepare(sent).bind("e_other", OTHER, "weekly-digest", "2026-11-09 09:00:00"),
+      logged("e_old", ORG, "weekly-digest", "2026-11-01 09:00:00"),
+      logged("e_new", ORG, "recall-nudge", "2026-11-08 09:00:00"),
+      logged("e_other", OTHER, "weekly-digest", "2026-11-09 09:00:00"),
     ]);
   }
 
@@ -111,7 +120,7 @@ describe("/email/unsubscribe (engram#736), against real SQLite", () => {
     expect(await state()).toEqual(UNTOUCHED);
   });
 
-  it("opts the org out on a POST, and credits the latest email sent to that org", async () => {
+  it("opts the org out on a POST, and credits the latest email with the link sent to that org", async () => {
     const done = await send(link(ORG), { method: "POST" });
     expect(done.status).toBe(200);
     expect(done.location).toBeNull();
@@ -122,6 +131,36 @@ describe("/email/unsubscribe (engram#736), against real SQLite", () => {
     const after = await state();
     expect(after).toMatchObject({ out: 1, otherOut: 0, credited: ["e_new"] });
     expect(after.at).toMatch(/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/);
+  });
+
+  // Every email that carries the link, by the type engram-web logs it as.
+  it.each(["weekly-digest", "activation-nudge", "import-nudge", "maxout-nudge", "recall-nudge", "plan-changed"])(
+    "credits a %s sent since, which carries the link (engram#745)",
+    async (type) => {
+      await logged("e_latest", ORG, type, "2026-11-10 09:00:00").run();
+      await send(link(ORG), { method: "POST" });
+      expect(await state()).toMatchObject({ out: 1, otherOut: 0, credited: ["e_latest"] });
+    },
+  );
+
+  // The reader can't have clicked the link in an email that doesn't have one.
+  it.each(["welcome", "team-invite", "payment-reminder"])(
+    "never credits a %s, which has no link, though it was sent since (engram#745)",
+    async (type) => {
+      await logged("e_latest", ORG, type, "2026-11-10 09:00:00").run();
+      await send(link(ORG), { method: "POST" });
+      expect(await state()).toMatchObject({ out: 1, otherOut: 0, credited: ["e_new"] });
+    },
+  );
+
+  it("opts the org out but credits no email when none sent to it had the link (engram#745)", async () => {
+    await db.batch([
+      db.prepare("DELETE FROM email_log WHERE org_id = ?").bind(ORG),
+      logged("e_welcome", ORG, "welcome", "2026-11-10 09:00:00"),
+    ]);
+    const done = await send(link(ORG), { method: "POST" });
+    expect(done.body).toContain("You're unsubscribed");
+    expect(await state()).toMatchObject({ out: 1, otherOut: 0, credited: [] });
   });
 
   it("changes nothing on a second POST, even after a later email", async () => {

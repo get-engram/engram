@@ -102,6 +102,7 @@
  * only closes a leak inside the existing one.
  */
 
+import { engramCommand } from "./package-runner.js";
 import { isRefusal } from "./status.js";
 import {
   asVaultKeyProblem,
@@ -1031,7 +1032,7 @@ export class SecretScrubber {
         `vault scrubber: holding sends — ${mismatch.message}, so ${one ? "it" : "they"} can't ` +
           `${unknown < mismatch.secrets ? "all " : ""}be scrubbed. Capture goes on, and what it ` +
           `captures is sent once ${one ? "the secret decrypts, or is" : "the secrets decrypt, or are"} ` +
-          "deleted. See 'engram status'.",
+          `deleted. See '${engramCommand("status")}'.`,
       );
     } else if (was.secrets !== mismatch.secrets || recheck) {
       this.log(`vault scrubber: still holding sends — ${mismatch.message}`);

@@ -37,6 +37,7 @@ import {
 } from "./daemon/ownership.js";
 import { findRootDaemon, rootDaemonLines } from "./daemon/root-daemon.js";
 import { asRootRefusal, rootForAnotherUser } from "./daemon/as-root.js";
+import { engramCommand } from "./daemon/package-runner.js";
 import { alive, pidInFile } from "./daemon/instance.js";
 
 // Read from package.json rather than duplicated here. The previous hardcoded
@@ -138,8 +139,8 @@ async function getClient(options: { vault?: boolean } = {}): Promise<Engram> {
   if (!apiKey) {
     console.error(
       "Not authenticated. Run:\n\n" +
-        "  engram signup     # create a free account\n" +
-        "  engram login      # sign in with email + password\n",
+        `  ${engramCommand("signup")}     # create a free account\n` +
+        `  ${engramCommand("login")}      # sign in with email + password\n`,
     );
     process.exit(1);
   }
@@ -262,7 +263,7 @@ async function printSyncBanner(): Promise<void> {
     // the file itself. Once it reads fine, the daemon picks up on its own.
     if (s.capture_error && s.capture_error.kind !== "config") {
       console.error(red(bold("engram:")) + ` ${captureErrorSummary(s.capture_error)}`);
-      console.error(dim("  (run 'engram status' for details)"));
+      console.error(dim(`  (run '${engramCommand("status")}' for details)`));
       console.error("");
     }
     if (
@@ -297,7 +298,7 @@ async function printSyncBanner(): Promise<void> {
         ? ` ${s.pending_messages.toLocaleString("en-US")} message${s.pending_messages === 1 ? "" : "s"} waiting locally.`
         : "";
     console.error(red(bold("engram:")) + ` ${syncErrorSummary(s.error_type, s.storage)}${queued}`);
-    console.error(dim("  (run 'engram status' for details)"));
+    console.error(dim(`  (run '${engramCommand("status")}' for details)`));
     console.error("");
   } catch {
     // Never let a status-file problem block the command the user asked for.
@@ -385,7 +386,7 @@ async function printConfigBanner(): Promise<void> {
   const problem = await configProblem();
   if (!problem) return;
   console.error(red(bold("engram:")) + ` ${configProblemSummary(problem.message)}`);
-  console.error(dim("  (run 'engram status' for details)"));
+  console.error(dim(`  (run '${engramCommand("status")}' for details)`));
   console.error("");
 }
 
@@ -651,7 +652,7 @@ async function main(): Promise<void> {
           console.error("Available: list, create, get, delete");
         } else {
           console.error(`Unknown command: ${cmd}`);
-          console.error("Run 'engram help' for usage.");
+          console.error(`Run '${engramCommand("help")}' for usage.`);
         }
         process.exit(1);
     }

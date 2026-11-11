@@ -21,6 +21,7 @@ import { configuredAccount, ownedKeysOf } from "./key-source.js";
 import { makeDirPrivateSync, type PrivateDirReport } from "../private-files.js";
 import { START_FAILED_EXIT } from "./supervise.js";
 import { foreignFiles, foreignFilesFix, foreignFilesProblem, OWNERSHIP_FIX } from "./ownership.js";
+import { engramCommand } from "./package-runner.js";
 import {
   heldVaultMismatch,
   notifyDesktopBeforeExit,
@@ -114,7 +115,7 @@ async function main(): Promise<void> {
   if (foreign?.stopsDaemon) {
     log(`daemon exiting: ${foreignFilesProblem(foreign, "stopped")}`);
     log(foreignFilesFix(foreign));
-    log("Then run: engram start");
+    log(`Then run: ${engramCommand("start")}`);
     // The log may be one of them, and nobody reads it: this reaches the user.
     await notifyDesktopBeforeExit(
       "Engram capture has stopped",
@@ -432,7 +433,7 @@ async function main(): Promise<void> {
 
   log(
     envKey
-      ? "API key: ENGRAM_API_KEY (fixed for this process; 'engram auth login' and 'logout' don't change it)"
+      ? `API key: ENGRAM_API_KEY (fixed for this process; '${engramCommand("auth login")}' and 'logout' don't change it)`
       : "API key: ~/.engram/config.json (read again every few seconds)",
   );
   // Never the address itself, which can carry credentials.

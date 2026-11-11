@@ -44,6 +44,7 @@ import { rootForAnotherUser } from "./as-root.js";
 import { ENGRAM_DIR, LOG_FILE, PID_FILE } from "./launch.js";
 import { systemJob, type SystemJob } from "./launchd.js";
 import { lockedDir, lockedDirFix, lockedDirProblem } from "./ownership.js";
+import { engramCommand } from "./package-runner.js";
 import { powerShellArgs, windowsPowerShellPath } from "./powershell.js";
 import { notifyDesktopBeforeExit } from "./status.js";
 import { ensurePrivateDirSync, readSmallFileSync, writePrivateFileSync } from "../private-files.js";
@@ -1200,7 +1201,7 @@ async function claimOnce(options: ClaimOptions): Promise<Claim> {
   // couldn't stop it. It takes nothing: no socket, no PID file.
   if (rootForAnotherUser()) {
     const message =
-      "daemon exiting: it runs as root, and Engram's daemon runs as you. Run 'engram start' as yourself, without sudo";
+      `daemon exiting: it runs as root, and Engram's daemon runs as you. Run '${engramCommand("start")}' as yourself, without sudo`;
     log(message);
     return { state: "refused", message };
   }
@@ -1237,7 +1238,7 @@ async function claimOnce(options: ClaimOptions): Promise<Claim> {
     const message = `daemon exiting: ${lockedDirProblem(locked, "stopped")}`;
     log(message);
     log(lockedDirFix(locked));
-    log("Then run: engram start");
+    log(`Then run: ${engramCommand("start")}`);
     await notifyDesktopBeforeExit("Engram capture has stopped", `${lockedDirProblem(locked)} ${lockedDirFix(locked)}`);
     return { state: "refused", message };
   }
@@ -1262,7 +1263,7 @@ async function claimOnce(options: ClaimOptions): Promise<Claim> {
     if (result.state === "held") unlockEndpoint(result.held);
     const message =
       result.state === "held"
-        ? `an older daemon is already running (pid ${inFile.pid}); this one is exiting. Run 'engram stop' and then 'engram start' to update it`
+        ? `an older daemon is already running (pid ${inFile.pid}); this one is exiting. Run '${engramCommand("stop")}' and then '${engramCommand("start")}' to update it`
         : `another daemon is already running (pid ${inFile.pid}); this one is exiting`;
     log(message);
     return { state: "taken", message, retry: false };
@@ -1273,7 +1274,7 @@ async function claimOnce(options: ClaimOptions): Promise<Claim> {
   const root = rootDaemonPid(inFile);
   if (root !== null) {
     if (result.state === "held") unlockEndpoint(result.held);
-    const message = `a daemon started with sudo is still running as root (pid ${root}); this one is exiting. Run 'engram status' to see how to stop it`;
+    const message = `a daemon started with sudo is still running as root (pid ${root}); this one is exiting. Run '${engramCommand("status")}' to see how to stop it`;
     log(message);
     return { state: "taken", message, retry: false };
   }

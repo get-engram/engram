@@ -16,7 +16,7 @@ import {
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative } from "node:path";
-import type { Probe } from "../daemon/instance.js";
+import type { DaemonOutput, Probe } from "../daemon/instance.js";
 import type { UnitPaths } from "../daemon/systemd.js";
 
 /**
@@ -35,10 +35,11 @@ const { home, cli, daemon, systemd, spawn, execSync, execFileSync } = vi.hoisted
   // This build's worker, when it isn't the one in the test's home: a CLI
   // installed with brew runs from a versioned keg (engram#652).
   cli: { worker: null as string | null },
-  // What answers on the daemon's socket: a daemon, or nothing. `root`: a
-  // process that runs the worker as root (engram#680).
+  // What answers on the daemon's socket: a daemon, or nothing, and where it
+  // says its output goes (engram#720). `root`: a process that runs the
+  // worker as root (engram#680).
   daemon: {
-    answering: null as { pid: number; stopping?: boolean; version?: string } | null,
+    answering: null as { pid: number; stopping?: boolean; version?: string; output?: DaemonOutput } | null,
     root: null as number | null,
   },
   // The fake user service manager: whether it answers, and whether it
@@ -384,6 +385,15 @@ function said(): string {
   vi.mocked(console.log).mockClear();
   vi.mocked(console.error).mockClear();
   return text;
+}
+
+/** What `text` says of the log: its "Log:" line and the lines under it, or none (engram#720). */
+function logLines(text: string): string[] {
+  const lines = text.split("\n");
+  const at = lines.findIndex((line) => line.startsWith("Log:"));
+  if (at < 0) return [];
+  const end = lines.findIndex((line, i) => i > at && !line.startsWith("  "));
+  return lines.slice(at, end < 0 ? undefined : end);
 }
 
 beforeEach(() => {
@@ -1006,6 +1016,99 @@ describe("engram status on Linux (engram#615)", () => {
     expect(text).not.toContain("journalctl");
   });
 
+  it("says when a running daemon doesn't write to its log, and what has it write there (engram#720)", async () => {
+    writeUnit(unitWith());
+    systemdRunsDaemon();
+    // It started while its log couldn't be written, and now it can be.
+    daemon.answering = { pid: process.pid, output: "none" };
+    await daemonStatus();
+    // systemd's: in the journal.
+    expect(logLines(said())).toEqual([
+      `Log: ${LOG_FILE}, but the daemon doesn't write to it: it started without it.`,
+      "  systemd keeps its output in the journal: journalctl --user -u engram",
+      "  'engram stop' and then 'engram start' have the daemon write to it.",
+    ]);
+
+    // One systemd didn't start: its output is dropped, and nothing is said of the journal.
+    systemd.mainPid = 0;
+    await daemonStatus();
+    expect(logLines(said())).toEqual([
+      `Log: ${LOG_FILE}, but the daemon doesn't write to it: it started without it.`,
+      "  'engram stop' and then 'engram start' have the daemon write to it.",
+    ]);
+  });
+
+  it("says why a running daemon doesn't write to its log (engram#720)", async () => {
+    writeUnit(unitWith());
+    systemdRunsDaemon();
+    for (const [output, why] of [
+      ["deleted", "the log it writes to has been deleted or replaced"],
+      ["file", "it writes to another file"],
+    ] as const) {
+      daemon.answering = { pid: process.pid, output };
+      await daemonStatus();
+      // Its output isn't in the journal, though systemd runs it.
+      expect(logLines(said()), output).toEqual([
+        `Log: ${LOG_FILE}, but the daemon doesn't write to it: ${why}.`,
+        "  'engram stop' and then 'engram start' have the daemon write to it.",
+      ]);
+    }
+    // One in the foreground was started to write to the terminal.
+    systemd.mainPid = 0;
+    daemon.answering = { pid: process.pid, output: "terminal" };
+    await daemonStatus();
+    expect(logLines(said())).toEqual([
+      `Log: ${LOG_FILE}, but the daemon doesn't write to it: it writes to the terminal it was started in.`,
+    ]);
+  });
+
+  it("says only where the log is while the daemon writes to it, or doesn't say (engram#720)", async () => {
+    writeUnit(unitWith());
+    systemdRunsDaemon();
+    daemon.answering = { pid: process.pid, output: "log" };
+    await daemonStatus();
+    expect(logLines(said())).toEqual([`Log: ${LOG_FILE}`]);
+    // One from before says nothing of where its output goes.
+    daemon.answering = { pid: process.pid };
+    await daemonStatus();
+    expect(logLines(said())).toEqual([`Log: ${LOG_FILE}`]);
+  });
+
+  permissionsIt("says what a log that can't be written means by where the running daemon's output goes (engram#720)", async () => {
+    writeUnit(unitWith());
+    systemdRunsDaemon();
+    unwritableLog();
+    const FIX = "  To fix it, run: chmod u+w ~/.engram/daemon.log";
+    const JOURNAL = "  systemd keeps its output in the journal: journalctl --user -u engram";
+    const AGAIN = "  Once it can be written, 'engram stop' and then 'engram start' have the daemon write to it again.";
+
+    // It opened the log before: it still writes there, and a restart now
+    // would lose it.
+    daemon.answering = { pid: process.pid, output: "log" };
+    await daemonStatus();
+    expect(logLines(said())).toEqual([
+      `Log: ${LOG_FILE}. The daemon writes to it, but it can't be opened for writing now (EACCES), so a daemon started again would run without it.`,
+      FIX,
+    ]);
+
+    for (const [output, lines] of [
+      ["none", [JOURNAL, FIX, AGAIN]],
+      // As one from before: it may be in the journal.
+      [undefined, [JOURNAL, FIX, AGAIN]],
+      ["deleted", [FIX, AGAIN]],
+      ["file", [FIX, AGAIN]],
+    ] as const) {
+      daemon.answering = { pid: process.pid, output };
+      await daemonStatus();
+      expect(logLines(said()), String(output)).toEqual([`Log: ${CANT_BE_WRITTEN}`, ...lines]);
+    }
+
+    systemd.mainPid = 0;
+    daemon.answering = { pid: process.pid, output: "terminal" };
+    await daemonStatus();
+    expect(logLines(said())).toEqual([`Log: ${CANT_BE_WRITTEN}`, FIX]);
+  });
+
   it("says nothing of a unit it didn't write, or of none", async () => {
     daemonRunning();
     await daemonStatus();
@@ -1362,6 +1465,40 @@ describe("engram start through systemd (engram#689)", () => {
     const text = output();
     expect(text).toContain(`Daemon already running (pid ${process.pid})`);
     expect(text).not.toContain("systemd");
+  });
+
+  it("says, of a daemon already running, that it doesn't write to the log it now can (engram#720)", async () => {
+    systemdRunsDaemon();
+    daemon.answering = { pid: process.pid, output: "none" };
+    await daemonStart([], {});
+    expect(spawn).not.toHaveBeenCalled();
+    let text = said();
+    expect(text).toContain(`Daemon already running (pid ${process.pid})`);
+    expect(logLines(text)).toEqual([
+      `Log: ${LOG_FILE}, but the daemon doesn't write to it: it started without it.`,
+      "  systemd keeps its output in the journal: journalctl --user -u engram",
+      "  'engram stop' and then 'engram start' have the daemon write to it.",
+    ]);
+
+    // Nothing of the log while it writes there, or doesn't say.
+    for (const output of ["log", undefined] as const) {
+      daemon.answering = { pid: process.pid, output };
+      await daemonStart([], {});
+      text = said();
+      expect(text, String(output)).toContain(`Daemon already running (pid ${process.pid})`);
+      expect(logLines(text), String(output)).toEqual([]);
+    }
+  });
+
+  permissionsIt("says nothing of the log for a daemon already running while it can't be written (engram#720)", async () => {
+    systemdRunsDaemon();
+    unwritableLog();
+    daemon.answering = { pid: process.pid, output: "none" };
+    await daemonStart([], {});
+    const text = said();
+    expect(text).toContain(`Daemon already running (pid ${process.pid})`);
+    // `engram status` says it; a start changes nothing of it.
+    expect(logLines(text)).toEqual([]);
   });
 
   it("starts the daemon itself, and says systemd won't restart it, when systemctl won't start it", async () => {

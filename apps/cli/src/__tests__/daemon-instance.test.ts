@@ -1,10 +1,14 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import {
+  chmodSync,
+  closeSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -32,12 +36,33 @@ import { writePrivateFileSync } from "../private-files.js";
  * processes signalled are the ones these tests start.
  */
 
-const { home } = vi.hoisted(() => ({ home: { dir: "" } }));
+const { home, tty, stats } = vi.hoisted(() => ({
+  home: { dir: "" },
+  // Whether a descriptor is a terminal, for those a test says: none of the
+  // ones these tests open is (engram#720).
+  tty: { forced: new Map<number, boolean>() },
+  // How a path's stats read, for those a test says (engram#720): no test
+  // can make a file on another device with a given inode.
+  stats: { altered: new Map<string, (real: import("node:fs").BigIntStats) => unknown>() },
+}));
 
 vi.mock("node:os", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:os")>()),
   homedir: () => home.dir,
 }));
+vi.mock("node:tty", async (importOriginal) => {
+  const real = await importOriginal<typeof import("node:tty")>();
+  return { ...real, isatty: (fd: number) => tty.forced.get(fd) ?? real.isatty(fd) };
+});
+vi.mock("node:fs", async (importOriginal) => {
+  const real = await importOriginal<typeof import("node:fs")>();
+  const statSync = ((path: import("node:fs").PathLike, options?: import("node:fs").StatSyncOptions) => {
+    const result = real.statSync(path, options);
+    const alter = stats.altered.get(String(path));
+    return alter && result ? alter(result as import("node:fs").BigIntStats) : result;
+  }) as typeof real.statSync;
+  return { ...real, statSync };
+});
 
 const POSIX = process.platform !== "win32";
 
@@ -58,6 +83,7 @@ const {
   alive,
   confirmedDaemonInPidFile,
   daemonEndpoint,
+  daemonOutput,
   identifyProcess,
   lockEndpoint,
   parseAnswer,
@@ -78,6 +104,10 @@ let dir = "";
 const holders: Array<{ stop: () => Promise<void> }> = [];
 const lockServers: Server[] = [];
 const children: ChildProcess[] = [];
+/** Descriptors a test opened, closed after it. */
+const fds: number[] = [];
+/** Folders a test made unsearchable, given their mode back after it. */
+const lockedDirs: string[] = [];
 
 // On a fresh Windows machine, the first PowerShells to ask WMI about a
 // process can take longer than identifyProcess waits, while WMI starts
@@ -107,6 +137,10 @@ beforeEach(() => {
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  tty.forced.clear();
+  stats.altered.clear();
+  for (const fd of fds.splice(0)) closeSync(fd);
+  for (const at of lockedDirs.splice(0)) chmodSync(at, 0o700);
   // Closing a server removes the socket file at its path, by name: each
   // test has its own folder, so only that test's files go.
   for (const h of holders.splice(0)) await h.stop();
@@ -362,6 +396,17 @@ describe("reading the daemon's answer", () => {
     }
   });
 
+  it("reads where its output goes, when it says (engram#720)", () => {
+    for (const output of ["log", "terminal", "deleted", "file", "none"]) {
+      expect(parseAnswer(answerLine({ output }).trim())?.output).toBe(output);
+    }
+    // One from before, or one on Windows, says nothing of it: then nothing
+    // is said of where it writes. Nothing else is an answer.
+    for (const value of [undefined, null, "", "LOG", "log\n", "journal", 1, true, ["log"], { log: true }]) {
+      expect(parseAnswer(answerLine({ output: value }).trim())?.output, String(value)).toBeUndefined();
+    }
+  });
+
   it("reads whether it takes a request to stop from the stop file (engram#613)", () => {
     expect(parseAnswer(answerLine({ stop_file: true }).trim())?.stopFile).toBe(true);
     // A daemon from before then says nothing of it; only true is taken for yes.
@@ -412,6 +457,114 @@ describe("reading the daemon's answer", () => {
       ready: false,
       stopping: true,
     });
+  });
+});
+
+describe("where the daemon's output goes (engram#720)", () => {
+  const posixIt = POSIX ? it : it.skip;
+  /** For a test of file permissions, which root doesn't keep to. */
+  const permissionsIt = POSIX && process.getuid?.() !== 0 ? it : it.skip;
+
+  /** `path` opened to append to, as a start opens the log, closed after the test. */
+  function opened(path: string): number {
+    const fd = openSync(path, "a", 0o600);
+    fds.push(fd);
+    return fd;
+  }
+
+  posixIt("is the log while it writes to the file at the log's path", () => {
+    const log = join(dir, "daemon.log");
+    const fd = opened(log);
+    expect(daemonOutput(fd, log)).toBe("log");
+    // However the path to it is spelled.
+    symlinkSync(dir, join(dir, "linked"), "dir");
+    expect(daemonOutput(fd, join(dir, "linked", "daemon.log"))).toBe("log");
+    // A log that is a link to the file it writes to, which a start opens
+    // through the link.
+    symlinkSync(log, join(dir, "daemon-link.log"));
+    expect(daemonOutput(fd, join(dir, "daemon-link.log"))).toBe("log");
+    // And on the systems it is asked on.
+    for (const platform of ["darwin", "linux"] as const) expect(daemonOutput(fd, log, platform)).toBe("log");
+  });
+
+  posixIt("is a deleted log once the log it writes to is deleted, or replaced", () => {
+    const log = join(dir, "daemon.log");
+    const fd = opened(log);
+    unlinkSync(log);
+    expect(daemonOutput(fd, log)).toBe("deleted");
+    // A new log at the path is another file.
+    writeFileSync(log, "");
+    expect(daemonOutput(fd, log)).toBe("deleted");
+
+    // Replaced by renaming another file over it, as an editor saves.
+    const again = opened(log);
+    expect(daemonOutput(again, log)).toBe("log");
+    writeFileSync(join(dir, "daemon.log.new"), "");
+    renameSync(join(dir, "daemon.log.new"), log);
+    expect(daemonOutput(again, log)).toBe("deleted");
+  });
+
+  posixIt("is another file when the log it writes to was moved, or it writes to another", () => {
+    const log = join(dir, "daemon.log");
+    const fd = opened(log);
+    renameSync(log, join(dir, "daemon.log.1"));
+    expect(daemonOutput(fd, log)).toBe("file");
+    writeFileSync(log, "");
+    expect(daemonOutput(fd, log)).toBe("file");
+    expect(daemonOutput(opened(join(dir, "other.log")), log)).toBe("file");
+  });
+
+  posixIt("is another file when that file has the log's inode on another device", () => {
+    const log = join(dir, "daemon.log");
+    const fd = opened(join(dir, "other.log"));
+    const other = fstatSync(fd, { bigint: true });
+    writeFileSync(log, "");
+    // An inode number names a file on one device only.
+    stats.altered.set(log, (real) => ({ ...real, dev: other.dev + 1n, ino: other.ino }));
+    expect(daemonOutput(fd, log)).toBe("file");
+    stats.altered.set(log, (real) => ({ ...real, dev: other.dev, ino: other.ino }));
+    expect(daemonOutput(fd, log)).toBe("log");
+  });
+
+  posixIt("is none when it writes to no file, as with its output dropped", () => {
+    const log = join(dir, "daemon.log");
+    const nowhere = opened("/dev/null");
+    expect(daemonOutput(nowhere, log)).toBe("none");
+    writeFileSync(log, "");
+    expect(daemonOutput(nowhere, log)).toBe("none");
+    // A log path through a file, which no log can be at, is no log.
+    writeFileSync(join(dir, "a-file"), "");
+    expect(daemonOutput(nowhere, join(dir, "a-file", "daemon.log"))).toBe("none");
+  });
+
+  posixIt("is the terminal it was started in, as in the foreground", () => {
+    const log = join(dir, "daemon.log");
+    const fd = opened("/dev/null");
+    tty.forced.set(fd, true);
+    expect(daemonOutput(fd, log)).toBe("terminal");
+    writeFileSync(log, "");
+    expect(daemonOutput(fd, log)).toBe("terminal");
+  });
+
+  permissionsIt("can't be told while the log's folder can't be searched", () => {
+    const at = mkdtempSync(join(dir, "locked"));
+    const log = join(at, "daemon.log");
+    const fd = opened(log);
+    chmodSync(at, 0o600);
+    lockedDirs.push(at);
+    expect(daemonOutput(fd, log)).toBeUndefined();
+    chmodSync(at, 0o700);
+    expect(daemonOutput(fd, log)).toBe("log");
+  });
+
+  it("can't be told for output that isn't open, and isn't asked on Windows", () => {
+    const log = join(dir, "daemon.log");
+    // No process has this many open.
+    expect(daemonOutput(999_999, log)).toBeUndefined();
+    const fd = opened(log);
+    expect(daemonOutput(fd, log, "win32")).toBeUndefined();
+    tty.forced.set(fd, true);
+    expect(daemonOutput(fd, log, "win32")).toBeUndefined();
   });
 });
 
@@ -837,6 +990,8 @@ describe("taking the endpoint", () => {
         // and the vault when told it changed (engram#701).
         vaultKeyReread: true,
         vaultChangeNotice: true,
+        // Where this process's output goes (engram#720); not on Windows.
+        output: daemonOutput(),
       },
     });
   });
@@ -1058,6 +1213,30 @@ describe("the daemon's answer as it starts and stops", () => {
     const other = endpointIn(mkdtempSync(join(dir, "o")));
     heldOf(await lock(other));
     expect(await probeDaemon({ endpoint: other })).toMatchObject({ info: { ready: false, stopping: false } });
+  });
+
+  (POSIX ? it : it.skip)("says where its output goes each time it answers (engram#720)", async () => {
+    const endpoint = endpointIn(dir);
+    heldOf(await lock(endpoint));
+    const said = async (): Promise<Record<string, unknown>> => JSON.parse((await exchange(endpoint)).trim());
+    // This process stands in for the daemon: its stderr is whatever runs
+    // the tests, and the log in this test's home isn't there.
+    tty.forced.set(2, true);
+    expect((await said()).output).toBe("terminal");
+    expect(await probeDaemon({ endpoint })).toMatchObject({ info: { output: "terminal" } });
+    tty.forced.set(2, false);
+    const now = (await said()).output;
+    expect(now).toBe(daemonOutput());
+    expect(now).not.toBe("terminal");
+    expect(["file", "none"]).toContain(now);
+  });
+
+  it("says where its output goes, except on Windows (engram#720)", async () => {
+    const endpoint = endpointIn(dir);
+    heldOf(await lock(endpoint));
+    const answer = JSON.parse((await exchange(endpoint)).trim());
+    if (!POSIX) expect(answer).not.toHaveProperty("output");
+    else expect(answer).toHaveProperty("output");
   });
 
   it("says whether it has a vault key once it has read it, and not before (engram#698)", async () => {

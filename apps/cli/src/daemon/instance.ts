@@ -35,12 +35,13 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { lstatSync, readdirSync, readFileSync, statSync, unlinkSync, type BigIntStats } from "node:fs";
+import { fstatSync, lstatSync, readdirSync, readFileSync, statSync, unlinkSync, type BigIntStats } from "node:fs";
 import { createRequire } from "node:module";
 import { connect, createServer, type Server } from "node:net";
 import { dirname, join } from "node:path";
+import { isatty } from "node:tty";
 import { rootForAnotherUser } from "./as-root.js";
-import { ENGRAM_DIR, PID_FILE } from "./launch.js";
+import { ENGRAM_DIR, LOG_FILE, PID_FILE } from "./launch.js";
 import { systemJob, type SystemJob } from "./launchd.js";
 import { lockedDir, lockedDirFix, lockedDirProblem } from "./ownership.js";
 import { powerShellArgs, windowsPowerShellPath } from "./powershell.js";
@@ -195,6 +196,64 @@ export interface DaemonInfo {
    * one that hasn't read it yet.
    */
   vaultKey?: boolean;
+  /**
+   * Where its output goes (engram#720): see daemonOutput. Undefined: one
+   * from before, one on Windows, or one that can't tell.
+   */
+  output?: DaemonOutput;
+}
+
+/**
+ * Where the daemon's output goes (engram#720). Since engram#679, a daemon
+ * whose ~/.engram/daemon.log can't be written starts without it: `engram
+ * start` drops its output, the systemd unit sends it to the journal, and
+ * the launchd job runs from a plist without a log. Once the log could be
+ * written again, `engram status` named it as the daemon's log, though the
+ * daemon wrote somewhere else until it was started again.
+ *
+ * - "log": daemon.log, the file at that path now.
+ * - "terminal": the terminal it was started in (`engram start --foreground`).
+ * - "deleted": a file that is no longer anywhere: the log, deleted or
+ *   replaced while the daemon ran.
+ * - "file": another file.
+ * - "none": not a file: nowhere (/dev/null), the systemd journal, a pipe.
+ */
+export type DaemonOutput = "log" | "terminal" | "deleted" | "file" | "none";
+
+const OUTPUTS: readonly DaemonOutput[] = ["log", "terminal", "deleted", "file", "none"];
+
+/**
+ * Where this process's output goes: `fd`, stderr, which the daemon writes
+ * its log lines to, and which every start points at the same place as
+ * stdout. Undefined on Windows, which isn't asked, and when it can't be
+ * told. Read again each time the daemon answers, so a log deleted or
+ * replaced while it runs is seen without a timer. BigInt stats, as for the
+ * socket (see lstatSocketPath). Exported for tests.
+ */
+export function daemonOutput(
+  fd = 2,
+  log: string = LOG_FILE,
+  platform: NodeJS.Platform = process.platform,
+): DaemonOutput | undefined {
+  if (platform === "win32") return undefined;
+  let out: BigIntStats;
+  try {
+    out = fstatSync(fd, { bigint: true });
+  } catch {
+    return undefined;
+  }
+  try {
+    const at = statSync(log, { bigint: true });
+    if (at.dev === out.dev && at.ino === out.ino) return "log";
+  } catch (err: unknown) {
+    // None there is an answer: it was deleted, or was never made. Anything
+    // else, such as a ~/.engram that can't be searched, isn't.
+    const code = errCode(err);
+    if (code !== "ENOENT" && code !== "ENOTDIR") return undefined;
+  }
+  if (isatty(fd)) return "terminal";
+  if (out.isFile()) return out.nlink === 0n ? "deleted" : "file";
+  return "none";
 }
 
 const self = {
@@ -205,6 +264,7 @@ const self = {
 };
 
 function answer(id: string): string {
+  const output = daemonOutput();
   return `${JSON.stringify({
     engram: "daemon",
     protocol: 1,
@@ -218,6 +278,7 @@ function answer(id: string): string {
     vault_key_reread: true,
     vault_change_notice: true,
     ...(self.vaultKey === undefined ? {} : { vault_key: self.vaultKey }),
+    ...(output === undefined ? {} : { output }),
   })}\n`;
 }
 
@@ -250,6 +311,7 @@ export function parseAnswer(line: string): DaemonInfo | null {
     vaultKeyReread: a.vault_key_reread === true,
     vaultChangeNotice: a.vault_change_notice === true,
     vaultKey: typeof a.vault_key === "boolean" ? a.vault_key : undefined,
+    output: OUTPUTS.find((o) => o === a.output),
   };
 }
 

@@ -15,6 +15,11 @@
  * says it couldn't record that capture is off, why, and what fixes it, and
  * exits 1; once it's fixed, a stop records it (engram#681).
  *
+ * On macOS and Linux, a daemon started while its log couldn't be written
+ * runs without it; once the log can be written, status and start say the
+ * daemon doesn't write to it, and what has it write there. A log moved or
+ * deleted while the daemon runs is said too (engram#720).
+ *
  * On Windows it also checks the supervisor (engram#613): every way of
  * starting the daemon runs the worker under one, `engram stop` asks the
  * worker to stop through ~/.engram/daemon.stop and it shuts down as it does
@@ -43,6 +48,7 @@ import {
   readFileSync,
   readlinkSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -369,6 +375,8 @@ try {
   check(!existsSync(join(home, "Library")), "nothing launchd-shaped is written");
   r = engram("daemon", "status");
   check(/Status: running/.test(r.out), "status says running");
+  // It writes to its log, or on Windows doesn't say where it writes (engram#720).
+  check(r.out.split("\n").includes(`Log: ${LOG_FILE}`), "status says where the log is, and nothing more of it");
 
   // ── engram status: the daemon, then usage, with the API unreachable (engram#609) ──
   r = engram("status");
@@ -600,6 +608,74 @@ try {
   r = engram("stop");
   check(r.status === 0 && /Daemon is not running/.test(r.out), "once it's fixed, stop exits 0");
   check(JSON.parse(readFileSync(CONFIG, "utf-8")).autocapture === "off", "and records that capture is off");
+
+  // ── a daemon that doesn't write to its log (engram#720) ──
+  // Started while its log can't be written, the daemon runs with its output
+  // dropped (engram#679). It says where its output goes each time it's
+  // asked, over its socket; a home whose socket path would be too long has
+  // none (see daemonEndpoint), and on Windows it doesn't say.
+  const SOCKET = join(ENGRAM_DIR, "daemon.sock");
+  const socketFits = Buffer.byteLength(SOCKET) <= (process.platform === "linux" ? 107 : 103);
+  if (!WINDOWS && !socketFits) console.log(`\n(skipped engram#720: ${SOCKET} is too long for a socket here)`);
+  if (!WINDOWS && socketFits) {
+    const NOT_THE_LOG = `Log: ${LOG_FILE}, but the daemon doesn't write to it:`;
+    const RESTART = "  'engram stop' and then 'engram start' have the daemon write to it.";
+    chmodSync(LOG_FILE, 0o400);
+    r = engram("start");
+    check(r.status === 0, "start exits 0 while the log can't be written");
+    check(
+      r.out.includes(`Log: ${LOG_FILE} can't be written (EACCES), so the daemon runs without it.`),
+      "start says the daemon runs without its log",
+    );
+    pid = await started("the worker starts without its log");
+    await soon("the daemon answers on its socket", () => existsSync(SOCKET), 15_000);
+    const before = readFileSync(LOG_FILE, "utf-8");
+
+    chmodSync(LOG_FILE, 0o600);
+    r = engram("daemon", "status");
+    check(
+      r.out.includes(`${NOT_THE_LOG} it started without it.\n${RESTART}`),
+      "once the log can be written, status says the daemon doesn't write to it, and what has it write there",
+    );
+    check(!/can't be written|journal/.test(r.out), "and nothing of a log that can't be written, or a journal");
+    r = engram("start");
+    check(/Daemon already running/.test(r.out), "start finds it running");
+    check(r.out.includes(`${NOT_THE_LOG} it started without it.\n${RESTART}`), "and says it doesn't write to the log");
+    check(readFileSync(LOG_FILE, "utf-8") === before, "it doesn't: nothing it says reaches the log");
+
+    await stopped(pid);
+    r = engram("start");
+    check(r.status === 0 && r.out.split("\n").includes(`Log: ${LOG_FILE}`), "a start once it can be written has it write there");
+    pid = await started("the worker starts with its log");
+    await soon("the daemon writes to its log", () => readLog().includes(`daemon started (pid ${pid})`));
+    r = engram("daemon", "status");
+    check(
+      r.out.split("\n").includes(`Log: ${LOG_FILE}`) && !r.out.includes(NOT_THE_LOG),
+      "status says where the log is, and nothing more of it",
+    );
+
+    // The log moved, as a log rotation does without telling the daemon,
+    // then deleted, while it runs.
+    renameSync(LOG_FILE, `${LOG_FILE}.1`);
+    r = engram("daemon", "status");
+    check(r.out.includes(`${NOT_THE_LOG} it writes to another file.\n${RESTART}`), "a log moved away: it writes to another file");
+    rmSync(`${LOG_FILE}.1`);
+    r = engram("daemon", "status");
+    check(
+      r.out.includes(`${NOT_THE_LOG} the log it writes to has been deleted or replaced.\n${RESTART}`),
+      "a log deleted: the log it writes to has been deleted or replaced",
+    );
+    check(!existsSync(LOG_FILE), "status makes no log");
+    await stopped(pid);
+    r = engram("start");
+    pid = await started("the worker starts again");
+    r = engram("daemon", "status");
+    check(
+      r.out.split("\n").includes(`Log: ${LOG_FILE}`) && !r.out.includes(NOT_THE_LOG),
+      "after a stop and a start it writes to the log again",
+    );
+    await stopped(pid);
+  }
 } catch (err) {
   check(false, `smoke test crashed: ${err instanceof Error ? err.stack : err}`);
 } finally {

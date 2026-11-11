@@ -5,6 +5,7 @@ import { unsubscribeSig } from "../services/secrets.js";
 import {
   BASE_SECURITY_HEADERS,
   HTML_CONTENT_SECURITY_POLICY,
+  UNSUBSCRIBE_PAGE_SECURITY_POLICY,
 } from "../middleware/security-headers.js";
 import { adminConsoleSecurityPolicy } from "../routes/admin-dashboard.js";
 
@@ -21,6 +22,10 @@ function makeEnv() {
 
 function get(path: string) {
   return app.fetch(new Request(`http://localhost${path}`), makeEnv(), ctx);
+}
+
+function post(path: string) {
+  return app.fetch(new Request(`http://localhost${path}`, { method: "POST" }), makeEnv(), ctx);
 }
 
 function expectBaseHeaders(res: Response) {
@@ -60,20 +65,38 @@ describe("response hardening headers (engram#459)", () => {
     expect(res.headers.get("Content-Security-Policy")).toBeNull();
   });
 
-  it("gives the unsubscribe confirmation page the HTML policy", async () => {
+  it("gives the unsubscribe page the HTML policy, except that its form may post back here (engram#736)", async () => {
     const org = "org_headers_test";
     const sig = await unsubscribeSig(org, ADMIN_SECRET);
     const res = await get(`/email/unsubscribe?org=${org}&sig=${sig}`);
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type") ?? "").toMatch(/^text\/html/);
+    expect(await res.text()).toContain('<form method="post">');
     expectBaseHeaders(res);
     const csp = res.headers.get("Content-Security-Policy") ?? "";
-    expect(csp).toBe(HTML_CONTENT_SECURITY_POLICY);
+    expect(csp).toBe(UNSUBSCRIBE_PAGE_SECURITY_POLICY);
+    // The one difference from the HTML policy: the form may post to this
+    // origin, and nowhere else.
+    expect(HTML_CONTENT_SECURITY_POLICY).toContain("form-action 'none'");
+    expect(csp).toBe(HTML_CONTENT_SECURITY_POLICY.replace("form-action 'none'", "form-action 'self'"));
     // A static page: no script of any kind (no script-src, so default-src
     // 'none' governs), and never 'unsafe-inline' for script anywhere.
     expect(csp).toContain("default-src 'none'");
     expect(csp).not.toContain("script-src");
     // The URL carries the signed token; a click off this page must not leak it.
+    expect(res.headers.get("Referrer-Policy")).toBe("no-referrer");
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("gives the page after unsubscribing the HTML policy: it has no form", async () => {
+    const org = "org_headers_test";
+    const sig = await unsubscribeSig(org, ADMIN_SECRET);
+    const res = await post(`/email/unsubscribe?org=${org}&sig=${sig}`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type") ?? "").toMatch(/^text\/html/);
+    expect(await res.text()).not.toContain("<form");
+    expectBaseHeaders(res);
+    expect(res.headers.get("Content-Security-Policy")).toBe(HTML_CONTENT_SECURITY_POLICY);
     expect(res.headers.get("Referrer-Policy")).toBe("no-referrer");
     expect(res.headers.get("Cache-Control")).toBe("no-store");
   });

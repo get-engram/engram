@@ -17,7 +17,7 @@ import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative } from "node:path";
 import type { Probe } from "../daemon/instance.js";
-import type { PlistPaths } from "../daemon/launchd.js";
+import type { LaunchAgentsCheck, PlistPaths } from "../daemon/launchd.js";
 
 /**
  * engram#616 — start at login on macOS: the launchd agent,
@@ -96,6 +96,17 @@ const { home, cli, daemon, launchd, spawn, execSync, execFileSync } = vi.hoisted
     system: null as { plist: string; pid: number | null } | null,
     /** Daemons running as root, which ps lists and the user can't signal (engram#680). */
     rootWorkers: [] as number[],
+    /**
+     * Who owns ~/Library/LaunchAgents, as Engram sees it, when a test says
+     * (engram#678): no test can give a folder to root. null: whoever does.
+     */
+    agentsOwner: null as number | null,
+    /**
+     * The error code writing the plist fails with, when a test says: EPERM,
+     * as macOS gives for a folder made immutable, which no test can make
+     * here. null: none.
+     */
+    writeFails: null as string | null,
     /** Calls the fake didn't expect; each fails the test. */
     unexpected: [] as string[],
   },
@@ -148,6 +159,24 @@ vi.mock("../daemon/instance.js", async (importOriginal) => {
   };
   return { ...real, probeDaemon };
 });
+// Who owns ~/Library/LaunchAgents is `launchd.agentsOwner`, and the
+// plist's write fails with `launchd.writeFails`, when a test sets them; the
+// rest is the real module (engram#678).
+vi.mock("../daemon/launchd.js", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../daemon/launchd.js")>();
+  const launchAgentsNotYours = (check: LaunchAgentsCheck = {}) =>
+    real.launchAgentsNotYours({
+      ...(launchd.agentsOwner === null ? {} : { ownerOf: () => launchd.agentsOwner }),
+      ...check,
+    });
+  const writePlistFile = (text: string): void => {
+    if (launchd.writeFails !== null) {
+      throw Object.assign(new Error(`${launchd.writeFails}: operation not permitted`), { code: launchd.writeFails });
+    }
+    real.writePlistFile(text);
+  };
+  return { ...real, launchAgentsNotYours, writePlistFile };
+});
 
 /** The OS this runs on: the tests say darwin, whatever it is. */
 const HOST = process.platform;
@@ -196,6 +225,7 @@ const {
   agentPid,
   disabledIn,
   generatePlist,
+  launchAgentsNotYours,
   launchctlPath,
   pathsIn,
   plistPath,
@@ -620,6 +650,8 @@ beforeEach(() => {
     reaping: false,
     system: null,
     rootWorkers: [],
+    agentsOwner: null,
+    writeFails: null,
     unexpected: [],
   });
   daemon.answering = null;
@@ -1327,7 +1359,7 @@ describe("engram start on macOS (engram#616)", () => {
     writePlist(v1Plist());
     for (const platform of ["linux", "win32"]) {
       Object.defineProperty(process, "platform", { value: platform, configurable: true });
-      expect(repairLaunchdIfStale()).toBe(false);
+      expect(repairLaunchdIfStale()).toBe("unchanged");
     }
     expect(readFileSync(PLIST, "utf-8")).toBe(v1Plist());
     expect(execFileSync).not.toHaveBeenCalled();
@@ -2486,6 +2518,425 @@ describe("auto-capture on macOS (engram#616)", () => {
     const text = said();
     expect(text).toContain("Auto-start enabled");
     expect(text).toContain("Auto-capture is on");
+  });
+});
+
+describe("a ~/Library/LaunchAgents that isn't the user's (engram#678, engram#715)", () => {
+  const ROOTS = "~/Library/LaunchAgents belongs to root, not to you";
+  /** What makes it the user's again: the folder only. */
+  const FIX = `  Make it yours with: sudo chown "$(id -un)" ~/Library/LaunchAgents`;
+
+  /**
+   * ~/Library/LaunchAgents, as `sudo engram install` could leave it before
+   * engram#653: root's, as Engram sees it, and not to be written in.
+   * `owner`: another user's.
+   */
+  function agentsOwnedBy(owner = 0): void {
+    mkdirSync(AGENTS, { recursive: true });
+    chmodSync(AGENTS, 0o555);
+    launchd.agentsOwner = owner;
+  }
+
+  /** This plist there, in a folder root owns. */
+  function inRootsFolder(text: string): void {
+    if (existsSync(AGENTS)) chmodSync(AGENTS, 0o755);
+    writePlist(text);
+    agentsOwnedBy();
+  }
+
+  /** `sudo chown "$(id -un)" ~/Library/LaunchAgents` */
+  function madeTheUsers(): void {
+    launchd.agentsOwner = null;
+    chmodSync(AGENTS, 0o755);
+  }
+
+  /** What went to stderr. */
+  function errors(): string {
+    return vi
+      .mocked(console.error)
+      .mock.calls.map((c) => c.join(" "))
+      .join("\n");
+  }
+
+  afterEach(() => {
+    if (existsSync(AGENTS)) chmodSync(AGENTS, 0o755);
+  });
+
+  describe("engram install", () => {
+    permissionsIt("says whose it is and what makes it the user's, not a temporary file's EACCES", async () => {
+      agentsOwnedBy();
+      await daemonInstall();
+      const text = errors();
+      expect(text).toBe(`Couldn't turn on start at login: ${ROOTS}.\n${FIX}\n  Then run 'engram install' again.`);
+      expect(output()).not.toContain("Auto-start enabled");
+      expect(readdirSync(AGENTS)).toEqual([]);
+      expect(launchctlCalls()).toEqual([]);
+      expect(process.exitCode).toBe(1);
+    });
+
+    permissionsIt("leaves an older plist as it is, and the job launchd loaded from it", async () => {
+      inRootsFolder(v1Plist());
+      launchd.loaded = true;
+      launchd.loadedText = v1Plist();
+      await daemonInstall();
+      expect(errors()).toContain(`Couldn't turn on start at login: ${ROOTS}.\n${FIX}`);
+      expect(readFileSync(PLIST, "utf-8")).toBe(v1Plist());
+      expect(readdirSync(AGENTS)).toEqual([`${LABEL}.plist`]);
+      expect(launchd.loaded).toBe(true);
+      expect(launchd.loadedText).toBe(v1Plist());
+      // Only whether launchd runs a daemon for it.
+      expect(launchctlCalls()).toEqual(["list"]);
+      expect(process.exitCode).toBe(1);
+    });
+
+    permissionsIt("turns start at login on all the same when the plist there is current: nothing is written", async () => {
+      inRootsFolder(plistWith());
+      await daemonInstall();
+      const text = output();
+      expect(text).toContain("Auto-start enabled — daemon will start on login");
+      expect(text).not.toContain("Couldn't");
+      expect(launchd.loadedText).toBe(plistWith());
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    permissionsIt("says another user's, when it is", async () => {
+      agentsOwnedBy(4242);
+      await daemonInstall();
+      expect(errors()).toContain(
+        "Couldn't turn on start at login: ~/Library/LaunchAgents belongs to another user, not to you.",
+      );
+      expect(process.exitCode).toBe(1);
+    });
+
+    permissionsIt("works once it is the user's", async () => {
+      agentsOwnedBy();
+      await daemonInstall();
+      said();
+      madeTheUsers();
+      process.exitCode = undefined;
+      await daemonInstall();
+      expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+      expect(said()).toContain("Auto-start enabled — daemon will start on login");
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it("says nothing of a folder another user owns that can be written in all the same", async () => {
+      mkdirSync(AGENTS, { recursive: true });
+      launchd.agentsOwner = 4242;
+      await daemonInstall();
+      expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+      expect(said()).toContain("Auto-start enabled — daemon will start on login");
+      await daemonStatus();
+      expect(said()).not.toContain("LaunchAgents belongs");
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    permissionsIt("puts down only a refused write to whose the folder is", async () => {
+      // ~/Library/LaunchAgents a file, which no plist can go in.
+      mkdirSync(join(home.dir, "Library"), { recursive: true });
+      writeFileSync(AGENTS, "");
+      launchd.agentsOwner = 0;
+      await daemonInstall();
+      const text = errors();
+      expect(text).toContain("Couldn't turn on start at login.");
+      expect(text).not.toContain("belongs to");
+      expect(process.exitCode).toBe(1);
+    });
+
+    permissionsIt("puts down EPERM to it as well as EACCES", async () => {
+      agentsOwnedBy();
+      launchd.writeFails = "EPERM";
+      await daemonInstall();
+      expect(errors()).toContain(`Couldn't turn on start at login: ${ROOTS}.\n${FIX}`);
+      expect(errors()).not.toContain("operation not permitted");
+      launchd.writeFails = "EIO";
+      process.exitCode = undefined;
+      said();
+      await daemonInstall();
+      expect(errors()).toBe("Couldn't turn on start at login.\n  EIO: operation not permitted");
+      expect(process.exitCode).toBe(1);
+    });
+
+    permissionsIt("says it, and to run engram install again, when the daemon is still stopping", async () => {
+      agentsOwnedBy();
+      // A daemon stopping, still there when install has waited for it.
+      const stopping = 4_243;
+      madeUp.add(stopping);
+      daemon.answering = { pid: stopping, stopping: true };
+      let now = 0;
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => (now += 5_000));
+      try {
+        await daemonInstall();
+      } finally {
+        clock.mockRestore();
+      }
+      expect(errors()).toBe(
+        `Couldn't turn on start at login: ${ROOTS}.\n${FIX}\n  Then run 'engram install' again.\n` +
+          `The daemon is still stopping (pid ${stopping}). Run 'engram start' in a moment.`,
+      );
+      expect(readdirSync(AGENTS)).toEqual([]);
+      expect(launchctlCalls()).toEqual([]);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(process.exitCode).toBe(1);
+    });
+  });
+
+  describe("engram start", () => {
+    permissionsIt("says it couldn't update start at login, and why, and starts the daemon all the same", async () => {
+      inRootsFolder(v1Plist());
+      await daemonStart([], {});
+      expect(errors()).toBe(`Couldn't update start at login: ${ROOTS}.\n${FIX}\n  Then run: engram install`);
+      expect(readFileSync(PLIST, "utf-8")).toBe(v1Plist());
+      expect(readdirSync(AGENTS)).toEqual([`${LABEL}.plist`]);
+      expect(launchctlCalls()).toEqual(["list", "print-disabled"]);
+      expect(output()).not.toContain("Updated auto-start configuration");
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    permissionsIt("says nothing of a plist it can't write for another reason, and starts the daemon all the same", async () => {
+      // The user's own folder, that they can't write in; and a write that
+      // fails on its own, in root's.
+      const others: (() => void)[] = [
+        () => {
+          launchd.agentsOwner = null;
+        },
+        () => {
+          launchd.writeFails = "EIO";
+        },
+      ];
+      for (const other of others) {
+        inRootsFolder(v1Plist());
+        other();
+        daemonGone();
+        spawn.mockClear();
+        said();
+        await daemonStart([], {});
+        expect(errors()).toBe("");
+        expect(readFileSync(PLIST, "utf-8")).toBe(v1Plist());
+        expect(spawn).toHaveBeenCalledTimes(1);
+        expect(process.exitCode).toBeUndefined();
+      }
+    });
+
+    permissionsIt("says nothing of it while the plist needs no update", async () => {
+      inRootsFolder(plistWith());
+      await daemonStart([], {});
+      expect(output()).not.toContain("LaunchAgents");
+      expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    permissionsIt("with --install, says it once, as it turns start at login on, and starts the daemon", async () => {
+      inRootsFolder(v1Plist());
+      await daemonStart([], { install: "" });
+      const text = errors();
+      expect(text).toBe(`Couldn't turn on start at login: ${ROOTS}.\n${FIX}\n  Then run 'engram start --install' again.`);
+      expect(readFileSync(PLIST, "utf-8")).toBe(v1Plist());
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(process.exitCode).toBe(1);
+    });
+
+    permissionsIt("with --install and a server set here, starts the daemon itself, then says it as it turns start at login on", async () => {
+      // launchd's daemon wouldn't have the server (engram#641).
+      vi.stubEnv("ENGRAM_BASE_URL", "http://127.0.0.1:9");
+      inRootsFolder(v1Plist());
+      await daemonStart([], { install: "" });
+      expect(errors()).toBe(`Couldn't turn on start at login: ${ROOTS}.\n${FIX}\n  Then run 'engram start --install' again.`);
+      expect(readFileSync(PLIST, "utf-8")).toBe(v1Plist());
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(process.exitCode).toBe(1);
+    });
+
+    permissionsIt("with --install while the daemon runs, says it as it turns start at login on", async () => {
+      agentsOwnedBy();
+      daemonRunning();
+      await daemonStart([], { install: "" });
+      expect(output()).toContain("Daemon already running");
+      expect(errors()).toBe(`Couldn't turn on start at login: ${ROOTS}.\n${FIX}\n  Then run 'engram start --install' again.`);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(process.exitCode).toBe(1);
+    });
+  });
+
+  describe("engram uninstall", () => {
+    permissionsIt("says why it can't turn start at login off, and leaves launchd and the plist as they are", async () => {
+      inRootsFolder(plistWith());
+      launchd.loaded = true;
+      launchd.loadedText = plistWith();
+      await daemonUninstall();
+      expect(errors()).toBe(`Couldn't turn off start at login: ${ROOTS}.\n${FIX}\n  Then run 'engram uninstall' again.`);
+      expect(output()).not.toContain("Auto-start disabled");
+      expect(existsSync(PLIST)).toBe(true);
+      expect(launchd.loaded).toBe(true);
+      expect(launchctlCalls()).toEqual([]);
+      expect(process.exitCode).toBe(1);
+
+      madeTheUsers();
+      process.exitCode = undefined;
+      await daemonUninstall();
+      expect(existsSync(PLIST)).toBe(false);
+      expect(launchd.loaded).toBe(false);
+      expect(output()).toContain("Auto-start disabled — launchd agent removed");
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    permissionsIt("says nothing of it with no plist there", async () => {
+      agentsOwnedBy();
+      await daemonUninstall();
+      expect(output()).toBe("Launchd agent not installed.");
+      expect(process.exitCode).toBeUndefined();
+    });
+  });
+
+  describe("engram status", () => {
+    const UNDER = `  ${ROOTS}, so Engram can't update or remove its launchd agent.\n${FIX}`;
+
+    permissionsIt("says it under start at login, whatever the plist's state", async () => {
+      const states: [string, string][] = [
+        [plistWith(), "Auto-start: enabled (launchd)"],
+        [v1Plist(), "Auto-start: enabled (launchd)  — outdated config, run 'engram install' to update"],
+        [
+          plistWith({ node: join(home.dir, "gone", "node") }),
+          "Auto-start: enabled (launchd)  — broken, run 'engram install' to repair",
+        ],
+      ];
+      for (const [text, line] of states) {
+        inRootsFolder(text);
+        await daemonStatus();
+        expect(said()).toContain(`${line}\n${UNDER}`);
+      }
+      launchd.switchedOff = true;
+      await daemonStatus();
+      expect(said()).toContain(`Auto-start: off — disabled in launchd  ('engram install' turns it back on)\n${UNDER}`);
+      expect(readFileSync(PLIST, "utf-8")).toBe(states[2][0]);
+    });
+
+    permissionsIt("says nothing of it with no plist there, or once it is the user's", async () => {
+      agentsOwnedBy();
+      await daemonStatus();
+      expect(said()).not.toContain("LaunchAgents");
+      inRootsFolder(plistWith());
+      madeTheUsers();
+      await daemonStatus();
+      const text = said();
+      expect(text).toContain("Auto-start: enabled (launchd)");
+      expect(text).not.toContain("LaunchAgents");
+    });
+
+    permissionsIt("says another user's, when it is", async () => {
+      inRootsFolder(plistWith());
+      launchd.agentsOwner = 4242;
+      await daemonStatus();
+      expect(output()).toContain(
+        "  ~/Library/LaunchAgents belongs to another user, not to you, so Engram can't update or remove its launchd agent.",
+      );
+    });
+  });
+
+  describe("auto-capture", () => {
+    signedInAtATerminal();
+
+    permissionsIt("says what stops start at login after sign-in, and turns capture on all the same", async () => {
+      agentsOwnedBy();
+      await autoEnableCapture({ after: "login" });
+      const text = said();
+      expect(text).toContain(
+        `  Couldn't set up start at login: ${ROOTS}. Make it yours with: sudo chown "$(id -un)" ~/Library/LaunchAgents`,
+      );
+      expect(text).not.toContain("Run 'engram install' to try again.");
+      expect(text).toContain("Auto-capture is on");
+      expect(readdirSync(AGENTS)).toEqual([]);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    permissionsIt("says nothing after a command while the daemon runs; says it with the rest when it starts one", async () => {
+      inRootsFolder(v1Plist());
+      daemonRunning();
+      await autoEnableCapture({ after: "command" });
+      expect(said()).toBe("");
+
+      daemonGone();
+      await autoEnableCapture({ after: "command" });
+      const text = said();
+      expect(text).toContain(`  Couldn't set up start at login: ${ROOTS}. Make it yours with:`);
+      // Not the repair's own warning as well.
+      expect(text).not.toContain("Couldn't update start at login");
+      expect(text).toContain("Auto-capture is on");
+      expect(readFileSync(PLIST, "utf-8")).toBe(v1Plist());
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    permissionsIt("sets start at login up after the next command once the folder is the user's", async () => {
+      agentsOwnedBy();
+      await autoEnableCapture({ after: "login" });
+      said();
+      madeTheUsers();
+      await autoEnableCapture({ after: "command" });
+      expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+      expect(said()).toContain("Auto-start enabled — daemon will start on login");
+    });
+  });
+
+  describe("launchAgentsNotYours", () => {
+    const me = 501;
+    const looked: string[] = [];
+    const owner = (uid: number | null) => (path: string) => {
+      looked.push(path);
+      return uid;
+    };
+    const writable = (can: boolean) => (path: string) => {
+      looked.push(path);
+      return can;
+    };
+
+    beforeEach(() => {
+      looked.length = 0;
+    });
+
+    it("is root's, or another user's, when they own it and it can't be written in", () => {
+      expect(launchAgentsNotYours({ euid: me, ownerOf: owner(0), canWriteIn: writable(false) })).toEqual({ root: true });
+      expect(looked).toEqual([AGENTS, AGENTS]);
+      expect(launchAgentsNotYours({ euid: me, ownerOf: owner(502), canWriteIn: writable(false) })).toEqual({
+        root: false,
+      });
+    });
+
+    it("is null when it can be written in all the same, as on a network home that maps owners wrongly", () => {
+      expect(launchAgentsNotYours({ euid: me, ownerOf: owner(0), canWriteIn: writable(true) })).toBeNull();
+    });
+
+    it("is null when it is the user's, even one they can't write in", () => {
+      expect(launchAgentsNotYours({ euid: me, ownerOf: owner(me), canWriteIn: writable(false) })).toBeNull();
+    });
+
+    it("is null when it isn't there", () => {
+      expect(launchAgentsNotYours({ euid: me, ownerOf: owner(null), canWriteIn: writable(false) })).toBeNull();
+    });
+
+    it("is null as root, which can write in it, and looks at nothing", () => {
+      expect(launchAgentsNotYours({ euid: 0, ownerOf: owner(502), canWriteIn: writable(false) })).toBeNull();
+      expect(looked).toEqual([]);
+    });
+
+    posixIt("is null with no uid to go by, as on Windows", () => {
+      vi.spyOn(process, "geteuid").mockReturnValue(undefined as unknown as number);
+      expect(launchAgentsNotYours({ ownerOf: owner(0), canWriteIn: writable(false) })).toBeNull();
+      expect(looked).toEqual([]);
+    });
+
+    permissionsIt("goes by this process's uid, and the folder's own owner", () => {
+      const uid = process.geteuid?.() ?? -1;
+      // Not there yet: nobody's.
+      expect(launchAgentsNotYours({ euid: uid + 1, canWriteIn: writable(false) })).toBeNull();
+      mkdirSync(AGENTS, { recursive: true });
+      expect(launchAgentsNotYours({ ownerOf: owner(uid), canWriteIn: writable(false) })).toBeNull();
+      expect(launchAgentsNotYours({ canWriteIn: writable(false) })).toBeNull();
+      expect(launchAgentsNotYours({ ownerOf: owner(uid + 1), canWriteIn: writable(false) })).toEqual({ root: false });
+      // Its owner, as another user would see it.
+      expect(launchAgentsNotYours({ euid: uid + 1, canWriteIn: writable(false) })).toEqual({ root: false });
+    });
   });
 });
 

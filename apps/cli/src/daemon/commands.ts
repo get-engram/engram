@@ -73,6 +73,7 @@ import {
   type RootDaemon,
 } from "./root-daemon.js";
 import {
+  LAUNCH_AGENTS_FIX,
   PLIST_VERSION,
   agentDisabled,
   agentLoaded,
@@ -80,6 +81,7 @@ import {
   enableAgent,
   generatePlist,
   kickstartAgent,
+  launchAgentsNotYours,
   loadAgent,
   plistPath,
   readPlist,
@@ -315,7 +317,7 @@ export async function daemonStart(
     // --install still asks for start at login (engram#602). On macOS,
     // loading the launchd agent starts a worker there and then, which finds
     // this daemon and exits (engram#612).
-    if ("install" in flags) await enableStartAtLogin(true);
+    if ("install" in flags) await enableStartAtLogin(true, "engram start --install");
     printOutsideManager(found);
     return;
   }
@@ -347,8 +349,9 @@ export async function daemonStart(
 
   // A stale plist survives every CLI upgrade, so check it here rather than
   // only at install time (engram#469), and a broken one too (engram#616).
-  // The Windows entry and the systemd unit likewise.
-  repairLaunchdIfStale();
+  // The Windows entry and the systemd unit likewise. With --install, start
+  // at login is turned on below, which says what stops it (engram#715).
+  repairLaunchdIfStale(undefined, { quiet: "install" in flags });
   repairRunEntryIfBroken();
   repairSystemdUnitIfStale();
 
@@ -362,7 +365,7 @@ export async function daemonStart(
   const platform = process.platform;
   const managerFirst =
     "install" in flags && !daemonEnvOverrides() && (platform === "darwin" || (platform === "linux" && systemdSession()));
-  if (managerFirst && platform === "darwin") await enableLaunchdStartAtLogin();
+  if (managerFirst && platform === "darwin") await enableLaunchdStartAtLogin(false, "engram start --install");
   if (managerFirst && platform === "linux") await enableSystemdStartAtLogin(true, false);
 
   const started = await startInBackground();
@@ -374,7 +377,7 @@ export async function daemonStart(
   console.log(`${dim("DB:")}  ${DB_FILE}`);
 
   if ("install" in flags && !managerFirst) {
-    await enableStartAtLogin(true);
+    await enableStartAtLogin(true, "engram start --install");
   }
 }
 
@@ -1243,8 +1246,9 @@ export async function daemonStatus(): Promise<void> {
  * be started again after a crash (engram#692, engram#689).
  */
 function printAutoStart(found?: DaemonFound): boolean {
-  const { on, line } = autoStart();
+  const { on, line, after = [] } = autoStart();
   if (line !== null) console.log(line);
+  for (const more of after) console.log(more);
   // On: launchd hasn't the job switched off, as autoStart asked, or the
   // systemd unit is enabled.
   if (on && found) printOutsideManager(found, true);
@@ -1257,6 +1261,8 @@ interface AutoStart {
   on: boolean;
   /** What status says of it: null when Engram has nothing there. */
   line: string | null;
+  /** Said under it. */
+  after?: string[];
 }
 
 function autoStart(): AutoStart {
@@ -1287,18 +1293,31 @@ function autoStart(): AutoStart {
 /** autoStart for the launchd agent: nothing when there is none. */
 function launchdAutoStart(plist: PlistState): AutoStart {
   if (plist.kind === "none") return { on: false, line: null };
+  // A plist in a folder that isn't the user's can't be rewritten or removed
+  // (engram#715): said whatever its state, as it is what 'engram install'
+  // and 'engram uninstall' would stop at.
+  const notYours = launchAgentsNotYours();
+  const after =
+    notYours === null
+      ? []
+      : [
+          red(`  ${launchAgentsWhose(notYours)}, so Engram can't update or remove its launchd agent.`),
+          dim(`  Make it yours with: ${LAUNCH_AGENTS_FIX}`),
+        ];
   // Said before broken or outdated: 'engram start' won't repair a job the
   // user switched off (engram#654).
   if (agentDisabled() === true) {
     return {
       on: false,
       line: `${dim("Auto-start:")} off — disabled in launchd` + dim("  ('engram install' turns it back on)"),
+      after,
     };
   }
   if (plist.broken) {
     return {
       on: false,
       line: `${dim("Auto-start:")} enabled (launchd)` + red("  — broken, run 'engram install' to repair"),
+      after,
     };
   }
   return {
@@ -1306,6 +1325,7 @@ function launchdAutoStart(plist: PlistState): AutoStart {
     line:
       `${dim("Auto-start:")} enabled (launchd)` +
       (plist.outdated ? red("  — outdated config, run 'engram install' to update") : ""),
+    after,
   };
 }
 
@@ -1740,6 +1760,31 @@ function prepareLaunchdLog(): void {
   }
 }
 
+/** "~/Library/LaunchAgents belongs to root, not to you" (engram#678). */
+function launchAgentsWhose({ root }: { root: boolean }): string {
+  return `~/Library/LaunchAgents belongs to ${root ? "root" : "another user"}, not to you`;
+}
+
+/**
+ * Writing the plist failed because ~/Library/LaunchAgents isn't the user's
+ * (engram#678): whether it is root's. Null when it failed for another
+ * reason.
+ */
+function launchAgentsRefused(err: unknown): { root: boolean } | null {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  if (code !== "EACCES" && code !== "EPERM") return null;
+  return launchAgentsNotYours();
+}
+
+/** What repairLaunchdIfStale did. */
+export type LaunchdRepair =
+  /** Rewrote the plist, and reloaded the job. */
+  | "repaired"
+  /** Nothing: the plist is current, or left as it is. */
+  | "unchanged"
+  /** The plist needs rewriting, and ~/Library/LaunchAgents isn't the user's (engram#715). */
+  | "refused";
+
 /**
  * Rewrite and reload a plist of ours that an older CLI wrote (engram#469),
  * or that can't start the daemon (engram#616): one launchd can't read, or
@@ -1753,33 +1798,46 @@ function prepareLaunchdLog(): void {
  *
  * One the user switched off in launchd is left as it is, as on Linux: only
  * `engram install` switches it back on (engram#654).
+ *
+ * In a ~/Library/LaunchAgents that isn't the user's, it can't be rewritten:
+ * that is said, unless `quiet` (engram#715). It used to be left broken
+ * without a word, while `engram status` said to run `engram install`,
+ * which failed on it too. Auto-capture says it with the rest, and `engram
+ * start --install` as it turns start at login on.
  */
-export function repairLaunchdIfStale(plist?: PlistState): boolean {
-  if (process.platform !== "darwin") return false;
+export function repairLaunchdIfStale(plist?: PlistState, { quiet = false }: { quiet?: boolean } = {}): LaunchdRepair {
+  if (process.platform !== "darwin") return "unchanged";
   const state = plist ?? readPlist();
-  if (state.kind !== "ours") return false;
-  if (!state.broken && !state.outdated) return false;
+  if (state.kind !== "ours") return "unchanged";
+  if (!state.broken && !state.outdated) return "unchanged";
   // Only a source checkout run through tsx has no worker.js: the build ships it.
-  if (!existsSync(workerPath())) return false;
+  if (!existsSync(workerPath())) return "unchanged";
   // Never fails the command it runs in: a plist that can't be made or
   // written is left as it is, and `engram install` says why.
   const made = plistForThisCli();
-  if ("error" in made) return false;
+  if ("error" in made) return "unchanged";
   // One the user switched off is left as it is too: reloading it would stop
   // the daemon launchd still runs, if it runs one, and launchd wouldn't load
   // it again.
-  if (agentDisabled() === true) return false;
+  if (agentDisabled() === true) return "unchanged";
   try {
     writePlistFile(made.text);
-  } catch {
-    return false;
+  } catch (err: unknown) {
+    const notYours = launchAgentsRefused(err);
+    if (notYours === null) return "unchanged";
+    if (!quiet) {
+      console.error(red(`Couldn't update start at login: ${launchAgentsWhose(notYours)}.`));
+      console.error(dim(`  Make it yours with: ${LAUNCH_AGENTS_FIX}`));
+      console.error(dim("  Then run: engram install"));
+    }
+    return "refused";
   }
   prepareLaunchdLog();
   // launchd keeps running the job it loaded until it is unloaded. One it
   // can't load now loads from the file at the next login.
   reloadAgent();
   console.log(`${bold("Updated auto-start configuration")} ${dim(`(plist v${PLIST_VERSION})`)}`);
-  return true;
+  return "repaired";
 }
 
 function isLaunchdInstalled(): boolean {
@@ -1800,8 +1858,9 @@ function shellWord(path: string): string {
  * launchd load it, which starts the daemon (RunAtLoad). A job launchd has
  * loaded already isn't loaded again, so it starts no daemon: with `start`
  * (no daemon runs), launchd is asked to start one then (engram#691).
+ * `again`: the command to run again, once the plist can be written.
  */
-async function enableLaunchdStartAtLogin(start = false): Promise<void> {
+async function enableLaunchdStartAtLogin(start = false, again = "engram install"): Promise<void> {
   if (!existsSync(workerPath())) {
     // Only a source checkout run through tsx gets here: the build ships it.
     console.error(red(`Can't turn on start at login: ${workerPath()} is missing.`));
@@ -1820,8 +1879,17 @@ async function enableLaunchdStartAtLogin(start = false): Promise<void> {
     try {
       writePlistFile(made.text);
     } catch (err: unknown) {
-      console.error(red("Couldn't turn on start at login."));
-      console.error(dim(`  ${err instanceof Error ? err.message : String(err)}`));
+      // engram#678: the error alone names a temporary file in the folder,
+      // and not why.
+      const notYours = launchAgentsRefused(err);
+      if (notYours) {
+        console.error(red(`Couldn't turn on start at login: ${launchAgentsWhose(notYours)}.`));
+        console.error(dim(`  Make it yours with: ${LAUNCH_AGENTS_FIX}`));
+        console.error(dim(`  Then run '${again}' again.`));
+      } else {
+        console.error(red("Couldn't turn on start at login."));
+        console.error(dim(`  ${err instanceof Error ? err.message : String(err)}`));
+      }
       process.exitCode = 1;
       return;
     }
@@ -1865,7 +1933,10 @@ async function enableLaunchdStartAtLogin(start = false): Promise<void> {
  */
 function autoEnableLaunchdStartAtLogin(): "changed" | "unchanged" | "failed" {
   const plist = readPlist();
-  if (plist.kind === "ours") return repairLaunchdIfStale(plist) ? "changed" : "unchanged";
+  if (plist.kind === "ours") {
+    const repair = repairLaunchdIfStale(plist, { quiet: true });
+    return repair === "repaired" ? "changed" : repair === "refused" ? "failed" : "unchanged";
+  }
   // Only a source checkout run through tsx has no worker.js: the build ships it.
   if (!existsSync(workerPath())) return "unchanged";
   const made = plistForThisCli();
@@ -1891,6 +1962,17 @@ function autoEnableLaunchdStartAtLogin(): "changed" | "unchanged" | "failed" {
 function uninstallLaunchd(): void {
   if (!isLaunchdInstalled()) {
     console.log("Launchd agent not installed.");
+    return;
+  }
+  // The plist can't be removed from a folder that isn't the user's
+  // (engram#715). launchd is left as it is, rather than stop the daemon it
+  // runs now and start it again at the next login.
+  const notYours = launchAgentsNotYours();
+  if (notYours) {
+    console.error(red(`Couldn't turn off start at login: ${launchAgentsWhose(notYours)}.`));
+    console.error(dim(`  Make it yours with: ${LAUNCH_AGENTS_FIX}`));
+    console.error(dim("  Then run 'engram uninstall' again."));
+    process.exitCode = 1;
     return;
   }
   unloadAgent();
@@ -2281,11 +2363,12 @@ const START_AFTER_RESTART = "  Run 'engram start' to capture now, and again afte
  * (engram#602), a systemd user unit on Linux (engram#615). Elsewhere, this
  * used to write a macOS plist into ~/Library/LaunchAgents and run a
  * launchctl that isn't there; now it says what actually happens. `running`:
- * whether a daemon is up right now.
+ * whether a daemon is up right now. `again`: the command that asked, to
+ * run again where something stops it.
  */
-async function enableStartAtLogin(running: boolean): Promise<void> {
+async function enableStartAtLogin(running: boolean, again = "engram install"): Promise<void> {
   if (process.platform === "darwin") {
-    await enableLaunchdStartAtLogin(!running);
+    await enableLaunchdStartAtLogin(!running, again);
     return;
   }
   if (process.platform === "win32") {
@@ -2522,12 +2605,16 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
       }
       return;
     }
-    const autoEnableStartAtLogin = (): "changed" | "unchanged" | "failed" | "unavailable" =>
-      platform === "darwin"
-        ? autoEnableLaunchdStartAtLogin()
-        : platform === "win32"
-          ? autoEnableWindowsStartAtLogin()
-          : autoEnableSystemdStartAtLogin();
+    // When launchd's start at login couldn't be set up because
+    // ~/Library/LaunchAgents isn't the user's (engram#678): whose it is.
+    let launchAgents = null as { root: boolean } | null;
+    const autoEnableStartAtLogin = (): "changed" | "unchanged" | "failed" | "unavailable" => {
+      if (platform === "win32") return autoEnableWindowsStartAtLogin();
+      if (platform !== "darwin") return autoEnableSystemdStartAtLogin();
+      const result = autoEnableLaunchdStartAtLogin();
+      if (result === "failed") launchAgents = launchAgentsNotYours();
+      return result;
+    };
     // On macOS and Linux, with no daemon at all, start at login first: then
     // launchd or systemd starts the daemon, and starts it again after a crash
     // (engram#641, engram#689). Not with settings in this environment that
@@ -2552,7 +2639,16 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
     // after a command, that is when the daemon had to be started, which is
     // what start at login would have done.
     if (startAtLoginFailed) {
-      console.log(dim("  Couldn't turn on start at login. Run 'engram install' to try again."));
+      // A ~/Library/LaunchAgents that isn't the user's (engram#678): what
+      // makes it theirs. Start at login is set up once it is, after the
+      // next command.
+      console.log(
+        dim(
+          launchAgents
+            ? `  Couldn't set up start at login: ${launchAgentsWhose(launchAgents)}. Make it yours with: ${LAUNCH_AGENTS_FIX}`
+            : "  Couldn't turn on start at login. Run 'engram install' to try again.",
+        ),
+      );
     }
     console.log(
       `${bold("Auto-capture is on")} — conversations from supported agents on this machine save to your Engram.`,

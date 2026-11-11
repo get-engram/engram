@@ -5,7 +5,6 @@ import {
   chunkId,
   summarizeChunk,
   redactMessages,
-  MAX_MESSAGE_CONTENT_CHARS,
   type MessageInput,
   type Message,
   type Conversation,
@@ -195,12 +194,17 @@ export function assertWritesEnabled(env: Env): void {
  * clipped rather than silently altered. Enormous single messages are
  * tool-output dumps (Claude Code), where the tail is the least useful part;
  * the request still succeeds and every other message is stored verbatim.
- * Exported for direct testing.
+ *
+ * Every body goes through boundContent, not only long ones: a screenshot's
+ * base64 becomes a short note before anything else sees it (engram#386), so
+ * the redactor never mistakes it for a secret and a short body that carries
+ * a small image is noted too. Exported for direct testing.
  */
 export function boundMessageContent(messageInputs: MessageInput[]): MessageInput[] {
-  return messageInputs.map((m) =>
-    m.content.length > MAX_MESSAGE_CONTENT_CHARS ? { ...m, content: boundContent(m.content) } : m,
-  );
+  return messageInputs.map((m) => {
+    const content = boundContent(m.content);
+    return content === m.content ? m : { ...m, content };
+  });
 }
 
 const CONVERSATION_NOT_FOUND = "No conversation with that id exists in this account.";

@@ -16,7 +16,7 @@
 
 | Resource | Limit | Notes |
 |----------|-------|-------|
-| Message content size | No hard limit | Practical limit ~100KB per message. D1 TEXT fields have no defined max |
+| Message content size | 100,000 characters | Longer bodies are clipped and end with a visible `…[truncated: …]` marker. Screenshots and other base64-encoded files become a short note such as `[image not stored: PNG, 234 KB]` first, so they don't count toward it |
 | Tags per conversation | No hard limit | Stored as JSON array. Keep reasonable for query performance |
 | Metadata size | No hard limit | Stored as JSON object. Keep under a few KB |
 | Title length | No hard limit | TEXT field |

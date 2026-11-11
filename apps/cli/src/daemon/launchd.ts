@@ -1,7 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
+  accessSync,
   chmodSync,
+  constants,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -290,6 +292,64 @@ export function readPlist(): PlistState {
       (pinnedToKeg(paths.node) || pinnedToKeg(paths.worker) || (paths.log === null && logProblem() === null));
   }
   return { kind: "ours", broken, version, outdated };
+}
+
+/**
+ * Makes ~/Library/LaunchAgents the user's again (engram#678). The folder
+ * only: the other agents in it are theirs to look at, and Engram needs no
+ * more than to write in it.
+ */
+export const LAUNCH_AGENTS_FIX = 'sudo chown "$(id -un)" ~/Library/LaunchAgents';
+
+export interface LaunchAgentsCheck {
+  /** The effective uid: undefined where there is none (Windows). */
+  euid?: number;
+  /** Who owns `path`, through a symlink: null when nothing is there, or it can't be looked at. */
+  ownerOf?: (path: string) => number | null;
+  /** Whether this process can make, rename and remove files in the folder `path`. */
+  canWriteIn?: (path: string) => boolean;
+}
+
+function ownerOfPath(path: string): number | null {
+  try {
+    return statSync(path).uid;
+  } catch {
+    return null;
+  }
+}
+
+function writableDir(path: string): boolean {
+  try {
+    accessSync(path, constants.W_OK | constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * ~/Library/LaunchAgents is another user's, and Engram can't write in it
+ * (engram#678, engram#715): whether that user is root. Run with sudo, a CLI
+ * from before engram#653 made the folder as root when it wasn't there yet:
+ * macOS keeps HOME under sudo. The plist can't be written, replaced or
+ * removed then, as each is a change to the folder. Null when the folder is
+ * the user's, isn't there, or can be written in all the same.
+ *
+ * A plist that root owns, in the user's own folder, is no problem: launchd
+ * loads one (refusedByLaunchd), and it is replaced and removed like any
+ * other.
+ */
+export function launchAgentsNotYours({
+  euid = process.geteuid?.(),
+  ownerOf = ownerOfPath,
+  canWriteIn = writableDir,
+}: LaunchAgentsCheck = {}): { root: boolean } | null {
+  // Root can write in any folder, and is refused before this (engram#653).
+  if (euid === undefined || euid === 0) return null;
+  const dir = plistDir();
+  const uid = ownerOf(dir);
+  if (uid === null || uid === euid || canWriteIn(dir)) return null;
+  return { root: uid === 0 };
 }
 
 /**

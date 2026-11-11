@@ -38,12 +38,22 @@
  *     root and exits 0, so launchd doesn't start it again, and it makes no
  *     file. Status says the job is still loaded, and how to unload it; the
  *     user's own daemon starts beside it.
+ *   - macOS: ~/Library/LaunchAgents root's, as `sudo engram install` left it
+ *     where it made the folder before engram#653, with the plist it wrote
+ *     in it root's too (engram#678): status, install, uninstall and start
+ *     say whose the folder is and how to make it the user's, and name no
+ *     temporary file. Install and uninstall exit 1 and leave the plist and
+ *     launchd as they are; start starts the user's own daemon. Made the
+ *     user's with the command status gave, nothing is said of it, and, last
+ *     of all, uninstall removes the plist root left in it (engram#715).
  *   - Commands run with sudo (engram#682), HOME the user's as macOS sudo
  *     keeps it: each but help and version says to run it as yourself and
  *     exits 1. Help and version print only themselves. None of them makes
  *     or changes a file in ~/.engram, or runs launchctl or systemctl.
- *   - Through all of it, the CLI only looks at launchd and systemd:
- *     `launchctl print`, `list` and `print-disabled`, `systemctl show`.
+ *   - Through all of it but that last uninstall, the CLI only looks at
+ *     launchd and systemd: `launchctl print`, `list` and `print-disabled`,
+ *     `systemctl show`. That uninstall only unloads the user's own job,
+ *     which isn't loaded.
  *
  * Usage, on a Linux or macOS CI runner with sudo that needs no password,
  * after `pnpm build`:
@@ -154,6 +164,7 @@ const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
 const STATUS_FILE = join(ENGRAM_DIR, "status.json");
 const SOCK = join(ENGRAM_DIR, "daemon.sock");
 const PLIST = join(home, "Library", "LaunchAgents", `${LABEL}.plist`);
+const AGENTS = dirname(PLIST);
 const UNIT = join(home, ".config", "systemd", "user", "engram.service");
 if (Buffer.byteLength(SOCK) > 100) {
   console.error(`the socket's path would be too long here (${SOCK}): set TMPDIR to a shorter directory`);
@@ -270,6 +281,10 @@ const LOG_AGAIN = "Once it can be written, 'engram stop' and then 'engram start'
 const DAEMON_AS_YOU = "Engram's daemon runs as you, and this is running as root.";
 const PER_USER = "Start at login is per user, and this is running as root.";
 const RUN_AS_YOU = (command) => `Run 'engram ${command}' as yourself, without sudo.`;
+/** What status says of the plist 0.6.1 wrote: not as this CLI writes one of its version. */
+const BROKEN = "Auto-start: enabled (launchd)  — broken, run 'engram install' to repair";
+const AGENTS_ROOTS = "~/Library/LaunchAgents belongs to root, not to you";
+const AGENTS_FIX = 'Make it yours with: sudo chown "$(id -un)" ~/Library/LaunchAgents';
 
 // ── Helpers ──
 
@@ -322,6 +337,15 @@ function stubCalls() {
   } catch {
     return [];
   }
+}
+
+/** The launchctl verbs that only look. */
+const LOOKS = ["print", "list", "print-disabled"];
+/** The launchctl calls logged after the first `from` that do more than look. */
+function launchdChanges(from) {
+  return stubCalls()
+    .slice(from)
+    .filter((l) => l.startsWith("launchctl ") && !LOOKS.includes(l.split(" ")[1]));
 }
 
 // The home has no API key, so `engram status` ends by saying so, and exits
@@ -456,6 +480,7 @@ const TOLD = [
   /^sudo kill \d+( \d+)*$/,
   /^sudo launchctl bootout system\/app\.getengram\.daemon$/,
   /^sudo chown -R "\$\(id -un\)" ~\/\.engram$/,
+  /^sudo chown "\$\(id -un\)" ~\/Library\/LaunchAgents$/,
 ];
 
 /** Runs the command the CLI gave after `prefix`, as the user would, through sudo. */
@@ -818,6 +843,119 @@ async function systemJobRunsWorker() {
 }
 
 /**
+ * macOS: ~/Library/LaunchAgents root's (engram#678). `sudo engram install`
+ * before engram#653 made the folder where there was none, as root, and
+ * wrote its plist in it. Nothing in it can then be made, replaced or
+ * removed but by root: install failed on it with an error naming a
+ * temporary file, start's repair of the plist 0.6.1 wrote and uninstall
+ * without a word (engram#715). True when the folder was made the user's again, the
+ * plist root wrote still in it.
+ */
+async function launchAgentsRoots() {
+  console.log("\n── macOS: ~/Library/LaunchAgents root's, as sudo engram install left it before engram#653 (engram#678) ──");
+  const notTheirs = readdirSync(ENGRAM_DIR).filter((name) => ownerOf(join(ENGRAM_DIR, name)) !== UID);
+  if (!check(notTheirs.length === 0, `everything in ~/.engram is the user's to start with (${snapshot()})`)) return false;
+  const clear = launchctl("print", SYSTEM).status !== 0 && ourWorkers().length === 0;
+  if (!check(clear, "no job is loaded in launchd's system domain, and no daemon of this build runs")) return false;
+  rmSync(PLIST, { force: true });
+  mkdirSync(AGENTS, { recursive: true });
+  writeFileSync(PLIST, plist06(WORKER), { mode: 0o644 });
+  const plist = readFileSync(PLIST, "utf-8");
+  const made = sudo(CHOWN_BIN, "0", PLIST).status === 0 && sudo(CHOWN_BIN, "0", AGENTS).status === 0;
+  if (!check(made && ownerOf(PLIST) === 0 && ownerOf(AGENTS) === 0, "the folder, and the plist in it, were made root's")) {
+    return false;
+  }
+  /** The plist and the folder as they were made, with nothing else in it. */
+  const asMade = () =>
+    readFileSync(PLIST, "utf-8") === plist &&
+    ownerOf(PLIST) === 0 &&
+    ownerOf(AGENTS) === 0 &&
+    readdirSync(AGENTS).join(" ") === basename(PLIST);
+
+  const status = engram(["status"]);
+  ranThrough(status);
+  says(
+    status,
+    "status: the agent needs repairing, the folder is root's, and how to make it the user's",
+    BROKEN,
+    `${AGENTS_ROOTS}, so Engram can't update or remove its launchd agent.`,
+    AGENTS_FIX,
+  );
+
+  const install = engram(["install"]);
+  check(install.status === 1, "install exits 1");
+  says(
+    install,
+    "install says whose the folder is, how to make it the user's, and to run it again",
+    `Couldn't turn on start at login: ${AGENTS_ROOTS}.`,
+    AGENTS_FIX,
+    AGAIN("engram install"),
+  );
+  saysNot(install, "install names no temporary file, and starts no daemon", "EACCES", ".tmp", "Auto-start enabled", "Engram daemon");
+  check(asMade(), "install left the plist and the folder as they were");
+
+  const calls = stubCalls().length;
+  const uninstall = engram(["uninstall"]);
+  check(uninstall.status === 1, "uninstall exits 1");
+  says(
+    uninstall,
+    "uninstall says whose the folder is, how to make it the user's, and to run it again",
+    `Couldn't turn off start at login: ${AGENTS_ROOTS}.`,
+    AGENTS_FIX,
+    AGAIN("engram uninstall"),
+  );
+  saysNot(uninstall, "uninstall says it removed nothing", "Auto-start disabled", "Couldn't remove");
+  check(asMade(), "uninstall left the plist and the folder as they were");
+  const unloaded = launchdChanges(calls);
+  check(unloaded.length === 0, `uninstall left launchd as it was${unloaded.length > 0 ? ` (but ran: ${unloaded.join("; ")})` : ""}`);
+
+  const start = engram(["start"]);
+  says(
+    start,
+    "start says the agent can't be updated, whose the folder is, and how to make it the user's",
+    `Couldn't update start at login: ${AGENTS_ROOTS}.`,
+    AGENTS_FIX,
+    "Then run: engram install",
+  );
+  saysNot(start, "start names no temporary file", "EACCES", ".tmp", "Updated auto-start configuration");
+  const P = Number(STARTED.exec(start.out)?.[1]) || null;
+  if (check(start.status === 0 && P !== null, "start starts the user's own daemon all the same")) {
+    await waitFor("it runs as the user", () => ourWorkers().some((w) => w.pid === P && w.uid === UID));
+    says(engram(["stop"]), "stop stops it", `Daemon stopped (pid ${P})`);
+    await waitFor("no daemon of this build runs", () => ourWorkers().length === 0);
+  }
+  check(asMade(), "start left the plist and the folder as they were");
+
+  runAsTold(status, "Make it yours with: ", "status's command");
+  const theirs = ownerOf(AGENTS) === UID;
+  check(theirs && ownerOf(PLIST) === 0, "the folder is the user's, and the plist in it still root's");
+  const after = engram(["status"]);
+  says(after, "status: the agent still needs repairing", BROKEN);
+  saysNot(after, "status says nothing more of the folder", "LaunchAgents belongs", "Make it yours");
+  return theirs;
+}
+
+/**
+ * The plist root wrote, in the folder made the user's again: uninstall
+ * removes it. Last, after onlyLooked: it unloads the user's own job, which
+ * isn't loaded.
+ */
+function rootsPlistRemoved() {
+  console.log("\n── macOS: the plist root wrote, in the folder made the user's again ──");
+  const calls = stubCalls().length;
+  const r = engram(["uninstall"]);
+  check(r.status === 0, "uninstall exits 0");
+  says(r, "uninstall says the agent is removed", "Auto-start disabled — launchd agent removed");
+  check(!existsSync(PLIST), "the plist root wrote is gone");
+  const changes = launchdChanges(calls);
+  const unload = [`launchctl bootout gui/${UID}/${LABEL}`, `launchctl unload ${PLIST}`];
+  check(
+    changes.includes(unload[0]) && changes.every((l) => unload.includes(l)),
+    `uninstall only unloaded the user's own job (${changes.join("; ") || "no launchctl call"})`,
+  );
+}
+
+/**
  * Commands run with sudo (engram#682). Before, they ran, and wrote the
  * user's ~/.engram as root: config.json from login, exclude, stop and
  * uninstall, the vault key from `vault keygen --save`.
@@ -859,7 +997,7 @@ function sudoCommands() {
 function onlyLooked() {
   const lines = stubCalls();
   const launchd = lines.filter((l) => l.startsWith("launchctl ")).map((l) => l.split(" ")[1]);
-  const changedLaunchd = [...new Set(launchd.filter((verb) => !["print", "list", "print-disabled"].includes(verb)))];
+  const changedLaunchd = [...new Set(launchd.filter((verb) => !LOOKS.includes(verb)))];
   check(
     changedLaunchd.length === 0,
     `the CLI only looked at launchd (${launchd.length} launchctl call(s)${changedLaunchd.length > 0 ? `, and these: ${changedLaunchd.join(", ")}` : ""})`,
@@ -882,11 +1020,14 @@ async function run() {
     await filesMadeTheirs(after);
     await logMadeRoots();
   }
+  let madeTheirs = false;
   if (MAC) {
     await systemJobRunsStandIn();
     await systemJobRunsWorker();
+    madeTheirs = await launchAgentsRoots();
   }
   onlyLooked();
+  if (madeTheirs) rootsPlistRemoved();
 }
 
 function diagnostics() {
@@ -896,6 +1037,16 @@ function diagnostics() {
     console.log(`$ launchctl print ${SYSTEM}  (exit ${r.status})\n${r.out}`);
   }
   console.log(`~/.engram: ${snapshot()}`);
+  if (MAC) {
+    let agents = "(none)";
+    try {
+      const names = readdirSync(AGENTS).map((name) => `${name}:${ownerOf(join(AGENTS, name))}`);
+      agents = `${ownerOf(AGENTS)}, holding ${names.join(" ") || "nothing"}`;
+    } catch {
+      // none
+    }
+    console.log(`~/Library/LaunchAgents: ${agents}`);
+  }
   let calls = "(none)";
   try {
     calls = readFileSync(STUB_LOG, "utf-8").trimEnd();

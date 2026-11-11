@@ -281,7 +281,8 @@ const LOG_AGAIN = "Once it can be written, 'engram stop' and then 'engram start'
 const DAEMON_AS_YOU = "Engram's daemon runs as you, and this is running as root.";
 const PER_USER = "Start at login is per user, and this is running as root.";
 const RUN_AS_YOU = (command) => `Run 'engram ${command}' as yourself, without sudo.`;
-const OUTDATED = "Auto-start: enabled (launchd)  — outdated config, run 'engram install' to update";
+/** What status says of the plist 0.6.1 wrote: not as this CLI writes one of its version. */
+const BROKEN = "Auto-start: enabled (launchd)  — broken, run 'engram install' to repair";
 const AGENTS_ROOTS = "~/Library/LaunchAgents belongs to root, not to you";
 const AGENTS_FIX = 'Make it yours with: sudo chown "$(id -un)" ~/Library/LaunchAgents';
 
@@ -846,8 +847,8 @@ async function systemJobRunsWorker() {
  * before engram#653 made the folder where there was none, as root, and
  * wrote its plist in it. Nothing in it can then be made, replaced or
  * removed but by root: install failed on it with an error naming a
- * temporary file, start's repair of an outdated plist and uninstall without
- * a word (engram#715). True when the folder was made the user's again, the
+ * temporary file, start's repair of the plist 0.6.1 wrote and uninstall
+ * without a word (engram#715). True when the folder was made the user's again, the
  * plist root wrote still in it.
  */
 async function launchAgentsRoots() {
@@ -875,8 +876,8 @@ async function launchAgentsRoots() {
   ranThrough(status);
   says(
     status,
-    "status: the agent is outdated, the folder root's, and how to make it the user's",
-    OUTDATED,
+    "status: the agent needs repairing, the folder is root's, and how to make it the user's",
+    BROKEN,
     `${AGENTS_ROOTS}, so Engram can't update or remove its launchd agent.`,
     AGENTS_FIX,
   );
@@ -929,7 +930,7 @@ async function launchAgentsRoots() {
   const theirs = ownerOf(AGENTS) === UID;
   check(theirs && ownerOf(PLIST) === 0, "the folder is the user's, and the plist in it still root's");
   const after = engram(["status"]);
-  says(after, "status: the agent is still outdated", OUTDATED);
+  says(after, "status: the agent still needs repairing", BROKEN);
   saysNot(after, "status says nothing more of the folder", "LaunchAgents belongs", "Make it yours");
   return theirs;
 }

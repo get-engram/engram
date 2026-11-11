@@ -701,6 +701,21 @@ function daemonEnvOverrides(): boolean {
 }
 
 /**
+ * This command's environment without the settings in it a daemon spawned
+ * from it would take over ~/.engram's (daemonEnvOverrides): the key, the
+ * server and the vault key. For one that takes over from the daemon
+ * launchd ran, which read them from ~/.engram (engram#667): the account it
+ * captures for, and how it scrubs vault values, stay as they were.
+ */
+function withoutEnvOverrides(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.ENGRAM_API_KEY;
+  delete env.ENGRAM_BASE_URL;
+  delete env.ENGRAM_VAULT_KEY;
+  return env;
+}
+
+/**
  * The agent is ours and current, for this CLI (plistForThisCli), and the
  * daemon launchd starts from it has everything this command's environment
  * would give one (daemonEnvOverrides). No launchctl call.
@@ -825,15 +840,7 @@ export async function waitForAgent(
 /** Say how a worker just spawned got on; false when it didn't start. */
 function reportStart(started: WorkerStart): boolean {
   if (started.state === "failed") {
-    const problem = logProblem();
-    if (problem === null) {
-      console.error("Daemon failed to start. Check the log:");
-      console.error(`  ${process.platform === "win32" ? "type" : "cat"} "${LOG_FILE}"`);
-    } else {
-      // It ran without one (engram#679), so what it said is gone.
-      console.error(`Daemon failed to start, and its log can't be written (${problem}). To see why, run it here:`);
-      console.error("  engram start --foreground");
-    }
+    printStartFailed("Daemon failed to start");
     return false;
   }
   if (started.state === "running") {
@@ -846,6 +853,19 @@ function reportStart(started: WorkerStart): boolean {
     console.log(dim("  Check on it with 'engram status' in a minute."));
   }
   return true;
+}
+
+/** Say that a worker just spawned didn't start, `what` first, and where to see why. */
+function printStartFailed(what: string): void {
+  const problem = logProblem();
+  if (problem === null) {
+    console.error(`${what}. Check the log:`);
+    console.error(`  ${process.platform === "win32" ? "type" : "cat"} "${LOG_FILE}"`);
+  } else {
+    // It ran without one (engram#679), so what it said is gone.
+    console.error(`${what}, and its log can't be written (${problem}). To see why, run it here:`);
+    console.error("  engram start --foreground");
+  }
 }
 
 export type WorkerStart =
@@ -2167,14 +2187,23 @@ function autoEnableLaunchdStartAtLogin(): "changed" | "unchanged" | "failed" | "
   return "changed";
 }
 
-function uninstallLaunchd(): void {
+/**
+ * Turn start at login off: unload the agent and remove its plist.
+ * Unloading it stops the daemon launchd runs for it, where on Linux and
+ * Windows the daemon keeps running until `engram stop` or sign-out
+ * (engram#667): that one is started again, outside launchd. One launchd
+ * won't unload runs on under launchd until sign-out, and the plist it
+ * would load at the next login is gone all the same.
+ */
+async function uninstallLaunchd(): Promise<void> {
   if (!isLaunchdInstalled()) {
-    console.log("Launchd agent not installed.");
+    console.log("Auto-start isn't on.");
+    await printKeepsRunning();
     return;
   }
   // The plist can't be removed from a folder that isn't the user's
-  // (engram#715). launchd is left as it is, rather than stop the daemon it
-  // runs now and start it again at the next login.
+  // (engram#715), and launchd would load it again at the next login:
+  // launchd, and the daemon it runs, are left as they are.
   const notYours = launchAgentsNotYours();
   if (notYours) {
     console.error(red(`Couldn't turn off start at login: ${launchAgentsWhose(notYours)}.`));
@@ -2183,16 +2212,81 @@ function uninstallLaunchd(): void {
     process.exitCode = 1;
     return;
   }
-  unloadAgent();
+  const pid = agentPid();
+  const ran = pid !== null && alive(pid) ? pid : null;
+  const unloaded = unloadAgent();
   try {
     rmSync(plistPath(), { force: true });
+    console.log(`${bold("Auto-start disabled")} — launchd agent removed`);
   } catch {
+    // Unloaded all the same, and loaded again at the next login: the
+    // daemon is started again all the same.
     console.error(red("Couldn't remove the launchd agent."));
     console.error(dim(`  Remove ${plistPath()} to turn start at login off.`));
     process.exitCode = 1;
+  }
+  if (ran === null) await printKeepsRunning();
+  else await keepRunning(ran, unloaded);
+}
+
+/**
+ * Start the daemon again, as `engram start` would, once the one launchd
+ * ran for the agent just unloaded has exited (engram#667), and say it
+ * keeps running. Not before: a worker started while that one still
+ * answers takes it for the daemon, and leaves the capture to it. From
+ * ~/.engram's key, server and vault key, as launchd's read them, not ones
+ * set in this command's environment (withoutEnvOverrides). When it can't
+ * be, that is said, and the command fails. `unloaded`: whether launchctl
+ * took the unload (unloadAgent).
+ */
+async function keepRunning(ran: number, unloaded: boolean): Promise<void> {
+  // launchctl took neither the bootout nor the unload. A daemon launchd
+  // still runs, refusing them, answers as running, not stopping; one
+  // bootout gave up waiting for answers as stopping, and is waited for.
+  if (!unloaded && (await runsOn())) return;
+  const slow = () => console.log(dim("  Waiting for the daemon launchd ran to finish what it was sending..."));
+  if (!(await exited(ran, slow))) {
+    // Never stopped after all: it answers as running.
+    if (await runsOn()) return;
+    console.error(red(`The daemon launchd ran (pid ${ran}) is stopping with its agent, and hasn't finished, so it wasn't started again.`));
+    console.error(dim("  Run 'engram start' in a moment to start it again."));
+    process.exitCode = 1;
     return;
   }
-  console.log(`${bold("Auto-start disabled")} — launchd agent removed`);
+  // Another, started meanwhile, or one running as root for them (engram#680).
+  const found = await findDaemon();
+  if (found.state !== "stopped") {
+    await printKeepsRunning(found);
+    return;
+  }
+  // One started now would stop at once (engram#659, engram#723). The banner
+  // before the command said what is wrong, and how to fix it.
+  if (stopsCapture(foreignFiles()) || lockedDir() !== null) {
+    console.error(red("The daemon launchd ran stopped with its agent, and wasn't started again: one started now would stop at once."));
+    console.error(dim("  Once that's fixed, run 'engram start' to start it."));
+    process.exitCode = 1;
+    return;
+  }
+  const started = await waitForWorker(spawnWorker(withoutEnvOverrides()));
+  if (started.state === "failed") {
+    printStartFailed("The daemon launchd ran stopped with its agent, and couldn't be started again");
+    console.error(dim("  Run 'engram start' to start it."));
+    process.exitCode = 1;
+    return;
+  }
+  console.log(dim(KEEPS_RUNNING));
+  if (started.state === "starting") console.log(dim("  It is still starting: check on it with 'engram status' in a minute."));
+}
+
+/**
+ * Whether the daemon answers as running, not stopping, as one launchd
+ * didn't stop with its agent does: then that it keeps running is said.
+ */
+async function runsOn(): Promise<boolean> {
+  const found = await findDaemon();
+  if (found.state !== "running") return false;
+  await printKeepsRunning(found);
+  return true;
 }
 
 // ── Windows: a per-user Run entry ──
@@ -2685,9 +2779,22 @@ function autoEnableWindowsStartAtLogin(): "changed" | "unchanged" | "failed" | "
   return "changed";
 }
 
+const KEEPS_RUNNING = "  The daemon keeps running until 'engram stop' or sign-out.";
+
+/**
+ * Say that the daemon keeps running, after start at login is turned off,
+ * when one of the user's runs: `found`, or the one found now. Not one
+ * running as root, which `engram stop` can't stop (engram#680), nor one
+ * that is stopping.
+ */
+async function printKeepsRunning(found?: DaemonFound): Promise<void> {
+  const { state } = found ?? (await findDaemon());
+  if (state === "running" || state === "unresponsive") console.log(dim(KEEPS_RUNNING));
+}
+
 async function disableStartAtLogin(): Promise<void> {
   if (process.platform === "darwin") {
-    uninstallLaunchd();
+    await uninstallLaunchd();
     return;
   }
   removeStrayPlist();
@@ -2706,10 +2813,7 @@ async function disableStartAtLogin(): Promise<void> {
       clearStartupSwitch();
       console.log(`${bold("Auto-start disabled")} — the Windows startup entry is removed`);
     }
-    const state = (await findDaemon()).state;
-    if (state !== "stopped" && state !== "root") {
-      console.log(dim("  The daemon keeps running until 'engram stop' or sign-out."));
-    }
+    await printKeepsRunning();
     return;
   }
   if (process.platform === "linux") {
@@ -2730,10 +2834,7 @@ async function disableStartAtLogin(): Promise<void> {
       }
       console.log(`${bold("Auto-start disabled")} — the systemd unit is removed`);
     }
-    const state = (await findDaemon()).state;
-    if (state !== "stopped" && state !== "root") {
-      console.log(dim("  The daemon keeps running until 'engram stop' or sign-out."));
-    }
+    await printKeepsRunning();
     return;
   }
   console.log(`Start at login isn't set up on ${platformLabel()}, so there is nothing to remove.`);

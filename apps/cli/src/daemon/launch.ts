@@ -101,9 +101,9 @@ export function logProblem(file = LOG_FILE): string | null {
   }
 }
 
-/** Start the worker detached, logging to LOG_FILE. */
-export function spawnWorker(): ChildProcess {
-  return spawnDetached(workerPath());
+/** Start the worker detached, logging to LOG_FILE, with `env` (this process's environment, by default). */
+export function spawnWorker(env: NodeJS.ProcessEnv = process.env): ChildProcess {
+  return spawnDetached(workerPath(), [], env);
 }
 
 /**
@@ -123,14 +123,14 @@ export function spawnSupervisor(reportUntil?: number): ChildProcess {
  * Windows a detached child otherwise gets a console window of its own, and
  * closing that window ends the daemon.
  */
-function spawnDetached(script: string, args: string[] = []): ChildProcess {
+function spawnDetached(script: string, args: string[] = [], env: NodeJS.ProcessEnv = process.env): ChildProcess {
   const logFd = openLogSync();
   try {
     const child = spawn(process.execPath, [script, ...args], {
       detached: true,
       windowsHide: true,
       stdio: logFd === null ? "ignore" : ["ignore", logFd, logFd],
-      env: { ...process.env },
+      env: { ...env },
     });
     child.unref();
     return child;

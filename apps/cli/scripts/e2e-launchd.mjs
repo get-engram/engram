@@ -48,7 +48,10 @@
  *   - `engram status` says when the job was switched off with launchctl, and
  *     `engram install` switches it back on without starting a second daemon.
  *   - `engram uninstall` boots the job out, which stops the daemon launchd
- *     runs (engram#667), and removes the plist.
+ *     runs, and removes the plist; then it starts the daemon again outside
+ *     launchd, from config.json's server, not ENGRAM_BASE_URL's, and it
+ *     keeps running until `engram stop` or sign-out, as on Linux and Windows
+ *     (engram#667).
  *   - A plist from before engram#616, its paths unescaped, launchd can't
  *     load: `engram status` says it's broken, and `engram start` rewrites it
  *     and launchd loads it.
@@ -317,6 +320,21 @@ const modeOf = (p) => {
 const logText = () => (existsSync(LOG_FILE) ? readFileSync(LOG_FILE, "utf-8") : "");
 const startedPid = (out) => Number(/Engram daemon started \(pid (\d+)\)/.exec(out)?.[1]) || null;
 const autoStartLine = (out) => out.split("\n").map((l) => l.trim()).find((l) => l.startsWith("Auto-start:")) ?? null;
+const KEEPS_RUNNING = "The daemon keeps running until 'engram stop' or sign-out.";
+
+/**
+ * Whether the process has `name` set in its environment, as `ps -E` shows
+ * it after the command; null when ps shows no environment for it (it does
+ * for Node run by the same user). Never prints the environment. HOME, which
+ * every daemon of this test has, tells the two apart; not by its value,
+ * whose "ü" ps may print otherwise.
+ */
+function hasEnv(pid, name) {
+  const r = spawnSync("/bin/ps", ["-E", "-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf-8", timeout: 30_000 });
+  const line = (r.stdout ?? "").trim();
+  if (!line.includes(" HOME=")) return null;
+  return line.includes(` ${name}=`);
+}
 
 /** `engram status` finds the daemon with this pid: its output. */
 async function statusRunning(pid, what) {
@@ -821,15 +839,32 @@ async function run() {
   check(same?.state === "running" && same.pid === n, `launchd runs the same daemon (pid ${same?.pid}, was ${n})`);
   check(isDeepStrictEqual(ourWorkers(), [n]), `one daemon runs (${ourWorkers().join(", ")})`);
 
-  // ── engram uninstall: launchd lets go of the job, and its daemon stops ─────
+  // ── engram uninstall: launchd lets go of the job, and the daemon keeps running (engram#667)
   const uninstall = engram(["uninstall"]);
   check(uninstall.status === 0, "uninstall: exits 0");
   check(uninstall.out.includes("Auto-start disabled — launchd agent removed"), "uninstall: says the agent is removed");
+  check(uninstall.out.includes(KEEPS_RUNNING), "uninstall: says the daemon keeps running");
   check(job() === null, "launchd no longer has the job");
   check(!there(PLIST), "the plist is gone");
-  // Booting the job out stops the daemon launchd runs; on Linux and Windows
-  // uninstall leaves it running (engram#667).
-  await waitFor("the daemon launchd ran stopped with the job", () => ourWorkers().length === 0);
+  // Booting the job out stops the daemon launchd ran. Uninstall waits for
+  // it to exit, and then starts one outside launchd, as on Linux and
+  // Windows, where uninstall leaves the daemon running.
+  check(!ourWorkers().includes(n), `the daemon launchd ran stopped with the job (pid ${n})`);
+  const kept = await waitFor("uninstall: one daemon runs, started again outside launchd", () => {
+    const pids = ourWorkers();
+    return pids.length === 1 && pids[0] !== n ? pids[0] : 0;
+  });
+  if (kept) {
+    await statusRunning(kept, "started again by uninstall");
+    // As launchd's read it: the server from config.json. This command had
+    // ENGRAM_BASE_URL set.
+    const baseUrlSet = hasEnv(kept, "ENGRAM_BASE_URL");
+    if (baseUrlSet === null) console.log("  (ps shows no environment for it: not checked)");
+    else check(!baseUrlSet, "uninstall: the daemon it started has no ENGRAM_BASE_URL");
+  }
+  const stopKept = engram(["stop"]);
+  check(stopKept.status === 0, "stop: exits 0");
+  await waitFor("stop: the daemon uninstall started stops", () => ourWorkers().length === 0);
   const none = engram(["status"]);
   check(none.out.includes("Status: stopped"), "status: stopped");
   check(autoStartLine(none.out) === null, `status: nothing about start at login (${autoStartLine(none.out)})`);
@@ -856,7 +891,14 @@ async function run() {
   }
   const removed = engram(["uninstall"]);
   check(removed.status === 0, "uninstall: exits 0");
-  await waitForGone("uninstall: launchd lets go of the job, and its daemon stops");
+  check(removed.out.includes(KEEPS_RUNNING), "uninstall: says the daemon keeps running");
+  await waitFor("uninstall: launchd lets go of the job", () => job() === null);
+  await waitFor("uninstall: one daemon runs, started again outside launchd", () => {
+    const pids = ourWorkers();
+    return pids.length === 1 && pids[0] !== installedPid ? pids[0] : 0;
+  });
+  engram(["stop"]);
+  await waitFor("stop: no daemon of this test runs", () => ourWorkers().length === 0);
 
   // ── A plist from before engram#616, which launchd can't load ───────────────
   mkdirSync(dirname(PLIST), { recursive: true });
@@ -887,7 +929,7 @@ async function run() {
     await statusRunning(after, "repaired by start");
   }
 
-  // ── Done: uninstall, and stop whatever start ran itself ────────────────────
+  // ── Done: uninstall, and stop the daemon it keeps running ─────────────────
   engram(["uninstall"]);
   if (ourWorkers().length > 0) engram(["stop"]);
   await waitFor("no daemon of this test runs", () => ourWorkers().length === 0);

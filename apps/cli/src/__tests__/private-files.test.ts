@@ -792,7 +792,7 @@ describe("launchd's log (engram#627)", () => {
       writeFileSync(plist, "<plist></plist>");
       calls.length = 0;
       logModes.length = 0;
-      expect(repairLaunchdIfStale()).toBe(true);
+      expect(repairLaunchdIfStale()).toBe("repaired");
       expect(calls).toEqual(["print-disabled", "bootout", "list", "bootstrap"]);
       expect(logModes).toEqual([0o600]);
     } finally {

@@ -11,7 +11,7 @@ import {
   type StripeCustomer,
 } from "../services/stripe.js";
 import { bindStripeCustomer } from "../services/stripe-customer.js";
-import { insertOrganizationWithEmail } from "@getengram/db";
+import { getOrganizationById, insertOrganizationWithEmail } from "@getengram/db";
 import { createMockD1, createMockEnv } from "./helpers.js";
 import type { Env, AuthContext } from "../types.js";
 
@@ -1194,5 +1194,264 @@ describe("one organization per Stripe customer (engram#536)", () => {
     await expect(
       bindStripeCustomer(failing("D1_ERROR: database is locked"), "org_x", "cus_x"),
     ).rejects.toThrow(/locked/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Billing notices (engram#747). A declined renewal, and a plan Stripe ended
+// for non-payment, are emailed through engram-web from hello@getengram.app.
+// ---------------------------------------------------------------------------
+
+describe("webhook: billing notices (engram#747)", () => {
+  let db: D1Database;
+  let env: Env;
+  let mail: ReturnType<typeof vi.fn>;
+  let errors: MockInstance;
+
+  /** 2026-11-14T00:00:00Z, as Stripe sends it: unix seconds. */
+  const NEXT_ATTEMPT = 1_794_614_400;
+  const INVOICE_PAGE = "https://invoice.stripe.com/i/acct_test/test_dun";
+
+  beforeEach(async () => {
+    db = createMockD1();
+    env = createBillingEnv(db);
+    await db.exec(
+      "INSERT INTO organizations (id, name, email, tier, stripe_subscription_id, messages_stored_total) VALUES ('org_dun', 'Dun Org', 'dun@example.com', 'pro', 'sub_dun', 12345)",
+    );
+    mail = vi.fn(async () => new Response(JSON.stringify({ sent: true }), { status: 200 }));
+    vi.stubGlobal("fetch", mail);
+    errors = vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    errors.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  /** Rewrite columns on the seeded org (a plain UPDATE, which the mock applies). */
+  const setOrg = async (cols: Record<string, unknown>) => {
+    const names = Object.keys(cols);
+    await db
+      .prepare(`UPDATE organizations SET ${names.map((n) => `${n} = ?`).join(", ")} WHERE id = ?`)
+      .bind(...names.map((n) => cols[n]), "org_dun")
+      .run();
+  };
+
+  /** invoice.payment_failed as the endpoint's API version (dahlia) renders it. */
+  const renewalFailed = (id: string, invoice: Record<string, unknown> = {}) => ({
+    id,
+    type: "invoice.payment_failed",
+    data: {
+      object: {
+        id: "in_dun",
+        customer: "cus_dun",
+        customer_email: "billing@example.com",
+        billing_reason: "subscription_cycle",
+        attempt_count: 1,
+        amount_due: 900,
+        currency: "usd",
+        next_payment_attempt: NEXT_ATTEMPT,
+        hosted_invoice_url: INVOICE_PAGE,
+        parent: {
+          type: "subscription_details",
+          subscription_details: { subscription: "sub_dun", metadata: { organization_id: "org_dun" } },
+        },
+        ...invoice,
+      },
+    },
+  });
+
+  /** customer.subscription.deleted after Stripe's last retry failed. */
+  const cancelledForNonPayment = (id: string, sub: Record<string, unknown> = {}) => ({
+    id,
+    type: "customer.subscription.deleted",
+    data: {
+      object: {
+        id: "sub_dun",
+        customer: "cus_dun",
+        status: "canceled",
+        cancellation_details: { reason: "payment_failed" },
+        metadata: { organization_id: "org_dun" },
+        items: { data: [{ price: { id: TEST_PRICE_PRO }, quantity: 1 }] },
+        ...sub,
+      },
+    },
+  });
+
+  /** What each call to engram-web carried. */
+  const sent = () =>
+    mail.mock.calls.map((call) => {
+      const [url, init] = call as [string, RequestInit];
+      return {
+        url,
+        auth: (init.headers as Record<string, string>).Authorization,
+        body: JSON.parse(String(init.body)) as Record<string, unknown>,
+      };
+    });
+
+  describe("invoice.payment_failed", () => {
+    it("emails the first failure of a renewal, with Stripe's page for paying it", async () => {
+      const res = await sendWebhookEvent(createWebhookApp(), env, renewalFailed("evt_pf_first"));
+      expect(res.status).toBe(200);
+      expect(sent()).toEqual([
+        {
+          url: `${TEST_APP_URL}/api/email/payment-failed`,
+          auth: "Bearer admin_test",
+          body: {
+            to: "dun@example.com",
+            tier: "pro",
+            amount_due: 900,
+            currency: "usd",
+            next_payment_attempt: "2026-11-14T00:00:00.000Z",
+            hosted_invoice_url: INVOICE_PAGE,
+            org_id: "org_dun",
+          },
+        },
+      ]);
+      // A failed renewal is not a cancellation: the org keeps its plan.
+      const org = (await getOrganizationById(db, "org_dun")) as { tier: string };
+      expect(org.tier).toBe("pro");
+    });
+
+    it("stays quiet on the retries after the first failure, the last one included", async () => {
+      const app = createWebhookApp();
+      await sendWebhookEvent(app, env, renewalFailed("evt_pf_retry", { attempt_count: 2 }));
+      await sendWebhookEvent(
+        app,
+        env,
+        renewalFailed("evt_pf_last", { attempt_count: 9, next_payment_attempt: null }),
+      );
+      expect(mail).not.toHaveBeenCalled();
+    });
+
+    it("says nothing about a first payment or a mid-cycle change", async () => {
+      const app = createWebhookApp();
+      await sendWebhookEvent(app, env, renewalFailed("evt_pf_create", { billing_reason: "subscription_create" }));
+      await sendWebhookEvent(app, env, renewalFailed("evt_pf_update", { billing_reason: "subscription_update" }));
+      expect(mail).not.toHaveBeenCalled();
+    });
+
+    it("leaves the retry date out when Stripe has none", async () => {
+      await sendWebhookEvent(createWebhookApp(), env, renewalFailed("evt_pf_nodate", { next_payment_attempt: null }));
+      expect(sent()[0].body.next_payment_attempt).toBeNull();
+    });
+
+    it("writes to the invoice's own address when the org has none", async () => {
+      await setOrg({ email: null });
+      await sendWebhookEvent(createWebhookApp(), env, renewalFailed("evt_pf_noemail"));
+      expect(sent()[0].body.to).toBe("billing@example.com");
+    });
+
+    it.each([
+      ["is on Free", { tier: "free" }],
+      ["was deleted", { deleted_at: "2026-11-01 00:00:00" }],
+      ["has moved to another subscription", { stripe_subscription_id: "sub_newer" }],
+    ])("says nothing when the org %s", async (_why, cols) => {
+      await setOrg(cols);
+      const res = await sendWebhookEvent(createWebhookApp(), env, renewalFailed("evt_pf_skip"));
+      expect(res.status).toBe(200);
+      expect(mail).not.toHaveBeenCalled();
+    });
+
+    it("says nothing when no org owns the invoice", async () => {
+      const res = await sendWebhookEvent(
+        createWebhookApp(),
+        env,
+        renewalFailed("evt_pf_stranger", {
+          customer: "cus_stranger",
+          parent: { type: "subscription_details", subscription_details: { subscription: "sub_x", metadata: {} } },
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect(mail).not.toHaveBeenCalled();
+    });
+
+    it("answers 500 and gives the event back when the email fails, so Stripe's retry sends it", async () => {
+      const log = tapStatements(db);
+      mail.mockResolvedValueOnce(new Response("smtp down", { status: 500 }));
+      const app = createWebhookApp();
+
+      const first = await sendWebhookEvent(app, env, renewalFailed("evt_pf_flaky"));
+      expect(first.status).toBe(500);
+      const release = log.find((s) => /DELETE FROM stripe_webhook_events/.test(s.sql));
+      expect(release?.args[0]).toBe("evt_pf_flaky");
+
+      const retry = await sendWebhookEvent(app, env, renewalFailed("evt_pf_flaky"));
+      expect(retry.status).toBe(200);
+      expect(await retry.json()).toEqual({ received: true });
+      expect(mail).toHaveBeenCalledTimes(2);
+      expect(log.filter((s) => /SET processed_at/.test(s.sql))).toHaveLength(1);
+    });
+
+    it("sends nothing, and still acknowledges, when the worker has no website bearer", async () => {
+      env = { ...env, ADMIN_SECRET: "", INTERNAL_CRON_SECRET: "" } as Env;
+      const res = await sendWebhookEvent(createWebhookApp(), env, renewalFailed("evt_pf_nobearer"));
+      expect(res.status).toBe(200);
+      expect(mail).not.toHaveBeenCalled();
+      expect(errors.mock.calls.map((c) => String(c[0])).join("\n")).toContain("payment-failed email for org org_dun");
+    });
+  });
+
+  describe("customer.subscription.deleted", () => {
+    it("moves the org to Free, then emails what that means for what they saved", async () => {
+      const res = await sendWebhookEvent(createWebhookApp(), env, cancelledForNonPayment("evt_pe_first"));
+      expect(res.status).toBe(200);
+      const org = (await getOrganizationById(db, "org_dun")) as { tier: string; stripe_subscription_id: string | null };
+      expect(org.tier).toBe("free");
+      expect(org.stripe_subscription_id).toBeNull();
+      expect(sent()).toEqual([
+        {
+          url: `${TEST_APP_URL}/api/email/plan-ended`,
+          auth: "Bearer admin_test",
+          body: { to: "dun@example.com", tier: "pro", stored_messages: 12345, free_limit: 10_000, org_id: "org_dun" },
+        },
+      ]);
+    });
+
+    it("names the plan from the cancelled subscription", async () => {
+      await sendWebhookEvent(
+        createWebhookApp(),
+        env,
+        cancelledForNonPayment("evt_pe_team", { items: { data: [{ price: { id: TEST_PRICE_TEAM }, quantity: 3 }] } }),
+      );
+      expect(sent()[0].body.tier).toBe("team");
+    });
+
+    it("says nothing when the customer cancelled, or the subscription never started", async () => {
+      const app = createWebhookApp();
+      await sendWebhookEvent(
+        app,
+        env,
+        cancelledForNonPayment("evt_pe_requested", { cancellation_details: { reason: "cancellation_requested" } }),
+      );
+      await sendWebhookEvent(app, env, cancelledForNonPayment("evt_pe_expired", { status: "incomplete_expired" }));
+      expect(mail).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["has moved to another subscription", { stripe_subscription_id: "sub_newer" }],
+      ["holds a grace window", { grace_ends_at: "2099-01-01 00:00:00" }],
+    ])("keeps the plan and says nothing when the org %s", async (_why, cols) => {
+      await setOrg(cols);
+      const res = await sendWebhookEvent(createWebhookApp(), env, cancelledForNonPayment("evt_pe_kept"));
+      expect(res.status).toBe(200);
+      const org = (await getOrganizationById(db, "org_dun")) as { tier: string };
+      expect(org.tier).toBe("pro");
+      expect(mail).not.toHaveBeenCalled();
+    });
+
+    it("on Stripe's retry after a failed send, still names the plan the org had", async () => {
+      mail.mockResolvedValueOnce(new Response("smtp down", { status: 500 }));
+      const app = createWebhookApp();
+
+      const first = await sendWebhookEvent(app, env, cancelledForNonPayment("evt_pe_flaky"));
+      expect(first.status).toBe(500);
+      // The downgrade already happened; the retry finds the org on Free.
+      const retry = await sendWebhookEvent(app, env, cancelledForNonPayment("evt_pe_flaky"));
+      expect(retry.status).toBe(200);
+      expect(sent().map((c) => c.body)).toEqual([
+        { to: "dun@example.com", tier: "pro", stored_messages: 12345, free_limit: 10_000, org_id: "org_dun" },
+        { to: "dun@example.com", tier: "pro", stored_messages: 12345, free_limit: 10_000, org_id: "org_dun" },
+      ]);
+    });
   });
 });

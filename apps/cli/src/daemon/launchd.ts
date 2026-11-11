@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { commandFailure, commandPath } from "./command-path.js";
 import { pinnedToKeg } from "./homebrew.js";
 import { logProblem } from "./launch.js";
+import { runnerCacheOf } from "./package-runner.js";
 
 // Start at login on macOS: a launchd agent,
 // ~/Library/LaunchAgents/app.getengram.daemon.plist. launchd loads the
@@ -250,8 +251,9 @@ export type PlistState =
        * An older CLI wrote it: an older version, or one that names Node or
        * the worker in a Homebrew version, which the next `brew upgrade`
        * removes (engram#652). Or it names no log, and the log can be
-       * written again (engram#679). `engram start` and auto-capture rewrite
-       * it.
+       * written again (engram#679). Or the worker it names is in a package
+       * runner's cache, which can be cleared at any time (engram#665).
+       * `engram start` and auto-capture rewrite it, from a CLI that isn't.
        */
       outdated: boolean;
     };
@@ -289,7 +291,10 @@ export function readPlist(): PlistState {
       (paths.log !== null && logProblem(paths.log) !== null);
     outdated =
       paths !== null &&
-      (pinnedToKeg(paths.node) || pinnedToKeg(paths.worker) || (paths.log === null && logProblem() === null));
+      (pinnedToKeg(paths.node) ||
+        pinnedToKeg(paths.worker) ||
+        runnerCacheOf(paths.worker) !== null ||
+        (paths.log === null && logProblem() === null));
   }
   return { kind: "ours", broken, version, outdated };
 }

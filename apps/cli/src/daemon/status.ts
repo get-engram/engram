@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { writePrivateFileSync } from "../private-files.js";
 import { plural } from "../output.js";
 import { lockedDir, lockedDirFix, lockedDirReason, type LockedDir } from "./ownership.js";
+import { engramCommand } from "./package-runner.js";
 import { powerShellArgs, windowsPowerShellPath } from "./powershell.js";
 
 const STATUS_FILE = join(homedir(), ".engram", "status.json");
@@ -423,7 +424,7 @@ export function recordCaptureStall(
     ? lockedCaptureSummary(locked, currentStatus.capture_error.files)
     : captureErrorSummary(currentStatus.capture_error);
   console.error(`[engram] WARNING: ${summary}`);
-  console.error(`[engram] Run 'engram status' for details.`);
+  console.error(`[engram] Run '${engramCommand("status")}' for details.`);
   if (Date.now() - lastCaptureNotifyAt >= CAPTURE_NOTIFY_INTERVAL_MS) {
     lastCaptureNotifyAt = Date.now();
     if (kind === "config") {
@@ -709,7 +710,7 @@ export function syncErrorSummary(
   switch (errorType) {
     case "auth":
       return (
-        "Your API key was rejected — run 'engram auth login'. New captures are " +
+        `Your API key was rejected — run '${engramCommand("auth login")}'. New captures are ` +
         "queued locally and sync as soon as a working key is saved."
       );
     case "storage_full": {
@@ -804,7 +805,7 @@ export function deleteRefusedSummary(r: DeleteRefused): string {
   return (
     `This API key can't delete conversations, so ${which} waiting to be deleted from ` +
     `Engram. Create a key with the 'delete' permission at getengram.app/dashboard, then ` +
-    `run 'engram auth login <key>'.`
+    `run '${engramCommand("auth login <key>")}'.`
   );
 }
 
@@ -814,7 +815,7 @@ function logWarning(
   storage?: { used: number; limit: number } | null,
 ): void {
   console.error(`[engram] WARNING: ${syncErrorSummary(errorType, storage)}`);
-  console.error(`[engram] Run 'engram status' for details.`);
+  console.error(`[engram] Run '${engramCommand("status")}' for details.`);
 }
 
 /** A notifier that hangs (a PowerShell that never finishes loading, a stuck

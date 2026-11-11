@@ -2584,6 +2584,29 @@ describe("engram uninstall keeps the daemon running on macOS (engram#667)", () =
     expect(process.exitCode).toBe(1);
   });
 
+  describe("run from npx's cache (engram#727)", () => {
+    const NPX = join(home.dir, ".npm", "_npx", "f3920abdac2db749", "node_modules", "@getengram", "cli", "dist", "daemon", "worker.js");
+    beforeEach(() => {
+      cli.worker = NPX;
+    });
+    afterEach(() => {
+      cli.worker = null;
+    });
+
+    it("says it keeps running until it is stopped as npx runs the CLI", async () => {
+      await daemonUninstall();
+      expect(said()).toBe(`${REMOVED}\n  The daemon keeps running until 'npx @getengram/cli stop' or sign-out.`);
+      expect(started()).toEqual([WORKER_STARTED()]);
+    });
+
+    it("says to start it as npx runs the CLI, when the one launchd ran hasn't finished", async () => {
+      launchd.stopsIn = Infinity;
+      await withClock(5_000, daemonUninstall);
+      expect(errors()).toContain("  Run 'npx @getengram/cli start' in a moment to start it again.");
+      expect(process.exitCode).toBe(1);
+    });
+  });
+
   it("says at once that it keeps running when launchd won't unload the agent, which runs it on until sign-out", async () => {
     launchd.bootoutFails = true;
     launchd.unloadFails = true;
@@ -4185,6 +4208,37 @@ describe("a CLI run from npx's cache (engram#665)", () => {
     expect(after).not.toMatch(/broken|outdated/);
   });
 
+  it("engram status names what to run as the runner runs the CLI, and installs it first for start at login (engram#727)", async () => {
+    writePlist(plistWith(FROM_NPX));
+    await fromNpx(() => daemonStatus());
+    const outdated = said();
+    expect(outdated).toContain(
+      [
+        "Auto-start: enabled (launchd)  — outdated config, run 'npm install -g @getengram/cli && engram install' to update",
+        "  It should be running: start at login is on. It may have stopped after an error.",
+      ].join("\n"),
+    );
+    expect(outdated).toContain("  Run 'npx @getengram/cli start' to start it again.");
+    expect(outdated).not.toMatch(/'engram /);
+
+    writePlist(plistWith(CLEARED));
+    await fromNpx(() => daemonStatus());
+    const broken = said();
+    expect(broken).toContain(
+      "Auto-start: enabled (launchd)  — broken, run 'npm install -g @getengram/cli && engram install' to repair",
+    );
+    expect(broken).not.toMatch(/'engram /);
+
+    // pnpm dlx's: its own command.
+    const pnpm = join(home.dir, "Library", "Caches", "pnpm", "dlx", "t2vhrsiwfyb5ug4cvmxu7uvwla", "19a6c1f5e2b-1c4d");
+    const inStore = ["node_modules", ".pnpm", "@getengram+cli@0.7.0", "node_modules", "@getengram", "cli"];
+    writePlist(plistWith(FROM_NPX));
+    await fromNpx(() => daemonStatus(), join(pnpm, ...inStore, "dist", "daemon", "worker.js"));
+    const fromPnpm = said();
+    expect(fromPnpm).toContain("  Run 'pnpm dlx @getengram/cli start' to start it again.");
+    expect(fromPnpm).not.toMatch(/'engram /);
+  });
+
   it("the installed CLI's engram start points it at that CLI, once, and launchd loads it in its place", async () => {
     writePlist(plistWith(FROM_NPX));
     launchd.loaded = true;
@@ -4213,7 +4267,7 @@ describe("a CLI run from npx's cache (engram#665)", () => {
         [
           "Auto-capture is on — conversations from supported agents on this machine save to your Engram.",
           WONT_START_AT_LOGIN,
-          "  Turn off anytime: engram stop && engram uninstall",
+          "  Turn off anytime: npx @getengram/cli stop && npx @getengram/cli uninstall",
         ].join("\n"),
       );
 

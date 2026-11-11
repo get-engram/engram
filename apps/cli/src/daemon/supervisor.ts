@@ -18,6 +18,7 @@
 
 import { probeDaemon, readStopFile, removeStopFileIf } from "./instance.js";
 import { spawnWorker } from "./launch.js";
+import { engramCommand } from "./package-runner.js";
 import { reportUntilArg, supervise } from "./supervise.js";
 
 function log(msg: string): void {
@@ -52,7 +53,7 @@ try {
       now: () => Date.now(),
       log,
     },
-    { reportUntil: reportUntilArg(process.argv.slice(2)) },
+    { reportUntil: reportUntilArg(process.argv.slice(2)), command: engramCommand },
   );
   process.exit(code);
 } catch (err) {

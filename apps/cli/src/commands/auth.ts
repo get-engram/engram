@@ -3,6 +3,7 @@ import { loadConfigForUpdate, loadConfigForUse, requireWritableConfig, saveConfi
 import { green, red } from "../output.js";
 import { Engram } from "@getengram/sdk";
 import { autoEnableCapture } from "../daemon/commands.js";
+import { engramCommand } from "../daemon/package-runner.js";
 
 export async function authLogin(args: string[]): Promise<void> {
   const key = args[0];
@@ -49,7 +50,7 @@ export async function authLogin(args: string[]): Promise<void> {
 
 export async function authLogout(): Promise<void> {
   const config = await loadConfigForUpdate([
-    "To sign out anyway: run 'engram stop', then remove the file. The folders you",
+    `To sign out anyway: run '${engramCommand("stop")}', then remove the file. The folders you`,
     "excluded from capture go with it.",
   ]);
   // With no key saved there's nothing to remove, so nothing is written: a
@@ -83,7 +84,7 @@ export async function authStatus(): Promise<void> {
 
   if (!key) {
     console.log("Not authenticated");
-    console.log("\nRun: engram auth login <api-key>");
+    console.log(`\nRun: ${engramCommand("auth login <api-key>")}`);
     return;
   }
 

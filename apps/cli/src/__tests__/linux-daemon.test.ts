@@ -2507,6 +2507,51 @@ describe("a CLI run from npx's cache (engram#665)", () => {
     expect(after).not.toMatch(/broken|outdated/);
   });
 
+  it("engram status names what to run as the runner runs the CLI, and installs it first for start at login (engram#727)", async () => {
+    writeUnit(unitWith(FROM_NPX));
+    await fromNpx(() => daemonStatus());
+    let text = said();
+    expect(text).toContain(
+      [
+        "Auto-start: enabled (systemd)  — outdated config, run 'npm install -g @getengram/cli && engram install' to update",
+        "  It should be running: start at login is on. It may have stopped after an error.",
+      ].join("\n"),
+    );
+    expect(text).toContain("  Run 'npx @getengram/cli start' to start it again.");
+    expect(text).not.toMatch(/'engram /);
+
+    writeUnit(unitWith(CLEARED));
+    await fromNpx(() => daemonStatus());
+    text = said();
+    expect(text).toContain(
+      "Auto-start: enabled (systemd)  — broken, run 'npm install -g @getengram/cli && engram install' to repair",
+    );
+    expect(text).not.toMatch(/'engram /);
+
+    // As bunx runs it, from bunx's.
+    writeUnit(unitWith(FROM_NPX));
+    const bunx = join(home.dir, "tmp", "bunx-1000-@getengram", "cli@latest", "node_modules", "@getengram", "cli");
+    await fromNpx(() => daemonStatus(), join(bunx, "dist", "daemon", "worker.js"));
+    text = said();
+    expect(text).toContain("  Run 'bunx @getengram/cli start' to start it again.");
+    expect(text).not.toMatch(/'engram /);
+  });
+
+  it("engram uninstall says the daemon keeps running until it is stopped as npx runs the CLI (engram#727)", async () => {
+    writeUnit(unitWith(FROM_NPX));
+    daemonRunning();
+    await fromNpx(() => daemonUninstall());
+    expect(existsSync(UNIT)).toBe(false);
+    expect(linked()).toBe(false);
+    expect(said()).toBe(
+      [
+        "Auto-start disabled — the systemd unit is removed",
+        "  The daemon keeps running until 'npx @getengram/cli stop' or sign-out.",
+      ].join("\n"),
+    );
+    expect(process.exitCode).toBeUndefined();
+  });
+
   it("the installed CLI's engram start points it at that CLI, once, and systemd starts the daemon from it", async () => {
     writeUnit(unitWith(FROM_NPX));
     await daemonStart([], {});
@@ -2537,7 +2582,7 @@ describe("a CLI run from npx's cache (engram#665)", () => {
         [
           "Auto-capture is on — conversations from supported agents on this machine save to your Engram.",
           WONT_START_AT_LOGIN,
-          "  Turn off anytime: engram stop && engram uninstall",
+          "  Turn off anytime: npx @getengram/cli stop && npx @getengram/cli uninstall",
         ].join("\n"),
       );
 
@@ -2565,7 +2610,7 @@ describe("a CLI run from npx's cache (engram#665)", () => {
       expect(spawn).toHaveBeenCalledTimes(1);
       const text = said();
       expect(text).toContain(
-        "Start at login isn't available here (no systemd user session): run 'engram start' after a restart.",
+        "Start at login isn't available here (no systemd user session): run 'npx @getengram/cli start' after a restart.",
       );
       expect(text).not.toContain("won't start at login");
     });

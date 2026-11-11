@@ -3,6 +3,7 @@ import type { ConfigUnreadable } from "../config-file.js";
 import { configForUse, printConfigProblemForUse } from "../config-guard.js";
 import { bold, dim, red, plural, json as printJson } from "../output.js";
 import { readStatus } from "../daemon/status.js";
+import { engramCommand } from "../daemon/package-runner.js";
 
 
 /** How long to wait for the API before calling it unreachable. */
@@ -73,7 +74,7 @@ export async function fetchUsage(): Promise<UsageResult> {
 export function printUsageError(result: Exclude<UsageResult, { kind: "ok" }>): void {
   switch (result.kind) {
     case "signed-out":
-      console.error(red("Not authenticated. Run 'engram signup' first."));
+      console.error(red(`Not authenticated. Run '${engramCommand("signup")}' first.`));
       break;
     case "config":
       printConfigProblemForUse(result.problem);
@@ -83,10 +84,10 @@ export function printUsageError(result: Exclude<UsageResult, { kind: "ok" }>): v
       // status`, which shows this, so a bare "Failed to fetch usage (401)"
       // was a dead end at exactly the moment someone followed it
       // (engram#587).
-      console.error(red("Your API key was rejected — run 'engram auth login'."));
+      console.error(red(`Your API key was rejected — run '${engramCommand("auth login")}'.`));
       if (process.env.ENGRAM_API_KEY) {
         console.error(
-          dim("  ENGRAM_API_KEY is set in this shell, and it is used in place of the key 'engram auth login' saves."),
+          dim(`  ENGRAM_API_KEY is set in this shell, and it is used in place of the key '${engramCommand("auth login")}' saves.`),
         );
       }
       break;
@@ -163,9 +164,9 @@ export function printUsage(data: UsageResponse): void {
           ),
         );
       }
-      console.log("  Free space by deleting conversations, or upgrade: engram upgrade\n");
+      console.log(`  Free space by deleting conversations, or upgrade: ${engramCommand("upgrade")}\n`);
     } else if (pct >= 0.8) {
-      console.log(dim("  Heads up: memory is over 80% full. More room: engram upgrade\n"));
+      console.log(dim(`  Heads up: memory is over 80% full. More room: ${engramCommand("upgrade")}\n`));
     }
   }
 }

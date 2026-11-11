@@ -3,6 +3,7 @@ import { Engram, generateVaultKey } from "@getengram/sdk";
 import { bold, dim, plural, red } from "../output.js";
 import { configForUse } from "../config-guard.js";
 import { confirmedDaemonInPidFile, probeDaemon, type DaemonInfo } from "../daemon/instance.js";
+import { engramCommand } from "../daemon/package-runner.js";
 import { decryptFailed } from "../daemon/scrubber.js";
 import { readStatus } from "../daemon/status.js";
 import { noteVaultChanged } from "../daemon/vault-changed.js";
@@ -79,7 +80,7 @@ async function refuseOverVaultSecrets(key: string): Promise<void> {
   if (found === "no account" || found === 0) return;
   if (found === "unknown") {
     console.log(dim("Couldn't check your vault for secrets saved with another key. Any there"));
-    console.log(dim("don't decrypt with this one: 'engram vault list --check' shows which."));
+    console.log(dim(`don't decrypt with this one: '${engramCommand("vault list --check")}' shows which.`));
     return;
   }
   const one = found === 1;
@@ -88,13 +89,13 @@ async function refuseOverVaultSecrets(key: string): Promise<void> {
   console.error(`rather than send it with ${one ? "that secret" : "those secrets"} in it. The key wasn't saved.`);
   const env = await envVaultKeyState();
   if (env === "none") {
-    console.error(dim("  ENGRAM_VAULT_KEY holds a key. If it's that one, save it: engram vault save-key"));
+    console.error(dim(`  ENGRAM_VAULT_KEY holds a key. If it's that one, save it: ${engramCommand("vault save-key")}`));
   } else {
     console.error(dim("  If you have that key, put it in ~/.engram/vault-key."));
   }
-  console.error(dim("  To make a new key all the same: engram vault keygen --save --force. Then save"));
-  console.error(dim(`  ${one ? "the secret" : "each secret"} again with it (engram vault set <NAME>), or delete ${one ? "it if you no" : "each you no"}`));
-  console.error(dim(`  longer use${one ? " it" : ""} (engram vault delete <NAME>).`));
+  console.error(dim(`  To make a new key all the same: ${engramCommand("vault keygen --save --force")}. Then save`));
+  console.error(dim(`  ${one ? "the secret" : "each secret"} again with it (${engramCommand("vault set <NAME>")}), or delete ${one ? "it if you no" : "each you no"}`));
+  console.error(dim(`  longer use${one ? " it" : ""} (${engramCommand("vault delete <NAME>")}).`));
   process.exit(1);
 }
 
@@ -167,7 +168,7 @@ export async function vaultKeygen(
   // A daemon started at login may not get a shell's variables: it reads
   // the file (engram#690).
   if (flags.save === undefined) {
-    console.log(dim("  Then 'engram vault save-key' saves it for the daemon started at login."));
+    console.log(dim(`  Then '${engramCommand("vault save-key")}' saves it for the daemon started at login.`));
   }
 }
 
@@ -183,13 +184,13 @@ export async function vaultSaveKey(flags: Record<string, string>): Promise<void>
   const envKey = process.env.ENGRAM_VAULT_KEY;
   if (!envKey) {
     console.error(red("Error: ENGRAM_VAULT_KEY isn't set, so there is no key to save."));
-    console.error(dim("  To make a new vault key and save it instead: engram vault keygen --save"));
+    console.error(dim(`  To make a new vault key and save it instead: ${engramCommand("vault keygen --save")}`));
     process.exit(1);
   }
   const key = envKey.trim();
   if (!isVaultKey(key)) {
     console.error(red("Error: ENGRAM_VAULT_KEY doesn't hold a vault key, so it isn't saved."));
-    console.error(dim("  A vault key is 32 bytes, base64-encoded, as 'engram vault keygen' makes one."));
+    console.error(dim(`  A vault key is 32 bytes, base64-encoded, as '${engramCommand("vault keygen")}' makes one.`));
     process.exit(1);
   }
 
@@ -253,10 +254,10 @@ async function printDaemonKeyHint(fresh: boolean): Promise<void> {
   }
   if (fresh) {
     console.log(dim("The daemon running now read its key when it started. For it to use this one,"));
-    console.log(dim("run 'engram stop', then 'engram start'."));
+    console.log(dim(`run '${engramCommand("stop")}', then '${engramCommand("start")}'.`));
   } else {
     console.log(dim("The daemon running now read its key when it started. If that was without this one,"));
-    console.log(dim("as at login, run 'engram stop', then 'engram start'."));
+    console.log(dim(`as at login, run '${engramCommand("stop")}', then '${engramCommand("start")}'.`));
   }
 }
 
@@ -274,17 +275,17 @@ export async function vaultStatus(): Promise<void> {
     // The daemon reads the file when started without it, as at login.
     const file = await vaultKeyFileState();
     if (file instanceof VaultKeyUnreadable) {
-      console.log(red(`  ~/.engram/vault-key, which the daemon reads, ${file.problem}. See 'engram status'.`));
+      console.log(red(`  ~/.engram/vault-key, which the daemon reads, ${file.problem}. See '${engramCommand("status")}'.`));
       return;
     }
     // Not saved there (engram#690). Not said for a key that isn't one.
     const saved = await envVaultKeyState();
     if (saved === "none") {
       console.log(red("  ~/.engram/vault-key isn't there: a daemon started at login may not have this key."));
-      console.log(dim("  To save it there, readable only by you: engram vault save-key"));
+      console.log(dim(`  To save it there, readable only by you: ${engramCommand("vault save-key")}`));
     } else if (saved === "different") {
       console.log(red("  ~/.engram/vault-key holds a different key: a daemon started at login may use that one."));
-      console.log(dim("  If this one is right: engram vault save-key --force (the file's key is backed up first)"));
+      console.log(dim(`  If this one is right: ${engramCommand("vault save-key --force")} (the file's key is backed up first)`));
     }
     return;
   }
@@ -304,7 +305,7 @@ export async function vaultStatus(): Promise<void> {
   }
   if (key === undefined) {
     console.log(`${bold("Vault:")} not configured`);
-    console.log(dim("Run 'engram vault keygen --save' to generate a key."));
+    console.log(dim(`Run '${engramCommand("vault keygen --save")}' to generate a key.`));
     return;
   }
   const problem = whyNotVaultKey(key);
@@ -404,14 +405,14 @@ async function printDaemonVaultHint(told: boolean): Promise<void> {
   if (daemon === null) return;
   if (daemon !== "unknown" && daemon.vaultKey === false && (await vaultKeyFileState()) === "none") {
     console.log(dim("The daemon running now has no vault key, so it can't remove this secret from what it captures."));
-    console.log(dim("To save this key where it reads it: engram vault save-key"));
+    console.log(dim(`To save this key where it reads it: ${engramCommand("vault save-key")}`));
     return;
   }
   const notices = daemon !== "unknown" && daemon.vaultChangeNotice;
   if (notices && told) return;
   if (notices) console.log(dim("Couldn't write ~/.engram/vault-changed to tell the daemon running now."));
   console.log(dim("The daemon running now reads the vault every 10 minutes, and may send this secret unscrubbed until then."));
-  console.log(dim("To have it scrubbed from now on, run 'engram stop', then 'engram start'."));
+  console.log(dim(`To have it scrubbed from now on, run '${engramCommand("stop")}', then '${engramCommand("start")}'.`));
 }
 
 /**
@@ -487,7 +488,7 @@ export async function vaultList(
 
   if (secrets.length === 0) {
     console.log(dim("No secrets stored."));
-    console.log(dim("Run 'engram vault set <NAME> <value>' to store one."));
+    console.log(dim(`Run '${engramCommand("vault set <NAME> <value>")}' to store one.`));
     return;
   }
 
@@ -565,8 +566,8 @@ function printDecryptCheck(checks: Array<boolean | null>): void {
     );
     console.log(
       dim(
-        `(engram vault set <NAME>), or delete ${one ? "it if you no longer use it" : "each you no longer use"} ` +
-          "(engram vault delete <NAME>).",
+        `(${engramCommand("vault set <NAME>")}), or delete ${one ? "it if you no longer use it" : "each you no longer use"} ` +
+          `(${engramCommand("vault delete <NAME>")}).`,
       ),
     );
   }

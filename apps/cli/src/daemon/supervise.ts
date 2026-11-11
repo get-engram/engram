@@ -68,6 +68,12 @@ export interface SuperviseOptions {
    * moment before it gives up waiting; 0 when nothing waits, as at sign-in.
    */
   reportUntil: number;
+  /**
+   * `engram <rest>` as the log names a command to run: as the user runs the
+   * CLI that runs this supervisor (engram#727), `npx @getengram/cli start`
+   * from npx's cache.
+   */
+  command: (rest: string) => string;
 }
 
 /** The time a `--report-until=<ms since the epoch>` argument gives, or 0 when there is none. */
@@ -83,6 +89,7 @@ export function reportUntilArg(args: readonly string[]): number {
 export async function supervise(deps: SuperviseDeps, options: SuperviseOptions): Promise<number> {
   let failures = 0;
   let reportUntil = options.reportUntil;
+  const { command } = options;
   for (;;) {
     const before = deps.stopStamp();
     const startedAt = deps.now();
@@ -99,14 +106,14 @@ export async function supervise(deps: SuperviseDeps, options: SuperviseOptions):
     if (stopRequested(deps, before)) return 0;
     if (code === 0) return 0;
     if (reported) {
-      deps.log(`the daemon couldn't start (exit code ${code}); 'engram start' reports it, and it isn't started again`);
+      deps.log(`the daemon couldn't start (exit code ${code}); '${command("start")}' reports it, and it isn't started again`);
       return START_FAILED_EXIT;
     }
     if (deps.now() - startedAt >= STABLE_MS) failures = 0;
     failures += 1;
     if (failures >= MAX_FAILURES) {
       deps.log(
-        `the daemon exited ${how(code)}, ${failures} times in a row; not starting it again until 'engram start' or the next sign-in`,
+        `the daemon exited ${how(code)}, ${failures} times in a row; not starting it again until '${command("start")}' or the next sign-in`,
       );
       return code ?? 1;
     }

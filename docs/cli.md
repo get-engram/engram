@@ -315,6 +315,8 @@ It also holds the folders excluded from capture (`engram exclude`) and whether y
 
 If the file can be read but not written (it's read-only, say, or the disk is full), `engram stop` still stops the daemon and `engram uninstall` still turns off start at login, but each says that it couldn't record capture as off, why, and what fixes it, and exits 1: until it is recorded, the next engram command starts the daemon again.
 
+`engram signup` and `engram login` check that the file can be written before they ask the server for anything, as the new API key they get is saved there, and `engram auth login` checks before it sends the key to be checked. If it can't be written, they say why and what fixes it, and exit 1. `engram auth logout` and `engram exclude add` and `remove` say the same when their save fails, and what that means for the command. A full disk is found only by writing: if `engram signup` or `engram login` then can't save the key it got, it says so. The account `engram signup` made can't be used; the key `engram login` made is listed at getengram.app/dashboard as "CLI login", for you to delete.
+
 The background daemon reads the key and `baseUrl` together, every few seconds, so `engram auth login` or a new `baseUrl` takes effect without a restart. A different key or server is a different account: what was captured for one is sent only to its own server, with a key of its own account, and waits on this machine until then. While the file can't be read, the daemon sends nothing; it never falls back to the default server. `ENGRAM_API_KEY` or `ENGRAM_BASE_URL` set for the daemon stays fixed for its lifetime.
 
 With both `ENGRAM_API_KEY` and `ENGRAM_BASE_URL` set, commands that only use the key and server run without the file.

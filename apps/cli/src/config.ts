@@ -2,7 +2,7 @@ import { lstatSync, statSync, type Stats } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { ensurePrivateDirSync, writePrivateFileSync } from "./private-files.js";
+import { checkWritableSync, ensurePrivateDirSync, writePrivateFileSync } from "./private-files.js";
 import { isMissing, parseConfigText, readFailure, writeProblem } from "./config-file.js";
 
 // Where it always was, for the commands that import it from here.
@@ -70,6 +70,19 @@ export async function saveConfig(config: Config): Promise<void> {
  */
 export function saveFailure(err: unknown): { problem: string; fix: string | null } {
   return { problem: `~/.engram/config.json ${writeProblem(err)}`, fix: writableFix(err) };
+}
+
+/**
+ * What stops config.json being saved now, as saveFailure says it, or null
+ * when nothing does that can be found without writing (engram#717).
+ */
+export function configSaveProblem(): { problem: string; fix: string | null } | null {
+  try {
+    checkWritableSync(CONFIG_FILE);
+    return null;
+  } catch (err: unknown) {
+    return saveFailure(err);
+  }
 }
 
 /** `chmod u+w` for what lacks its write permission, when that is all that's wrong. */

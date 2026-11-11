@@ -55,6 +55,13 @@ jobs:
         working-directory: apps/cli
         run: node scripts/e2e-account-switch.mjs
 
+      # A config.json that can't be written, with the built CLI against a
+      # fake server: signup and login ask the server for nothing, and every
+      # command that saves says why it can't and what fixes it (engram#717).
+      - name: Unwritable config.json test
+        working-directory: apps/cli
+        run: node scripts/e2e-config-unwritable.mjs
+
       # A conversation Engram no longer has, under the real daemon, against a
       # fake server that answers as the real one does: its messages are kept
       # and not sent, it isn't created again, and it is checked again later
@@ -212,6 +219,14 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
         run: node scripts/smoke-daemon.mjs
+
+      # The unwritable config.json test above, on macOS's own file
+      # permissions too (engram#717).
+      - name: Unwritable config.json test
+        working-directory: apps/cli
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: node scripts/e2e-config-unwritable.mjs
 
       # The vault-key test above, here too: its desktop notification goes
       # through osascript (engram#677).

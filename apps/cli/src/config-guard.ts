@@ -15,7 +15,7 @@
  * empty for a moment.
  */
 
-import { loadConfigStrict, type Config } from "./config.js";
+import { configSaveProblem, loadConfigStrict, saveConfig, saveFailure, type Config } from "./config.js";
 import { ConfigUnreadable, excludePathsOf } from "./config-file.js";
 import { dim, red } from "./output.js";
 
@@ -112,4 +112,52 @@ export async function loadConfigForUse(): Promise<Config> {
     process.exit(1);
   }
   return read.config;
+}
+
+/**
+ * Commands, and a config.json they can read but not write (engram#717).
+ * A save that failed ended the command with Node's own error, which named
+ * the path and nothing else, after `engram login` and `engram signup` had
+ * made the API key that the save then lost. These say why it can't be
+ * written, what that means for the command, and what fixes it, and the
+ * command exits 1.
+ *
+ * `meaning`: what the command didn't do, said after why. `again`: the
+ * command to run once it's fixed; without it, "this", for one whose
+ * arguments shouldn't be repeated, such as a key.
+ */
+export function exitConfigUnsaved(
+  failure: { problem: string; fix: string | null },
+  meaning: string[],
+  again?: string,
+): never {
+  const command = again === undefined ? "this" : `'engram ${again}'`;
+  console.error(red(`Error: ${failure.problem}.`));
+  for (const line of meaning) console.error(`  ${line}`);
+  if (failure.fix) {
+    console.error(`  To fix it, run: ${failure.fix}`);
+    console.error(`  Then run ${command} again.`);
+  } else {
+    console.error(`  Once it's fixed, run ${command} again.`);
+  }
+  process.exit(1);
+}
+
+/**
+ * Stop, as exitConfigUnsaved does, when config.json can't be written now:
+ * before a command does what a failed save would waste, such as making an
+ * account or an API key. Nothing is written.
+ */
+export function requireWritableConfig(meaning: string[], again?: string): void {
+  const failure = configSaveProblem();
+  if (failure) exitConfigUnsaved(failure, meaning, again);
+}
+
+/** Save config.json, or stop as exitConfigUnsaved does. */
+export async function saveConfigOrExit(config: Config, meaning: string[], again?: string): Promise<void> {
+  try {
+    await saveConfig(config);
+  } catch (err: unknown) {
+    exitConfigUnsaved(saveFailure(err), meaning, again);
+  }
 }

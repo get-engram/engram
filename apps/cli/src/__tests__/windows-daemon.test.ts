@@ -723,6 +723,32 @@ describe("start at login on Windows (engram#602)", () => {
     expect(regCalls("delete")).toHaveLength(0);
   });
 
+  it("engram uninstall leaves the daemon running, and says so", async () => {
+    onWindows();
+    registry.value = ENTRY;
+    daemonRunning();
+    await daemonUninstall();
+    expect(registry.value).toBeNull();
+    expect(output()).toBe(
+      "Auto-start disabled — the Windows startup entry is removed\n" +
+        "  The daemon keeps running until 'engram stop' or sign-out.",
+    );
+    expect(signalled).toEqual([]);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("engram uninstall doesn't say a daemon that is stopping keeps running (engram#667)", async () => {
+    onWindows();
+    registry.value = ENTRY;
+    pidFile(4242);
+    madeUp(4242);
+    daemon.answering = { pid: 4242, stopping: true };
+    await daemonUninstall();
+    expect(output()).toBe("Auto-start disabled — the Windows startup entry is removed");
+    expect(signalled).toEqual([]);
+    expect(process.exitCode).toBeUndefined();
+  });
+
   it("engram status shows the entry, and a broken one, running or not", async () => {
     onWindows();
     registry.value = ENTRY;

@@ -16,8 +16,10 @@ import {
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { DaemonOutput, Probe } from "../daemon/instance.js";
 import type { LaunchAgentsCheck, PlistPaths } from "../daemon/launchd.js";
+import type { ForeignFiles, LockedDir, OwnershipCheck } from "../daemon/ownership.js";
 
 /**
  * engram#616 — start at login on macOS: the launchd agent,
@@ -30,7 +32,7 @@ import type { LaunchAgentsCheck, PlistPaths } from "../daemon/launchd.js";
  * plists back too (read-only, temp files).
  */
 
-const { home, cli, daemon, launchd, spawn, execSync, execFileSync } = vi.hoisted(() => ({
+const { home, cli, daemon, owned, launchd, spawn, execSync, execFileSync } = vi.hoisted(() => ({
   home: { dir: "" },
   // This build's worker, when it isn't the one in the test's home: a CLI
   // installed with brew runs from a versioned keg (engram#652).
@@ -50,6 +52,10 @@ const { home, cli, daemon, launchd, spawn, execSync, execFileSync } = vi.hoisted
     silent: false,
     unavailable: false,
   },
+  // What in ~/.engram is another user's, and how its permissions keep the
+  // user out of it, when a test says (engram#667): no test can give a file
+  // to root. null: what the files there are.
+  owned: { foreign: null as ForeignFiles | null, locked: null as LockedDir | null },
   // The fake launchd: the job it has loaded, and what it refuses.
   launchd: {
     loaded: false,
@@ -68,9 +74,29 @@ const { home, cli, daemon, launchd, spawn, execSync, execFileSync } = vi.hoisted
     bootstrapFails: false,
     loadFails: false,
     bootoutFails: false,
+    /**
+     * bootout gives up waiting for the daemon launchd runs for the job to
+     * exit: it fails with "Operation now in progress", and launchd lets go
+     * of the job all the same (engram#667).
+     */
+    bootoutGivesUp: false,
+    unloadFails: false,
     /** How many `list` calls after a bootout still find the job, while launchd lets go of it. */
     stillLoadedFor: 0,
     lingering: 0,
+    /**
+     * What the daemon launchd runs for the job does when the job is
+     * unloaded, when a test says (engram#667): it exits that many ms later,
+     * answering as one that is stopping until then; at once for 0, never
+     * for Infinity. null: it runs on.
+     */
+    stopsIn: null as number | null,
+    /**
+     * How many ms that daemon takes to handle the SIGTERM the unload sends
+     * it, answering as running, not stopping, until then: unload can return
+     * before it has (engram#667).
+     */
+    handlesStopIn: 0,
     /**
      * launchd's switch for the job, which it keeps with the plist gone
      * (engram#654): `launchctl disable` (or `unload -w`) switches it off,
@@ -183,6 +209,16 @@ vi.mock("../daemon/launchd.js", async (importOriginal) => {
     real.writePlistFile(text);
   };
   return { ...real, launchAgentsNotYours, writePlistFile };
+});
+// What foreignFiles and lockedDir find is `owned`, when a test sets it; the
+// rest is the real module (engram#667).
+vi.mock("../daemon/ownership.js", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../daemon/ownership.js")>();
+  return {
+    ...real,
+    foreignFiles: (check?: OwnershipCheck) => owned.foreign ?? real.foreignFiles(check),
+    lockedDir: (check?: OwnershipCheck) => owned.locked ?? real.lockedDir(check),
+  };
 });
 
 /** The OS this runs on: the tests say darwin, whatever it is. */
@@ -352,9 +388,36 @@ function load(plist: string): void {
 }
 
 function unload(): void {
+  const ran = launchd.pid;
   launchd.loaded = false;
   launchd.pid = null;
   launchd.lingering = launchd.stillLoadedFor;
+  if (ran !== null && launchd.stopsIn !== null) stopsWithJob(ran, launchd.stopsIn);
+}
+
+/**
+ * The daemon launchd ran, `pid`, stops with its job (engram#667): `ms`
+ * later, answering as one that is stopping until then, and then it is gone,
+ * its PID file with it.
+ */
+function stopsWithJob(pid: number, ms: number): void {
+  const answers = () => daemon.answering?.pid === pid;
+  const exit = () => {
+    madeUp.delete(pid);
+    if (answers()) daemon.answering = null;
+    if (existsSync(PID_FILE) && readFileSync(PID_FILE, "utf-8") === String(pid)) rmSync(PID_FILE);
+  };
+  if (ms === 0) {
+    exit();
+    return;
+  }
+  const stopping = () => {
+    if (answers()) daemon.answering = { pid, stopping: true };
+  };
+  if (launchd.handlesStopIn > 0) timers.push(setTimeout(stopping, launchd.handlesStopIn));
+  else stopping();
+  // Never, for Infinity, which setTimeout would take for 1 ms.
+  if (Number.isFinite(ms)) timers.push(setTimeout(exit, ms));
 }
 
 const UNESCAPED: Record<string, string> = { amp: "&", lt: "<", gt: ">" };
@@ -492,9 +555,11 @@ function fakeLaunchctl(file: string, args: string[]): string {
   if (is("bootout", `${DOMAIN}/${LABEL}`)) {
     if (launchd.bootoutFails || !launchd.loaded) throw failed(command, "Boot-out failed: 3: No such process\n");
     unload();
+    if (launchd.bootoutGivesUp) throw failed(command, "Boot-out failed: 36: Operation now in progress\n");
     return "";
   }
   if (is("unload", plist)) {
+    if (launchd.unloadFails) throw failed(command, "Unload failed: 1: Operation not permitted\n");
     if (!launchd.loaded) throw failed(command, "Unload failed: 113: Could not find specified service\n");
     unload();
     return "";
@@ -655,8 +720,12 @@ beforeEach(() => {
     bootstrapFails: false,
     loadFails: false,
     bootoutFails: false,
+    bootoutGivesUp: false,
+    unloadFails: false,
     stillLoadedFor: 0,
     lingering: 0,
+    stopsIn: null,
+    handlesStopIn: 0,
     switchedOff: null,
     disabledOutput: null,
     printDisabledFails: false,
@@ -673,6 +742,8 @@ beforeEach(() => {
   daemon.answering = null;
   daemon.silent = false;
   daemon.unavailable = false;
+  owned.foreign = null;
+  owned.locked = null;
   madeUp.clear();
   cli.worker = null;
   rmSync(join(home.dir, "Library"), { recursive: true, force: true });
@@ -2361,7 +2432,7 @@ describe("engram uninstall on macOS (engram#616)", () => {
     await daemonUninstall();
     expect(existsSync(PLIST)).toBe(false);
     expect(launchd.loaded).toBe(false);
-    expect(launchctlCalls()).toEqual(["bootout"]);
+    expect(launchctlCalls()).toEqual(["list", "bootout"]);
     expect(output()).toContain("Auto-start disabled — launchd agent removed");
     expect(process.exitCode).toBeUndefined();
   });
@@ -2372,7 +2443,7 @@ describe("engram uninstall on macOS (engram#616)", () => {
       execFileSync.mockClear();
       await daemonUninstall();
       expect(existsSync(PLIST)).toBe(false);
-      expect(launchctlCalls()).toEqual(["bootout", "unload"]);
+      expect(launchctlCalls()).toEqual(["list", "bootout", "unload"]);
       expect(said()).toContain("Auto-start disabled");
     }
   });
@@ -2388,8 +2459,8 @@ describe("engram uninstall on macOS (engram#616)", () => {
 
   it("says so when there is no plist", async () => {
     await daemonUninstall();
-    expect(output()).toContain("Launchd agent not installed.");
-    expect(execFileSync).not.toHaveBeenCalled();
+    expect(output()).toBe("Auto-start isn't on.");
+    expect(launchctlCalls()).toEqual([]);
     expect(process.exitCode).toBeUndefined();
   });
 
@@ -2403,6 +2474,333 @@ describe("engram uninstall on macOS (engram#616)", () => {
     expect(text).toContain(`Remove ${PLIST} to turn start at login off.`);
     expect(text).not.toContain("Auto-start disabled");
     expect(process.exitCode).toBe(1);
+  });
+});
+
+describe("engram uninstall keeps the daemon running on macOS (engram#667)", () => {
+  /** The daemon launchd runs for the job. */
+  const RAN = 4242;
+  const REMOVED = "Auto-start disabled — launchd agent removed";
+  const KEEPS = "  The daemon keeps running until 'engram stop' or sign-out.";
+  const WAITING = "  Waiting for the daemon launchd ran to finish what it was sending...";
+
+  /** What went to stdout, and to stderr. */
+  const logged = () => vi.mocked(console.log).mock.calls.map((c) => c.join(" ")).join("\n");
+  const errors = () => vi.mocked(console.error).mock.calls.map((c) => c.join(" ")).join("\n");
+
+  /**
+   * What was started: each program and its arguments. Never the options
+   * spawn was given, whose environment is this process's: a failure would
+   * print the whole of it.
+   */
+  const started = () => spawn.mock.calls.map(([node, args]) => [node, args]);
+  /**
+   * This build's worker, as `engram start` starts it: the one beside
+   * launch.js, whose own workerPath the mock above doesn't replace.
+   */
+  const WORKER_STARTED = () => [process.execPath, [fileURLToPath(new URL("../daemon/worker.js", import.meta.url))]];
+
+  /** Let the clock run `step` ms each time it is read, while `run` runs: the waits below, without waiting. */
+  async function withClock(step: number, run: () => Promise<void>): Promise<void> {
+    let now = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => (now += step));
+    try {
+      await run();
+    } finally {
+      clock.mockRestore();
+    }
+  }
+
+  beforeEach(() => {
+    // launchd runs the daemon, which answers and wrote its PID file; it
+    // stops as launchd unloads the job.
+    writePlist(plistWith());
+    launchd.loaded = true;
+    launchd.pid = RAN;
+    launchd.stopsIn = 0;
+    madeUp.add(RAN);
+    mkdirSync(ENGRAM_DIR, { recursive: true });
+    writeFileSync(PID_FILE, String(RAN));
+    daemon.answering = { pid: RAN };
+  });
+
+  it("starts it again once the one launchd ran has exited, and says it keeps running", async () => {
+    launchd.stopsIn = 300;
+    const gone: boolean[] = [];
+    spawn.mockImplementation(() => {
+      // Not before: a worker started while that one still answers takes
+      // it for the daemon, and exits.
+      gone.push(!madeUp.has(RAN) && daemon.answering === null);
+      return fakeSpawn();
+    });
+    await daemonUninstall();
+    expect(gone).toEqual([true]);
+    expect(existsSync(PLIST)).toBe(false);
+    expect(launchd.loaded).toBe(false);
+    expect(launchctlCalls()).toEqual(["list", "bootout"]);
+    expect(said()).toBe(`${REMOVED}\n${KEEPS}`);
+    // This build's worker, detached, as `engram start` starts it; launchd runs none.
+    expect(started()).toEqual([WORKER_STARTED()]);
+    expect((spawn.mock.calls[0][2] as { detached: boolean }).detached).toBe(true);
+    expect(daemon.answering).toEqual({ pid: process.pid });
+    expect(launchd.pid).toBeNull();
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("starts it from ~/.engram's key, server and vault key, as launchd's read them, not this command's", async () => {
+    vi.stubEnv("ENGRAM_API_KEY", "eng_test_667_env");
+    vi.stubEnv("ENGRAM_BASE_URL", "http://127.0.0.1:9");
+    vi.stubEnv("ENGRAM_VAULT_KEY", "test-vault-key-667");
+    await daemonUninstall();
+    expect(started()).toEqual([WORKER_STARTED()]);
+    // Names only: a failure prints what it compares.
+    const { env } = spawn.mock.calls[0][2] as { env: NodeJS.ProcessEnv };
+    expect(["ENGRAM_API_KEY", "ENGRAM_BASE_URL", "ENGRAM_VAULT_KEY"].filter((name) => name in env)).toEqual([]);
+    // The rest of this command's environment, as `engram start` gives it;
+    // and this command's own, as it was.
+    expect(env.PATH).toBe(BIN);
+    expect(process.env.ENGRAM_API_KEY).toBe("eng_test_667_env");
+    expect(said()).toBe(`${REMOVED}\n${KEEPS}`);
+  });
+
+  it("says it waits, while the one launchd ran takes a while to finish", async () => {
+    launchd.stopsIn = 350;
+    await withClock(1_000, daemonUninstall);
+    expect(said()).toBe(`${REMOVED}\n${WAITING}\n${KEEPS}`);
+    expect(started()).toEqual([WORKER_STARTED()]);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("fails, and says to start it, when the one launchd ran hasn't finished", async () => {
+    launchd.stopsIn = Infinity;
+    await withClock(5_000, daemonUninstall);
+    expect(started()).toEqual([]);
+    expect(existsSync(PLIST)).toBe(false);
+    expect(logged()).toBe(`${REMOVED}\n${WAITING}`);
+    expect(errors()).toBe(
+      `The daemon launchd ran (pid ${RAN}) is stopping with its agent, and hasn't finished, so it wasn't started again.\n` +
+        "  Run 'engram start' in a moment to start it again.",
+    );
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("says at once that it keeps running when launchd won't unload the agent, which runs it on until sign-out", async () => {
+    launchd.bootoutFails = true;
+    launchd.unloadFails = true;
+    await withClock(5_000, daemonUninstall);
+    expect(launchctlCalls()).toEqual(["list", "bootout", "unload"]);
+    expect(launchd.loaded).toBe(true);
+    expect(launchd.pid).toBe(RAN);
+    // Gone all the same: launchd won't load it at the next login.
+    expect(existsSync(PLIST)).toBe(false);
+    expect(started()).toEqual([]);
+    expect(said()).toBe(`${REMOVED}\n${KEEPS}`);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("waits for it, and starts it again, when bootout gives up waiting for it to exit", async () => {
+    launchd.stopsIn = 300;
+    launchd.bootoutGivesUp = true;
+    await daemonUninstall();
+    // unload, after it, finds the job gone already.
+    expect(launchctlCalls()).toEqual(["list", "bootout", "unload"]);
+    expect(launchd.loaded).toBe(false);
+    expect(started()).toEqual([WORKER_STARTED()]);
+    expect(said()).toBe(`${REMOVED}\n${KEEPS}`);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("waits for it, and starts it again, when unload took the agent before the one launchd ran began to stop", async () => {
+    // A macOS whose launchctl has no bootout: the unload after it returns
+    // before the daemon has handled its SIGTERM, so it still answers as
+    // running, and is waited for all the same.
+    launchd.bootoutFails = true;
+    launchd.stopsIn = 300;
+    launchd.handlesStopIn = 100;
+    await daemonUninstall();
+    expect(launchctlCalls()).toEqual(["list", "bootout", "unload"]);
+    expect(launchd.loaded).toBe(false);
+    expect(started()).toEqual([WORKER_STARTED()]);
+    expect(said()).toBe(`${REMOVED}\n${KEEPS}`);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("waits for one bootout gave up on that doesn't answer, rather than take it for one launchd runs on", async () => {
+    launchd.stopsIn = 300;
+    launchd.bootoutGivesUp = true;
+    // Busy finishing what it was sending, until just before it exits.
+    daemon.silent = true;
+    timers.push(setTimeout(() => (daemon.silent = false), 250));
+    await daemonUninstall();
+    expect(started()).toEqual([WORKER_STARTED()]);
+    expect(said()).toBe(`${REMOVED}\n${KEEPS}`);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("says it keeps running when the one launchd ran still answers as running, not stopping, after the wait", async () => {
+    // launchd took the bootout, but it runs on.
+    launchd.stopsIn = null;
+    await withClock(5_000, daemonUninstall);
+    expect(launchctlCalls()).toEqual(["list", "bootout"]);
+    expect(started()).toEqual([]);
+    expect(said()).toBe(`${REMOVED}\n${WAITING}\n${KEEPS}`);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("says so when the one it started is still starting", async () => {
+    spawn.mockImplementation(() => {
+      writeFileSync(PID_FILE, String(process.pid));
+      daemon.answering = { pid: process.pid, ready: false };
+      return fakeChild();
+    });
+    await withClock(5_000, daemonUninstall);
+    expect(started()).toEqual([WORKER_STARTED()]);
+    expect(said()).toBe(`${REMOVED}\n${KEEPS}\n  It is still starting: check on it with 'engram status' in a minute.`);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("starts none when the daemon launchd lists has exited already", async () => {
+    madeUp.delete(RAN);
+    daemon.answering = null;
+    rmSync(PID_FILE);
+    await daemonUninstall();
+    expect(started()).toEqual([]);
+    expect(said()).toBe(REMOVED);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("starts none beside one that started meanwhile", async () => {
+    launchd.stopsIn = 300;
+    // `engram start`, from another terminal, as the one launchd ran stops.
+    timers.push(setTimeout(daemonRunning, 100));
+    await daemonUninstall();
+    expect(started()).toEqual([]);
+    expect(said()).toBe(`${REMOVED}\n${KEEPS}`);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  // Root's is another user's only for a user who isn't root, and Windows
+  // has no uid to tell them apart by.
+  const me = process.geteuid?.();
+  (me === undefined || me === 0 ? it.skip : it)(
+    "starts none, and says nothing keeps running, beside one running as root (engram#680)",
+    async () => {
+      // Run by the job a sudo install loaded into launchd's system domain
+      // from the user's plist, before engram#653.
+      launchd.rootWorkers = [7777];
+      launchd.system = { plist: PLIST, pid: 7777 };
+      await daemonUninstall();
+      expect(started()).toEqual([]);
+      expect(said()).toBe(REMOVED);
+      expect(process.exitCode).toBeUndefined();
+    },
+  );
+
+  it("fails, and says why, when the one it started didn't start", async () => {
+    spawn.mockImplementation(failingSpawn);
+    await daemonUninstall();
+    expect(started()).toEqual([WORKER_STARTED()]);
+    expect(logged()).toBe(REMOVED);
+    expect(errors()).toBe(
+      "The daemon launchd ran stopped with its agent, and couldn't be started again. Check the log:\n" +
+        `  cat "${LOG_FILE}"\n` +
+        "  Run 'engram start' to start it.",
+    );
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("says so, and how to see why, when the log it would write can't be written", async () => {
+    spawn.mockImplementation(failingSpawn);
+    unwritableLog();
+    await daemonUninstall();
+    expect(errors()).toMatch(
+      /^The daemon launchd ran stopped with its agent, and couldn't be started again, and its log can't be written \(.+\)\. To see why, run it here:\n  engram start --foreground\n  Run 'engram start' to start it\.$/,
+    );
+    expect(process.exitCode).toBe(1);
+  });
+
+  it.each([
+    ["files in ~/.engram that are another user's", { foreign: { dir: false, files: ["daemon.db"], root: true, stopsDaemon: true, holdsSends: false } }],
+    ["a ~/.engram the user's permissions keep them out of", { locked: { search: true, write: false, command: "chmod u+x ~/.engram" } }],
+  ] as const)("starts none, and fails, with %s, which would stop it at once", async (_, given) => {
+    Object.assign(owned, given);
+    await daemonUninstall();
+    expect(started()).toEqual([]);
+    expect(logged()).toBe(REMOVED);
+    expect(errors()).toBe(
+      "The daemon launchd ran stopped with its agent, and wasn't started again: one started now would stop at once.\n" +
+        "  Once that's fixed, run 'engram start' to start it.",
+    );
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("starts it with files in ~/.engram that are another user's but don't stop it", async () => {
+    // The vault key: the daemon runs, and holds what it would send (engram#695).
+    owned.foreign = { dir: false, files: ["vault-key"], root: true, stopsDaemon: false, holdsSends: true };
+    await daemonUninstall();
+    expect(started()).toEqual([WORKER_STARTED()]);
+    expect(said()).toBe(`${REMOVED}\n${KEEPS}`);
+  });
+
+  it("starts it again when the plist can't be removed, and fails", async () => {
+    // A directory in its place, which removing a file won't remove; launchd
+    // has unloaded the job, and its daemon has stopped, all the same.
+    rmSync(PLIST);
+    mkdirSync(join(PLIST, "x"), { recursive: true });
+    await daemonUninstall();
+    expect(existsSync(PLIST)).toBe(true);
+    expect(launchd.loaded).toBe(false);
+    expect(started()).toEqual([WORKER_STARTED()]);
+    expect(logged()).toBe(KEEPS);
+    expect(errors()).toBe(`Couldn't remove the launchd agent.\n  Remove ${PLIST} to turn start at login off.`);
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("leaves one launchd doesn't run as it is", async () => {
+    // Started outside launchd: by `engram start` with ENGRAM_BASE_URL set
+    // (engram#641), or by a CLI before it.
+    launchd.pid = null;
+    daemonRunning();
+    await daemonUninstall();
+    expect(started()).toEqual([]);
+    expect(launchctlCalls()).toEqual(["list", "bootout"]);
+    expect(said()).toBe(`${REMOVED}\n${KEEPS}`);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("says nothing keeps running when none runs", async () => {
+    launchd.pid = null;
+    daemonGone();
+    await daemonUninstall();
+    expect(started()).toEqual([]);
+    expect(said()).toBe(REMOVED);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("says the daemon keeps running with no plist, as on Linux and Windows", async () => {
+    rmSync(PLIST);
+    Object.assign(launchd, { loaded: false, pid: null });
+    daemonRunning();
+    await daemonUninstall();
+    expect(started()).toEqual([]);
+    expect(launchctlCalls()).toEqual([]);
+    expect(said()).toBe(`Auto-start isn't on.\n${KEEPS}`);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("says it keeps running for one that doesn't answer, and not for one that is stopping", async () => {
+    rmSync(PLIST);
+    Object.assign(launchd, { loaded: false, pid: null });
+    daemon.answering = null;
+    daemon.silent = true;
+    await daemonUninstall();
+    expect(said()).toBe(`Auto-start isn't on.\n${KEEPS}`);
+
+    daemon.silent = false;
+    daemon.answering = { pid: RAN, stopping: true };
+    await daemonUninstall();
+    expect(said()).toBe("Auto-start isn't on.");
+    expect(started()).toEqual([]);
   });
 });
 
@@ -2821,7 +3219,7 @@ describe("a ~/Library/LaunchAgents that isn't the user's (engram#678, engram#715
     permissionsIt("says nothing of it with no plist there", async () => {
       agentsOwnedBy();
       await daemonUninstall();
-      expect(output()).toBe("Launchd agent not installed.");
+      expect(output()).toBe("Auto-start isn't on.");
       expect(process.exitCode).toBeUndefined();
     });
   });
@@ -3205,7 +3603,7 @@ describe("a job switched off in launchd (engram#654)", () => {
       execFileSync.mockClear();
       await daemonUninstall();
       expect(existsSync(PLIST)).toBe(false);
-      expect(launchctlCalls()).toEqual(["bootout", "unload"]);
+      expect(launchctlCalls()).toEqual(["list", "bootout", "unload"]);
       expect(launchd.switchedOff).toBe(switchedOff);
       expect(said()).toContain("Auto-start disabled");
     }

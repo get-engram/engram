@@ -258,7 +258,7 @@ function fakeKill(pid: number, signal: string | number = "SIGTERM"): true {
 }
 
 function foreign(root: boolean): ForeignFiles {
-  return { dir: false, files: ["daemon.db"], root, stopsDaemon: true, stopsStart: false, holdsSends: false };
+  return { dir: false, files: ["daemon.db"], root, stopsDaemon: true, holdsSends: false };
 }
 
 beforeEach(() => {

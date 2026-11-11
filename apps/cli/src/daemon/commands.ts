@@ -1,5 +1,5 @@
 import { execFileSync, type ChildProcess } from "node:child_process";
-import { readFileSync, existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { readFileSync, existsSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, win32 } from "node:path";
 import { bold, dim, plural, red } from "../output.js";
@@ -32,6 +32,7 @@ import {
   ENGRAM_DIR,
   LOG_FILE,
   START_WAIT_MS,
+  logProblem,
   loginStartPath,
   prepareLogSync,
   spawnSupervisor,
@@ -214,7 +215,7 @@ function printAlreadyRunning(found: Extract<DaemonFound, { state: "running" | "u
   const pid = found.pid === null ? "" : ` (pid ${found.pid})`;
   if (found.state === "unresponsive") {
     console.log(`Daemon already running${pid}, but it isn't answering right now`);
-    console.log(dim(`  It may be busy, or still starting. Its log: ${LOG_FILE}`));
+    console.log(dim(`  It may be busy, or still starting.${itsLog()}`));
     return;
   }
   console.log(`Daemon already running${pid}`);
@@ -320,9 +321,9 @@ export async function daemonStart(
   }
 
   if (foreign) {
-    // A daemon started now would stop at once, or its log couldn't be
-    // opened: none is started. Not in the foreground either, which doesn't
-    // need the log: the fix is the same, and takes a moment.
+    // A daemon started now would stop at once: none is started. Not in the
+    // foreground either: the fix is the same, and takes a moment. A log
+    // that is another user's only costs the log (engram#679).
     const stops = stopsCapture(foreign);
     printForeignFiles(foreign, "stopped", stops ? "start" : undefined);
     if (stops) {
@@ -364,11 +365,12 @@ export async function daemonStart(
   if (managerFirst && platform === "darwin") await enableLaunchdStartAtLogin();
   if (managerFirst && platform === "linux") await enableSystemdStartAtLogin(true, false);
 
-  if (!reportStart(await startInBackground())) {
+  const started = await startInBackground();
+  if (!reportStart(started)) {
     process.exit(1);
     return;
   }
-  console.log(`${dim("Log:")} ${LOG_FILE}`);
+  printLog(true, started.state === "failed" ? null : started.pid);
   console.log(`${dim("DB:")}  ${DB_FILE}`);
 
   if ("install" in flags && !managerFirst) {
@@ -416,10 +418,18 @@ function outsideLaunchd(pid: number, switchedOn: boolean): boolean {
  * answers, which could start it.
  */
 function outsideSystemd(pid: number): boolean {
-  if (!systemdRunsThisCli()) return false;
-  const file = systemctlPath();
-  const unit = file === null ? null : unitPid(file, "MainPID");
+  const unit = systemdMainPid();
   return unit !== null && unit !== pid;
+}
+
+/**
+ * The PID of the daemon Engram's unit runs, 0 when it runs none, or null
+ * when systemd couldn't run this CLI's daemon, or doesn't answer.
+ */
+function systemdMainPid(): number | null {
+  if (!systemdRunsThisCli()) return null;
+  const file = systemctlPath();
+  return file === null ? null : unitPid(file, "MainPID");
 }
 
 /**
@@ -434,9 +444,65 @@ function printForeignFiles(foreign: ForeignFiles, daemon: "running" | "stopped",
   if (again) console.error(dim(`  Then run 'engram ${again}' again.`));
 }
 
-/** Whether they stop the daemon, or its start. */
+/** Whether they stop the daemon. */
 function stopsCapture(foreign: ForeignFiles | null): boolean {
-  return foreign !== null && (foreign.stopsDaemon || foreign.stopsStart);
+  return foreign !== null && foreign.stopsDaemon;
+}
+
+/**
+ * The Log line of `engram start` and `engram status`: where the daemon's
+ * log is, or that it can't be written, so the daemon runs without it
+ * (engram#679), and what fixes that. `running`: whether a daemon runs,
+ * and `pid`, its PID where that is known: systemd keeps what one it
+ * started writes in the journal.
+ */
+function printLog(running: boolean, pid: number | null = null): void {
+  const problem = logProblem();
+  if (problem === null) {
+    console.log(`${dim("Log:")} ${LOG_FILE}`);
+    return;
+  }
+  console.log(
+    `${dim("Log:")} ${LOG_FILE} can't be written (${problem}), so the daemon ${running ? "runs" : "will run"} without it.`,
+  );
+  if (pid !== null && systemdMainPid() === pid) {
+    console.log(dim("  systemd keeps its output in the journal: journalctl --user -u engram"));
+  }
+  const fix = logFix(problem);
+  if (fix !== null) console.log(dim(`  To fix it, run: ${fix}`));
+  // One that runs keeps the output it was started with.
+  if (running) {
+    console.log(dim("  Once it can be written, 'engram stop' and then 'engram start' have the daemon write to it again."));
+  }
+}
+
+/** " Its log: …", after a sentence; nothing while it can't be written (engram#679). */
+function itsLog(): string {
+  return logProblem() === null ? ` Its log: ${LOG_FILE}` : "";
+}
+
+/**
+ * `chmod u+w` for the log, or for ~/.engram when the log isn't there, when
+ * the user's own lacks its write permission and that is all that's wrong.
+ * Null otherwise: another user's is said with the rest that is theirs
+ * (engram#659), with its chown.
+ */
+function logFix(problem: string): string | null {
+  if (problem !== "EACCES" || process.platform === "win32") return null;
+  for (const [path, shown] of [
+    [LOG_FILE, "~/.engram/daemon.log"],
+    [ENGRAM_DIR, "~/.engram"],
+  ]) {
+    let st;
+    try {
+      st = statSync(path);
+    } catch {
+      continue; // not there: the folder it is made in is what matters
+    }
+    if (st.uid !== process.geteuid?.()) return null;
+    return (st.mode & 0o200) === 0 ? `chmod u+w ${shown}` : null;
+  }
+  return null;
 }
 
 /**
@@ -638,8 +704,15 @@ export async function waitForAgent(
 /** Say how a worker just spawned got on; false when it didn't start. */
 function reportStart(started: WorkerStart): boolean {
   if (started.state === "failed") {
-    console.error("Daemon failed to start. Check the log:");
-    console.error(`  ${process.platform === "win32" ? "type" : "cat"} "${LOG_FILE}"`);
+    const problem = logProblem();
+    if (problem === null) {
+      console.error("Daemon failed to start. Check the log:");
+      console.error(`  ${process.platform === "win32" ? "type" : "cat"} "${LOG_FILE}"`);
+    } else {
+      // It ran without one (engram#679), so what it said is gone.
+      console.error(`Daemon failed to start, and its log can't be written (${problem}). To see why, run it here:`);
+      console.error("  engram start --foreground");
+    }
     return false;
   }
   if (started.state === "running") {
@@ -851,7 +924,7 @@ export async function daemonStop(): Promise<void> {
   }
   if (found.pid === null) {
     console.error(red("The daemon isn't answering, and no process could be confirmed as it, so nothing was stopped."));
-    console.error(dim(`  It may be busy, or still starting: try again in a minute. Its log: ${LOG_FILE}`));
+    console.error(dim(`  It may be busy, or still starting: try again in a minute.${itsLog()}`));
     process.exitCode = 1;
     return;
   }
@@ -869,7 +942,7 @@ export async function daemonStop(): Promise<void> {
     }
     if (process.platform === "win32" && found.state === "unresponsive") {
       console.error(red(`The daemon (pid ${pid}) isn't answering right now, so it wasn't stopped.`));
-      console.error(dim(`  It may be busy, or still starting: try again in a minute. Its log: ${LOG_FILE}`));
+      console.error(dim(`  It may be busy, or still starting: try again in a minute.${itsLog()}`));
       process.exitCode = 1;
       return;
     }
@@ -1098,10 +1171,22 @@ export async function daemonStatus(): Promise<void> {
       // Not stopped by 'engram stop', which records autocapture "off", and
       // started at sign-in, so it stopped by itself (engram#613).
       console.log(dim("  It should be running: start at login is on. It may have stopped after an error."));
-      console.log(dim(`  The end of its log says why: ${LOG_FILE}`));
+      // Without its log (engram#679), what it said is in the journal on
+      // Linux, and gone on macOS.
+      const linux = process.platform === "linux";
+      console.log(
+        dim(
+          logProblem() === null
+            ? `  The end of its log says why: ${LOG_FILE}`
+            : linux
+              ? "  The end of its output says why: journalctl --user -u engram"
+              : "  Its log can't be written: 'engram start --foreground' shows why it stops.",
+        ),
+      );
       console.log(dim("  Run 'engram start' to start it again."));
     }
     if (startsAtLogin) await printLoginVaultKeyWarning();
+    if (logProblem() !== null) printLog(false);
     return;
   }
 
@@ -1140,7 +1225,9 @@ export async function daemonStatus(): Promise<void> {
   // Show sync health warnings
   printSyncWarnings(syncStatus, problem, key, keyMissing);
 
-  console.log(`${dim("Log:")} ${LOG_FILE}`);
+  // One running as root can write to it, and does.
+  if (found.state === "root") console.log(`${dim("Log:")} ${LOG_FILE}`);
+  else printLog(true, found.pid);
 
   if (printAutoStart(found) && !keyMissing) await printLoginVaultKeyWarning();
 }
@@ -1614,7 +1701,9 @@ function plistForThisCli(): { text: string } | { error: string } {
         node,
         // A CLI installed with brew runs from a versioned keg too (engram#652).
         worker: throughOptLink(workerPath()),
-        log: LOG_FILE,
+        // None while it can't be written: launchd would never start the
+        // daemon (engram#679).
+        log: logProblem() === null ? LOG_FILE : null,
         home: homedir(),
         // launchd hands a job a bare PATH (/usr/bin:/bin:/usr/sbin:/sbin) —
         // npm is not on it. The ABI self-heal in preflight.ts shells out to
@@ -2339,8 +2428,8 @@ export async function daemonInstall(): Promise<void> {
   if (managed) found = await whileStopping(found);
   const running = found.state === "running" || found.state === "unresponsive";
   // Files in ~/.engram that are another user's (engram#659). Unless one
-  // runs already, start at login would start a daemon that stops at once,
-  // or whose log can't be opened: it isn't turned on.
+  // runs already, start at login would start a daemon that stops at once:
+  // it isn't turned on.
   const foreign = foreignFiles();
   if (found.state === "root") {
     // The daemon start at login started would exit at once (engram#680).

@@ -94,7 +94,6 @@ describe("foreignFiles (engram#659)", () => {
       files: [name],
       root: true,
       stopsDaemon: true,
-      stopsStart: false,
       holdsSends: false,
     });
     // SQLite opens it to write, too.
@@ -114,12 +113,12 @@ describe("foreignFiles (engram#659)", () => {
 
   it("finds an unreadable config.json stops the daemon, even with ENGRAM_API_KEY set (engram#673)", () => {
     const found = check({ ".": mine, "config.json": roots }, { env: { ENGRAM_API_KEY: "egm_test" } });
-    expect(found).toMatchObject({ files: ["config.json"], stopsDaemon: true, stopsStart: false });
+    expect(found).toMatchObject({ files: ["config.json"], stopsDaemon: true });
   });
 
   it("finds a config.json it can read but not update a warning", () => {
     const found = check({ ".": mine, "config.json": rootsReadable });
-    expect(found).toMatchObject({ files: ["config.json"], stopsDaemon: false, stopsStart: false });
+    expect(found).toMatchObject({ files: ["config.json"], stopsDaemon: false });
     expect(foreignFilesProblem(found!)).toBe(
       "config.json in ~/.engram belongs to root, not to you, so Engram can't update it.",
     );
@@ -132,7 +131,6 @@ describe("foreignFiles (engram#659)", () => {
       files: ["vault-key"],
       root: true,
       stopsDaemon: false,
-      stopsStart: false,
       holdsSends: true,
     });
     // Whether the daemon runs or not: one that runs captures, and sends
@@ -157,7 +155,6 @@ describe("foreignFiles (engram#659)", () => {
       files: ["vault-key"],
       root: true,
       stopsDaemon: false,
-      stopsStart: false,
       holdsSends: false,
     });
     const readable = check({ ".": mine, "vault-key": rootsReadable });
@@ -184,15 +181,29 @@ describe("foreignFiles (engram#659)", () => {
     expect(foreignFilesFix(many!)).toBe(`Make them yours with: ${OWNERSHIP_FIX}`);
   });
 
-  it("finds an unwritable daemon.log stops a start in the background, not the daemon", () => {
+  it("finds an unwritable daemon.log a warning: the daemon runs without its log (engram#679)", () => {
     const found = check({ ".": mine, "daemon.log": rootsReadable });
-    expect(found).toMatchObject({ files: ["daemon.log"], stopsDaemon: false, stopsStart: true });
-    expect(foreignFilesProblem(found!)).toBe("daemon.log in ~/.engram belongs to root, not to you, so the daemon can't start.");
+    expect(found).toEqual({ dir: false, files: ["daemon.log"], root: true, stopsDaemon: false, holdsSends: false });
+    expect(foreignFilesProblem(found!)).toBe("daemon.log in ~/.engram belongs to root, not to you, so the daemon can't write its log.");
+    expect(foreignFilesFix(found!)).toBe(`Make it yours with: ${OWNERSHIP_FIX}`);
+    // With another that only warns, said the way that one is.
+    const more = check({ ".": mine, "daemon.log": roots, "status.json": roots });
+    expect(foreignFilesProblem(more!)).toBe(
+      "daemon.log and status.json in ~/.engram belong to root, not to you, so Engram can't update them.",
+    );
+    // With what holds sends, the hold is said.
+    const held = check({ ".": mine, "vault-key": roots, "daemon.log": roots });
+    expect(foreignFilesProblem(held!)).toBe(
+      "vault-key and daemon.log in ~/.engram belong to root, not to you. Until they are yours, captured " +
+        "messages wait on this machine: nothing is lost.",
+    );
+    // Root's, and one it can write: not counted.
+    expect(check({ ".": mine, "daemon.log": { uid: ROOT } })).toBeNull();
   });
 
   it("finds status.json and daemon.pid it can't update warnings", () => {
     const found = check({ ".": mine, "status.json": rootsReadable, "daemon.pid": roots });
-    expect(found).toMatchObject({ files: ["status.json", "daemon.pid"], stopsDaemon: false, stopsStart: false });
+    expect(found).toMatchObject({ files: ["status.json", "daemon.pid"], stopsDaemon: false });
     expect(foreignFilesProblem(found!)).toBe(
       "status.json and daemon.pid in ~/.engram belong to root, not to you, so Engram can't update them.",
     );
@@ -206,7 +217,6 @@ describe("foreignFiles (engram#659)", () => {
       files: ["daemon.sock"],
       root: false,
       stopsDaemon: true,
-      stopsStart: false,
       holdsSends: false,
     });
     expect(foreignFilesProblem(found!, "stopped")).toBe(
@@ -216,7 +226,7 @@ describe("foreignFiles (engram#659)", () => {
 
   it("finds ~/.engram itself, when it is root's and closed to the user", () => {
     const found = check({ ".": roots, "daemon.db": mine });
-    expect(found).toEqual({ dir: true, files: [], root: true, stopsDaemon: true, stopsStart: false, holdsSends: false });
+    expect(found).toEqual({ dir: true, files: [], root: true, stopsDaemon: true, holdsSends: false });
     expect(foreignFilesProblem(found!)).toBe("~/.engram belongs to root, not to you, so the daemon can't start.");
     expect(foreignFilesFix(found!)).toBe(`Make it yours with: ${OWNERSHIP_FIX}`);
     // Open to the user, it is only a folder: what is in it is looked at.
@@ -235,7 +245,7 @@ describe("foreignFiles (engram#659)", () => {
   it("names them in order, and no more than four", () => {
     const every = check(Object.fromEntries([[".", mine], ...ALL.map((name) => [name, roots])]));
     expect(every?.files).toEqual(ALL);
-    expect(every).toMatchObject({ root: true, stopsDaemon: true, stopsStart: true, holdsSends: true });
+    expect(every).toMatchObject({ root: true, stopsDaemon: true, holdsSends: true });
     expect(foreignFilesProblem(every!, "running")).toBe(
       "daemon.db, daemon.db-wal, daemon.db-shm and 6 more in ~/.engram belong to root, not to you, " +
         "so the daemon can't start again once it stops.",
@@ -253,19 +263,16 @@ describe("foreignFiles (engram#659)", () => {
     // Started before they were root's: it captures until it stops.
     expect(foreignFilesProblem(db!, "running")).toBe(`${IS} the daemon can't start again once it stops.`);
     expect(foreignFilesProblem(db!)).toBe(`${IS} the daemon can't start.`);
-    // daemon.log stops a start, so it is said the same way.
-    const log = check({ ".": mine, "daemon.log": roots });
-    expect(foreignFilesProblem(log!, "stopped")).toBe(
-      "daemon.log in ~/.engram belongs to root, not to you, so the daemon can't start, and nothing new is captured.",
-    );
-    expect(foreignFilesProblem(log!, "running")).toBe(
-      "daemon.log in ~/.engram belongs to root, not to you, so the daemon can't start again once it stops.",
-    );
-    // What only warns doesn't depend on it.
+    // What only warns doesn't depend on it: daemon.log among them, which
+    // used to stop a start (engram#679).
     const status = check({ ".": mine, "status.json": roots });
+    const log = check({ ".": mine, "daemon.log": roots });
     for (const daemon of ["running", "stopped", undefined] as const) {
       expect(foreignFilesProblem(status!, daemon)).toBe(
         "status.json in ~/.engram belongs to root, not to you, so Engram can't update it.",
+      );
+      expect(foreignFilesProblem(log!, daemon)).toBe(
+        "daemon.log in ~/.engram belongs to root, not to you, so the daemon can't write its log.",
       );
     }
   });

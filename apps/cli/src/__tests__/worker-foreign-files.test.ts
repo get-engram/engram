@@ -111,7 +111,6 @@ describe("a daemon that finds files in ~/.engram it can't run with (engram#659)"
       files: ["daemon.db"],
       root: true,
       stopsDaemon: true,
-      stopsStart: false,
       holdsSends: false,
     };
     const { exit, log } = await runWorker();
@@ -142,7 +141,6 @@ describe("a daemon that finds files in ~/.engram it can't run with (engram#659)"
       files: ["daemon.sock"],
       root: false,
       stopsDaemon: true,
-      stopsStart: false,
       holdsSends: false,
     };
     const { exit, log } = await runWorker();
@@ -160,7 +158,6 @@ describe("a daemon that finds files in ~/.engram it can't run with (engram#659)"
       files: ["daemon.log", "status.json"],
       root: true,
       stopsDaemon: false,
-      stopsStart: true,
       holdsSends: false,
     };
     const { exit, log } = await runWorker();
@@ -169,8 +166,8 @@ describe("a daemon that finds files in ~/.engram it can't run with (engram#659)"
     expect(exit.mock.calls[0]).toEqual([START_FAILED_EXIT]);
     expect(log()).toContain("fatal: no queue in this test");
     expect(log()).toContain(
-      "warning: daemon.log and status.json in ~/.engram belong to root, not to you, so the daemon can't start again " +
-        `once it stops. Make them yours with: ${OWNERSHIP_FIX}\n`,
+      "warning: daemon.log and status.json in ~/.engram belong to root, not to you, so Engram can't update them. " +
+        `Make them yours with: ${OWNERSHIP_FIX}\n`,
     );
     expect(log()).toContain("daemon started");
     expect(shown.calls).toEqual([]);

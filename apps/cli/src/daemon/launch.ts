@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { closeSync, openSync } from "node:fs";
+import { accessSync, closeSync, constants, openSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createPrivateFileSync, ensurePrivateDirSync, PRIVATE_FILE_MODE, restrictSync } from "../private-files.js";
 
@@ -71,6 +71,36 @@ export function prepareLogSync(): void {
   restrictSync(LOG_FILE);
 }
 
+/**
+ * Why the daemon's log can't be written, as an error code ("EACCES"), or
+ * null when it can: it is there and opens for writing, or it isn't there
+ * and the nearest folder there is lets it be made. Never makes anything.
+ *
+ * Without its log the daemon still captures (engram#679): `engram start`
+ * runs it with its output dropped, the systemd unit with its output in the
+ * journal, and the launchd job without a log. launchd won't start a job
+ * whose log it can't open: it never runs it at all. Non-blocking, so a
+ * FIFO left in its place is never waited on.
+ */
+export function logProblem(file = LOG_FILE): string | null {
+  try {
+    closeSync(openSync(file, constants.O_WRONLY | constants.O_APPEND | (constants.O_NONBLOCK ?? 0)));
+    return null;
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") return code ?? "EIO";
+  }
+  for (let dir = dirname(file); ; dir = dirname(dir)) {
+    try {
+      accessSync(dir, constants.W_OK | constants.X_OK);
+      return null;
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" || dirname(dir) === dir) return code ?? "EIO";
+    }
+  }
+}
+
 /** Start the worker detached, logging to LOG_FILE. */
 export function spawnWorker(): ChildProcess {
   return spawnDetached(workerPath());
@@ -88,24 +118,43 @@ export function spawnSupervisor(reportUntil?: number): ChildProcess {
 }
 
 /**
- * Run `script` with this Node, detached, logging to LOG_FILE. windowsHide:
- * on Windows a detached child otherwise gets a console window of its own,
- * and closing that window ends the daemon.
+ * Run `script` with this Node, detached, logging to LOG_FILE, or with its
+ * output dropped when the log can't be opened (engram#679). windowsHide: on
+ * Windows a detached child otherwise gets a console window of its own, and
+ * closing that window ends the daemon.
  */
 function spawnDetached(script: string, args: string[] = []): ChildProcess {
-  prepareLogSync();
-  const logFd = openSync(LOG_FILE, "a", PRIVATE_FILE_MODE);
+  const logFd = openLogSync();
   try {
     const child = spawn(process.execPath, [script, ...args], {
       detached: true,
       windowsHide: true,
-      stdio: ["ignore", logFd, logFd],
+      stdio: logFd === null ? "ignore" : ["ignore", logFd, logFd],
       env: { ...process.env },
     });
     child.unref();
     return child;
   } finally {
     // The child has its own handle on the log from here on.
-    closeSync(logFd);
+    if (logFd !== null) closeSync(logFd);
+  }
+}
+
+/**
+ * The log, opened to append the daemon's output to; null when it can't be:
+ * another user's, as one a `sudo engram start` before 0.7.0 left, or one
+ * made read-only (engram#679). The daemon doesn't need its log to capture,
+ * and used to be refused a start without it. ~/.engram is made all the
+ * same, and an error there still stops the start: nothing runs without it.
+ * A log that is there is set to 0600 (engram#627); the open makes a missing
+ * one 0600.
+ */
+function openLogSync(): number | null {
+  ensurePrivateDirSync(ENGRAM_DIR);
+  try {
+    restrictSync(LOG_FILE);
+    return openSync(LOG_FILE, "a", PRIVATE_FILE_MODE);
+  } catch {
+    return null;
   }
 }

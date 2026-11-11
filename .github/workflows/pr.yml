@@ -98,7 +98,8 @@ jobs:
       # engram#653, really running as root (engram#680): status, start, stop,
       # install and the banner say so and how to stop it, no daemon of the
       # user's starts beside it, the worker won't run as root, and the
-      # commands they're given work.
+      # commands they're given work. A daemon.log it left root's costs only
+      # the log (engram#679): the user's own daemon runs without it.
       - name: Daemon left running as root test
         working-directory: apps/cli
         run: ENGRAM_E2E_ROOT=1 node scripts/e2e-root-daemon.mjs

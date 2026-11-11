@@ -30,6 +30,13 @@
  *     launchd start the daemon too (engram#691): a job launchd has loaded
  *     isn't loaded again, which is what starts one at login. Installed
  *     again, it starts no other.
+ *   - A daemon.log the user can't write costs only the log (engram#679).
+ *     launchd never starts the daemon of a plist that names it: xpcproxy
+ *     exits 78 (EX_CONFIG), and kickstart exits 0 all the same. `engram
+ *     start` writes a plist without a log, which launchd runs, and says the
+ *     daemon runs without its log, as `engram status` does; the log is left
+ *     as it was. Once it can be written, that plist is outdated, and a stop
+ *     and a start put the log back, and the daemon writes to it.
  *   - A plist and a worker marked as downloaded (com.apple.quarantine) load
  *     and run all the same.
  *   - The plist an older CLI wrote, naming worker-main.js, is outdated:
@@ -400,6 +407,102 @@ function diagnostics() {
   console.log(`\n── daemon.log, last 40 lines ──\n${logText().split("\n").slice(-40).join("\n")}`);
 }
 
+/** What start and status say while the log can't be written (engram#679). */
+const WITHOUT_LOG = `Log: ${LOG_FILE} can't be written (EACCES), so the daemon runs without it.`;
+
+/**
+ * A daemon.log the user can't write costs only the log (engram#679). Run
+ * with the job loaded from `installed`, the plist install writes, and no
+ * daemon running; it leaves them so.
+ */
+async function withoutItsLog(installed) {
+  const before = logText();
+  chmodSync(LOG_FILE, 0o400);
+
+  // What the plist without a log is for: launchd never starts the daemon of
+  // a plist naming one it can't open, and tries again every 10 s.
+  const runsBefore = job()?.runs ?? 0;
+  const kick = launchctl("kickstart", SERVICE);
+  await sleep(3_000);
+  const refused = job();
+  check(
+    kick.status === 0 &&
+      refused !== null &&
+      refused.state !== "running" &&
+      refused.runs > runsBefore &&
+      refused.lastExit?.startsWith("78") === true &&
+      ourWorkers().length === 0,
+    `the log read-only, launchd never starts the daemon of a plist naming it (kickstart exit ${kick.status}; ` +
+      `state ${refused?.state}, runs ${runsBefore} → ${refused?.runs}, last exit code ${refused?.lastExit})`,
+  );
+
+  const start = engram(["start"], { env: launchdEnv });
+  check(start.status === 0, "start, the log read-only: exits 0");
+  check(start.out.includes("Updated auto-start configuration (plist v2)"), "start: rewrites the plist launchd can't run");
+  const read = plistAsJson();
+  check(
+    read !== null &&
+      !("StandardOutPath" in read) &&
+      !("StandardErrorPath" in read) &&
+      isDeepStrictEqual(read.ProgramArguments, [NODE, WORKER]),
+    "plutil: the plist names no log, and this Node and worker",
+  );
+  const pid = startedPid(start.out);
+  const running = job();
+  check(
+    pid !== null && running?.state === "running" && running.pid === pid && isOurWorker(pid),
+    `start: launchd runs the daemon without the log (pid ${pid}; launchd's ${running?.pid}, ${running?.state})`,
+  );
+  check(
+    running !== null && running.stdout !== LOG_FILE && running.stderr !== LOG_FILE,
+    `launchctl print: no log (${running?.stdout}, ${running?.stderr})`,
+  );
+  check(
+    start.out.includes(`${WITHOUT_LOG}\n  To fix it, run: chmod u+w ~/.engram/daemon.log`),
+    "start: says the daemon runs without its log, and what fixes it",
+  );
+  if (pid !== null && isOurWorker(pid)) {
+    const status = await statusRunning(pid, "the log read-only");
+    check(
+      autoStartLine(status.out) === "Auto-start: enabled (launchd)",
+      `status: start at login is on, nothing broken or outdated (${autoStartLine(status.out)})`,
+    );
+    check(status.out.includes(WITHOUT_LOG), "status: says the daemon runs without its log");
+  }
+  check(modeOf(LOG_FILE) === "400" && logText() === before, `daemon.log is as it was (${modeOf(LOG_FILE)}), nothing added`);
+
+  // Put right: the plist without the log is outdated, and a stop and a
+  // start put the log back.
+  chmodSync(LOG_FILE, 0o600);
+  const fixed = engram(["status"], { env: launchdEnv });
+  check(
+    autoStartLine(fixed.out)?.includes("outdated config, run 'engram install' to update") === true,
+    `status, the log writable again: the plist without it is outdated (${autoStartLine(fixed.out)})`,
+  );
+  const stop = engram(["stop"]);
+  check(stop.out.includes(`Daemon stopped (pid ${pid})`), `stop: stops the daemon (pid ${pid})`);
+  await waitFor("stop: no daemon runs", () => ourWorkers().length === 0);
+  const again = engram(["start"], { env: launchdEnv });
+  check(again.status === 0, "start, the log writable again: exits 0");
+  check(again.out.includes("Updated auto-start configuration (plist v2)"), "start: says it rewrote the plist");
+  check(plistText() === installed, "start: the plist is the one install writes, the log back in it");
+  const againPid = startedPid(again.out);
+  const againJob = job();
+  check(
+    againPid !== null && againJob?.state === "running" && againJob.pid === againPid && againJob.stdout === LOG_FILE,
+    `start: launchd runs the daemon with its log (pid ${againPid}; launchd's ${againJob?.pid}, log ${againJob?.stdout})`,
+  );
+  check(
+    again.out.includes(`Log: ${LOG_FILE}\n`) && !again.out.includes("can't be written"),
+    "start: names the log, and nothing more of it",
+  );
+  if (againPid !== null) {
+    await waitFor(`daemon.log: the daemon started (pid ${againPid})`, () => logText().includes(`daemon started (pid ${againPid})`));
+  }
+  engram(["stop"]);
+  await waitFor("stop: no daemon runs", () => ourWorkers().length === 0);
+}
+
 async function run() {
   // ── engram install ─────────────────────────────────────────────────────────
   const install = engram(["install"]);
@@ -614,6 +717,9 @@ async function run() {
   }
   engram(["stop"]);
   await waitFor("stop: no daemon runs", () => ourWorkers().length === 0);
+
+  // ── A log that can't be written: launchd runs the daemon without it ────────
+  await withoutItsLog(INSTALLED);
 
   // ── Marked as downloaded: launchd loads and runs it all the same ────────────
   bootout();

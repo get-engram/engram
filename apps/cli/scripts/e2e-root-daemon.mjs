@@ -23,6 +23,12 @@
  *     stop name it from the process list, with the command that stops it.
  *   - Once the files are the user's again, with the command status gave,
  *     nothing is said of them, and the user's own daemon starts and stops.
+ *   - daemon.log root's, as `sudo engram start` before 0.7.0 left one it
+ *     made (engram#679): `engram start` starts the user's own daemon
+ *     without it, and start and status say whose it is and how to make it
+ *     the user's, and nothing of the daemon not starting. The log is left
+ *     as it was. Made the user's with the command status gave, a stop and a
+ *     start have the daemon write to it again.
  *   - macOS: a job loaded into launchd's system domain from the user's own
  *     plist, as `sudo engram install` did, running the stand-in, its PID
  *     file gone: status names it and says to unload the job; start, stop
@@ -258,6 +264,9 @@ const FILE_STATUS = "status.json in ~/.engram belongs to root, not to you, so En
 const CHOWN = `yours with: sudo chown -R "$(id -un)" ~/.engram`;
 const STARTED = /(?:Engram daemon started|Engram daemon is starting) \(pid (\d+)\)/;
 const AS_YOU = "Engram runs as you, and this is running as root.";
+const LOG_ROOTS = "daemon.log in ~/.engram belongs to root, not to you, so the daemon can't write its log.";
+const WITHOUT_LOG = (runs) => `Log: ${LOG_FILE} can't be written (EACCES), so the daemon ${runs} without it.`;
+const LOG_AGAIN = "Once it can be written, 'engram stop' and then 'engram start' have the daemon write to it again.";
 const DAEMON_AS_YOU = "Engram's daemon runs as you, and this is running as root.";
 const PER_USER = "Start at login is per user, and this is running as root.";
 const RUN_AS_YOU = (command) => `Run 'engram ${command}' as yourself, without sudo.`;
@@ -649,6 +658,75 @@ async function filesMadeTheirs(status) {
   await waitFor("no daemon of this build runs", () => ourWorkers().length === 0);
 }
 
+/**
+ * daemon.log root's, as `sudo engram start` before 0.7.0 left one it made
+ * (engram#679): 0.6.1 opened it with "a", so 0644. That costs only the
+ * log: the user's own daemon starts, and runs without it.
+ */
+async function logMadeRoots() {
+  console.log("\n── daemon.log root's, as sudo engram start before 0.7.0 left one it made (engram#679) ──");
+  const notTheirs = readdirSync(ENGRAM_DIR).filter((name) => ownerOf(join(ENGRAM_DIR, name)) !== UID);
+  if (!check(notTheirs.length === 0, `everything in ~/.engram is the user's to start with (${snapshot()})`)) return;
+  const made = sudo(CHOWN_BIN, "0", LOG_FILE).status === 0 && sudo("/bin/chmod", "644", LOG_FILE).status === 0;
+  if (!check(made && ownerOf(LOG_FILE) === 0, "daemon.log was made root's, 0644")) return;
+  const before = logText();
+
+  const stopped = engram(["status"]);
+  ranThrough(stopped);
+  says(
+    stopped,
+    "status, stopped: the log is root's, how to make it the user's, and that the daemon will run without it",
+    "Status: stopped",
+    LOG_ROOTS,
+    `Make it ${CHOWN}`,
+    WITHOUT_LOG("will run"),
+  );
+  saysNot(stopped, "status, stopped: nothing of the daemon not starting", "can't start", "Then run: engram start", "To fix it, run:");
+
+  const start = engram(["start"]);
+  const P = Number(STARTED.exec(start.out)?.[1]) || null;
+  if (!check(start.status === 0 && P !== null, "start starts the user's own daemon, its log root's")) return;
+  says(
+    start,
+    "start: the log is root's, how to make it the user's, and that the daemon runs without it",
+    LOG_ROOTS,
+    `Make it ${CHOWN}`,
+    WITHOUT_LOG("runs"),
+    LOG_AGAIN,
+  );
+  saysNot(start, "start: nothing of the daemon not starting", "can't start", "Then run 'engram start' again", "To fix it, run:");
+  await waitFor("it runs as the user, and holds its socket", () => ourWorkers().some((w) => w.pid === P && w.uid === UID) && isSocket());
+  const running = engram(["status"]);
+  says(
+    running,
+    "status, running: it runs without the log, which is root's, and how to make it the user's",
+    `Status: running (pid ${P})`,
+    LOG_ROOTS,
+    `Make it ${CHOWN}`,
+    WITHOUT_LOG("runs"),
+    LOG_AGAIN,
+  );
+  check(ownerOf(LOG_FILE) === 0 && logText() === before, "daemon.log is root's still, and nothing was added to it");
+
+  runAsTold(running, "yours with: ", "status's command");
+  check(ownerOf(LOG_FILE) === UID, "daemon.log is the user's");
+  const stop = engram(["stop"]);
+  check(stop.status === 0, "stop exits 0");
+  says(stop, "stop stops it", `Daemon stopped (pid ${P})`);
+  await waitFor("no daemon of this build runs", () => ourWorkers().length === 0);
+  const again = engram(["start"]);
+  const Q = Number(STARTED.exec(again.out)?.[1]) || null;
+  if (!check(again.status === 0 && Q !== null, "start starts it again")) return;
+  says(again, "start names the log", `Log: ${LOG_FILE}`);
+  saysNot(again, "start: nothing of root, or of a log it can't write", "belongs to root", "can't be written");
+  await waitFor(`it writes to its log again (pid ${Q})`, () => logText().includes(`daemon started (pid ${Q})`));
+  const mode = (lstatSync(LOG_FILE).mode & 0o777).toString(8);
+  check(mode === "600", `daemon.log is 0600 again (${mode})`);
+  const last = engram(["stop"]);
+  says(last, "stop stops it", `Daemon stopped (pid ${Q})`);
+  await waitFor("no daemon of this build runs", () => ourWorkers().length === 0);
+}
+
 /** macOS: the job `sudo engram install` loaded into the system domain, running the stand-in. */
 async function systemJobRunsStandIn() {
   console.log("\n── macOS: a job sudo engram install loaded into launchd's system domain, running a daemon from before engram#653 ──");
@@ -800,7 +878,10 @@ async function run() {
   if (tied === null) return;
   await stoppedAsTold(tied.status, tied.N);
   const after = await pidFileRemoved();
-  if (after !== null) await filesMadeTheirs(after);
+  if (after !== null) {
+    await filesMadeTheirs(after);
+    await logMadeRoots();
+  }
   if (MAC) {
     await systemJobRunsStandIn();
     await systemJobRunsWorker();

@@ -43,7 +43,10 @@ vi.mock("node:child_process", async (importOriginal) => {
     fake.unexpected.push(`${file} ${args.join(" ")}`);
     throw new Error(`unexpected: ${file} ${args.join(" ")}`);
   });
-  return { ...(await importOriginal<typeof import("node:child_process")>()), execFileSync };
+  return (await import("./helpers/child-process.js")).recordingNoEnvValues({
+    ...(await importOriginal<typeof import("node:child_process")>()),
+    execFileSync,
+  });
 });
 
 const POSIX = process.platform !== "win32";

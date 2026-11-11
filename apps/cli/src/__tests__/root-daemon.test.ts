@@ -74,7 +74,10 @@ vi.mock("node:child_process", async (importOriginal) => {
     fake.unexpected.push(`${file} ${command}`);
     throw new Error(`unexpected: ${file} ${command}`);
   });
-  return { ...(await importOriginal<typeof import("node:child_process")>()), execFileSync };
+  return (await import("./helpers/child-process.js")).recordingNoEnvValues({
+    ...(await importOriginal<typeof import("node:child_process")>()),
+    execFileSync,
+  });
 });
 
 // /proc, as Linux has it, for the made-up processes; every other path is the real one.

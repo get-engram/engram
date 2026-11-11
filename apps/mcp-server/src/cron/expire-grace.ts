@@ -32,7 +32,7 @@ export async function expireGracePeriods(env: Env): Promise<number> {
       "UPDATE organizations SET tier = 'free', grace_ends_at = NULL WHERE id = ?"
     ).bind(org.id).run();
 
-    console.log(`[grace] Expired grace for ${org.email ?? org.id}, downgraded to free`);
+    console.log(`[grace] Expired grace for org ${org.id}, downgraded to free`);
 
     // Send payment reminder email via the website API
     if (org.email && env.APP_URL && bearer) {
@@ -50,7 +50,7 @@ export async function expireGracePeriods(env: Env): Promise<number> {
           }),
         });
       } catch (err) {
-        console.error(`[grace] Failed to send reminder to ${org.email}:`, err);
+        console.error(`[grace] Failed to send the payment reminder for org ${org.id}:`, err);
       }
     }
 

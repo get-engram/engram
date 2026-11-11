@@ -87,7 +87,7 @@ export async function sendActivationNudges(env: Env): Promise<number> {
         sent++;
       }
     } catch (err) {
-      console.error(`[activation-nudge] Failed for ${org.email}:`, err);
+      console.error(`[activation-nudge] Failed for org ${org.id}:`, err);
     }
   }
   return sent;

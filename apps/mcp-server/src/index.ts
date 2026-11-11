@@ -64,12 +64,15 @@ const app = new Hono<HonoEnv>();
 // including the responses onError and bodyLimit produce.
 app.use("*", securityHeaders);
 
-// Global request body cap. The append schemas bound per-message content, but
-// this is the transport-level backstop against a multi-megabyte payload
-// (compressed bombs, giant metadata, oversized vault blobs) reaching a handler
-// at all. 8 MB is comfortably above the largest legitimate append batch
-// (200 messages x 100k chars is the schema ceiling, but real batches are tiny)
-// while bounding worst-case memory in the 128 MB isolate.
+// Global request body cap: the transport-level backstop against a
+// multi-megabyte payload (compressed bombs, giant metadata, oversized vault
+// blobs) reaching a handler at all, bounding worst-case memory in the 128 MB
+// isolate. The append schemas bound how many messages a request carries, not
+// how long each one is: a body is clipped to MAX_MESSAGE_CONTENT_CHARS only
+// after the request is parsed. So a full batch of long messages can exceed this
+// cap (200 x 100k characters is over 20 MB), and clients batch by size: the CLI
+// keeps each request to at most 2 MB of content and halves a batch this refuses
+// (engram#750).
 app.use("*", bodyLimit({ maxSize: 8 * 1024 * 1024 }));
 
 // Global error handler — catches any uncaught exception and returns a

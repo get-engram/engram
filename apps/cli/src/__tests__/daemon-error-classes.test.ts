@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { AuthenticationError, EngramError, NotFoundError, TimeoutError } from "@getengram/sdk";
-import { classifyError, isNotFound } from "../daemon/status.js";
+import { classifyError, isNotFound, syncErrorSummary } from "../daemon/status.js";
 
 // engram#587: the daemon read every failure by searching the error's text
 // for "401", "429", "rate"…, and the SDK's errors don't read like that.
@@ -58,6 +58,13 @@ describe("classifyError reads the error's structure first", () => {
     );
   });
 
+  it("a full memory is storage_full, even in text that also reads as a refusal for size", () => {
+    // Waiting, or sending in halves, can never clear a full memory: it needs
+    // the user. So it wins over a 413's words wherever a text has both.
+    expect(classifyError("413 storage_full")).toBe("storage_full");
+    expect(classifyError("Payload Too Large: storage_full")).toBe("storage_full");
+  });
+
   it("a maintenance pause is paused, its own kind (engram#596)", () => {
     // It passes on its own and holds the whole account, unlike an error on
     // the server's side, which holds one conversation.
@@ -78,6 +85,51 @@ describe("classifyError reads the error's structure first", () => {
   it("a 5xx is server", () => {
     expect(classifyError(httpError(500))).toBe("server");
     expect(classifyError(httpError(503))).toBe("server");
+  });
+
+  it("a request refused as too large is too_large, however the refusal arrives (engram#750)", () => {
+    // Engram's own limit answers in plain text, not JSON-RPC, so the SDK
+    // throws "Unexpected response format" with no status. Before: a network
+    // error, and the same oversized batch was sent again forever.
+    expect(classifyError(new EngramError("Unexpected response format: Payload Too Large"))).toBe("too_large");
+    // A proxy in front of Engram answers with its own page.
+    expect(
+      classifyError(
+        new EngramError(
+          "Unexpected response format: <html>\r\n<head><title>413 Request Entity Too Large</title></head>",
+        ),
+      ),
+    ).toBe("too_large");
+    // RFC 9110's name for it, and the status when an error carries one.
+    expect(classifyError("413 Content Too Large")).toBe("too_large");
+    expect(classifyError(httpError(413))).toBe("too_large");
+    // Each way of saying it counts alone: a page may give the reason
+    // without the number, or the number without the reason.
+    expect(classifyError(new EngramError("Unexpected response format: Request Entity Too Large"))).toBe(
+      "too_large",
+    );
+    expect(classifyError(new EngramError("Unexpected response format: Content Too Large"))).toBe("too_large");
+    expect(classifyError(new Error("Request failed with status 413"))).toBe("too_large");
+  });
+
+  it("a number that only contains 413 is not a refusal for size", () => {
+    expect(classifyError(new Error("fetch failed after 4130 ms"))).toBe("network");
+    expect(classifyError(new Error("connection reset (code 14135)"))).toBe("network");
+  });
+
+  it("a 413 inside a JSON body is data, not a refusal for size", () => {
+    expect(classifyError(refusal({ error: "something_new", used: 413 }))).toBe("network");
+    expect(classifyError(refusal({ error: { code: 413 } }))).toBe("network");
+    expect(classifyError(new EngramError(JSON.stringify({ error: "storage_full" }), "undefined", 413))).toBe(
+      "storage_full",
+    );
+  });
+
+  it("says a refusal for size keeps the message queued, in order", () => {
+    const summary = syncErrorSummary("too_large");
+    expect(summary).toMatch(/too large/);
+    expect(summary).toMatch(/stays queued here, in order/);
+    expect(summary).toMatch(/Nothing is lost\./);
   });
 
   it("network failures and timeouts are network", () => {

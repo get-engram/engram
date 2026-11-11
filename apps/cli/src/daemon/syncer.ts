@@ -20,6 +20,7 @@ import { queueing } from "./queue-error.js";
 import { engramCommand } from "./package-runner.js";
 import { plural } from "../output.js";
 import { isDefaultServer, normalizeServer, sameServer } from "../server-url.js";
+import { boundContent, stripBinaryPayloads } from "../message-bounds.js";
 import type { SecretScrubber } from "./scrubber.js";
 import { VaultKeyMismatch, VaultKeyUnreadable } from "../vault-key.js";
 import type { ParsedMessage, SessionMeta, PendingRow } from "./types.js";
@@ -765,6 +766,14 @@ export class Syncer {
       }
     }
 
+    // File payloads (a screenshot in a tool result, a PDF) become a short
+    // note before they are queued (engram#750): Engram never stores them
+    // (engram#386), and queued as base64 they filled daemon.db and every
+    // upload. Only that here: the clip waits for the send, after the scrub
+    // there, so daemon.db keeps the whole text for a vault value saved
+    // later to be found in.
+    for (const m of messages) m.content = stripBinaryPayloads(m.content);
+
     if (conversationId) {
       queueing(() => this.db.enqueue(conversationId, messages, keyFp));
     } else {
@@ -1360,9 +1369,21 @@ export class Syncer {
       // before the vault was read wasn't scrubbed against it.
       rows = this.rescrub(rows);
 
+      // Bounded the way Engram bounds them on arrival (engram#750): file
+      // payloads become a note, then the text is clipped with a visible
+      // marker. Engram stores the same text, or in one case less (see
+      // message-bounds.ts), and no single message can outgrow its request
+      // limit. Clipped only after the scrub above, so a vault value at the
+      // cut is replaced whole, never half sent; daemon.db keeps the whole
+      // text.
+      rows = rows.map((r) => {
+        const content = boundContent(r.content);
+        return content === r.content ? r : { ...r, content };
+      });
+
       // Byte budget: transcript messages vary wildly in size — trim the batch
       // so its total content stays inside the budget. Always send at least
-      // one row, however large (the server accepts it; it just needs time).
+      // one row (bounded above, it is far inside the server's limit).
       let bytes = 0;
       let take = 0;
       for (const r of rows) {
@@ -1433,6 +1454,21 @@ export class Syncer {
         if (errType === "rate_limit" || errType === "paused") {
           this.enterThrottle(msg, errType);
           return "wait";
+        }
+
+        // Refused as too large (engram#750). Every message is bounded far
+        // inside Engram's limit, so this is a batch that still adds up to
+        // more than something on the way accepts (a proxy with a smaller
+        // limit): send half of it at once. Waiting would change nothing,
+        // and the same batch would only be refused again. A single message
+        // that is still refused stays queued, in its place, and is tried
+        // again after a wait like any other failure: sending the ones after
+        // it first would store the conversation out of order.
+        if (errType === "too_large" && rows.length > 1) {
+          const next = Math.max(1, Math.floor(rows.length / 2));
+          this.batchOverride.set(conversationId, next);
+          console.error(`[engram] send refused as too large — sending it again in batches of ${next}`);
+          continue;
         }
 
         // Network/timeout/server — leave in queue, and try this conversation

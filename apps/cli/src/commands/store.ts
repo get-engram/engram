@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { Engram, type MessageInput } from "@getengram/sdk";
-import { json, green, plural } from "../output.js";
+import { json, green, dim, plural } from "../output.js";
+import { MAX_MESSAGE_CONTENT_CHARS, boundContent, stripBinaryPayloads } from "../message-bounds.js";
 
 export async function store(
   engram: Engram,
@@ -43,8 +44,23 @@ export async function store(
     process.exit(1);
   }
 
+  // Bounded the way Engram bounds it on arrival (engram#750): Engram stores
+  // the same text, or in one case less (see message-bounds.ts), and a large
+  // file is no longer refused for its size. Said, so nobody is surprised by
+  // what was kept.
+  const bounded = boundContent(content);
+  const stripped = stripBinaryPayloads(content);
+  const kept: string[] = [];
+  if (stripped !== content) {
+    kept.push("file data in it (base64 images, PDFs) is saved as a note saying what it was");
+  }
+  if (stripped.length > MAX_MESSAGE_CONTENT_CHARS) {
+    kept.push("it is saved cut at 100,000 characters, the most Engram keeps of one message");
+  }
+  if (kept.length > 0) console.error(dim(`Note: ${kept.join(", and ")}.`));
+
   const role = (flags.role ?? "user") as MessageInput["role"];
-  const messages: MessageInput[] = [{ role, content }];
+  const messages: MessageInput[] = [{ role, content: bounded }];
 
   if (flags.tool) {
     messages[0].toolName = flags.tool;

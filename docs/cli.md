@@ -321,6 +321,10 @@ The background daemon reads the key and `baseUrl` together, every few seconds, s
 
 With both `ENGRAM_API_KEY` and `ENGRAM_BASE_URL` set, commands that only use the key and server run without the file.
 
+## Daemon Log
+
+The capture daemon (`engram start`) writes what it does to `~/.engram/daemon.log`, readable only by you. If the log can't be written (it was made read-only, say, or a `sudo engram start` from before 0.7.0 left it owned by root), the daemon runs and captures without it. When systemd runs it (on Linux, after `engram install`), its output goes to the journal (`journalctl --user -u engram`); otherwise it isn't kept. `engram start` and `engram status` say so, and what fixes it. Once the log can be written again, `engram stop` and then `engram start` have the daemon write to it.
+
 ## Scripting Examples
 
 ### Create and populate a session

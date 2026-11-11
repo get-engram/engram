@@ -57,7 +57,6 @@ const DB_IS_ROOTS: ForeignFiles = {
   files: ["daemon.db"],
   root: true,
   stopsDaemon: true,
-  stopsStart: false,
   holdsSends: false,
 };
 const BANNER = [
@@ -71,7 +70,6 @@ const KEY_IS_ROOTS: ForeignFiles = {
   files: ["vault-key"],
   root: true,
   stopsDaemon: false,
-  stopsStart: false,
   holdsSends: true,
 };
 const KEY_BANNER = [

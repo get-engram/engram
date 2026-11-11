@@ -165,6 +165,7 @@ const NO_BIN = join(home.dir, "no-bin");
 const LAUNCHCTL = join(BIN, "launchctl");
 const ENGRAM_DIR = join(home.dir, ".engram");
 const PID_FILE = join(ENGRAM_DIR, "daemon.pid");
+const DB_FILE = join(ENGRAM_DIR, "daemon.db");
 const WORKER = join(home.dir, "cli", "dist", "daemon", "worker.js");
 const LABEL = "app.getengram.daemon";
 /** A PID fakeKill finds no process for. */
@@ -177,7 +178,7 @@ mkdirSync(NO_BIN);
 // Never run: execFileSync is the fake below. It is there to be found on PATH.
 writeFileSync(LAUNCHCTL, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
 
-const { LOG_FILE } = await import("../daemon/launch.js");
+const { LOG_FILE, logProblem } = await import("../daemon/launch.js");
 const { loadConfigStrict } = await import("../config.js");
 const {
   autoEnableCapture,
@@ -252,6 +253,17 @@ function writePlist(text: string | Uint8Array, mode = 0o644): void {
   chmodSync(plistPath(), mode);
 }
 
+/** The daemon's log, the user's own, made read-only: it can't be written (engram#679). */
+function unwritableLog(): void {
+  mkdirSync(ENGRAM_DIR, { recursive: true });
+  rmSync(LOG_FILE, { force: true });
+  writeFileSync(LOG_FILE, "");
+  chmodSync(LOG_FILE, 0o400);
+}
+
+/** What `engram start` and `engram status` say puts the log back, while a daemon runs without it (engram#679). */
+const RESTART = "  Once it can be written, 'engram stop' and then 'engram start' have the daemon write to it again.";
+
 /**
  * A home named `name`, inside the test's own, with this build's worker in it.
  * Gives back what puts the home back.
@@ -308,9 +320,17 @@ function unload(): void {
   launchd.lingering = launchd.stillLoadedFor;
 }
 
+const UNESCAPED: Record<string, string> = { amp: "&", lt: "<", gt: ">" };
+
 /** launchd starts the job's daemon, which then does what `launchd.kickstarts` says. */
 function startJob(): void {
   if (launchd.kickstarts === "never") return;
+  // launchd opens the job's log for it as it starts the daemon. One it
+  // can't open, it never starts the daemon at all: xpcproxy exits 78
+  // (EX_CONFIG), launchd tries again every 10 s, and kickstart still exits
+  // 0 (engram#679).
+  const log = /<key>StandardOutPath<\/key>\s*<string>([^<]*)<\/string>/.exec(launchd.loadedText ?? "");
+  if (log !== null && logProblem(log[1].replace(/&(amp|lt|gt);/g, (_, e: string) => UNESCAPED[e])) !== null) return;
   if (launchd.kickstarts === "dies") {
     // No process has this PID: it has exited, and launchd names it for a moment yet.
     launchd.pid = DEAD_PID;
@@ -609,6 +629,7 @@ beforeEach(() => {
   cli.worker = null;
   rmSync(join(home.dir, "Library"), { recursive: true, force: true });
   rmSync(PID_FILE, { force: true });
+  rmSync(LOG_FILE, { force: true });
   writeFileSync(WORKER, "");
   vi.stubEnv("PATH", BIN);
   // What a daemon spawned from here would have and launchd's wouldn't (engram#641).
@@ -693,6 +714,19 @@ describe("the plist (engram#616)", () => {
 </plist>`);
   });
 
+  it("leaves the log out of one without a log, so launchd gives the daemon no output file (engram#679)", () => {
+    const withLog = generatePlist(paths);
+    const logLines = [
+      "  <key>StandardOutPath</key>",
+      "  <string>/Users/op/.engram/daemon.log</string>",
+      "  <key>StandardErrorPath</key>",
+      "  <string>/Users/op/.engram/daemon.log</string>",
+      "",
+    ].join("\n");
+    expect(withLog).toContain(logLines);
+    expect(generatePlist({ ...paths, log: null })).toBe(withLog.replace(logLines, () => ""));
+  });
+
   it("gives every path back as it is, whatever is in it", () => {
     for (const odd of [
       "/Users/A&B",
@@ -708,6 +742,11 @@ describe("the plist (engram#616)", () => {
     ]) {
       for (const key of ["node", "worker", "log", "home", "path"] as const) {
         expect(pathsIn(generatePlist({ ...paths, [key]: odd }))).toEqual({ ...paths, [key]: odd });
+      }
+      // And from one without a log (engram#679).
+      for (const key of ["node", "worker", "home", "path"] as const) {
+        const none = { ...paths, log: null, [key]: odd };
+        expect(pathsIn(generatePlist(none))).toEqual(none);
       }
     }
   });
@@ -737,6 +776,9 @@ describe("the plist (engram#616)", () => {
   it("reads back nothing it wouldn't write", () => {
     const text = generatePlist(paths);
     expect(pathsIn(text)).toEqual(paths);
+    // One without a log: neither of its two keys (engram#679).
+    const none = generatePlist({ ...paths, log: null });
+    expect(pathsIn(none)).toEqual({ ...paths, log: null });
     const amp = generatePlist({ ...paths, home: "/Users/A&B" });
     for (const other of [
       amp.replace("&amp;", () => "&"), // raw, as CLIs before engram#616 wrote it
@@ -750,6 +792,10 @@ describe("the plist (engram#616)", () => {
       text.replace(/(<key>StandardErrorPath<\/key>\n {2}<string>)[^<]*/, (_, key: string) => `${key}/tmp/other.log`),
       asV1(text),
       text.replace(stamp(PLIST_VERSION), () => stamp(PLIST_VERSION + 1)),
+      // Only one of the log's two keys (engram#679).
+      text.replace(/\n {2}<key>StandardErrorPath<\/key>\n {2}<string>[^<]*<\/string>/, () => ""),
+      text.replace(/\n {2}<key>StandardOutPath<\/key>\n {2}<string>[^<]*<\/string>/, () => ""),
+      none.replace(stamp(PLIST_VERSION), () => stamp(PLIST_VERSION + 1)),
       text.replace("  <key>ThrottleInterval</key>", () => "  <key>Nice</key>\n  <integer>1</integer>\n  <key>ThrottleInterval</key>"),
     ]) {
       expect(other).not.toBe(text);
@@ -840,6 +886,29 @@ describe("reading the plist (engram#616)", () => {
     writePlist(plistWith({ node: join(home.dir, "gone", "node") }, PLIST_VERSION + 1));
     expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION + 1, outdated: false });
   });
+
+  permissionsIt("finds one naming a log that can't be written broken: launchd never starts the daemon from it (engram#679)", () => {
+    unwritableLog();
+    writePlist(plistWith());
+    expect(readPlist()).toEqual({ kind: "ours", broken: true, version: PLIST_VERSION, outdated: false });
+    // The one this CLI writes then, without a log, is current.
+    writePlist(plistWith({ log: null }));
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: false });
+    // As is one naming the log, once it can be written.
+    chmodSync(LOG_FILE, 0o600);
+    writePlist(plistWith());
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: false });
+  });
+
+  it("finds one without a log outdated while the log can be written (engram#679)", () => {
+    writePlist(plistWith({ log: null }));
+    // Not there, in a folder that lets it be made.
+    expect(existsSync(LOG_FILE)).toBe(false);
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: true });
+    mkdirSync(ENGRAM_DIR, { recursive: true });
+    writeFileSync(LOG_FILE, "");
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: true });
+  });
 });
 
 describe("launchctl (engram#616)", () => {
@@ -923,6 +992,16 @@ describe("engram install on macOS (engram#616)", () => {
     expect(text).toContain(`Plist: ${PLIST}`);
     expect(process.exitCode).toBeUndefined();
     expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: false });
+  });
+
+  permissionsIt("writes one without a log while the log can't be written: launchd would never start the daemon (engram#679)", async () => {
+    unwritableLog();
+    await daemonInstall();
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith({ log: null }));
+    expect(launchd.loadedText).toBe(plistWith({ log: null }));
+    expect(output()).toContain("Auto-start enabled — daemon will start on login");
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: false });
+    expect(process.exitCode).toBeUndefined();
   });
 
   posixIt("writes it 0644 whatever the umask: launchd won't load one others can write", async () => {
@@ -1151,6 +1230,75 @@ describe("engram start on macOS (engram#616)", () => {
     expect(statSync(PLIST).mode & 0o777).toBe(0o644);
     expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: false });
     expect(launchd.loaded).toBe(true);
+  });
+
+  permissionsIt("has launchd start the daemon without a log while that can't be written, and puts the log back once it can (engram#679)", async () => {
+    // A plist naming the log, as every CLI before engram#679 wrote one:
+    // launchd never started the daemon from it while the log couldn't be
+    // opened.
+    jobLoaded();
+    unwritableLog();
+    await daemonStart([], {});
+    const none = plistWith({ log: null });
+    expect(readFileSync(PLIST, "utf-8")).toBe(none);
+    expect(launchd.loadedText).toBe(none);
+    expect(launchctlCalls()).toEqual([
+      "list",
+      "print-disabled",
+      "bootout",
+      "list",
+      "bootstrap",
+      "list",
+      "print-disabled",
+      "kickstart",
+      "list",
+    ]);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(launchd.pid).toBe(process.pid);
+    expect(said()).toBe(
+      [
+        `Updated auto-start configuration (plist v${PLIST_VERSION})`,
+        `Engram daemon started (pid ${process.pid})`,
+        `Log: ${LOG_FILE} can't be written (EACCES), so the daemon runs without it.`,
+        "  To fix it, run: chmod u+w ~/.engram/daemon.log",
+        RESTART,
+        `DB:  ${DB_FILE}`,
+      ].join("\n"),
+    );
+    // The user's to change.
+    expect(statSync(LOG_FILE).mode & 0o777).toBe(0o400);
+    expect(process.exitCode).toBeUndefined();
+
+    // Fixed, then 'engram stop', which leaves the job loaded and stops its
+    // daemon, and 'engram start' again.
+    chmodSync(LOG_FILE, 0o600);
+    daemonGone();
+    execFileSync.mockClear();
+    await daemonStart([], {});
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+    expect(launchd.loadedText).toBe(plistWith());
+    expect(launchctlCalls()).toEqual([
+      "list",
+      "print-disabled",
+      "bootout",
+      "list",
+      "bootstrap",
+      "list",
+      "print-disabled",
+      "kickstart",
+      "list",
+    ]);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(launchd.pid).toBe(process.pid);
+    expect(said()).toBe(
+      [
+        `Updated auto-start configuration (plist v${PLIST_VERSION})`,
+        `Engram daemon started (pid ${process.pid})`,
+        `Log: ${LOG_FILE}`,
+        `DB:  ${DB_FILE}`,
+      ].join("\n"),
+    );
+    expect(process.exitCode).toBeUndefined();
   });
 
   it("leaves a current plist, and a newer CLI's, as they are", async () => {
@@ -1445,6 +1593,24 @@ describe("engram start through launchd (engram#641)", () => {
     const text = output();
     expect(text).toContain("Daemon failed to start. Check the log:");
     expect(text).not.toContain("started directly");
+  });
+
+  permissionsIt("says how to see why the daemon launchd starts exits as it starts, while its log can't be written (engram#679)", async () => {
+    writePlist(plistWith({ log: null }));
+    load(PLIST);
+    unwritableLog();
+    launchd.kickstarts = "dies";
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    await daemonStart([], {});
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(launchctlCalls()).toEqual(["list", "list", "print-disabled", "kickstart", "list"]);
+    const text = output();
+    // What it said went nowhere.
+    expect(text).toContain(
+      "Daemon failed to start, and its log can't be written (EACCES). To see why, run it here:\n  engram start --foreground",
+    );
+    expect(text).not.toContain("Check the log");
   });
 
   it("starts the daemon itself, and says so, when launchd hasn't started one in time", async () => {
@@ -2030,6 +2196,37 @@ describe("engram status on macOS (engram#616)", () => {
       expect(after).toContain(`Auto-start: enabled (launchd)\n  ${OUTSIDE_LAUNCHD}`);
       expect(after).not.toMatch(/broken|outdated|to (repair|update)/);
     }
+  });
+
+  permissionsIt("says the daemon runs without its log while that can't be written, and what fixes it (engram#679)", async () => {
+    unwritableLog();
+    writePlist(plistWith({ log: null }));
+    await daemonStatus();
+    // Stopped by itself: why can't be read anywhere.
+    expect(said()).toContain(
+      [
+        "Auto-start: enabled (launchd)",
+        "  It should be running: start at login is on. It may have stopped after an error.",
+        "  Its log can't be written: 'engram start --foreground' shows why it stops.",
+        "  Run 'engram start' to start it again.",
+        `Log: ${LOG_FILE} can't be written (EACCES), so the daemon will run without it.`,
+        "  To fix it, run: chmod u+w ~/.engram/daemon.log",
+      ].join("\n"),
+    );
+
+    load(PLIST);
+    launchd.pid = process.pid;
+    daemonRunning();
+    await daemonStatus();
+    const running = said();
+    expect(running).toContain(
+      [
+        `Log: ${LOG_FILE} can't be written (EACCES), so the daemon runs without it.`,
+        "  To fix it, run: chmod u+w ~/.engram/daemon.log",
+        RESTART,
+      ].join("\n"),
+    );
+    expect(running).not.toMatch(/broken|outdated|journal/);
   });
 
   it("says nothing of start at login without a plist", async () => {
@@ -3206,5 +3403,25 @@ describe("the plist, as macOS reads it (engram#616)", () => {
         EnvironmentVariables: { HOME: odd, PATH: paths.path, ENGRAM_PLIST_VERSION: String(PLIST_VERSION) },
       });
     }
+  });
+
+  macIt("is one plutil reads without a log too, with no output file in it (engram#679)", async () => {
+    const real = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    const dir = join(home.dir, "plutil");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, "no-log.plist");
+    writeFileSync(file, generatePlist({ ...THIS_CLI, log: null }));
+    real.execFileSync("/usr/bin/plutil", ["-lint", "-s", file], { stdio: "pipe" });
+    const read = JSON.parse(
+      real.execFileSync("/usr/bin/plutil", ["-convert", "json", "-o", "-", file], { encoding: "utf-8", stdio: "pipe" }),
+    );
+    expect(read).toEqual({
+      Label: LABEL,
+      ProgramArguments: [THIS_CLI.node, THIS_CLI.worker],
+      RunAtLoad: true,
+      KeepAlive: { SuccessfulExit: false },
+      ThrottleInterval: 10,
+      EnvironmentVariables: { HOME: home.dir, PATH: THIS_CLI.path, ENGRAM_PLIST_VERSION: String(PLIST_VERSION) },
+    });
   });
 });

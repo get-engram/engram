@@ -24,6 +24,12 @@
  *     then say systemd won't restart it after a crash. Refused by systemd,
  *     as after five starts in five minutes, `engram start` starts the daemon
  *     itself and says why.
+ *   - A daemon.log the user can't write costs only the log (engram#679):
+ *     systemd runs the daemon all the same, its output in the journal, and
+ *     `engram start` and `engram status` say so; the log is left as it was.
+ *     The unit before it never ran the daemon: its shell exited on the
+ *     redirection it couldn't make. Once the log can be written, a stop and
+ *     a start have the daemon write to it again.
  *   - `engram status` says when the unit was disabled with systemctl, and
  *     `engram install` turns it back on without starting a second daemon.
  *   - `engram uninstall` disables and removes the unit and leaves the daemon
@@ -290,6 +296,19 @@ process.on("SIGINT", () => {
   process.exit(130);
 });
 
+/**
+ * What the journal has of engram.service's output: the user's own journal,
+ * and the system's through sudo, as a runner's journal may be kept in
+ * memory, where it isn't split by user.
+ */
+function journal() {
+  const runs = [
+    ["journalctl", ["--user", "--no-pager", "-o", "cat", "-u", "engram.service"]],
+    ["sudo", ["-n", "journalctl", "--no-pager", "-o", "cat", `_UID=${process.getuid()}`, "_SYSTEMD_USER_UNIT=engram.service"]],
+  ];
+  return runs.map(([cmd, args]) => spawnSync(cmd, args, { encoding: "utf-8", timeout: 30_000 }).stdout ?? "").join("\n");
+}
+
 function diagnostics() {
   console.log("\n── diagnostics ──");
   const runs = [
@@ -302,6 +321,71 @@ function diagnostics() {
     console.log(`\n$ ${cmd} ${args.join(" ")}\n${r.stdout ?? ""}${r.stderr ?? ""}`);
   }
   console.log(`\n── daemon.log, last 40 lines ──\n${logText().split("\n").slice(-40).join("\n")}`);
+}
+
+/** What start and status say while the log can't be written (engram#679). */
+const WITHOUT_LOG = `Log: ${LOG_FILE} can't be written (EACCES), so the daemon runs without it.`;
+const IN_JOURNAL = "  systemd keeps its output in the journal: journalctl --user -u engram";
+
+/**
+ * A daemon.log the user can't write costs only the log (engram#679). Run
+ * with the unit enabled and no daemon running; it leaves them so.
+ */
+async function withoutItsLog() {
+  systemctl("reset-failed", "engram.service");
+  const before = logText();
+  chmodSync(LOG_FILE, 0o400);
+
+  const start = engram(["start"]);
+  check(start.status === 0, "start, the log read-only: exits 0");
+  check(!start.out.includes("started directly"), "start, the log read-only: has systemd start the daemon");
+  const pid = startedPid(start.out);
+  check(
+    pid !== null && isOurWorker(pid) && activeState() === "active" && mainPid() === pid,
+    `start, the log read-only: systemd runs the daemon (pid ${pid}; systemd's ${mainPid()}, ${activeState()})`,
+  );
+  check(
+    start.out.includes(`${WITHOUT_LOG}\n${IN_JOURNAL}\n  To fix it, run: chmod u+w ~/.engram/daemon.log`),
+    "start: says the daemon runs without its log, that its output is in the journal, and what fixes it",
+  );
+  if (pid === null || !isOurWorker(pid)) return;
+  const journaled = await waitFor(
+    `the journal has its output (pid ${pid})`,
+    () => journal().includes(`daemon started (pid ${pid})`),
+    30_000,
+  );
+  if (journaled) check(true, `the journal has its output: the daemon started (pid ${pid})`);
+  check(modeOf(LOG_FILE) === "400" && logText() === before, `daemon.log is as it was (${modeOf(LOG_FILE)}), nothing added`);
+  const status = await statusRunning(pid, "the log read-only");
+  check(
+    status.out.includes(`${WITHOUT_LOG}\n${IN_JOURNAL}`),
+    "status: says the daemon runs without its log, and that its output is in the journal",
+  );
+  check(!/broken|outdated/.test(status.out), "status: nothing broken or outdated");
+
+  // Put right: a stop and a start, and the daemon writes to the log again.
+  chmodSync(LOG_FILE, 0o600);
+  const stop = engram(["stop"]);
+  check(stop.out.includes(`Daemon stopped (pid ${pid})`), `stop: stopped pid ${pid}`);
+  await waitFor("engram.service is inactive", () => activeState() === "inactive", 20_000);
+  const again = engram(["start"]);
+  const againPid = startedPid(again.out);
+  check(
+    again.status === 0 && againPid !== null && isOurWorker(againPid) && mainPid() === againPid,
+    `start, the log writable again: systemd runs the daemon (pid ${againPid}; systemd's ${mainPid()})`,
+  );
+  check(
+    again.out.includes(`Log: ${LOG_FILE}\n`) && !again.out.includes("can't be written"),
+    "start: names the log, and nothing more of it",
+  );
+  if (againPid !== null) {
+    const logged = await waitFor(`daemon.log: the daemon started (pid ${againPid})`, () =>
+      logText().includes(`daemon started (pid ${againPid})`),
+    );
+    if (logged) check(true, `daemon.log has its output again: the daemon started (pid ${againPid})`);
+  }
+  engram(["stop"]);
+  await waitFor("engram.service is inactive", () => activeState() === "inactive", 20_000);
 }
 
 /**
@@ -472,7 +556,7 @@ try {
   if (atLogin) {
     check(true, `systemd ran ${JSON.stringify([NODE, WORKER])} (pid ${atLogin})`);
     const vars = environ(atLogin) ?? [];
-    for (const v of [`HOME=${home}`, `PATH=${UNIT_PATH_ENV}`, "ENGRAM_UNIT_VERSION=1", `ENGRAM_BASE_URL=${NOWHERE}`]) {
+    for (const v of [`HOME=${home}`, `PATH=${UNIT_PATH_ENV}`, "ENGRAM_UNIT_VERSION=2", `ENGRAM_BASE_URL=${NOWHERE}`]) {
       check(vars.includes(v), `its environment has ${v}`);
     }
     await waitFor("daemon.log says it started", () => logText().includes(`daemon started (pid ${atLogin})`));
@@ -500,6 +584,7 @@ try {
         `not started again 13s later (${activeState()}, ${ourWorkers().length} running)`);
 
       await startThroughSystemd();
+      await withoutItsLog();
     }
   }
 

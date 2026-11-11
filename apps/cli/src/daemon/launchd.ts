@@ -15,6 +15,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { commandFailure, commandPath } from "./command-path.js";
 import { pinnedToKeg } from "./homebrew.js";
+import { logProblem } from "./launch.js";
 
 // Start at login on macOS: a launchd agent,
 // ~/Library/LaunchAgents/app.getengram.daemon.plist. launchd loads the
@@ -56,8 +57,12 @@ export interface PlistPaths {
   node: string;
   /** This build's dist/daemon/worker.js. */
   worker: string;
-  /** ~/.engram/daemon.log: the job's output goes there. */
-  log: string;
+  /**
+   * ~/.engram/daemon.log: the job's output goes there. Null for none, while
+   * it can't be written (engram#679): launchd doesn't start a job whose log
+   * it can't open, ever, and the daemon doesn't need one to capture.
+   */
+  log: string | null;
   home: string;
   /** The PATH the daemon runs with. */
   path: string;
@@ -98,14 +103,25 @@ export function generatePlist(p: PlistPaths): string {
   return render({
     node: xmlText(p.node),
     worker: xmlText(p.worker),
-    log: xmlText(p.log),
+    log: p.log === null ? null : xmlText(p.log),
     home: xmlText(p.home),
     path: xmlText(p.path),
   });
 }
 
-/** The plist with each value's text in place. Every v2 plist has this text, but for the values. */
+/**
+ * The plist with each value's text in place. Every v2 plist has this text,
+ * but for the values, and for the log, which one without a log leaves out.
+ */
 function render(v: PlistPaths): string {
+  const log =
+    v.log === null
+      ? ""
+      : `
+  <key>StandardOutPath</key>
+  <string>${v.log}</string>
+  <key>StandardErrorPath</key>
+  <string>${v.log}</string>`;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -123,11 +139,7 @@ function render(v: PlistPaths): string {
   <dict>
     <key>SuccessfulExit</key>
     <false/>
-  </dict>
-  <key>StandardOutPath</key>
-  <string>${v.log}</string>
-  <key>StandardErrorPath</key>
-  <string>${v.log}</string>
+  </dict>${log}
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>EnvironmentVariables</key>
@@ -145,23 +157,27 @@ function render(v: PlistPaths): string {
 
 const UNESCAPES: Record<string, string> = { "&amp;": "&", "&lt;": "<", "&gt;": ">" };
 
-let templatePattern: RegExp | undefined;
+let templatePatterns: RegExp[] | undefined;
 
 /**
- * render()'s text as a pattern, each value a capture. A value never holds a
- * `<` (xmlText escapes it), and the log, there twice, is the same both times.
+ * render()'s text as patterns, each value a capture: the plist with a log,
+ * and the one without. A value never holds a `<` (xmlText escapes it), and
+ * the log, there twice, is the same both times.
  */
-function template(): RegExp {
-  if (templatePattern) return templatePattern;
+function templates(): RegExp[] {
+  return (templatePatterns ??= [template("\0log\0"), template(null)]);
+}
+
+function template(log: string | null): RegExp {
   const seen = new Set<string>();
-  const source = render({ node: "\0node\0", worker: "\0worker\0", log: "\0log\0", home: "\0home\0", path: "\0path\0" })
+  const source = render({ node: "\0node\0", worker: "\0worker\0", log, home: "\0home\0", path: "\0path\0" })
     .replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")
     .replace(/\0(\w+)\0/g, (_, name: string) => {
       if (seen.has(name)) return `\\k<${name}>`;
       seen.add(name);
       return `(?<${name}>[^<]*)`;
     });
-  return (templatePattern = new RegExp(`^${source}$`));
+  return new RegExp(`^${source}$`);
 }
 
 /**
@@ -176,13 +192,17 @@ function template(): RegExp {
  * writes is plain XML, which both read back as the paths it was made from.
  */
 export function pathsIn(text: string): PlistPaths | null {
-  const v = template().exec(text)?.groups;
+  let v: Record<string, string> | undefined;
+  for (const pattern of templates()) {
+    v = pattern.exec(text)?.groups;
+    if (v) break;
+  }
   if (!v) return null;
   const unescape = (s: string): string => s.replace(/&(?:amp|lt|gt);/g, (e) => UNESCAPES[e]);
   const paths: PlistPaths = {
     node: unescape(v.node),
     worker: unescape(v.worker),
-    log: unescape(v.log),
+    log: v.log === undefined ? null : unescape(v.log),
     home: unescape(v.home),
     path: unescape(v.path),
   };
@@ -217,9 +237,9 @@ export type PlistState =
       kind: "ours";
       /**
        * launchd may not start the daemon from it: it won't load it (others
-       * can write it), it isn't as this CLI writes one of its version, or the
+       * can write it), it isn't as this CLI writes one of its version, the
        * Node or the worker it names is gone (Node switched or removed, the
-       * CLI moved).
+       * CLI moved), or the log it names can't be written (engram#679).
        */
       broken: boolean;
       /** Its version; 1 for a plist from before the stamp. */
@@ -227,7 +247,9 @@ export type PlistState =
       /**
        * An older CLI wrote it: an older version, or one that names Node or
        * the worker in a Homebrew version, which the next `brew upgrade`
-       * removes (engram#652). `engram start` and auto-capture rewrite it.
+       * removes (engram#652). Or it names no log, and the log can be
+       * written again (engram#679). `engram start` and auto-capture rewrite
+       * it.
        */
       outdated: boolean;
     };
@@ -257,8 +279,15 @@ export function readPlist(): PlistState {
   // one's is a later CLI's to judge, not this one's.
   if (version === PLIST_VERSION) {
     const paths = pathsIn(text);
-    broken ||= paths === null || !existsSync(paths.node) || !existsSync(paths.worker);
-    outdated = paths !== null && (pinnedToKeg(paths.node) || pinnedToKeg(paths.worker));
+    broken ||=
+      paths === null ||
+      !existsSync(paths.node) ||
+      !existsSync(paths.worker) ||
+      // launchd would never start the job (engram#679).
+      (paths.log !== null && logProblem(paths.log) !== null);
+    outdated =
+      paths !== null &&
+      (pinnedToKeg(paths.node) || pinnedToKeg(paths.worker) || (paths.log === null && logProblem() === null));
   }
   return { kind: "ours", broken, version, outdated };
 }

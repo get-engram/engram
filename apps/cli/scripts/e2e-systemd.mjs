@@ -28,8 +28,9 @@
  *     systemd runs the daemon all the same, its output in the journal, and
  *     `engram start` and `engram status` say so; the log is left as it was.
  *     The unit before it never ran the daemon: its shell exited on the
- *     redirection it couldn't make. Once the log can be written, a stop and
- *     a start have the daemon write to it again.
+ *     redirection it couldn't make. Once the log can be written, status and
+ *     start say the daemon doesn't write to it, and what has it write there
+ *     (engram#720); a stop and a start have the daemon write to it again.
  *   - `engram status` says when the unit was disabled with systemctl, and
  *     `engram install` turns it back on without starting a second daemon.
  *   - `engram uninstall` disables and removes the unit and leaves the daemon
@@ -363,8 +364,24 @@ async function withoutItsLog() {
   );
   check(!/broken|outdated/.test(status.out), "status: nothing broken or outdated");
 
-  // Put right: a stop and a start, and the daemon writes to the log again.
+  // Put right: status and start say the daemon doesn't write to it
+  // (engram#720), and a stop and a start, and the daemon writes to the log
+  // again.
   chmodSync(LOG_FILE, 0o600);
+  const NOT_THE_LOG =
+    `Log: ${LOG_FILE}, but the daemon doesn't write to it: it started without it.\n${IN_JOURNAL}\n` +
+    "  'engram stop' and then 'engram start' have the daemon write to it.";
+  const fixed = engram(["status"]);
+  check(
+    fixed.out.includes(NOT_THE_LOG) && !fixed.out.includes("can't be written"),
+    "status, the log writable again: says the daemon doesn't write to it, its output is in the journal, and what has it write there",
+  );
+  const already = engram(["start"]);
+  check(
+    already.out.includes(`Daemon already running (pid ${pid})`) && already.out.includes(NOT_THE_LOG),
+    "start, the daemon running and the log writable again: says the same",
+  );
+  check(mainPid() === pid && isDeepStrictEqual(ourWorkers(), [pid]), `start: leaves the daemon as it is (pid ${mainPid()})`);
   const stop = engram(["stop"]);
   check(stop.out.includes(`Daemon stopped (pid ${pid})`), `stop: stopped pid ${pid}`);
   await waitFor("engram.service is inactive", () => activeState() === "inactive", 20_000);

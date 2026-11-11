@@ -35,8 +35,10 @@
  *     exits 78 (EX_CONFIG), and kickstart exits 0 all the same. `engram
  *     start` writes a plist without a log, which launchd runs, and says the
  *     daemon runs without its log, as `engram status` does; the log is left
- *     as it was. Once it can be written, that plist is outdated, and a stop
- *     and a start put the log back, and the daemon writes to it.
+ *     as it was. Once it can be written, that plist is outdated, status
+ *     says the daemon doesn't write to the log and what has it write there
+ *     (engram#720), and a stop and a start put the log back, and the daemon
+ *     writes to it.
  *   - A plist and a worker marked as downloaded (com.apple.quarantine) load
  *     and run all the same.
  *   - The plist an older CLI wrote, naming worker-main.js, is outdated:
@@ -478,6 +480,13 @@ async function withoutItsLog(installed) {
   check(
     autoStartLine(fixed.out)?.includes("outdated config, run 'engram install' to update") === true,
     `status, the log writable again: the plist without it is outdated (${autoStartLine(fixed.out)})`,
+  );
+  check(
+    fixed.out.includes(
+      `Log: ${LOG_FILE}, but the daemon doesn't write to it: it started without it.\n` +
+        "  'engram stop' and then 'engram start' have the daemon write to it.",
+    ) && !/can't be written|journal/.test(fixed.out),
+    "status, the log writable again: says the daemon doesn't write to it, and what has it write there (engram#720)",
   );
   const stop = engram(["stop"]);
   check(stop.out.includes(`Daemon stopped (pid ${pid})`), `stop: stops the daemon (pid ${pid})`);

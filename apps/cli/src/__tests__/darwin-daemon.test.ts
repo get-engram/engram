@@ -16,7 +16,7 @@ import {
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative } from "node:path";
-import type { Probe } from "../daemon/instance.js";
+import type { DaemonOutput, Probe } from "../daemon/instance.js";
 import type { LaunchAgentsCheck, PlistPaths } from "../daemon/launchd.js";
 
 /**
@@ -35,11 +35,18 @@ const { home, cli, daemon, launchd, spawn, execSync, execFileSync } = vi.hoisted
   // This build's worker, when it isn't the one in the test's home: a CLI
   // installed with brew runs from a versioned keg (engram#652).
   cli: { worker: null as string | null },
-  // What answers on the daemon's socket: a daemon, or nothing. `silent`:
-  // something holds it and doesn't answer, as a daemon busy starting does.
-  // `unavailable`: no socket can be used, so the PID file is all there is.
+  // What answers on the daemon's socket: a daemon, or nothing, and where it
+  // says its output goes (engram#720). `silent`: something holds it and
+  // doesn't answer, as a daemon busy starting does. `unavailable`: no
+  // socket can be used, so the PID file is all there is.
   daemon: {
-    answering: null as { pid: number; ready?: boolean; stopping?: boolean; version?: string } | null,
+    answering: null as {
+      pid: number;
+      ready?: boolean;
+      stopping?: boolean;
+      version?: string;
+      output?: DaemonOutput;
+    } | null,
     silent: false,
     unavailable: false,
   },
@@ -604,6 +611,15 @@ function said(): string {
   vi.mocked(console.log).mockClear();
   vi.mocked(console.error).mockClear();
   return text;
+}
+
+/** What `text` says of the log: its "Log:" line and the lines under it, or none (engram#720). */
+function logLines(text: string): string[] {
+  const lines = text.split("\n");
+  const at = lines.findIndex((line) => line.startsWith("Log:"));
+  if (at < 0) return [];
+  const end = lines.findIndex((line, i) => i > at && !line.startsWith("  "));
+  return lines.slice(at, end < 0 ? undefined : end);
 }
 
 /**
@@ -2259,6 +2275,27 @@ describe("engram status on macOS (engram#616)", () => {
       ].join("\n"),
     );
     expect(running).not.toMatch(/broken|outdated|journal/);
+  });
+
+  permissionsIt("says the daemon launchd started without its log doesn't write to it once it can be written (engram#720)", async () => {
+    unwritableLog();
+    writePlist(plistWith({ log: null }));
+    load(PLIST);
+    launchd.pid = process.pid;
+    daemonRunning();
+    // launchd gave it no output file: its output goes nowhere.
+    daemon.answering = { pid: process.pid, output: "none" };
+    chmodSync(LOG_FILE, 0o600);
+    await daemonStatus();
+    const text = said();
+    // The plist without a log is outdated now, and what has the daemon write
+    // to the log is said with the log.
+    expect(text).toContain("outdated");
+    expect(logLines(text)).toEqual([
+      `Log: ${LOG_FILE}, but the daemon doesn't write to it: it started without it.`,
+      "  'engram stop' and then 'engram start' have the daemon write to it.",
+    ]);
+    expect(text).not.toMatch(/journal|can't be written/);
   });
 
   it("says nothing of start at login without a plist", async () => {

@@ -215,7 +215,7 @@ mkdirSync(NO_BIN);
 writeFileSync(LAUNCHCTL, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
 
 const { LOG_FILE, logProblem } = await import("../daemon/launch.js");
-const { loadConfigStrict } = await import("../config.js");
+const { loadConfigStrict, saveConfig } = await import("../config.js");
 const {
   autoEnableCapture,
   daemonInstall,
@@ -3608,6 +3608,275 @@ describe("a CLI and a Node installed with brew (engram#652)", () => {
       }
       expect(execFileSync).not.toHaveBeenCalled();
       expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(THROUGH_OPT));
+    });
+  });
+});
+
+describe("a CLI run from npx's cache (engram#665)", () => {
+  // `npx @getengram/cli …` runs the CLI from npx's cache, which npm clears
+  // as it likes: a newer version of the package, or `npm cache clean`. A
+  // plist naming the worker there would then stop starting the daemon at
+  // login, without a word. So would one pnpm dlx, bunx or yarn dlx left.
+  const NPX_WORKER = join(
+    home.dir,
+    ".npm",
+    "_npx",
+    "f3920abdac2db749",
+    "node_modules",
+    "@getengram",
+    "cli",
+    "dist",
+    "daemon",
+    "worker.js",
+  );
+  /** The plist an npx run wrote before engram#665: it works until npm clears its cache. */
+  const FROM_NPX: Partial<PlistPaths> = { worker: NPX_WORKER };
+  /** One npm cleared since: the worker it names is gone. */
+  const CLEARED: Partial<PlistPaths> = {
+    worker: join(home.dir, ".npm", "_npx", "0123456789abcdef", "node_modules", "@getengram", "cli", "dist", "daemon", "worker.js"),
+  };
+  /** One that can't start the daemon: the CLI it names has moved. */
+  const BROKEN: Partial<PlistPaths> = { worker: join(home.dir, "moved", "cli", "dist", "daemon", "worker.js") };
+  const CANT_TURN_ON = [
+    "Can't turn on start at login: this Engram runs from npx's cache, which can be cleared at any time.",
+    "  Install the CLI with: npm install -g @getengram/cli",
+  ];
+  const CANT_REPAIR = [
+    "Can't repair start at login: this Engram runs from npx's cache, which can be cleared at any time.",
+    "  Install the CLI with: npm install -g @getengram/cli",
+    "  Then run: engram install",
+  ].join("\n");
+  const WONT_START_AT_LOGIN = [
+    "  The daemon won't start at login: this Engram runs from npx's cache, which can be cleared at any time.",
+    "  To start it at login, install the CLI: npm install -g @getengram/cli && engram install",
+  ].join("\n");
+
+  beforeAll(() => {
+    mkdirSync(dirname(NPX_WORKER), { recursive: true });
+    writeFileSync(NPX_WORKER, "");
+  });
+
+  beforeEach(() => {
+    vi.mocked(saveConfig).mockClear();
+  });
+
+  /** Run as `npx @getengram/cli` does: this build, in npx's cache. */
+  async function fromNpx(run: () => unknown, worker = NPX_WORKER): Promise<void> {
+    cli.worker = worker;
+    try {
+      await run();
+    } finally {
+      cli.worker = null;
+    }
+  }
+
+  /** launchctl only looked: it loaded, unloaded, started and switched nothing. */
+  function launchdLeftAlone(): void {
+    expect(launchctlCalls().filter((call) => call !== "list" && call !== "print-disabled")).toEqual([]);
+  }
+
+  it("engram install turns nothing on, records nothing, and says how to install the CLI", async () => {
+    await fromNpx(() => daemonInstall());
+    expect(existsSync(PLIST)).toBe(false);
+    expect(launchctlCalls()).toEqual([]);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(saveConfig).not.toHaveBeenCalled();
+    expect(said()).toBe([...CANT_TURN_ON, "  Then run: engram install"].join("\n"));
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("names the cache of the runner it runs from: pnpm dlx's", async () => {
+    const pnpm = join(home.dir, "Library", "Caches", "pnpm", "dlx", "t2vhrsiwfyb5ug4cvmxu7uvwla", "19a6c1f5e2b-1c4d");
+    const inStore = ["node_modules", ".pnpm", "@getengram+cli@0.7.0", "node_modules", "@getengram", "cli"];
+    await fromNpx(() => daemonInstall(), join(pnpm, ...inStore, "dist", "daemon", "worker.js"));
+    expect(existsSync(PLIST)).toBe(false);
+    expect(said()).toContain(
+      "Can't turn on start at login: this Engram runs from pnpm's dlx cache, which can be cleared at any time.",
+    );
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("engram start --install starts nothing and changes nothing, a broken plist included", async () => {
+    writePlist(plistWith(BROKEN));
+    await fromNpx(() => daemonStart([], { install: "" }));
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(BROKEN));
+    expect(launchctlCalls()).toEqual([]);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(saveConfig).not.toHaveBeenCalled();
+    expect(said()).toBe([...CANT_TURN_ON, "  Then run: engram start --install"].join("\n"));
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("engram start starts the daemon, and says nothing of start at login when there is none", async () => {
+    await fromNpx(() => daemonStart([], {}));
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(existsSync(PLIST)).toBe(false);
+    launchdLeftAlone();
+    const text = said();
+    expect(text).toContain("Engram daemon started");
+    expect(text).not.toContain("start at login");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("engram start leaves a broken plist as it is, and says why it can't repair it", async () => {
+    for (const broken of [BROKEN, CLEARED]) {
+      writePlist(plistWith(broken));
+      daemonGone();
+      spawn.mockClear();
+      execFileSync.mockClear();
+      await fromNpx(() => daemonStart([], {}));
+      expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(broken));
+      launchdLeftAlone();
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const text = said();
+      expect(text).toContain(CANT_REPAIR);
+      expect(text).toContain("Engram daemon started");
+      expect(text).not.toContain("Updated auto-start configuration");
+      expect(process.exitCode).toBeUndefined();
+    }
+  });
+
+  it("engram start says nothing of a broken one switched off in launchd: only engram install turns it on", async () => {
+    writePlist(plistWith(BROKEN));
+    launchd.switchedOff = true;
+    await fromNpx(() => daemonStart([], {}));
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(BROKEN));
+    launchdLeftAlone();
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(said()).not.toContain("Can't repair start at login");
+  });
+
+  it("engram start leaves a plist that works as it is, without a word: an older CLI's, or an npx run's", async () => {
+    for (const text of [v1Plist(), plistWith(FROM_NPX)]) {
+      writePlist(text);
+      daemonGone();
+      execFileSync.mockClear();
+      await fromNpx(() => daemonStart([], {}));
+      expect(readFileSync(PLIST, "utf-8")).toBe(text);
+      expect(launchctlCalls()).not.toContain("bootout");
+      expect(launchctlCalls()).not.toContain("bootstrap");
+      const out = said();
+      expect(out).toContain("Engram daemon started");
+      expect(out).not.toContain("Can't repair start at login");
+      expect(out).not.toContain("Updated auto-start configuration");
+    }
+  });
+
+  it("finds a plist naming the worker in npx's cache outdated, not broken, until npm clears it", () => {
+    writePlist(plistWith(FROM_NPX));
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION, outdated: true });
+    writePlist(plistWith(CLEARED));
+    expect(readPlist()).toEqual({ kind: "ours", broken: true, version: PLIST_VERSION, outdated: true });
+    // A newer CLI's is its own to judge.
+    writePlist(plistWith(FROM_NPX, PLIST_VERSION + 1));
+    expect(readPlist()).toEqual({ kind: "ours", broken: false, version: PLIST_VERSION + 1, outdated: false });
+  });
+
+  it("engram status says such a plist is outdated, until the installed CLI's engram install rewrites it", async () => {
+    writePlist(plistWith(FROM_NPX));
+    daemonRunning();
+    await daemonStatus();
+    expect(said()).toContain("Auto-start: enabled (launchd)  — outdated config, run 'engram install' to update");
+    await daemonInstall();
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+    expect(launchd.loadedText).toBe(plistWith());
+    said();
+    await daemonStatus();
+    const after = said();
+    expect(after).toContain("Auto-start: enabled (launchd)");
+    expect(after).not.toMatch(/broken|outdated/);
+  });
+
+  it("the installed CLI's engram start points it at that CLI, once, and launchd loads it in its place", async () => {
+    writePlist(plistWith(FROM_NPX));
+    launchd.loaded = true;
+    launchd.loadedText = plistWith(FROM_NPX);
+    await daemonStart([], {});
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+    expect(launchd.loadedText).toBe(plistWith());
+    expect(said()).toContain(`Updated auto-start configuration (plist v${PLIST_VERSION})`);
+
+    daemonGone();
+    await daemonStart([], {});
+    expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+    expect(said()).not.toContain("Updated auto-start configuration");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  describe("auto-capture", () => {
+    signedInAtATerminal();
+
+    it("after sign-in starts the daemon, sets up no start at login, and says why, then nothing more", async () => {
+      await fromNpx(() => autoEnableCapture({ after: "login" }));
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(existsSync(PLIST)).toBe(false);
+      expect(launchctlCalls()).toEqual([]);
+      expect(said()).toBe(
+        [
+          "Auto-capture is on — conversations from supported agents on this machine save to your Engram.",
+          WONT_START_AT_LOGIN,
+          "  Turn off anytime: engram stop && engram uninstall",
+        ].join("\n"),
+      );
+
+      for (let command = 0; command < 3; command++) {
+        await fromNpx(() => autoEnableCapture({ after: "command" }));
+        expect(said()).toBe("");
+      }
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(existsSync(PLIST)).toBe(false);
+      expect(launchctlCalls()).toEqual([]);
+    });
+
+    it("says it after a command that had to start the daemon: what start at login would have done", async () => {
+      await fromNpx(() => autoEnableCapture({ after: "command" }));
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(existsSync(PLIST)).toBe(false);
+      const text = said();
+      expect(text).toContain("Auto-capture is on");
+      expect(text).toContain(WONT_START_AT_LOGIN);
+    });
+
+    it("leaves a broken plist as it is, and says why", async () => {
+      writePlist(plistWith(BROKEN));
+      await fromNpx(() => autoEnableCapture({ after: "login" }));
+      expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(BROKEN));
+      launchdLeftAlone();
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const text = said();
+      expect(text).toContain(WONT_START_AT_LOGIN);
+      expect(text).not.toContain("Updated auto-start configuration");
+    });
+
+    it("leaves a plist that works as it is, and says nothing of start at login", async () => {
+      writePlist(plistWith(FROM_NPX));
+      daemonRunning();
+      await fromNpx(() => autoEnableCapture({ after: "login" }));
+      expect(readFileSync(PLIST, "utf-8")).toBe(plistWith(FROM_NPX));
+      const text = said();
+      expect(text).toContain("Auto-capture is on");
+      expect(text).not.toContain("start at login");
+      expect(text).not.toContain("Updated auto-start configuration");
+    });
+
+    it("from the installed CLI, points an npx run's plist at that CLI after a command, says so once, then nothing", async () => {
+      writePlist(plistWith(FROM_NPX));
+      launchd.loaded = true;
+      launchd.loadedText = plistWith(FROM_NPX);
+      daemonRunning();
+      await autoEnableCapture({ after: "command" });
+      expect(readFileSync(PLIST, "utf-8")).toBe(plistWith());
+      expect(launchd.loadedText).toBe(plistWith());
+      const text = said();
+      expect(text).toContain("Updated auto-start configuration");
+      expect(text).toContain("Auto-capture is on");
+
+      execFileSync.mockClear();
+      for (let command = 0; command < 3; command++) {
+        await autoEnableCapture({ after: "command" });
+        expect(said()).toBe("");
+      }
+      expect(execFileSync).not.toHaveBeenCalled();
     });
   });
 });

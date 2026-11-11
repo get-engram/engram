@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, afterAll, vi, type Mock } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi, type Mock } from "vitest";
 import {
   existsSync,
   mkdirSync,
@@ -28,10 +28,13 @@ import type { Probe } from "../daemon/instance.js";
  * fake: a signal reaches only a made-up process, never a real one.
  */
 
-const { home, registry, daemon, spawn, execSync, execFileSync } = vi.hoisted(() => {
+const { home, cli, registry, daemon, spawn, execSync, execFileSync } = vi.hoisted(() => {
   // vi.hoisted runs before imports: use require-free globals only.
   return {
     home: { dir: "" },
+    // Where this build's sign-in script is, when a test runs it from
+    // somewhere else: npx's cache (engram#665).
+    cli: { loginStart: null as string | null },
     // HKCU\…\Run and StartupApproved\Run, as far as our one value goes:
     // the Run entry's command line, and the switch's data as reg exports it.
     registry: { value: null as string | null, approved: null as string | null },
@@ -75,7 +78,7 @@ vi.mock("../daemon/launch.js", async (importOriginal) => {
   const path = await import("node:path");
   return {
     ...(await importOriginal<typeof import("../daemon/launch.js")>()),
-    loginStartPath: () => path.join(home.dir, "login-start.js"),
+    loginStartPath: () => cli.loginStart ?? path.join(home.dir, "login-start.js"),
   };
 });
 // The probe answers from `daemon.answering`; the rest is the real module.
@@ -103,7 +106,7 @@ const { workerPathFor, loginStartPathFor, supervisorPathFor, supervisorPath, STA
   "../daemon/launch.js"
 );
 const { IDENTIFY_STATEMENTS, VERSION } = await import("../daemon/instance.js");
-const { loadConfigStrict } = await import("../config.js");
+const { loadConfigStrict, saveConfig } = await import("../config.js");
 const {
   autoEnableCapture,
   daemonInstall,
@@ -343,6 +346,7 @@ function onWindows(): void {
 }
 
 beforeEach(() => {
+  cli.loginStart = null;
   registry.value = null;
   registry.approved = null;
   daemon.answering = null;
@@ -1738,6 +1742,297 @@ describe("auto-capture after any other command (engram#644)", () => {
   });
 });
 
+describe("a CLI run from npx's cache, on Windows (engram#665)", () => {
+  // npm clears npx's cache as it likes, and an entry naming the sign-in
+  // script there would then stop starting the daemon at sign-in, without a
+  // word. So would one pnpm dlx, bunx or yarn dlx left.
+  const NPX_LOGIN_START = join(
+    home.dir,
+    "AppData",
+    "Local",
+    "npm-cache",
+    "_npx",
+    "f3920abdac2db749",
+    "node_modules",
+    "@getengram",
+    "cli",
+    "dist",
+    "daemon",
+    "login-start.js",
+  );
+  const NODE = throughOptLink(realpathSync.native(process.execPath));
+  /** The entry an npx run added before engram#665: it works until npm clears its cache. */
+  const FROM_NPX = `"${NODE}" "${NPX_LOGIN_START}"`;
+  /** One npm cleared since: the script it names is gone. */
+  const CLEARED = `"${NODE}" "${join(home.dir, "AppData", "Local", "npm-cache", "_npx", "0123456789abcdef", "node_modules", "@getengram", "cli", "dist", "daemon", "login-start.js")}"`;
+  const CANT_TURN_ON = [
+    "Can't turn on start at login: this Engram runs from npx's cache, which can be cleared at any time.",
+    "  Install the CLI with: npm install -g @getengram/cli",
+  ];
+  const CANT_REPAIR = [
+    "Can't repair start at login: this Engram runs from npx's cache, which can be cleared at any time.",
+    "  Install the CLI with: npm install -g @getengram/cli",
+    "  Then run: engram install",
+  ].join("\n");
+  const WONT_START_AT_LOGIN = [
+    "  The daemon won't start at login: this Engram runs from npx's cache, which can be cleared at any time.",
+    "  To start it at login, install the CLI: npm install -g @getengram/cli && engram install",
+  ].join("\n");
+
+  beforeAll(() => {
+    mkdirSync(dirname(NPX_LOGIN_START), { recursive: true });
+    writeFileSync(NPX_LOGIN_START, "");
+  });
+
+  beforeEach(() => {
+    vi.mocked(saveConfig).mockClear();
+  });
+
+  /** What was said since the last call. */
+  function said(): string {
+    const text = output();
+    vi.mocked(console.log).mockClear();
+    vi.mocked(console.error).mockClear();
+    return text;
+  }
+
+  /** The daemon is gone, as after a restart. */
+  function daemonGone(): void {
+    daemon.answering = null;
+    rmSync(PID_FILE, { force: true });
+  }
+
+  /** Run as `npx @getengram/cli` does on Windows: this build, in npx's cache. */
+  async function fromNpx(run: () => unknown, loginStart = NPX_LOGIN_START): Promise<void> {
+    cli.loginStart = loginStart;
+    try {
+      await run();
+    } finally {
+      cli.loginStart = null;
+    }
+  }
+
+  it("engram install adds no entry, records nothing, and says how to install the CLI", async () => {
+    onWindows();
+    await fromNpx(() => daemonInstall());
+    expect(registry.value).toBeNull();
+    expect(execFileSync).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(saveConfig).not.toHaveBeenCalled();
+    expect(said()).toBe([...CANT_TURN_ON, "  Then run: engram install"].join("\n"));
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("names the place the runner runs it from: yarn dlx's temporary folder", async () => {
+    onWindows();
+    const yarnDlx = join(home.dir, "AppData", "Local", "Temp", "xfs-1a2b3c4d", "dlx-5678", "node_modules", "@getengram", "cli");
+    await fromNpx(() => daemonInstall(), join(yarnDlx, "dist", "daemon", "login-start.js"));
+    expect(registry.value).toBeNull();
+    expect(said()).toContain(
+      "Can't turn on start at login: this Engram runs from a temporary folder, which can be cleared at any time.",
+    );
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("engram start --install starts nothing and changes nothing, a broken entry included", async () => {
+    onWindows();
+    registry.value = BROKEN_ENTRY;
+    await fromNpx(() => daemonStart([], { install: "" }));
+    expect(registry.value).toBe(BROKEN_ENTRY);
+    expect(execFileSync).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(saveConfig).not.toHaveBeenCalled();
+    expect(said()).toBe([...CANT_TURN_ON, "  Then run: engram start --install"].join("\n"));
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("engram start starts the daemon, and says nothing of start at login when there is no entry", async () => {
+    onWindows();
+    await fromNpx(() => daemonStart([], {}));
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(registry.value).toBeNull();
+    expect(regCalls("add")).toHaveLength(0);
+    const text = said();
+    expect(text).toContain("Engram daemon started");
+    expect(text).not.toContain("start at login");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("engram start leaves a broken entry as it is, and says why it can't repair it", async () => {
+    onWindows();
+    for (const broken of [BROKEN_ENTRY, CLEARED]) {
+      registry.value = broken;
+      daemonGone();
+      spawn.mockClear();
+      execFileSync.mockClear();
+      await fromNpx(() => daemonStart([], {}));
+      expect(registry.value).toBe(broken);
+      expect(regCalls("add")).toHaveLength(0);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const text = said();
+      expect(text).toContain(CANT_REPAIR);
+      expect(text).toContain("Engram daemon started");
+      expect(text).not.toContain("Updated the start-at-login entry");
+      expect(process.exitCode).toBeUndefined();
+    }
+  });
+
+  it("engram start says nothing of a broken entry switched off in Startup apps", async () => {
+    onWindows();
+    registry.value = BROKEN_ENTRY;
+    registry.approved = SWITCHED_OFF;
+    await fromNpx(() => daemonStart([], {}));
+    expect(registry.value).toBe(BROKEN_ENTRY);
+    expect(registry.approved).toBe(SWITCHED_OFF);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(said()).not.toContain("Can't repair start at login");
+  });
+
+  it("engram start leaves an entry that works as it is, without a word: the installed CLI's, or an npx run's", async () => {
+    onWindows();
+    for (const entry of [ENTRY, FROM_NPX]) {
+      registry.value = entry;
+      daemonGone();
+      execFileSync.mockClear();
+      await fromNpx(() => daemonStart([], {}));
+      expect(registry.value).toBe(entry);
+      expect(regCalls("add")).toHaveLength(0);
+      const out = said();
+      expect(out).toContain("Engram daemon started");
+      expect(out).not.toContain("Can't repair start at login");
+      expect(out).not.toContain("Updated the start-at-login entry");
+    }
+  });
+
+  it("engram status says an entry naming npx's cache is outdated, until the installed CLI's engram install points it at that CLI", async () => {
+    onWindows();
+    registry.value = FROM_NPX;
+    daemonRunning();
+    await daemonStatus();
+    expect(said()).toContain(
+      "Auto-start: enabled (Windows sign-in)  — outdated config, run 'engram install' to update",
+    );
+    await daemonInstall();
+    expect(registry.value).toBe(ENTRY);
+    said();
+    await daemonStatus();
+    const after = said();
+    expect(after).toContain("Auto-start: enabled (Windows sign-in)");
+    expect(after).not.toMatch(/broken|outdated/);
+  });
+
+  it("the installed CLI's engram start points such an entry at that CLI, once, and leaves the Startup apps switch", async () => {
+    onWindows();
+    registry.value = FROM_NPX;
+    registry.approved = SWITCHED_OFF;
+    await daemonStart([], {});
+    expect(registry.value).toBe(ENTRY);
+    expect(registry.approved).toBe(SWITCHED_OFF);
+    expect(said()).toContain("Updated the start-at-login entry");
+
+    daemonGone();
+    execFileSync.mockClear();
+    await daemonStart([], {});
+    expect(registry.value).toBe(ENTRY);
+    expect(regCalls("add")).toHaveLength(0);
+    expect(said()).not.toContain("Updated the start-at-login entry");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  describe("auto-capture", () => {
+    signedInAtATerminal();
+
+    it("after sign-in starts the daemon, adds no entry, and says why, then nothing more", async () => {
+      onWindows();
+      await fromNpx(() => autoEnableCapture({ after: "login" }));
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(registry.value).toBeNull();
+      expect(regCalls("add")).toHaveLength(0);
+      expect(said()).toBe(
+        [
+          "Auto-capture is on — conversations from supported agents on this machine save to your Engram.",
+          WONT_START_AT_LOGIN,
+          "  Turn off anytime: engram stop && engram uninstall",
+        ].join("\n"),
+      );
+
+      for (let command = 0; command < 3; command++) {
+        await fromNpx(() => autoEnableCapture({ after: "command" }));
+        expect(said()).toBe("");
+      }
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(registry.value).toBeNull();
+      expect(regCalls("add")).toHaveLength(0);
+    });
+
+    it("says it after a command that had to start the daemon: what start at login would have done", async () => {
+      onWindows();
+      await fromNpx(() => autoEnableCapture({ after: "command" }));
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(registry.value).toBeNull();
+      const text = said();
+      expect(text).toContain("Auto-capture is on");
+      expect(text).toContain(WONT_START_AT_LOGIN);
+    });
+
+    it("leaves a broken entry as it is, and says why", async () => {
+      onWindows();
+      registry.value = BROKEN_ENTRY;
+      await fromNpx(() => autoEnableCapture({ after: "login" }));
+      expect(registry.value).toBe(BROKEN_ENTRY);
+      expect(regCalls("add")).toHaveLength(0);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const text = said();
+      expect(text).toContain(WONT_START_AT_LOGIN);
+      expect(text).not.toContain("Updated the start-at-login entry");
+    });
+
+    it("says nothing of start at login when the broken entry is switched off in Startup apps", async () => {
+      onWindows();
+      registry.value = BROKEN_ENTRY;
+      registry.approved = SWITCHED_OFF;
+      await fromNpx(() => autoEnableCapture({ after: "login" }));
+      expect(registry.value).toBe(BROKEN_ENTRY);
+      expect(registry.approved).toBe(SWITCHED_OFF);
+      const text = said();
+      expect(text).toContain("Auto-capture is on");
+      expect(text).not.toContain("start at login");
+    });
+
+    it("leaves an entry that works as it is, and says nothing of start at login", async () => {
+      onWindows();
+      registry.value = FROM_NPX;
+      daemonRunning();
+      await fromNpx(() => autoEnableCapture({ after: "login" }));
+      expect(registry.value).toBe(FROM_NPX);
+      expect(regCalls("add")).toHaveLength(0);
+      const text = said();
+      expect(text).toContain("Auto-capture is on");
+      expect(text).not.toContain("start at login");
+      expect(text).not.toContain("Updated the start-at-login entry");
+    });
+
+    it("from the installed CLI, points an npx run's entry at that CLI after a command, says so once, then nothing", async () => {
+      onWindows();
+      registry.value = FROM_NPX;
+      daemonRunning();
+      await autoEnableCapture({ after: "command" });
+      expect(registry.value).toBe(ENTRY);
+      const text = said();
+      expect(text).toContain("Updated the start-at-login entry");
+      expect(text).toContain("Auto-capture is on");
+
+      execFileSync.mockClear();
+      for (let command = 0; command < 3; command++) {
+        await autoEnableCapture({ after: "command" });
+        expect(said()).toBe("");
+      }
+      expect(regCalls("add")).toHaveLength(0);
+      expect(registry.value).toBe(ENTRY);
+    });
+  });
+});
+
 // Last: resetModules leaves the modules imported above on their old instances.
 describe("the Windows sign-in launcher (engram#602)", () => {
   it("starts the supervisor hidden, without trusting the last session's PID file", async () => {
@@ -1762,7 +2057,7 @@ describe("the Windows sign-in launcher (engram#602)", () => {
    * import nothing at all: a module that seems to import nothing otherwise
    * means the pattern has stopped matching.
    */
-  const NO_IMPORTS = new Set(["output.ts", "supervise.ts"]);
+  const NO_IMPORTS = new Set(["output.ts", "package-runner.ts", "supervise.ts"]);
   function modulesLoaded(entries: string[], dynamic: boolean): string[] {
     const imports = dynamic ? /\b(?:from|import)\s*\(?\s*["']([^"']+)["']/g : /\b(?:from|import)\s+["']([^"']+)["']/g;
     const seen = new Set<string>();
@@ -1800,7 +2095,8 @@ describe("the Windows sign-in launcher (engram#602)", () => {
     // body comes after, through import(). The lock looks for a daemon
     // running as root, in launchd's system domain too (engram#680), and
     // says, with a desktop notice, when ~/.engram's own permissions keep
-    // the daemon out of it (engram#723).
+    // the daemon out of it (engram#723). launchd.ts reads a plist naming a
+    // package runner's cache as outdated (engram#665).
     expect(modulesLoaded(["worker.ts"], false)).toEqual([
       "as-root.ts",
       "command-path.ts",
@@ -1810,6 +2106,7 @@ describe("the Windows sign-in launcher (engram#602)", () => {
       "launchd.ts",
       "output.ts",
       "ownership.ts",
+      "package-runner.ts",
       "powershell.ts",
       "preflight.ts",
       "private-files.ts",
@@ -1833,6 +2130,7 @@ describe("the Windows sign-in launcher (engram#602)", () => {
       "launchd.ts",
       "output.ts",
       "ownership.ts",
+      "package-runner.ts",
       "powershell.ts",
       "private-files.ts",
       "status.ts",

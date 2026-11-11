@@ -5,7 +5,7 @@ import { HTTPException } from "hono/http-exception";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { authMiddleware, timingSafeEqual } from "./middleware/auth.js";
 import { rateLimitMiddleware } from "./middleware/rate-limit.js";
-import { securityHeaders } from "./middleware/security-headers.js";
+import { securityHeaders, UNSUBSCRIBE_PAGE_SECURITY_POLICY } from "./middleware/security-headers.js";
 import { createMcpServer } from "./mcp/server.js";
 import { keys } from "./routes/keys.js";
 import { seats } from "./routes/seats.js";
@@ -187,35 +187,84 @@ app.use(
 );
 app.route("/signup", signup);
 
-// One-click digest unsubscribe (engram#256) — signed link from the
-// weekly email; no login required. GET so it works from any mail client.
-// The link is signed with UNSUBSCRIBE_HMAC_KEY (services/secrets.ts, engram#456).
+// Unsubscribe from lifecycle email (engram#256): the signed link in the
+// weekly digest and the reminder emails, no login needed. The link is signed
+// with UNSUBSCRIBE_HMAC_KEY (services/secrets.ts, engram#456).
+//
+// GET changes nothing (engram#736). Mail security gateways fetch every link
+// in a message to check it, on delivery or when it is opened. While GET did
+// the opt-out, that fetch alone unsubscribed people who never saw the link,
+// and the unsubscribe numbers counted the scanners. GET shows a page with
+// one Unsubscribe button, and POST to the same URL does the opt-out. That
+// POST is also the RFC 8058 one-click endpoint: for an email whose
+// List-Unsubscribe header names this link and that carries
+// List-Unsubscribe-Post, a mail client's own Unsubscribe button posts here
+// without opening a page. The answer is never a redirect, which RFC 8058
+// forbids.
+/** An unsubscribe page: fixed text only, nothing taken from the request. */
+function unsubscribePage(title: string, heading: string, content: string): string {
+  return `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>${title}</title><body style="font-family:sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;color:#27272a"><h1 style="font-size:1.4rem">${heading}</h1>${content}<p><a href="https://getengram.app">getengram.app</a></p>`;
+}
+
+const STILL_SENT = "Emails about your account, billing and security still arrive when needed.";
+
+/** The page a link opens. Its form has no action, so it posts back to the link itself. */
+const UNSUBSCRIBE_CONFIRM_PAGE = unsubscribePage(
+  "Unsubscribe",
+  "Unsubscribe from Engram emails?",
+  `<p>You'll stop getting the weekly digest and our reminder emails. ${STILL_SENT}</p><form method="post"><button type="submit" style="font:inherit;padding:.5rem 1rem">Unsubscribe</button></form>`,
+);
+
+const UNSUBSCRIBED_PAGE = unsubscribePage(
+  "Unsubscribed",
+  "You're unsubscribed",
+  `<p>No more weekly digest or reminder emails. ${STILL_SENT}</p>`,
+);
+
+/** The org an unsubscribe link names, or null when the link isn't signed. */
+async function unsubscribeLinkOrg(env: Env, org: string | undefined, sig: string | undefined): Promise<string | null> {
+  return org && sig && (await unsubscribeSigValid(env, org, sig)) ? org : null;
+}
+
 app.get("/email/unsubscribe", async (c) => {
-  const org = c.req.query("org") ?? "";
-  const sig = c.req.query("sig") ?? "";
-  if (!org || !sig || !(await unsubscribeSigValid(c.env, org, sig))) return c.text("Invalid link.", 400);
-  await c.env.DB.prepare(
-    "UPDATE organizations SET digest_opt_out = 1, digest_opt_out_at = COALESCE(digest_opt_out_at, datetime('now')) WHERE id = ?",
+  const org = await unsubscribeLinkOrg(c.env, c.req.query("org"), c.req.query("sig"));
+  if (org === null) return c.text("Invalid link.", 400);
+  const row = await c.env.DB.prepare("SELECT digest_opt_out FROM organizations WHERE id = ?")
+    .bind(org)
+    .first<{ digest_opt_out: number }>();
+  if (row?.digest_opt_out === 1) return c.html(UNSUBSCRIBED_PAGE);
+  // The shared HTML policy forbids forms; this page's one form posts here.
+  c.header("Content-Security-Policy", UNSUBSCRIBE_PAGE_SECURITY_POLICY);
+  return c.html(UNSUBSCRIBE_CONFIRM_PAGE);
+});
+
+app.post("/email/unsubscribe", async (c) => {
+  const org = await unsubscribeLinkOrg(c.env, c.req.query("org"), c.req.query("sig"));
+  if (org === null) return c.text("Invalid link.", 400);
+  const optOut = await c.env.DB.prepare(
+    "UPDATE organizations SET digest_opt_out = 1, digest_opt_out_at = COALESCE(digest_opt_out_at, datetime('now')) WHERE id = ? AND digest_opt_out = 0",
   )
     .bind(org)
     .run();
   // Attribute the unsubscribe to the email that (almost certainly) contained
-  // the link they clicked: the most recent send to this org. Approximate but
-  // link-format-free — nothing needs threading through the senders.
-  try {
-    await c.env.DB.prepare(
-      `UPDATE email_log SET unsubscribed_at = datetime('now')
-       WHERE id = (SELECT id FROM email_log WHERE org_id = ? ORDER BY sent_at DESC LIMIT 1)
-         AND unsubscribed_at IS NULL`,
-    )
-      .bind(org)
-      .run();
-  } catch {
-    // email_log may predate migration 0031 mid-deploy; the opt-out already stuck.
+  // the link: the most recent send to this org. Approximate but
+  // link-format-free, so nothing needs threading through the senders. Only
+  // when this request is what opted the org out, so a second click, or a
+  // mail client's retry, isn't counted again against a later email.
+  if ((optOut.meta.changes ?? 0) > 0) {
+    try {
+      await c.env.DB.prepare(
+        `UPDATE email_log SET unsubscribed_at = datetime('now')
+         WHERE id = (SELECT id FROM email_log WHERE org_id = ? ORDER BY sent_at DESC LIMIT 1)
+           AND unsubscribed_at IS NULL`,
+      )
+        .bind(org)
+        .run();
+    } catch {
+      // email_log may predate migration 0031 mid-deploy; the opt-out already stuck.
+    }
   }
-  return c.html(
-    "<!doctype html><meta charset=utf-8><title>Unsubscribed</title><body style=\"font-family:sans-serif;max-width:32rem;margin:4rem auto;color:#27272a\"><h1 style=\"font-size:1.4rem\">You're unsubscribed</h1><p>No more weekly digest emails. Account and security emails still arrive when needed.</p><p><a href=\"https://getengram.app\">getengram.app</a></p>",
-  );
+  return c.html(UNSUBSCRIBED_PAGE);
 });
 
 // Open-tracking pixel (migration 0029) — referenced from transactional

@@ -62,13 +62,15 @@ vi.mock("node:fs", async (importOriginal) => {
   }) as typeof real.statSync;
   return { ...real, statSync, default: { ...real, statSync } };
 });
-vi.mock("node:child_process", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("node:child_process")>()),
-  spawn,
-  execSync,
-  execFileSync,
-  execFile,
-}));
+vi.mock("node:child_process", async (importOriginal) =>
+  (await import("./helpers/child-process.js")).recordingNoEnvValues({
+    ...(await importOriginal<typeof import("node:child_process")>()),
+    spawn,
+    execSync,
+    execFileSync,
+    execFile,
+  }),
+);
 vi.mock("../private-files.js", async (importOriginal) => {
   const real = await importOriginal<typeof import("../private-files.js")>();
   return {

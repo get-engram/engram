@@ -30,13 +30,15 @@ vi.mock("node:os", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:os")>()),
   homedir: () => home.dir,
 }));
-vi.mock("node:child_process", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("node:child_process")>()),
-  spawn,
-  execSync,
-  execFileSync,
-  execFile,
-}));
+vi.mock("node:child_process", async (importOriginal) =>
+  (await import("./helpers/child-process.js")).recordingNoEnvValues({
+    ...(await importOriginal<typeof import("node:child_process")>()),
+    spawn,
+    execSync,
+    execFileSync,
+    execFile,
+  }),
+);
 // An install has dist/daemon/worker.js beside launch.js; under vitest the
 // module beside launch.ts is worker.ts. Point at a file that exists.
 vi.mock("../daemon/launch.js", async (importOriginal) => {

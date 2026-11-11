@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { FROM_TEST_ENV } from "./helpers/child-process.js";
 
 // engram#581: the notifier called a bare `require`, which doesn't exist in
 // this ES-module build. The ReferenceError was swallowed, so no "memory is
@@ -18,10 +19,12 @@ vi.mock("node:os", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:os")>()),
   homedir: () => home.dir,
 }));
-vi.mock("node:child_process", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("node:child_process")>()),
-  execFile,
-}));
+vi.mock("node:child_process", async (importOriginal) =>
+  (await import("./helpers/child-process.js")).recordingNoEnvValues({
+    ...(await importOriginal<typeof import("node:child_process")>()),
+    execFile,
+  }),
+);
 
 home.dir = mkdtempSync(join(tmpdir(), "engram-581-"));
 mkdirSync(join(home.dir, ".engram"));
@@ -123,8 +126,9 @@ describe("desktop notifications (engram#581)", () => {
       expect.objectContaining({
         ENGRAM_NOTIFY_TITLE: "Engram needs attention",
         ENGRAM_NOTIFY_BODY: expect.stringContaining("engram auth login"),
-        // the rest of the daemon's environment comes along: PowerShell needs it
-        ENGRAM_TEST_KEPT: "kept",
+        // the rest of the daemon's environment comes along: PowerShell needs
+        // it (what the mock records in place of its values: engram#728)
+        ENGRAM_TEST_KEPT: FROM_TEST_ENV,
       }),
     );
     expect(callback).toEqual(expect.any(Function));

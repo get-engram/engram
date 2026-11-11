@@ -30,10 +30,12 @@ vi.mock("node:os", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:os")>()),
   homedir: () => home.dir,
 }));
-vi.mock("node:child_process", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("node:child_process")>()),
-  spawn,
-}));
+vi.mock("node:child_process", async (importOriginal) =>
+  (await import("./helpers/child-process.js")).recordingNoEnvValues({
+    ...(await importOriginal<typeof import("node:child_process")>()),
+    spawn,
+  }),
+);
 
 home.dir = mkdtempSync(join(tmpdir(), "engram-679-"));
 const ENGRAM = join(home.dir, ".engram");

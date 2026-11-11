@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 import type { DaemonOutput, Probe } from "../daemon/instance.js";
 import type { LaunchAgentsCheck, PlistPaths } from "../daemon/launchd.js";
 import type { ForeignFiles, LockedDir, OwnershipCheck } from "../daemon/ownership.js";
+import { FROM_TEST_ENV } from "./helpers/child-process.js";
 
 /**
  * engram#616 — start at login on macOS: the launchd agent,
@@ -152,13 +153,15 @@ vi.mock("node:os", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:os")>()),
   homedir: () => home.dir,
 }));
-vi.mock("node:child_process", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("node:child_process")>()),
-  spawn,
-  execSync,
-  execFileSync,
-  execFile: vi.fn(),
-}));
+vi.mock("node:child_process", async (importOriginal) =>
+  (await import("./helpers/child-process.js")).recordingNoEnvValues({
+    ...(await importOriginal<typeof import("node:child_process")>()),
+    spawn,
+    execSync,
+    execFileSync,
+    execFile: vi.fn(),
+  }),
+);
 vi.mock("../config.js", () => {
   const loadConfigStrict = vi.fn(async () => ({}));
   return {
@@ -2555,10 +2558,13 @@ describe("engram uninstall keeps the daemon running on macOS (engram#667)", () =
     expect(started()).toEqual([WORKER_STARTED()]);
     // Names only: a failure prints what it compares.
     const { env } = spawn.mock.calls[0][2] as { env: NodeJS.ProcessEnv };
-    expect(["ENGRAM_API_KEY", "ENGRAM_BASE_URL", "ENGRAM_VAULT_KEY"].filter((name) => name in env)).toEqual([]);
-    // The rest of this command's environment, as `engram start` gives it;
+    const overrides = ["ENGRAM_API_KEY", "ENGRAM_BASE_URL", "ENGRAM_VAULT_KEY"];
+    expect(overrides.filter((name) => name in env)).toEqual([]);
+    // The rest of this command's environment, as `engram start` gives it
+    // (each value the mock records in place of this command's: engram#728);
     // and this command's own, as it was.
-    expect(env.PATH).toBe(BIN);
+    expect(Object.keys(env).sort()).toEqual(Object.keys(process.env).filter((name) => !overrides.includes(name)).sort());
+    expect(env.PATH).toBe(FROM_TEST_ENV);
     expect(process.env.ENGRAM_API_KEY).toBe("eng_test_667_env");
     expect(said()).toBe(`${REMOVED}\n${KEEPS}`);
   });

@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -61,10 +61,15 @@ vi.mock("../daemon/launch.js", async (importOriginal) => {
   };
 });
 // `engram start --foreground` runs the worker in the process by importing it.
-vi.mock("../daemon/worker.js", () => {
-  imported.worker = true;
-  return {};
-});
+// Mocked again before each test, so each import is seen: an import that
+// was already made is otherwise never made again.
+function mockWorker(): void {
+  vi.doMock("../daemon/worker.js", () => {
+    imported.worker = true;
+    return {};
+  });
+}
+mockWorker();
 vi.mock("../daemon/instance.js", async (importOriginal) => {
   const real = await importOriginal<typeof import("../daemon/instance.js")>();
   const probeDaemon = async (): Promise<Probe> => {
@@ -125,6 +130,11 @@ const FIX = 'sudo chown -R "$(id -un)" ~/.engram';
 const DB_IS_ROOTS = "daemon.db in ~/.engram belongs to root, not to you, so";
 const KEY_IS_ROOTS =
   "vault-key in ~/.engram belongs to root, not to you. Until it is yours, captured messages wait on this machine: nothing is lost.";
+const LOG_IS_ROOTS = "daemon.log in ~/.engram belongs to root, not to you, so the daemon can't write its log.";
+/** A user this process isn't: what owns a file that is another user's. */
+const OTHER_UID = (process.geteuid?.() ?? 0) + 1000;
+/** What `engram start` and `engram status` say once the log can be written again (engram#679). */
+const RESTART = "  Once it can be written, 'engram stop' and then 'engram start' have the daemon write to it again.";
 
 afterAll(() => {
   rmSync(home.dir, { recursive: true, force: true });
@@ -145,6 +155,7 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
     daemon.root = null;
     given.roots = [];
     imported.worker = false;
+    mockWorker();
     rmSync(CONFIG, { recursive: true, force: true });
     rmSync(ENGRAM_DIR, { recursive: true, force: true });
     mkdirSync(ENGRAM_DIR, { mode: 0o700 });
@@ -205,6 +216,15 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
     chmodSync(KEY_FILE, 0o000);
   }
 
+  /**
+   * A daemon.log that can't be written (engram#679): one of the user's own
+   * made read-only, or, with the euid spied on, another user's.
+   */
+  function unwritableLog(mode = 0o000): void {
+    writeFileSync(LOG_FILE, "");
+    chmodSync(LOG_FILE, mode);
+  }
+
   /** Start at login on: a unit of ours for this CLI, enabled. */
   function startAtLoginOn(): void {
     mkdirSync(dirname(wantsPath()), { recursive: true });
@@ -244,21 +264,57 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
       expectNothingStarted();
     });
 
-    it("starts nothing while its log can't be opened, in the foreground either", async () => {
-      // The foreground doesn't need the log, but the fix is the same.
+    it("starts the daemon without its log while that is another user's, in the foreground too (engram#679)", async () => {
       given.roots = ["daemon.log"];
-      for (const flags of [{}, { foreground: "" }] as Record<string, string>[]) {
-        errs.length = 0;
-        process.exitCode = undefined;
-        await daemonStart([], flags);
-        expect(process.exitCode).toBe(1);
-        expect(errs).toEqual([
-          "daemon.log in ~/.engram belongs to root, not to you, so the daemon can't start, and nothing new is captured.",
-          `  Make it yours with: ${FIX}`,
-          "  Then run 'engram start' again.",
-        ]);
-      }
-      expectNothingStarted();
+      unwritableLog();
+      // Root's, as a `sudo engram start` before 0.7.0 left it: no chmod of
+      // the user's fixes that.
+      vi.spyOn(process, "geteuid").mockReturnValue(OTHER_UID);
+      startsAWorker();
+      await daemonStart([], {});
+      // Said once: no "Then run 'engram start' again", it starts.
+      expect(errs).toEqual([LOG_IS_ROOTS, `  Make it yours with: ${FIX}`]);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      // Its output is dropped: the log can't be opened.
+      expect(spawn.mock.calls[0]?.[2]).toMatchObject({ stdio: "ignore" });
+      expect(out).toEqual([
+        `Engram daemon started (pid ${process.pid})`,
+        `Log: ${LOG_FILE} can't be written (EACCES), so the daemon runs without it.`,
+        // The fix is the chown above, not a chmod.
+        RESTART,
+        `DB:  ${DB_FILE}`,
+      ]);
+      expect(process.exitCode).toBeUndefined();
+
+      // The foreground has no log: what it says goes to the terminal.
+      daemon.answering = null;
+      errs.length = 0;
+      out.length = 0;
+      await daemonStart([], { foreground: "" });
+      expect(errs).toEqual([LOG_IS_ROOTS, `  Make it yours with: ${FIX}`]);
+      expect(out).toEqual(["Starting daemon in foreground..."]);
+      expect(imported.worker).toBe(true);
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it("starts the daemon without a log the user made read-only, and says what fixes it (engram#679)", async () => {
+      unwritableLog(0o400);
+      startsAWorker();
+      await daemonStart([], {});
+      // The user's own: nothing in ~/.engram is another user's.
+      expect(errs).toEqual([]);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(spawn.mock.calls[0]?.[2]).toMatchObject({ stdio: "ignore" });
+      expect(out).toEqual([
+        `Engram daemon started (pid ${process.pid})`,
+        `Log: ${LOG_FILE} can't be written (EACCES), so the daemon runs without it.`,
+        "  To fix it, run: chmod u+w ~/.engram/daemon.log",
+        RESTART,
+        `DB:  ${DB_FILE}`,
+      ]);
+      expect(process.exitCode).toBeUndefined();
+      // Left as the user made it: only the fix they run changes it.
+      expect(statSync(LOG_FILE).mode & 0o777).toBe(0o400);
     });
 
     it("starts nothing while ~/.engram itself is closed to the user", async () => {
@@ -327,6 +383,11 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
       await daemonStart([], {});
       expect(errs).toEqual([]);
       expect(spawn).toHaveBeenCalledTimes(1);
+      // Its output goes to the log, made for it.
+      const stdio = (spawn.mock.calls[0]?.[2] as { stdio: unknown }).stdio;
+      expect(stdio).toEqual(["ignore", expect.any(Number), expect.any(Number)]);
+      expect(statSync(LOG_FILE).mode & 0o777).toBe(0o600);
+      expect(out).toEqual([`Engram daemon started (pid ${process.pid})`, `Log: ${LOG_FILE}`, `DB:  ${DB_FILE}`]);
     });
   });
 
@@ -344,12 +405,12 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
       expectNothingStarted();
     });
 
-    it("doesn't turn it on while the daemon's log can't be opened", async () => {
+    it("turns it on while the daemon's log is another user's: that only costs the log (engram#679)", async () => {
       given.roots = ["daemon.log"];
       await daemonInstall();
-      expect(process.exitCode).toBe(1);
-      expect(errs.at(-1)).toBe("  Then run 'engram install' again.");
-      expectNothingStarted();
+      expect(errs).toEqual([LOG_IS_ROOTS, `  Make it yours with: ${FIX}`]);
+      expect(out[0]).toBe("Start at login isn't available here: it needs a systemd user session ('systemctl --user').");
+      expect(process.exitCode).toBeUndefined();
     });
 
     it("turns it on with a daemon running, and says what they stop once it stops", async () => {
@@ -388,7 +449,7 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
 
   describe("auto-capture", () => {
     it("starts nothing after signing in, and says why", async () => {
-      for (const roots of [["daemon.db"], ["daemon.log"]]) {
+      for (const roots of [["daemon.db"], ["daemon.db", "daemon.log"], [".engram"]]) {
         given.roots = roots;
         out.length = 0;
         await autoEnableCapture({ after: "login" });
@@ -397,6 +458,19 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
       expect(errs).toEqual([]);
       expect(process.exitCode).toBeUndefined();
       expectNothingStarted();
+    });
+
+    it("starts the daemon when only its log is another user's (engram#679)", async () => {
+      given.roots = ["daemon.log"];
+      unwritableLog();
+      startsAWorker();
+      await autoEnableCapture({ after: "login" });
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(spawn.mock.calls[0]?.[2]).toMatchObject({ stdio: "ignore" });
+      expect(out).toContain(
+        "Auto-capture is on — conversations from supported agents on this machine save to your Engram.",
+      );
+      expect(out.join("\n")).not.toContain("wasn't turned on");
     });
 
     it("starts nothing after another command, and says nothing: the banner before it did", async () => {
@@ -431,6 +505,80 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
   });
 
   describe("engram status", () => {
+    it("says a running daemon runs without its log while that is another user's (engram#679)", async () => {
+      given.roots = ["daemon.log"];
+      unwritableLog();
+      vi.spyOn(process, "geteuid").mockReturnValue(OTHER_UID);
+      daemonRunning();
+      await daemonStatus();
+      expect(out.slice(0, 5)).toEqual([
+        `Status: running (pid ${process.pid})`,
+        "",
+        `  ${LOG_IS_ROOTS}`,
+        `  Make it yours with: ${FIX}`,
+        "",
+      ]);
+      const at = out.findIndex((line) => line.startsWith("Log: "));
+      expect(out.slice(at, at + 2)).toEqual([
+        `Log: ${LOG_FILE} can't be written (EACCES), so the daemon runs without it.`,
+        RESTART,
+      ]);
+      expect(out.join("\n")).not.toContain("To fix it");
+      expect(errs).toEqual([]);
+    });
+
+    it("says what fixes a log the user made read-only, or a ~/.engram it can't be made in (engram#679)", async () => {
+      daemonRunning();
+      unwritableLog(0o400);
+      await daemonStatus();
+      let at = out.findIndex((line) => line.startsWith("Log: "));
+      expect(out.slice(at)).toEqual([
+        `Log: ${LOG_FILE} can't be written (EACCES), so the daemon runs without it.`,
+        "  To fix it, run: chmod u+w ~/.engram/daemon.log",
+        RESTART,
+      ]);
+
+      rmSync(LOG_FILE);
+      chmodSync(ENGRAM_DIR, 0o500);
+      try {
+        out.length = 0;
+        await daemonStatus();
+      } finally {
+        chmodSync(ENGRAM_DIR, 0o700);
+      }
+      at = out.findIndex((line) => line.startsWith("Log: "));
+      expect(out.slice(at, at + 2)).toEqual([
+        `Log: ${LOG_FILE} can't be written (EACCES), so the daemon runs without it.`,
+        "  To fix it, run: chmod u+w ~/.engram",
+      ]);
+      expect(errs).toEqual([]);
+    });
+
+    it("says only where the log is while it can be written, made or not (engram#679)", async () => {
+      daemonRunning();
+      await daemonStatus();
+      expect(existsSync(LOG_FILE)).toBe(false);
+      expect(out.filter((line) => line.startsWith("Log: "))).toEqual([`Log: ${LOG_FILE}`]);
+      expect(out.join("\n")).not.toContain("can't be written");
+    });
+
+    it("says a stopped daemon's output is in the journal while its log can't be written (engram#679)", async () => {
+      unwritableLog(0o400);
+      startAtLoginOn();
+      await daemonStatus();
+      expect(out).toEqual([
+        "Status: stopped",
+        "Auto-start: enabled (systemd)",
+        "  It should be running: start at login is on. It may have stopped after an error.",
+        "  The end of its output says why: journalctl --user -u engram",
+        "  Run 'engram start' to start it again.",
+        // Nothing runs, so nothing to restart once it can be written.
+        `Log: ${LOG_FILE} can't be written (EACCES), so the daemon will run without it.`,
+        "  To fix it, run: chmod u+w ~/.engram/daemon.log",
+      ]);
+      expect(errs).toEqual([]);
+    });
+
     it("says why a stopped daemon is stopped, and what to run once they are the user's", async () => {
       given.roots = ["daemon.db"];
       unreadableDb();
@@ -638,6 +786,16 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("files in ~/.engr
       );
       expect(out.filter((line) => line.includes("belongs to root"))).toHaveLength(1);
       expect(process.exitCode).toBeUndefined();
+    });
+
+    it("status names the log it writes to: root writes to it whoever owns it, so it runs with it (engram#679)", async () => {
+      given.roots = ["daemon.db", "daemon.log"];
+      unwritableLog();
+      await daemonStatus();
+      expect(out).toContain(`Status: running as root (pid ${ROOT}), started with sudo`);
+      expect(out.filter((line) => line.startsWith("Log: "))).toEqual([`Log: ${LOG_FILE}`]);
+      expect(out).not.toContain(RESTART);
+      expect(out.join("\n")).not.toMatch(/can't be written|To fix it|journalctl/);
     });
 
     it("status, its PID file gone, says it as one nothing ties to the user, then the files, a blank line between", async () => {

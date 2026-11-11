@@ -28,11 +28,10 @@ const { R_OK, W_OK, X_OK } = constants;
 interface Watched {
   name: string;
   /**
-   * Without this access to it, the daemon can't run ("daemon"), or `engram
-   * start` can't start it in the background ("start"). "always": whatever
-   * the access. Not while `unlessEnv` is set.
+   * Without this access to it, the daemon can't run. "always": whatever the
+   * access. Not while `unlessEnv` is set.
    */
-  stops?: { mode: number | "always"; what: "daemon" | "start"; unlessEnv?: string };
+  stops?: { mode: number | "always"; unlessEnv?: string };
   /**
    * Without this access to it, the daemon runs, but sends nothing: what it
    * captures waits on this machine. Not while `unlessEnv` is set.
@@ -46,20 +45,22 @@ interface Watched {
 const WATCHED: Watched[] = [
   // The queue of captured messages. SQLite opens the database, and the -wal
   // and -shm beside it, to read and write.
-  { name: "daemon.db", stops: { mode: R_OK | W_OK, what: "daemon" } },
-  { name: "daemon.db-wal", stops: { mode: R_OK | W_OK, what: "daemon" } },
-  { name: "daemon.db-shm", stops: { mode: R_OK | W_OK, what: "daemon" } },
+  { name: "daemon.db", stops: { mode: R_OK | W_OK } },
+  { name: "daemon.db-wal", stops: { mode: R_OK | W_OK } },
+  { name: "daemon.db-shm", stops: { mode: R_OK | W_OK } },
   // The API key, and the paths `engram exclude add` keeps out of capture.
   // Even with ENGRAM_API_KEY set: unread, the exclusions would be lost, and
   // the sessions they keep out captured (engram#673).
-  { name: "config.json", stops: { mode: R_OK, what: "daemon" }, warns: W_OK },
+  { name: "config.json", stops: { mode: R_OK }, warns: W_OK },
   // The vault key. One that can't be read holds sends, rather than let the
   // values of named secrets go out as they are (engram#677). Another
   // user's too (engram#695): it used to stop the daemon, and capture with
   // it. Not read at all while ENGRAM_VAULT_KEY is set.
   { name: "vault-key", holds: { mode: R_OK, unlessEnv: "ENGRAM_VAULT_KEY" }, warns: W_OK },
-  // `engram start` and the systemd unit open it for the daemon's output.
-  { name: "daemon.log", stops: { mode: W_OK, what: "start" } },
+  // The daemon's output. One that can't be written only costs the log: the
+  // daemon runs without it (engram#679). It used to stop every start
+  // through `engram start`, launchd and the systemd unit.
+  { name: "daemon.log", warns: W_OK },
   // The daemon replaces these, and the CLI reads them.
   { name: "status.json", warns: R_OK | W_OK },
   { name: "daemon.pid", warns: R_OK | W_OK },
@@ -67,7 +68,7 @@ const WATCHED: Watched[] = [
   // mode (engram#612), so the daemon couldn't hold the single-daemon lock.
   // It would run beside the daemon that made the socket, if that one still
   // runs, and everything would be captured twice.
-  { name: "daemon.sock", stops: { mode: "always", what: "daemon" } },
+  { name: "daemon.sock", stops: { mode: "always" } },
 ];
 
 export interface OwnershipCheck {
@@ -92,11 +93,6 @@ export interface ForeignFiles {
   root: boolean;
   /** The daemon can't run until they are the user's. */
   stopsDaemon: boolean;
-  /**
-   * The daemon can't be started: `engram start` and the systemd unit open
-   * daemon.log for its output, and can't. Started some other way, it runs.
-   */
-  stopsStart: boolean;
   /**
    * The daemon runs, but sends nothing until they are the user's: it can't
    * read the vault key, so what it captures waits here (engram#695).
@@ -149,7 +145,6 @@ export function foreignFiles({
     files: [],
     root: true,
     stopsDaemon: false,
-    stopsStart: false,
     holdsSends: false,
   };
   const counted = (uid: number): void => {
@@ -174,8 +169,7 @@ export function foreignFiles({
     if (!stopped && !held && !warned) continue;
     found.files.push(name);
     counted(uid);
-    if (stopped && stops.what === "daemon") found.stopsDaemon = true;
-    if (stopped && stops.what === "start") found.stopsStart = true;
+    if (stopped) found.stopsDaemon = true;
     if (held) found.holdsSends = true;
   }
   return found.dir || found.files.length > 0 ? found : null;
@@ -204,8 +198,9 @@ export function foreignFilesProblem(f: ForeignFiles, daemon?: "running" | "stopp
   const many = foreignAreMany(f);
   const what = f.dir ? "~/.engram" : `${names(f.files)} in ~/.engram`;
   const whose = `${what} ${many ? "belong" : "belongs"} to ${f.root ? "root" : "another user"}, not to you`;
-  if (!f.stopsDaemon && !f.stopsStart) {
+  if (!f.stopsDaemon) {
     if (f.holdsSends) return `${whose}. Until ${many ? "they are" : "it is"} yours, captured messages wait on this machine: nothing is lost.`;
+    if (!f.dir && f.files.length === 1 && f.files[0] === "daemon.log") return `${whose}, so the daemon can't write its log.`;
     return `${whose}, so Engram can't update ${many ? "them" : "it"}.`;
   }
   if (daemon === "running") return `${whose}, so the daemon can't start again once it stops.`;

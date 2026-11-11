@@ -27,7 +27,9 @@ export const UNIT_NAME = "engram.service";
 // Bump when generateUnit() changes in a way installed units must pick up:
 // `engram start` rewrites an enabled unit older than this. A unit is written
 // once, at install, and a CLI upgrade alone never touches it (engram#469).
-export const UNIT_VERSION = 1;
+//
+// v2: a log that can't be opened no longer stops the start (engram#679).
+export const UNIT_VERSION = 2;
 
 /** What marks a unit as one Engram wrote, and which version of it. */
 const VERSION_ENV = "ENGRAM_UNIT_VERSION";
@@ -96,8 +98,16 @@ function envAssignment(name: string, value: string): string {
  * preflight keeps the usual one (worker-main sets 0077 after it). `exec`
  * keeps the worker the service's main process, the one systemd watches.
  * `$$` is systemd's escape for `$`.
+ *
+ * A log that can't be opened, another user's or one made read-only, costs
+ * only the log (engram#679): the worker runs without it, and its output
+ * goes to the journal (`journalctl --user -u engram`). The subshell opening
+ * the log is the test, as it can't stop the shell. A redirection that fails
+ * on `exec` does: v1 ran the worker with this one only, so the worker never
+ * ran, and systemd started the unit again until its start limit, at every
+ * login.
  */
-const START_SCRIPT = `( umask 077; mkdir -p -- "$$4" && : >>"$$3" ) 2>/dev/null; exec "$$1" "$$2" >>"$$3" 2>&1`;
+const START_SCRIPT = `if ( umask 077; mkdir -p -- "$$4" && : >>"$$3" ) 2>/dev/null; then exec "$$1" "$$2" >>"$$3" 2>&1; fi; exec "$$1" "$$2"`;
 
 /**
  * The unit for the paths given. Pure: tests pass made-up paths.

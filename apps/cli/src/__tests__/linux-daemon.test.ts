@@ -173,6 +173,26 @@ function unitWith(paths: Partial<UnitPaths> = {}, version = UNIT_VERSION): strin
   return text.replace(`ENGRAM_UNIT_VERSION=${UNIT_VERSION}\n`, `ENGRAM_UNIT_VERSION=${version}\n`);
 }
 
+/**
+ * A unit as CLIs before engram#679 wrote it: its script ran the worker only
+ * with its output appended to the log, so while the log couldn't be opened
+ * the worker never ran.
+ */
+function v1Unit(): string {
+  const script = `( umask 077; mkdir -p -- "$$4" && : >>"$$3" ) 2>/dev/null; exec "$$1" "$$2" >>"$$3" 2>&1`;
+  return unitWith({}, 1).replace(/^ExecStart=\/bin\/sh -c '[^']*'/m, () => `ExecStart=/bin/sh -c '${script}'`);
+}
+
+/** A daemon.log of the user's own made read-only: it can't be written (engram#679). */
+function unwritableLog(): void {
+  mkdirSync(ENGRAM_DIR, { recursive: true });
+  writeFileSync(LOG_FILE, "");
+  chmodSync(LOG_FILE, 0o400);
+}
+
+/** What `engram start` and `engram status` say of a log that can't be written, after "Log:" (engram#679). */
+const CANT_BE_WRITTEN = `${LOG_FILE} can't be written (EACCES), so the daemon runs without it.`;
+
 /** Put `text` where the unit goes; enabled, it has the link `systemctl enable` makes. */
 function writeUnit(text: string, enabled = true): void {
   mkdirSync(UNIT_DIR, { recursive: true });
@@ -381,6 +401,7 @@ beforeEach(() => {
   cli.worker = null;
   rmSync(CONFIG, { recursive: true, force: true });
   rmSync(PID_FILE, { force: true });
+  rmSync(LOG_FILE, { force: true });
   writeFileSync(WORKER, "");
   vi.stubEnv("XDG_CONFIG_HOME", CONFIG);
   vi.stubEnv("PATH", BIN);
@@ -431,12 +452,12 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=/bin/sh -c '( umask 077; mkdir -p -- "$$4" && : >>"$$3" ) 2>/dev/null; exec "$$1" "$$2" >>"$$3" 2>&1' engram "/usr/lib/node/bin/node" "/usr/lib/node_modules/@getengram/cli/dist/daemon/worker.js" "/home/op/.engram/daemon.log" "/home/op/.engram"
+ExecStart=/bin/sh -c 'if ( umask 077; mkdir -p -- "$$4" && : >>"$$3" ) 2>/dev/null; then exec "$$1" "$$2" >>"$$3" 2>&1; fi; exec "$$1" "$$2"' engram "/usr/lib/node/bin/node" "/usr/lib/node_modules/@getengram/cli/dist/daemon/worker.js" "/home/op/.engram/daemon.log" "/home/op/.engram"
 Restart=on-failure
 RestartSec=10
 Environment="HOME=/home/op"
 Environment="PATH=/usr/lib/node/bin:/usr/local/bin:/usr/bin:/bin"
-Environment=ENGRAM_UNIT_VERSION=1
+Environment=ENGRAM_UNIT_VERSION=2
 
 [Install]
 WantedBy=default.target
@@ -457,7 +478,7 @@ WantedBy=default.target
     expect(execWords(exec)).toEqual([
       "/bin/sh",
       "-c",
-      `( umask 077; mkdir -p -- "$4" && : >>"$3" ) 2>/dev/null; exec "$1" "$2" >>"$3" 2>&1`,
+      `if ( umask 077; mkdir -p -- "$4" && : >>"$3" ) 2>/dev/null; then exec "$1" "$2" >>"$3" 2>&1; fi; exec "$1" "$2"`,
       "engram",
       `${odd}/node`,
       `${odd}/worker.js`,
@@ -961,6 +982,30 @@ describe("engram status on Linux (engram#615)", () => {
     }
   });
 
+  permissionsIt("says where a running daemon's output goes while its log can't be written (engram#679)", async () => {
+    writeUnit(unitWith());
+    systemdRunsDaemon();
+    unwritableLog();
+    await daemonStatus();
+    // systemd's: in the journal.
+    let text = said();
+    expect(text).toContain(
+      [
+        `Log: ${CANT_BE_WRITTEN}`,
+        "  systemd keeps its output in the journal: journalctl --user -u engram",
+        "  To fix it, run: chmod u+w ~/.engram/daemon.log",
+        "  Once it can be written, 'engram stop' and then 'engram start' have the daemon write to it again.",
+      ].join("\n"),
+    );
+
+    // One systemd didn't start: its output is dropped, and nothing is said of the journal.
+    systemd.mainPid = 0;
+    await daemonStatus();
+    text = said();
+    expect(text).toContain(`Log: ${CANT_BE_WRITTEN}\n  To fix it, run: chmod u+w ~/.engram/daemon.log\n`);
+    expect(text).not.toContain("journalctl");
+  });
+
   it("says nothing of a unit it didn't write, or of none", async () => {
     daemonRunning();
     await daemonStatus();
@@ -984,6 +1029,17 @@ describe("engram status on Linux (engram#615)", () => {
 });
 
 describe("engram start on Linux (engram#615)", () => {
+  it("rewrites a v1 unit, whose daemon never ran while its log couldn't be opened (engram#679)", async () => {
+    writeUnit(v1Unit());
+    expect(readUnit()).toEqual({ kind: "ours", enabled: true, broken: false, version: 1, outdated: true });
+    await daemonStart([], {});
+    expect(readFileSync(UNIT, "utf-8")).toBe(unitWith());
+    expect(linked()).toBe(true);
+    expect(systemctlCalls()).toEqual(["daemon-reload", ...THROUGH_SYSTEMD]);
+    expect(output()).toContain(`Updated auto-start configuration (systemd unit v${UNIT_VERSION})`);
+    expect(UNIT_VERSION).toBe(2);
+  });
+
   it("updates an older unit it wrote, and leaves it enabled", async () => {
     writeUnit(unitWith({}, 0));
     await daemonStart([], {});
@@ -1321,6 +1377,36 @@ describe("engram start through systemd (engram#689)", () => {
     expect(text).not.toContain("journalctl");
     expect(text).toContain(`Engram daemon started (pid ${process.pid})`);
     expect(process.exitCode).toBeUndefined();
+  });
+
+  permissionsIt("says the daemon systemd starts keeps its output in the journal while its log can't be written (engram#679)", async () => {
+    unwritableLog();
+    await daemonStart([], {});
+    expect(spawn).not.toHaveBeenCalled();
+    expect(systemd.mainPid).toBe(process.pid);
+    expect(output()).toContain(
+      [
+        `Engram daemon started (pid ${process.pid})`,
+        `Log: ${CANT_BE_WRITTEN}`,
+        "  systemd keeps its output in the journal: journalctl --user -u engram",
+        "  To fix it, run: chmod u+w ~/.engram/daemon.log",
+        "  Once it can be written, 'engram stop' and then 'engram start' have the daemon write to it again.",
+      ].join("\n"),
+    );
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  permissionsIt("says how to see why the daemon didn't start while its log can't be written (engram#679)", async () => {
+    systemd.starts = "dies";
+    unwritableLog();
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    await daemonStart([], {});
+    expect(exit).toHaveBeenCalledWith(1);
+    const text = output();
+    expect(text).toContain(
+      "Daemon failed to start, and its log can't be written (EACCES). To see why, run it here:\n  engram start --foreground",
+    );
+    expect(text).not.toContain("Check the log");
   });
 
   it("fails when the daemon systemd starts exits as it starts, and starts no other", async () => {

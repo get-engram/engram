@@ -73,7 +73,7 @@ export async function sendWeeklyDigests(env: Env): Promise<number> {
       });
       if (res.ok) sent++;
     } catch (err) {
-      console.error(`[digest] Failed for ${org.email}:`, err);
+      console.error(`[digest] Failed for org ${org.id}:`, err);
     }
   }
   return sent;

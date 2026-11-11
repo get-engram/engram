@@ -59,7 +59,7 @@ export async function sendMaxoutNudges(env: Env): Promise<number> {
         sent++;
       }
     } catch (err) {
-      console.error(`[maxout-nudge] Failed for ${org.email}:`, err);
+      console.error(`[maxout-nudge] Failed for org ${org.id}:`, err);
     }
   }
   return sent;

@@ -70,7 +70,7 @@ export async function sendRecallNudges(env: Env): Promise<number> {
         sent++;
       }
     } catch (err) {
-      console.error(`[recall-nudge] Failed for ${org.email}:`, err);
+      console.error(`[recall-nudge] Failed for org ${org.id}:`, err);
     }
   }
   return sent;

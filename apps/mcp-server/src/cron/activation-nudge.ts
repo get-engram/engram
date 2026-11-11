@@ -70,6 +70,7 @@ export async function sendActivationNudges(env: Env): Promise<number> {
         body: JSON.stringify({
           to: org.email,
           name: org.name,
+          org_id: org.id,
           unsubscribe_url: unsubscribeUrl,
           saved_messages: org.saved ?? 0,
           days_since_signup: org.days_old ?? 0,

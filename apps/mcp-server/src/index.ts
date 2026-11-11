@@ -41,7 +41,7 @@ import { reconcileStripeToD1 } from "./cron/reconcile-stripe.js";
 export { DrainerDO } from "./services/drainer-do.js";
 export { ChunkMoverDO } from "./services/chunk-mover-do.js";
 import { sendWeeklyDigests } from "./cron/weekly-digest.js";
-import { unsubscribeSigValid } from "./services/secrets.js";
+import { UNSUBSCRIBE_LINK_EMAILS, unsubscribeSigValid } from "./services/secrets.js";
 import { sendShareNudge } from "./cron/share-nudge.js";
 import { sendDailyReport } from "./services/daily-report.js";
 import { oauth } from "./oauth/router.js";
@@ -246,19 +246,22 @@ app.post("/email/unsubscribe", async (c) => {
   )
     .bind(org)
     .run();
-  // Attribute the unsubscribe to the email that (almost certainly) contained
-  // the link: the most recent send to this org. Approximate but
-  // link-format-free, so nothing needs threading through the senders. Only
+  // Credit the unsubscribe to the email that (almost certainly) carried the
+  // link: the latest email to this org of a kind that has one. A welcome
+  // email or a team invite sent since has no link, so it is never the one
+  // (engram#745). The senders log each of these emails with its org. Only
   // when this request is what opted the org out, so a second click, or a
   // mail client's retry, isn't counted again against a later email.
   if ((optOut.meta.changes ?? 0) > 0) {
     try {
       await c.env.DB.prepare(
         `UPDATE email_log SET unsubscribed_at = datetime('now')
-         WHERE id = (SELECT id FROM email_log WHERE org_id = ? ORDER BY sent_at DESC LIMIT 1)
+         WHERE id = (SELECT id FROM email_log
+                     WHERE org_id = ? AND type IN (${UNSUBSCRIBE_LINK_EMAILS.map(() => "?").join(", ")})
+                     ORDER BY sent_at DESC LIMIT 1)
            AND unsubscribed_at IS NULL`,
       )
-        .bind(org)
+        .bind(org, ...UNSUBSCRIBE_LINK_EMAILS)
         .run();
     } catch {
       // email_log may predate migration 0031 mid-deploy; the opt-out already stuck.

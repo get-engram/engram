@@ -20,6 +20,7 @@ import { ALL_ADAPTERS } from "./adapters.js";
 import { asRootRefusal, rootForAnotherUser } from "./as-root.js";
 import { commandFailure } from "./command-path.js";
 import { throughOptLink } from "./homebrew.js";
+import { scoopVersionOf, throughScoopCurrent } from "./scoop.js";
 import { INSTALL_CLI, engramCommand, runnerCacheOf, runnerCacheOfThisCli } from "./package-runner.js";
 import {
   foreignFiles,
@@ -2314,11 +2315,13 @@ export function runEntryCommand(nodePath: string, entryPath: string): string {
  * through a link made for one shell session (fnm's multishell directories),
  * which may be gone by the next sign-in; the program it links to stays.
  * Homebrew's Node goes by its opt link, which outlasts the version the next
- * `brew upgrade` removes (engram#652).
+ * `brew upgrade` removes (engram#652); on Windows, Scoop's by its `current`
+ * junction, which outlasts the version `scoop cleanup` removes (engram#664).
  */
 function nodePathForEntry(): string {
   try {
-    return throughOptLink(realpathSync.native(process.execPath));
+    const real = realpathSync.native(process.execPath);
+    return process.platform === "win32" ? throughScoopCurrent(real) : throughOptLink(real);
   } catch {
     return process.execPath;
   }
@@ -2436,11 +2439,14 @@ function runEntryBroken(entry: string): boolean {
 /**
  * The entry starts the CLI from a package runner's cache, which can be
  * cleared at any time (engram#665): a CLI run that way wrote it, before
- * none did.
+ * none did. Or it names Node by a version of the Scoop app this CLI's Node
+ * goes by the `current` of, which the next update and cleanup remove
+ * (engram#664): never the Node nodePathForEntry names, so a CLI never
+ * rewrites the entry it just wrote.
  */
 function runEntryOutdated(entry: string): boolean {
   const m = entry.match(RUN_ENTRY);
-  return m !== null && runnerCacheOf(m[2]) !== null;
+  return m !== null && (runnerCacheOf(m[2]) !== null || scoopVersionOf(m[1], nodePathForEntry()));
 }
 
 /** Add the entry, or point it at this CLI. Null when reg did; else what reg said, to print. */
@@ -2470,9 +2476,10 @@ function deleteRunEntry(): string | null {
  * Point a broken entry at this CLI, the counterpart of repairLaunchdIfStale:
  * an entry naming a Node or a CLI that has since moved fails at every
  * sign-in without a word. And one naming a package runner's cache, which
- * can be cleared at any time (engram#665). A working entry is left as it
- * is. So is any, from a CLI that runs from such a cache: "runner" when it
- * is broken, and not switched off in Startup apps, for the caller to say.
+ * can be cleared at any time (engram#665), or Node by a Scoop version the
+ * next update and cleanup remove (engram#664). A working entry is left as
+ * it is. So is any, from a CLI that runs from such a cache: "runner" when
+ * it is broken, and not switched off in Startup apps, for the caller to say.
  */
 export function repairRunEntryIfStale(entry: string | null = readRunEntry()): Exclude<LaunchdRepair, "refused"> {
   if (entry === null) return "unchanged";

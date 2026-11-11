@@ -30,6 +30,13 @@
  * for SIGTERM, a worker ended outright is started again, and one ended
  * after a stop request isn't.
  *
+ * On Windows, Node run from a Scoop app's `current` junction is named by it
+ * in the Run entry, which outlasts the version `scoop update` and
+ * `scoop cleanup` remove (engram#664): an entry naming the version reads as
+ * outdated, the next start points it at `current`, and after an update and
+ * a cleanup the entry still starts the daemon at sign-in. The junction is a
+ * real one, which the unit tests have only where they run on Windows.
+ *
  * Usage, after `pnpm build`:  node scripts/smoke-daemon.mjs
  *
  * Everything happens under a temporary home with a placeholder API key and
@@ -178,7 +185,16 @@ function engram(...args) {
 
 /** engram(), with the CLI at `cli`. */
 function engramAt(cli, ...args) {
-  const r = spawnSync(node, [cli, ...args], {
+  return runEngram(node, cli, args);
+}
+
+/** engram(), run by the Node at `by` (engram#664). */
+function engramBy(by, ...args) {
+  return runEngram(by, CLI, args);
+}
+
+function runEngram(by, cli, args) {
+  const r = spawnSync(by, [cli, ...args], {
     env,
     cwd: root,
     encoding: "utf-8",
@@ -186,7 +202,8 @@ function engramAt(cli, ...args) {
     windowsHide: true,
   });
   const out = `${r.stdout ?? ""}${r.stderr ?? ""}`.replace(/\x1b\[[0-9;]*m/g, "");
-  console.log(`\n$ engram ${args.join(" ")}  (exit ${r.status ?? r.signal ?? r.error?.message})`);
+  const nodeSaid = by === node ? "" : `  by ${by}`;
+  console.log(`\n$ engram ${args.join(" ")}  (exit ${r.status ?? r.signal ?? r.error?.message})${nodeSaid}`);
   for (const line of out.trimEnd().split("\n")) console.log(`  │ ${line}`);
   return { status: r.status, out };
 }
@@ -538,6 +555,99 @@ try {
         check(!existsSync(STOP_FILE), "the supervisor removes the request");
       }
     }
+
+    // ── Node from Scoop, by its current junction (engram#664) ──
+    // Scoop keeps each version of an app in a folder of its own, and
+    // `current`, a junction to the one in use: `scoop update` points it at
+    // the new version and `scoop cleanup` removes the old one. Windows
+    // resolves the junction in Node's own path, so the entry named the
+    // version, and stopped starting the daemon at sign-in after a cleanup.
+    // Under the home, where Scoop keeps its apps.
+    const APP = join(home, "scoop", "apps", "nodejs");
+    const scoopNode = (version) => join(APP, version, "node.exe");
+    /** This Node, as a version of the app. */
+    const addVersion = (version) => {
+      mkdirSync(join(APP, version), { recursive: true });
+      copyFileSync(process.execPath, scoopNode(version));
+    };
+    /** Point current at the version, as `scoop update` does. */
+    const pointCurrent = (version) => {
+      rmSync(join(APP, "current"), { force: true }); // the junction, not the version it leads to
+      symlinkSync(join(APP, version), join(APP, "current"), "junction");
+    };
+    const BY_CURRENT = scoopNode("current");
+    // By its real path, as the CLI names Node: the runner's temp folder is
+    // an 8.3 short name.
+    const scoopEntry = (version) => `"${join(realpathSync.native(APP), version, "node.exe")}" "${LOGIN_START}"`;
+    addVersion("22.11.0");
+    pointCurrent("22.11.0");
+
+    // None running: start repairs the entry only then, and the version
+    // folder is removed below, which Windows refuses while a program in it
+    // runs. The worker ended outright above left its PID file.
+    const ended = daemonPid();
+    if (ended !== null && pids.has(ended) && alive(ended)) await stopped(ended);
+
+    r = engramBy(BY_CURRENT, "install");
+    check(r.status === 0, "install from Scoop's Node exits 0");
+    pid = await started("install from Scoop's Node starts a worker", ended);
+    let scoopNow = regValue(RUN_KEY, "string");
+    check(
+      scoopNow === scoopEntry("current"),
+      `the Run entry names Node by Scoop's current junction: ${scoopEntry("current")} (got ${JSON.stringify(scoopNow)})`,
+    );
+    r = engramBy(BY_CURRENT, "daemon", "status");
+    check(
+      /Auto-start: enabled \(Windows sign-in\)/.test(r.out) && !/broken|outdated/.test(r.out),
+      "status reads that entry as working and up to date",
+    );
+    await stopped(pid);
+
+    // The entry a CLI from before #664 wrote: Node by its version.
+    execFileSync(REG, ["add", RUN_KEY, "/v", VALUE, "/t", "REG_SZ", "/d", scoopEntry("22.11.0"), "/f"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    check(regValue(RUN_KEY, "string") === scoopEntry("22.11.0"), "an entry naming Scoop's version, as before #664");
+    r = engramBy(BY_CURRENT, "daemon", "status");
+    check(/outdated config/.test(r.out) && !/broken/.test(r.out), "status says that entry is outdated");
+    r = engramBy(BY_CURRENT, "start");
+    check(r.status === 0, "start from Scoop's Node exits 0");
+    check(
+      r.out.split("\n").filter((line) => line.includes("Updated the start-at-login entry")).length === 1,
+      "start says it updated the entry, once",
+    );
+    pid = await started("start from Scoop's Node starts a worker");
+    scoopNow = regValue(RUN_KEY, "string");
+    check(scoopNow === scoopEntry("current"), `start points it at current (got ${JSON.stringify(scoopNow)})`);
+    r = engramBy(BY_CURRENT, "daemon", "status");
+    check(!/broken|outdated/.test(r.out), "and status reads it as up to date: nothing rewrites it again");
+    await stopped(pid);
+
+    // scoop update nodejs, then scoop cleanup nodejs.
+    addVersion("23.1.0");
+    pointCurrent("23.1.0");
+    rmSync(join(APP, "22.11.0"), { recursive: true, maxRetries: 10, retryDelay: 500 });
+    check(!existsSync(scoopNode("22.11.0")), "the cleanup removes the version the entry used to name");
+    r = engramBy(BY_CURRENT, "daemon", "status");
+    check(
+      /Auto-start: enabled \(Windows sign-in\)/.test(r.out) && !/broken|outdated/.test(r.out),
+      "after the update and the cleanup, status reads the entry as working",
+    );
+    scoopNow = regValue(RUN_KEY, "string");
+    check(scoopNow === scoopEntry("current"), "the entry is unchanged");
+    const signInAfterUpdate = spawnSync(scoopNow ?? scoopEntry("current"), {
+      shell: true,
+      stdio: "ignore",
+      env,
+      timeout: 60_000,
+      windowsHide: true,
+    });
+    check(signInAfterUpdate.status === 0, "the entry runs at sign-in after the update");
+    pid = await started("and starts a worker, on the new version");
+    await stopped(pid);
+    r = engram("uninstall");
+    check(regValue(RUN_KEY, "string") === null, "uninstall removes the entry");
 
     check(existsSync(win32.join(SYSTEM32, "rundll32.exe")), "rundll32.exe, the URL opener, is where upgrade.ts looks");
   } else if (process.platform === "linux") {

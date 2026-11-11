@@ -57,13 +57,15 @@ vi.mock("node:os", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:os")>()),
   homedir: () => home.dir,
 }));
-vi.mock("node:child_process", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("node:child_process")>()),
-  spawn,
-  execSync,
-  execFileSync,
-  execFile: vi.fn(),
-}));
+vi.mock("node:child_process", async (importOriginal) =>
+  (await import("./helpers/child-process.js")).recordingNoEnvValues({
+    ...(await importOriginal<typeof import("node:child_process")>()),
+    spawn,
+    execSync,
+    execFileSync,
+    execFile: vi.fn(),
+  }),
+);
 vi.mock("../config.js", () => {
   const loadConfigStrict = vi.fn(async () => ({}));
   return {

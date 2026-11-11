@@ -62,17 +62,19 @@ vi.mock("node:os", async (importOriginal) => ({
 
 // Nothing is run. `engram install` on macOS runs launchctl, which would load
 // a launchd job under a real install's label.
-vi.mock("node:child_process", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("node:child_process")>()),
-  execSync: vi.fn(() => {
-    throw new Error("not run in these tests");
+vi.mock("node:child_process", async (importOriginal) =>
+  (await import("./helpers/child-process.js")).recordingNoEnvValues({
+    ...(await importOriginal<typeof import("node:child_process")>()),
+    execSync: vi.fn(() => {
+      throw new Error("not run in these tests");
+    }),
+    execFile: vi.fn(),
+    execFileSync: run,
+    spawn: vi.fn(() => {
+      throw new Error("not run in these tests");
+    }),
   }),
-  execFile: vi.fn(),
-  execFileSync: run,
-  spawn: vi.fn(() => {
-    throw new Error("not run in these tests");
-  }),
-}));
+);
 
 // An install has dist/daemon/worker.js beside launch.js; under vitest the
 // module beside launch.ts is worker.ts. A test that needs one makes this one.

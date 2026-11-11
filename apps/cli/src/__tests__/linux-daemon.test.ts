@@ -822,6 +822,16 @@ describe("engram uninstall on Linux (engram#615)", () => {
     expect(process.exitCode).toBeUndefined();
   });
 
+  it("doesn't say a daemon that is stopping keeps running (engram#667)", async () => {
+    writeUnit(unitWith());
+    daemonStopping();
+    await daemonUninstall();
+    expect(existsSync(UNIT)).toBe(false);
+    expect(said()).toBe("Auto-start disabled — the systemd unit is removed");
+    expect(signals()).toEqual([]);
+    expect(process.exitCode).toBeUndefined();
+  });
+
   it("doesn't say one running as root keeps running until 'engram stop', which can't stop it (engram#680)", async () => {
     writeUnit(unitWith());
     // `sudo engram start` (CLI 0.6.1 and before) left one running as root,

@@ -570,18 +570,25 @@ export function kickstartAgent(): string | null {
   }
 }
 
-/** Unload the agent, which stops a daemon launchd runs for it. Quiet when it isn't loaded. */
-export function unloadAgent(): void {
+/**
+ * Unload the agent, which stops a daemon launchd runs for it. Quiet when it
+ * isn't loaded. Whether launchctl took the bootout, or the unload after it:
+ * false when it took neither, as when the job isn't loaded, when launchd
+ * refuses, or when bootout gives up waiting for the daemon to exit
+ * ("Operation now in progress") and launchd lets go of the job after.
+ */
+export function unloadAgent(): boolean {
   try {
     launchctl(["bootout", `${guiDomain()}/${PLIST_LABEL}`]);
-    return;
+    return true;
   } catch {
     // not loaded, or older macOS
   }
   try {
     launchctl(["unload", plistPath()]);
+    return true;
   } catch {
-    // not loaded
+    return false; // not loaded
   }
 }
 

@@ -53,6 +53,7 @@ import {
   pidInFile,
   probeDaemon,
   removePidFileIf,
+  type DaemonOutput,
   type Probe,
 } from "./instance.js";
 import {
@@ -131,6 +132,8 @@ type DaemonFound =
       /** From its answer: which server it is, and whether it stops when STOP_FILE asks it to (engram#613). */
       id?: string;
       stopFile?: boolean;
+      /** From its answer: where its output goes (engram#720). */
+      output?: DaemonOutput;
     }
   /** It answers, and is shutting down: finishing a send, then exiting. */
   | { state: "stopping"; pid: number }
@@ -161,6 +164,7 @@ function fromAnswer(probe: Probe): DaemonFound | null {
     older: false,
     id: info.id,
     stopFile: info.stopFile,
+    output: info.output,
   };
 }
 
@@ -227,6 +231,11 @@ function printAlreadyRunning(found: Extract<DaemonFound, { state: "running" | "u
   }
   console.log(`Daemon already running${pid}`);
   printVersionHint(found);
+  // Its log can be written, and it doesn't write there (engram#720): a
+  // start after fixing the log finds it running.
+  if (found.output !== undefined && found.output !== "log" && logProblem() === null) {
+    printLog(true, found.pid, undefined, found.output);
+  }
 }
 
 /** When the running daemon isn't this CLI's version, how to switch to it. */
@@ -484,29 +493,62 @@ function stopsCapture(foreign: ForeignFiles | null): boolean {
 }
 
 /**
+ * Why a running daemon doesn't write to its log, by where its output goes
+ * (engram#720).
+ */
+const NOT_THE_LOG: Record<Exclude<DaemonOutput, "log">, string> = {
+  none: "it started without it",
+  deleted: "the log it writes to has been deleted or replaced",
+  file: "it writes to another file",
+  terminal: "it writes to the terminal it was started in",
+};
+
+const IN_JOURNAL = "  systemd keeps its output in the journal: journalctl --user -u engram";
+
+/**
  * The Log line of `engram start` and `engram status`: where the daemon's
  * log is, or that it can't be written, so the daemon runs without it
  * (engram#679), and what fixes that. `running`: whether a daemon runs,
  * and `pid`, its PID where that is known: systemd keeps what one it
  * started writes in the journal. `said`: a fix said above it, for
- * ~/.engram (engram#723), which isn't said again.
+ * ~/.engram (engram#723), which isn't said again. `output`: where the
+ * running daemon's output goes, when it says (engram#720), given only for
+ * one that runs. One that runs keeps the output it was started with,
+ * whatever is done to the log since, until it is started again.
  */
-function printLog(running: boolean, pid: number | null = null, said?: string): void {
+function printLog(running: boolean, pid: number | null = null, said?: string, output?: DaemonOutput): void {
   const problem = logProblem();
+  // Asked only when it would be said: it runs systemctl.
+  const journal = (): boolean => pid !== null && systemdMainPid() === pid;
   if (problem === null) {
-    console.log(`${dim("Log:")} ${LOG_FILE}`);
+    if (output === undefined || output === "log") {
+      console.log(`${dim("Log:")} ${LOG_FILE}`);
+      return;
+    }
+    console.log(`${dim("Log:")} ${LOG_FILE}, but the daemon doesn't write to it: ${NOT_THE_LOG[output]}.`);
+    if (output === "none" && journal()) console.log(dim(IN_JOURNAL));
+    // Not one in the foreground, which was started to write there.
+    if (output !== "terminal") console.log(dim("  'engram stop' and then 'engram start' have the daemon write to it."));
+    return;
+  }
+  const fix = logFix(problem);
+  const fixLine = fix !== null && fix !== said ? dim(`  To fix it, run: ${fix}`) : null;
+  if (output === "log") {
+    // It opened the log as it started, and goes on writing to it. Started
+    // again before the log is fixed, it would run without it: no stop and
+    // start is suggested.
+    console.log(
+      `${dim("Log:")} ${LOG_FILE}. The daemon writes to it, but it can't be opened for writing now (${problem}), so a daemon started again would run without it.`,
+    );
+    if (fixLine) console.log(fixLine);
     return;
   }
   console.log(
     `${dim("Log:")} ${LOG_FILE} can't be written (${problem}), so the daemon ${running ? "runs" : "will run"} without it.`,
   );
-  if (pid !== null && systemdMainPid() === pid) {
-    console.log(dim("  systemd keeps its output in the journal: journalctl --user -u engram"));
-  }
-  const fix = logFix(problem);
-  if (fix !== null && fix !== said) console.log(dim(`  To fix it, run: ${fix}`));
-  // One that runs keeps the output it was started with.
-  if (running) {
+  if ((output === undefined || output === "none") && journal()) console.log(dim(IN_JOURNAL));
+  if (fixLine) console.log(fixLine);
+  if (running && output !== "terminal") {
     console.log(dim("  Once it can be written, 'engram stop' and then 'engram start' have the daemon write to it again."));
   }
 }
@@ -1330,7 +1372,7 @@ export async function daemonStatus(): Promise<void> {
   // ~/.engram that can't be searched opened it as it started, and goes on
   // writing to it: no one else can open it then (engram#723).
   if (found.state === "root" || locked?.search) console.log(`${dim("Log:")} ${LOG_FILE}`);
-  else printLog(true, found.pid, ownDaemon ? locked?.command : undefined);
+  else printLog(true, found.pid, ownDaemon ? locked?.command : undefined, found.state === "running" ? found.output : undefined);
 
   if (printAutoStart(found) && !keyMissing) await printLoginVaultKeyWarning();
 }

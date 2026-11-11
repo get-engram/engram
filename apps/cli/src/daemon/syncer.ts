@@ -17,6 +17,7 @@ import { retryDelay, formatWait } from "./backoff.js";
 import { parseStorageFullError } from "../storage-error.js";
 import { isPathExcluded, detectOptOut } from "./exclusions.js";
 import { queueing } from "./queue-error.js";
+import { engramCommand } from "./package-runner.js";
 import { plural } from "../output.js";
 import { isDefaultServer, normalizeServer, sameServer } from "../server-url.js";
 import type { SecretScrubber } from "./scrubber.js";
@@ -645,7 +646,7 @@ export class Syncer {
     console.log(
       `[engram] signed out — capture paused and nothing is sent; ${queued} queued message(s) ` +
         `stay on this machine, to be sent only with their account's key. ` +
-        `Capture resumes when 'engram auth login' saves a key.`,
+        `Capture resumes when '${engramCommand("auth login")}' saves a key.`,
     );
   }
 
@@ -876,7 +877,7 @@ export class Syncer {
               `[engram] opt-out delete refused for ${row.conversation_id}: this API key can't ` +
                 `delete conversations. ${plural(waiting, "opt-out delete")} kept on this ` +
                 `machine, waiting for a key that can; not retried with this one. ` +
-                `Run 'engram status' for details.`,
+                `Run '${engramCommand("status")}' for details.`,
             );
           }
           recordDeletesRefused(waiting);
@@ -1665,7 +1666,7 @@ export class Syncer {
       this.authHoldStep++;
       console.error(
         `[engram] API key rejected — sync paused. Retrying in ${Math.round(delay / 60_000)}m, ` +
-          `or as soon as a new key is saved ('engram auth login'): ${msg}`,
+          `or as soon as a new key is saved ('${engramCommand("auth login")}'): ${msg}`,
       );
     }
     recordFailure(msg, "auth", this.pendingCount(), { retryAt: this.nextRetryAt() });

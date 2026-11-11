@@ -3,6 +3,7 @@ import { createInterface } from "node:readline";
 import { Engram, type MessageInput } from "@getengram/sdk";
 import { resolveBaseUrl } from "../config.js";
 import { configForUse } from "../config-guard.js";
+import { engramCommand } from "../daemon/package-runner.js";
 import { green, dim, bold, plural } from "../output.js";
 
 import { parseStorageFullError } from "../storage-error.js";
@@ -249,7 +250,7 @@ export async function fetchSharedConversation(url: string): Promise<ChatConversa
   if (!convo) {
     throw new Error(
       "Couldn't find the conversation in the share page — ChatGPT may have changed its page format.\n" +
-        "Fallback: ChatGPT Settings → Data controls → Export data, then: engram import conversations.json",
+        `Fallback: ChatGPT Settings → Data controls → Export data, then: ${engramCommand("import conversations.json")}`,
     );
   }
   // Idempotent re-imports: if the conversation JSON carries no id, the

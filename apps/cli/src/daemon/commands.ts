@@ -20,7 +20,7 @@ import { ALL_ADAPTERS } from "./adapters.js";
 import { asRootRefusal, rootForAnotherUser } from "./as-root.js";
 import { commandFailure } from "./command-path.js";
 import { throughOptLink } from "./homebrew.js";
-import { INSTALL_CLI, runnerCacheOf } from "./package-runner.js";
+import { INSTALL_CLI, engramCommand, runnerCacheOf, runnerCacheOfThisCli } from "./package-runner.js";
 import {
   foreignFiles,
   foreignFilesFix,
@@ -242,10 +242,10 @@ function printAlreadyRunning(found: Extract<DaemonFound, { state: "running" | "u
 /** When the running daemon isn't this CLI's version, how to switch to it. */
 function printVersionHint(found: { version?: string; older: boolean }): void {
   if (found.older) {
-    console.log(dim("  It's from an older version of Engram: run 'engram stop' and then 'engram start' to update it."));
+    console.log(dim(`  It's from an older version of Engram: run '${engramCommand("stop")}' and then '${engramCommand("start")}' to update it.`));
   } else if (found.version && VERSION !== "unknown" && found.version !== VERSION) {
     console.log(
-      dim(`  It runs version ${found.version}, and this CLI is ${VERSION}: run 'engram stop' and then 'engram start' to switch.`),
+      dim(`  It runs version ${found.version}, and this CLI is ${VERSION}: run '${engramCommand("stop")}' and then '${engramCommand("start")}' to switch.`),
     );
   }
 }
@@ -300,16 +300,6 @@ function refusedAsRoot(command: "start" | "stop" | "install" | "uninstall"): boo
 }
 
 /**
- * Where this CLI runs from, as a message names it ("npx's cache"), when a
- * package runner installed it there (engram#665); null when it is
- * installed. Told by the path start at login would name: the worker, and on
- * Windows the sign-in entry beside it.
- */
-function runnerCacheOfThisCli(): string | null {
-  return runnerCacheOf(process.platform === "win32" ? loginStartPath() : workerPath());
-}
-
-/**
  * Say that start at login can't be turned on or repaired from this CLI,
  * which runs from a package runner's cache (`where`, engram#665), and how
  * to install the CLI. `again`: the command to run then.
@@ -346,7 +336,7 @@ export async function daemonStart(
   // finishing a send. A worker started now would only wait for it too.
   const found = await whileStopping(await findDaemon());
   if (found.state === "stopping") {
-    console.error(red(`The daemon is still stopping (pid ${found.pid}). Run 'engram start' again in a moment.`));
+    console.error(red(`The daemon is still stopping (pid ${found.pid}). Run '${engramCommand("start")}' again in a moment.`));
     process.exitCode = 1;
     return;
   }
@@ -354,7 +344,7 @@ export async function daemonStart(
   // ~/.engram whose own permissions keep the user out of it (engram#723).
   const foreign = foreignFiles();
   const locked = lockedDir();
-  const again = "install" in flags ? "engram start --install" : "engram start";
+  const again = "install" in flags ? engramCommand("start --install") : engramCommand("start");
   if (found.state === "root") {
     // A daemon started beside it would exit at once (engram#680), and with
     // --install, so would the one start at login starts.
@@ -379,7 +369,7 @@ export async function daemonStart(
     // --install still asks for start at login (engram#602). On macOS,
     // loading the launchd agent starts a worker there and then, which finds
     // this daemon and exits (engram#612).
-    if ("install" in flags) await enableStartAtLogin(true, "engram start --install");
+    if ("install" in flags) await enableStartAtLogin(true, engramCommand("start --install"));
     printOutsideManager(found);
     return;
   }
@@ -436,7 +426,7 @@ export async function daemonStart(
   const platform = process.platform;
   const managerFirst =
     "install" in flags && !daemonEnvOverrides() && (platform === "darwin" || (platform === "linux" && systemdSession()));
-  if (managerFirst && platform === "darwin") await enableLaunchdStartAtLogin(false, "engram start --install");
+  if (managerFirst && platform === "darwin") await enableLaunchdStartAtLogin(false, engramCommand("start --install"));
   if (managerFirst && platform === "linux") await enableSystemdStartAtLogin(true, false);
 
   const started = await startInBackground();
@@ -448,7 +438,7 @@ export async function daemonStart(
   console.log(`${dim("DB:")}  ${DB_FILE}`);
 
   if ("install" in flags && !managerFirst) {
-    await enableStartAtLogin(true, "engram start --install");
+    await enableStartAtLogin(true, engramCommand("start --install"));
   }
 }
 
@@ -472,7 +462,7 @@ function printOutsideManager(found: DaemonFound, switchedOn = false): void {
   if (manager === null) return;
   console.log(
     dim(
-      `  The running daemon (pid ${found.pid}) wasn't started by ${manager}, so ${manager} won't restart it after a crash: run 'engram stop' and then 'engram start' to fix that.`,
+      `  The running daemon (pid ${found.pid}) wasn't started by ${manager}, so ${manager} won't restart it after a crash: run '${engramCommand("stop")}' and then '${engramCommand("start")}' to fix that.`,
     ),
   );
 }
@@ -515,7 +505,7 @@ function systemdMainPid(): number | null {
 function printForeignFiles(foreign: ForeignFiles, daemon: "running" | "stopped", again?: "start" | "install"): void {
   console.error(red(foreignFilesProblem(foreign, daemon)));
   console.error(dim(`  ${foreignFilesFix(foreign)}`));
-  if (again) console.error(dim(`  Then run 'engram ${again}' again.`));
+  if (again) console.error(dim(`  Then run '${engramCommand(again)}' again.`));
 }
 
 /**
@@ -572,7 +562,7 @@ function printLog(running: boolean, pid: number | null = null, said?: string, ou
     console.log(`${dim("Log:")} ${LOG_FILE}, but the daemon doesn't write to it: ${NOT_THE_LOG[output]}.`);
     if (output === "none" && journal()) console.log(dim(IN_JOURNAL));
     // Not one in the foreground, which was started to write there.
-    if (output !== "terminal") console.log(dim("  'engram stop' and then 'engram start' have the daemon write to it."));
+    if (output !== "terminal") console.log(dim(`  '${engramCommand("stop")}' and then '${engramCommand("start")}' have the daemon write to it.`));
     return;
   }
   const fix = logFix(problem);
@@ -593,7 +583,7 @@ function printLog(running: boolean, pid: number | null = null, said?: string, ou
   if ((output === undefined || output === "none") && journal()) console.log(dim(IN_JOURNAL));
   if (fixLine) console.log(fixLine);
   if (running && output !== "terminal") {
-    console.log(dim("  Once it can be written, 'engram stop' and then 'engram start' have the daemon write to it again."));
+    console.log(dim(`  Once it can be written, '${engramCommand("stop")}' and then '${engramCommand("start")}' have the daemon write to it again.`));
   }
 }
 
@@ -850,7 +840,7 @@ function reportStart(started: WorkerStart): boolean {
     // a Node it wasn't built for, which takes a minute or two.
     const pid = started.pid === null ? "" : ` (pid ${started.pid})`;
     console.log(`${bold("Engram daemon is starting")}${pid} — this one is taking a while`);
-    console.log(dim("  Check on it with 'engram status' in a minute."));
+    console.log(dim(`  Check on it with '${engramCommand("status")}' in a minute.`));
   }
   return true;
 }
@@ -864,7 +854,7 @@ function printStartFailed(what: string): void {
   } else {
     // It ran without one (engram#679), so what it said is gone.
     console.error(`${what}, and its log can't be written (${problem}). To see why, run it here:`);
-    console.error("  engram start --foreground");
+    console.error(`  ${engramCommand("start --foreground")}`);
   }
 }
 
@@ -993,7 +983,7 @@ async function recordCaptureIntent(v: "on" | "off", command: string): Promise<vo
             ? err.message
             : "~/.engram/config.json can't be read";
         console.error(red(`Couldn't record that capture is off: ${why}.`));
-        const again = `run 'engram ${command}' again, or the next engram command turns capture back on.`;
+        const again = `run '${engramCommand(command)}' again, or the next engram command turns capture back on.`;
         if (locked) {
           console.error(dim(`  ${lockedDirFix(locked)}`));
           console.error(dim(`  Then ${again}`));
@@ -1013,7 +1003,7 @@ async function recordCaptureIntent(v: "on" | "off", command: string): Promise<vo
     if (v === "off") {
       process.exitCode = 1;
       console.error(red(`Couldn't record that capture is off: ${problem}.`));
-      const again = `run 'engram ${command}' again, or the next engram command turns capture back on.`;
+      const again = `run '${engramCommand(command)}' again, or the next engram command turns capture back on.`;
       if (fix) {
         console.error(dim(`  To fix it, run: ${fix}`));
         console.error(dim(`  Then ${again}`));
@@ -1027,9 +1017,9 @@ async function recordCaptureIntent(v: "on" | "off", command: string): Promise<vo
       console.error(dim("  Until it is, other engram commands won't start the daemon again if it stops."));
       if (fix) {
         console.error(dim(`  To fix it, run: ${fix}`));
-        console.error(dim(`  Then run 'engram ${command}' again.`));
+        console.error(dim(`  Then run '${engramCommand(command)}' again.`));
       } else {
-        console.error(dim(`  Once it's fixed, run 'engram ${command}' again.`));
+        console.error(dim(`  Once it's fixed, run '${engramCommand(command)}' again.`));
       }
     }
   }
@@ -1081,7 +1071,7 @@ export async function daemonStop(): Promise<void> {
   }
   if (found.state === "root") {
     // It can't be signalled, and launchd may run it (engram#680).
-    printRootDaemon(found, "'engram stop' can't stop it.", { foreign: foreignFiles() });
+    printRootDaemon(found, `'${engramCommand("stop")}' can't stop it.`, { foreign: foreignFiles() });
     process.exitCode = 1;
     return;
   }
@@ -1137,7 +1127,7 @@ export async function daemonStop(): Promise<void> {
       } else if (asked === "unwritten") {
         // Its supervisor finds no request, so it takes this for a crash.
         console.log(dim(`  Couldn't write ${STOP_FILE}, so it was ended outright, and may start again in a few seconds.`));
-        console.log(dim("  If 'engram status' shows it running again, run 'engram stop' again."));
+        console.log(dim(`  If '${engramCommand("status")}' shows it running again, run '${engramCommand("stop")}' again.`));
       }
     }
   }
@@ -1155,7 +1145,7 @@ export async function daemonStop(): Promise<void> {
   const root = findRootDaemon();
   const foreign = foreignFiles();
   if (root !== null) {
-    printRootDaemon(root, "'engram stop' can't stop it.", { foreign });
+    printRootDaemon(root, `'${engramCommand("stop")}' can't stop it.`, { foreign });
     process.exitCode = 1;
   }
   printUntiedRootWorkers([pid, root?.pid ?? null, root?.job?.pid ?? null], foreign);
@@ -1273,7 +1263,7 @@ function printForeignFilesWarning(foreign: ForeignFiles, stopped: boolean, blank
   if (blankBefore) console.log("");
   console.log(red(`  ${foreignFilesProblem(foreign, stopped ? "stopped" : "running")}`));
   console.log(dim(`  ${foreignFilesFix(foreign)}`));
-  if (thenStart && stopped && stopsCapture(foreign)) console.log(dim("  Then run: engram start"));
+  if (thenStart && stopped && stopsCapture(foreign)) console.log(dim(`  Then run: ${engramCommand("start")}`));
   console.log("");
 }
 
@@ -1285,7 +1275,7 @@ function printLockedDirWarning(locked: LockedDir, stopped: boolean, blankBefore 
   if (blankBefore) console.log("");
   console.log(red(`  ${lockedDirProblem(locked, stopped ? "stopped" : "running")}`));
   console.log(dim(`  ${lockedDirFix(locked)}`));
-  if (stopped) console.log(dim("  Then run: engram start"));
+  if (stopped) console.log(dim(`  Then run: ${engramCommand("start")}`));
   console.log("");
 }
 
@@ -1307,7 +1297,7 @@ function printRootWarnings(found: DaemonFound, foreign: ForeignFiles | null): bo
     const { problem, fixes } = rootDaemonLines(root);
     const why =
       found.state === "root"
-        ? "'engram stop' can't stop it, and no daemon of yours starts while it runs."
+        ? `'${engramCommand("stop")}' can't stop it, and no daemon of yours starts while it runs.`
         : "It runs beside yours, and only one should.";
     console.log(red(`  ${problem} ${why}`));
     for (const fix of fixes) console.log(dim(`  ${fix}`));
@@ -1316,7 +1306,7 @@ function printRootWarnings(found: DaemonFound, foreign: ForeignFiles | null): bo
         console.log(red(`  ${foreignFilesProblem(foreign)}`));
         console.log(dim(`  ${foreignFilesFix(foreign, true)}`));
       }
-      console.log(dim("  Then run: engram start"));
+      console.log(dim(`  Then run: ${engramCommand("start")}`));
     }
   } else if (job !== null) {
     console.log(dim(`  ${systemJobLeft()}`));
@@ -1375,10 +1365,10 @@ export async function daemonStatus(): Promise<void> {
             ? `  The end of its log says why: ${LOG_FILE}`
             : linux
               ? "  The end of its output says why: journalctl --user -u engram"
-              : "  Its log can't be written: 'engram start --foreground' shows why it stops.",
+              : `  Its log can't be written: '${engramCommand("start --foreground")}' shows why it stops.`,
         ),
       );
-      console.log(dim("  Run 'engram start' to start it again."));
+      console.log(dim(`  Run '${engramCommand("start")}' to start it again.`));
     }
     if (startsAtLogin) await printLoginVaultKeyWarning();
     // Not "will run without it": in a ~/.engram that keeps them out, it
@@ -1484,20 +1474,20 @@ function autoStart(): AutoStart {
       on: false,
       line:
         `${dim("Auto-start:")} off — switched off in Windows Startup apps` +
-        dim("  ('engram install' turns it back on)"),
+        dim(`  ('${engramCommand("install")}' turns it back on)`),
     };
   }
   if (runEntryBroken(entry)) {
     return {
       on: false,
-      line: `${dim("Auto-start:")} enabled (Windows sign-in)` + red("  — broken, run 'engram install' to repair"),
+      line: `${dim("Auto-start:")} enabled (Windows sign-in)` + red(`  — broken, run '${engramCommand("install")}' to repair`),
     };
   }
   return {
     on: true,
     line:
       `${dim("Auto-start:")} enabled (Windows sign-in)` +
-      (runEntryOutdated(entry) ? red("  — outdated config, run 'engram install' to update") : ""),
+      (runEntryOutdated(entry) ? red(`  — outdated config, run '${engramCommand("install")}' to update`) : ""),
   };
 }
 
@@ -1520,14 +1510,14 @@ function launchdAutoStart(plist: PlistState): AutoStart {
   if (agentDisabled() === true) {
     return {
       on: false,
-      line: `${dim("Auto-start:")} off — disabled in launchd` + dim("  ('engram install' turns it back on)"),
+      line: `${dim("Auto-start:")} off — disabled in launchd` + dim(`  ('${engramCommand("install")}' turns it back on)`),
       after,
     };
   }
   if (plist.broken) {
     return {
       on: false,
-      line: `${dim("Auto-start:")} enabled (launchd)` + red("  — broken, run 'engram install' to repair"),
+      line: `${dim("Auto-start:")} enabled (launchd)` + red(`  — broken, run '${engramCommand("install")}' to repair`),
       after,
     };
   }
@@ -1535,7 +1525,7 @@ function launchdAutoStart(plist: PlistState): AutoStart {
     on: true,
     line:
       `${dim("Auto-start:")} enabled (launchd)` +
-      (plist.outdated ? red("  — outdated config, run 'engram install' to update") : ""),
+      (plist.outdated ? red(`  — outdated config, run '${engramCommand("install")}' to update`) : ""),
     after,
   };
 }
@@ -1546,20 +1536,20 @@ function systemdAutoStart(unit: UnitState): AutoStart {
   if (!unit.enabled) {
     return {
       on: false,
-      line: `${dim("Auto-start:")} off — disabled with systemctl` + dim("  ('engram install' turns it back on)"),
+      line: `${dim("Auto-start:")} off — disabled with systemctl` + dim(`  ('${engramCommand("install")}' turns it back on)`),
     };
   }
   if (unit.broken) {
     return {
       on: false,
-      line: `${dim("Auto-start:")} enabled (systemd)` + red("  — broken, run 'engram install' to repair"),
+      line: `${dim("Auto-start:")} enabled (systemd)` + red(`  — broken, run '${engramCommand("install")}' to repair`),
     };
   }
   return {
     on: true,
     line:
       `${dim("Auto-start:")} enabled (systemd)` +
-      (unit.outdated ? red("  — outdated config, run 'engram install' to update") : ""),
+      (unit.outdated ? red(`  — outdated config, run '${engramCommand("install")}' to update`) : ""),
   };
 }
 
@@ -1571,12 +1561,12 @@ function printConfigWarning(problem: ConfigUnreadable): void {
   console.log("");
   console.log(red(`  WARNING: ${configProblemSummary(problem.message)}`));
   if (problem.empty) {
-    console.log(dim("  Add back any folders you had excluded ('engram exclude add <path>'),"));
-    console.log(dim("  then sign in again ('engram login')."));
+    console.log(dim(`  Add back any folders you had excluded ('${engramCommand("exclude add <path>")}'),`));
+    console.log(dim(`  then sign in again ('${engramCommand("login")}').`));
   } else {
     console.log(dim("  Fix the file: it holds your API key and the folders you excluded, so Engram"));
-    console.log(dim("  won't save over it. To start over instead: run 'engram stop', remove it, add"));
-    console.log(dim("  back the folders you excluded ('engram exclude add <path>'), then 'engram login'."));
+    console.log(dim(`  won't save over it. To start over instead: run '${engramCommand("stop")}', remove it, add`));
+    console.log(dim(`  back the folders you excluded ('${engramCommand("exclude add <path>")}'), then '${engramCommand("login")}'.`));
   }
   console.log("");
 }
@@ -1645,13 +1635,13 @@ async function printLoginVaultKeyWarning(startsAtLogin: () => boolean = () => tr
     console.log(red("  WARNING: ENGRAM_VAULT_KEY is set here, but ~/.engram/vault-key isn't there."));
     console.log(dim("  A daemon started at login may not get this shell's variables. Then it has no"));
     console.log(dim("  vault key, and your vault's secrets aren't removed from what it captures."));
-    console.log(dim("  To save the key there, readable only by you: engram vault save-key"));
+    console.log(dim(`  To save the key there, readable only by you: ${engramCommand("vault save-key")}`));
   } else {
     console.log(red("  WARNING: ~/.engram/vault-key holds a different vault key from ENGRAM_VAULT_KEY."));
     console.log(dim("  A daemon started at login may not get this shell's variables. Then it uses the"));
     console.log(dim("  file's key, and secrets encrypted with ENGRAM_VAULT_KEY's aren't removed from"));
     console.log(dim("  what it captures. If ENGRAM_VAULT_KEY's key is the right one:"));
-    console.log(dim("  engram vault save-key --force (the file's key is backed up first)."));
+    console.log(dim(`  ${engramCommand("vault save-key --force")} (the file's key is backed up first).`));
     console.log(dim("  If the file's is, unset ENGRAM_VAULT_KEY."));
   }
   console.log("");
@@ -1688,9 +1678,9 @@ function printVaultKeyMissingWarning({ secrets, envKey }: KeyMissing): void {
   console.log(dim(`  Without the key, it can't remove ${one ? "its value" : "their values"} from what it captures before`));
   console.log(dim("  sending it."));
   if (envKey) {
-    console.log(dim("  To save ENGRAM_VAULT_KEY's key for it: engram vault save-key"));
+    console.log(dim(`  To save ENGRAM_VAULT_KEY's key for it: ${engramCommand("vault save-key")}`));
   } else {
-    console.log(dim("  Put your vault key in ~/.engram/vault-key, or run 'engram vault save-key'"));
+    console.log(dim(`  Put your vault key in ~/.engram/vault-key, or run '${engramCommand("vault save-key")}'`));
     console.log(dim("  from a shell where ENGRAM_VAULT_KEY holds it."));
   }
   console.log(dim("  The daemon reads it before its next send: no restart needed."));
@@ -1728,19 +1718,19 @@ function printVaultMismatchWarning(status: SyncStatus): void {
     // The others decrypt with this key, and wouldn't with that one.
   } else if (status.vault_key === "env") {
     console.log(dim(`    Set ENGRAM_VAULT_KEY to the key ${they} saved with, then run`));
-    console.log(dim("    'engram stop' and 'engram start' from that shell."));
+    console.log(dim(`    '${engramCommand("stop")}' and '${engramCommand("start")}' from that shell.`));
   } else {
     console.log(dim(`    Put the key ${they} saved with in ~/.engram/vault-key.`));
   }
-  console.log(dim(`    Save ${one ? "it" : "each"} again with this key: engram vault set <NAME>`));
+  console.log(dim(`    Save ${one ? "it" : "each"} again with this key: ${engramCommand("vault set <NAME>")}`));
   // Not "whose key is lost": one still in use, deleted, is no longer
   // removed from what the daemon captures. Saved again, it is.
-  console.log(dim(`    Delete ${one ? "it, if you no longer use it" : "each you no longer use"}: engram vault delete <NAME>`));
+  console.log(dim(`    Delete ${one ? "it, if you no longer use it" : "each you no longer use"}: ${engramCommand("vault delete <NAME>")}`));
   if (decrypted > 0) {
-    console.log(dim("  'engram vault list --check' shows which. Then the daemon sends what it held"));
+    console.log(dim(`  '${engramCommand("vault list --check")}' shows which. Then the daemon sends what it held`));
     console.log(dim("  within 5 minutes."));
   } else {
-    console.log(dim(`  'engram vault list' lists ${one ? "it" : "them"}. Then the daemon sends what it held within`));
+    console.log(dim(`  '${engramCommand("vault list")}' lists ${one ? "it" : "them"}. Then the daemon sends what it held within`));
     console.log(dim("  5 minutes."));
   }
   if (status.pending_messages > 0) {
@@ -1775,8 +1765,8 @@ function printVaultUndecryptableWarning(found: { secrets: number; unscrubbed: nu
     console.log(dim(`  They were saved with another key. The daemon can't remove ${unscrubbed} of them from`));
     console.log(dim("  what it captures before sending it, and the others only until it restarts."));
   }
-  console.log(dim(`  Save ${one ? "it" : "each"} again with this key (engram vault set <NAME>), or delete ${one ? "it if you" : "each you"}`));
-  console.log(dim(`  no longer use${one ? " it" : ""} (engram vault delete <NAME>). 'engram vault list --check'`));
+  console.log(dim(`  Save ${one ? "it" : "each"} again with this key (${engramCommand("vault set <NAME>")}), or delete ${one ? "it if you" : "each you"}`));
+  console.log(dim(`  no longer use${one ? " it" : ""} (${engramCommand("vault delete <NAME>")}). '${engramCommand("vault list --check")}'`));
   console.log(dim("  shows which don't decrypt."));
   console.log("");
 }
@@ -1823,7 +1813,7 @@ function printSyncWarnings(
     if (!problem) {
       console.log("");
       console.log(red("  Signed out — capture is paused and nothing is sent."));
-      console.log(dim("  Run 'engram auth login' to resume. Queued messages stay on this machine."));
+      console.log(dim(`  Run '${engramCommand("auth login")}' to resume. Queued messages stay on this machine.`));
       console.log(dim(`  Since: ${status.signed_out_at}`));
       console.log("");
     }
@@ -2053,7 +2043,7 @@ export function repairLaunchdIfStale(plist?: PlistState, { quiet = false }: { qu
     if (!quiet) {
       console.error(red(`Couldn't update start at login: ${launchAgentsWhose(notYours)}.`));
       console.error(dim(`  Make it yours with: ${LAUNCH_AGENTS_FIX}`));
-      console.error(dim("  Then run: engram install"));
+      console.error(dim(`  Then run: ${engramCommand("install")}`));
     }
     return "refused";
   }
@@ -2085,7 +2075,7 @@ function shellWord(path: string): string {
  * (no daemon runs), launchd is asked to start one then (engram#691).
  * `again`: the command to run again, once the plist can be written.
  */
-async function enableLaunchdStartAtLogin(start = false, again = "engram install"): Promise<void> {
+async function enableLaunchdStartAtLogin(start = false, again = engramCommand("install")): Promise<void> {
   if (!existsSync(workerPath())) {
     // Only a source checkout run through tsx gets here: the build ships it.
     console.error(red(`Can't turn on start at login: ${workerPath()} is missing.`));
@@ -2179,7 +2169,7 @@ function autoEnableLaunchdStartAtLogin(): "changed" | "unchanged" | "failed" | "
   // from now on the plist is there, and current.
   if (agentDisabled() === true) {
     console.log(`${bold("Start at login is switched off")} in launchd`);
-    console.log(dim("  Run 'engram install' to start the daemon when you log in."));
+    console.log(dim(`  Run '${engramCommand("install")}' to start the daemon when you log in.`));
     return "changed";
   }
   loadAgent(); // one launchd can't load now loads at the next login
@@ -2208,7 +2198,7 @@ async function uninstallLaunchd(): Promise<void> {
   if (notYours) {
     console.error(red(`Couldn't turn off start at login: ${launchAgentsWhose(notYours)}.`));
     console.error(dim(`  Make it yours with: ${LAUNCH_AGENTS_FIX}`));
-    console.error(dim("  Then run 'engram uninstall' again."));
+    console.error(dim(`  Then run '${engramCommand("uninstall")}' again.`));
     process.exitCode = 1;
     return;
   }
@@ -2249,7 +2239,7 @@ async function keepRunning(ran: number, unloaded: boolean): Promise<void> {
     // Never stopped after all: it answers as running.
     if (await runsOn()) return;
     console.error(red(`The daemon launchd ran (pid ${ran}) is stopping with its agent, and hasn't finished, so it wasn't started again.`));
-    console.error(dim("  Run 'engram start' in a moment to start it again."));
+    console.error(dim(`  Run '${engramCommand("start")}' in a moment to start it again.`));
     process.exitCode = 1;
     return;
   }
@@ -2263,19 +2253,19 @@ async function keepRunning(ran: number, unloaded: boolean): Promise<void> {
   // before the command said what is wrong, and how to fix it.
   if (stopsCapture(foreignFiles()) || lockedDir() !== null) {
     console.error(red("The daemon launchd ran stopped with its agent, and wasn't started again: one started now would stop at once."));
-    console.error(dim("  Once that's fixed, run 'engram start' to start it."));
+    console.error(dim(`  Once that's fixed, run '${engramCommand("start")}' to start it.`));
     process.exitCode = 1;
     return;
   }
   const started = await waitForWorker(spawnWorker(withoutEnvOverrides()));
   if (started.state === "failed") {
     printStartFailed("The daemon launchd ran stopped with its agent, and couldn't be started again");
-    console.error(dim("  Run 'engram start' to start it."));
+    console.error(dim(`  Run '${engramCommand("start")}' to start it.`));
     process.exitCode = 1;
     return;
   }
-  console.log(dim(KEEPS_RUNNING));
-  if (started.state === "starting") console.log(dim("  It is still starting: check on it with 'engram status' in a minute."));
+  console.log(dim(keepsRunning()));
+  if (started.state === "starting") console.log(dim(`  It is still starting: check on it with '${engramCommand("status")}' in a minute.`));
 }
 
 /**
@@ -2596,14 +2586,14 @@ async function enableSystemdStartAtLogin(running: boolean, start = !running): Pr
   removeStrayPlist();
   if (readUnit().kind === "foreign") {
     console.error(red(`Can't turn on start at login: ${unitPath()} is there already, and Engram didn't write it.`));
-    console.error(dim("  Rename or remove it, then run 'engram install' again."));
+    console.error(dim(`  Rename or remove it, then run '${engramCommand("install")}' again.`));
     process.exitCode = 1;
     return;
   }
   const systemctl = systemctlPath();
   if (systemctl === null || !systemdReachable(systemctl)) {
     console.log(bold("Start at login isn't available here: it needs a systemd user session ('systemctl --user')."));
-    console.log(dim(running ? RUNS_UNTIL_RESTART : START_AFTER_RESTART));
+    console.log(dim(running ? runsUntilRestart() : startAfterRestart()));
     return;
   }
   if (!existsSync(workerPath())) {
@@ -2684,9 +2674,13 @@ function platformLabel(platform: NodeJS.Platform = process.platform): string {
   }
 }
 
-const RUNS_UNTIL_RESTART =
-  "  The daemon keeps running until you sign out or restart. Run 'engram start' again after that.";
-const START_AFTER_RESTART = "  Run 'engram start' to capture now, and again after you sign out or restart.";
+function runsUntilRestart(): string {
+  return `  The daemon keeps running until you sign out or restart. Run '${engramCommand("start")}' again after that.`;
+}
+
+function startAfterRestart(): string {
+  return `  Run '${engramCommand("start")}' to capture now, and again after you sign out or restart.`;
+}
 
 /**
  * Start at login: a launchd agent on macOS, a Run entry on Windows
@@ -2696,7 +2690,7 @@ const START_AFTER_RESTART = "  Run 'engram start' to capture now, and again afte
  * whether a daemon is up right now. `again`: the command that asked, to
  * run again where something stops it.
  */
-async function enableStartAtLogin(running: boolean, again = "engram install"): Promise<void> {
+async function enableStartAtLogin(running: boolean, again = engramCommand("install")): Promise<void> {
   if (process.platform === "darwin") {
     await enableLaunchdStartAtLogin(!running, again);
     return;
@@ -2710,7 +2704,7 @@ async function enableStartAtLogin(running: boolean, again = "engram install"): P
     return;
   }
   console.log(bold(`Start at login isn't available on ${platformLabel()} yet.`));
-  console.log(dim(running ? RUNS_UNTIL_RESTART : START_AFTER_RESTART));
+  console.log(dim(running ? runsUntilRestart() : startAfterRestart()));
 }
 
 async function enableWindowsStartAtLogin(running: boolean): Promise<void> {
@@ -2729,7 +2723,7 @@ async function enableWindowsStartAtLogin(running: boolean): Promise<void> {
   if (failed !== null) {
     console.error(red("Couldn't add the Windows startup entry."));
     console.error(dim(`  reg: ${failed}`));
-    console.error(dim(`  It goes in ${RUN_KEY} as "${RUN_VALUE}". Run 'engram install' to try again.`));
+    console.error(dim(`  It goes in ${RUN_KEY} as "${RUN_VALUE}". Run '${engramCommand("install")}' to try again.`));
     process.exitCode = 1;
     return;
   }
@@ -2771,7 +2765,7 @@ function autoEnableWindowsStartAtLogin(): "changed" | "unchanged" | "failed" | "
   if (writeRunEntry() !== null) return "failed";
   if (switchedOffInStartupApps()) {
     console.log(`${bold("Start at login is switched off")} in Windows Startup apps`);
-    console.log(dim("  Switch Engram on there, or run 'engram install', to start the daemon when you sign in."));
+    console.log(dim(`  Switch Engram on there, or run '${engramCommand("install")}', to start the daemon when you sign in.`));
     return "changed";
   }
   console.log(`${bold("Auto-start enabled")} — daemon will start when you sign in to Windows`);
@@ -2779,7 +2773,9 @@ function autoEnableWindowsStartAtLogin(): "changed" | "unchanged" | "failed" | "
   return "changed";
 }
 
-const KEEPS_RUNNING = "  The daemon keeps running until 'engram stop' or sign-out.";
+function keepsRunning(): string {
+  return `  The daemon keeps running until '${engramCommand("stop")}' or sign-out.`;
+}
 
 /**
  * Say that the daemon keeps running, after start at login is turned off,
@@ -2789,7 +2785,7 @@ const KEEPS_RUNNING = "  The daemon keeps running until 'engram stop' or sign-ou
  */
 async function printKeepsRunning(found?: DaemonFound): Promise<void> {
   const { state } = found ?? (await findDaemon());
-  if (state === "running" || state === "unresponsive") console.log(dim(KEEPS_RUNNING));
+  if (state === "running" || state === "unresponsive") console.log(dim(keepsRunning()));
 }
 
 async function disableStartAtLogin(): Promise<void> {
@@ -2866,7 +2862,7 @@ export async function daemonInstall(): Promise<void> {
     // The daemon start at login started would exit at once (engram#680).
     printRootDaemon(found, "Start at login wasn't turned on: no daemon of yours starts while it runs.", {
       foreign,
-      again: "engram install",
+      again: engramCommand("install"),
     });
     process.exitCode = 1;
     return;
@@ -2874,7 +2870,7 @@ export async function daemonInstall(): Promise<void> {
   if (foreign || locked) {
     const stops = (!running && stopsCapture(foreign)) || locked !== null;
     if (foreign) printForeignFiles(foreign, running ? "running" : "stopped", stops && !locked ? "install" : undefined);
-    if (locked) printLockedDir(locked, running ? "running" : "stopped", "engram install");
+    if (locked) printLockedDir(locked, running ? "running" : "stopped", engramCommand("install"));
     if (stops) {
       process.exitCode = 1;
       return;
@@ -2886,7 +2882,7 @@ export async function daemonInstall(): Promise<void> {
     // now starts one, which waits for that one to go, engram#612.)
     if (platform === "darwin") await enableLaunchdStartAtLogin();
     else await enableSystemdStartAtLogin(false, false);
-    console.error(red(`The daemon is still stopping (pid ${found.pid}). Run 'engram start' in a moment.`));
+    console.error(red(`The daemon is still stopping (pid ${found.pid}). Run '${engramCommand("start")}' in a moment.`));
     process.exitCode = 1;
     return;
   }
@@ -2960,7 +2956,7 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
         const { problem, fixes } = rootDaemonLines(found);
         console.log(dim(`  Auto-capture wasn't turned on. ${problem}`));
         for (const fix of fixes) console.log(dim(`  ${fix}`));
-        console.log(dim("  Then run: engram start"));
+        console.log(dim(`  Then run: ${engramCommand("start")}`));
       }
       return;
     }
@@ -3007,7 +3003,7 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
         dim(
           launchAgents
             ? `  Couldn't set up start at login: ${launchAgentsWhose(launchAgents)}. Make it yours with: ${LAUNCH_AGENTS_FIX}`
-            : "  Couldn't turn on start at login. Run 'engram install' to try again.",
+            : `  Couldn't turn on start at login. Run '${engramCommand("install")}' to try again.`,
         ),
       );
     }
@@ -3016,7 +3012,7 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
     );
     if (startAtLoginUnavailable) {
       console.log(
-        dim("  Start at login isn't available here (no systemd user session): run 'engram start' after a restart."),
+        dim(`  Start at login isn't available here (no systemd user session): run '${engramCommand("start")}' after a restart.`),
       );
     }
     if (runner !== null) {
@@ -3025,7 +3021,7 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
       );
       console.log(dim(`  To start it at login, install the CLI: ${INSTALL_CLI} && engram install`));
     }
-    console.log(dim("  Turn off anytime: engram stop && engram uninstall"));
+    console.log(dim(`  Turn off anytime: ${engramCommand("stop")} && ${engramCommand("uninstall")}`));
     // When start at login is on: the daemon it starts reads the file
     // (engram#690). Not one the user switched off, or never there.
     await printLoginVaultKeyWarning(() => autoStart().on);

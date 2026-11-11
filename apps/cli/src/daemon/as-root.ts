@@ -1,5 +1,6 @@
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
+import { engramCommand } from "./package-runner.js";
 
 /**
  * engram#653 — capture is the user's own: the daemon runs as the user, and
@@ -71,7 +72,7 @@ export function rootForAnotherUser({
  * as the CLI parsed them, without its arguments.
  */
 export function asRootRefusal(cmd: string): { problem: string; fix: string } {
-  const fix = `  Run '${cmd === "" ? "engram" : `engram ${cmd}`}' as yourself, without sudo.`;
+  const fix = `  Run '${engramCommand(cmd)}' as yourself, without sudo.`;
   switch (cmd.replace(/^daemon /, "")) {
     case "install":
       return { problem: "Start at login is per user, and this is running as root.", fix };

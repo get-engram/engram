@@ -1947,6 +1947,53 @@ describe("a CLI run from npx's cache, on Windows (engram#665)", () => {
     expect(after).not.toMatch(/broken|outdated/);
   });
 
+  it("engram status names what to run as the runner runs the CLI, and installs it first for start at login (engram#727)", async () => {
+    onWindows();
+    registry.value = FROM_NPX;
+    await fromNpx(() => daemonStatus());
+    let text = said();
+    expect(text).toContain(
+      [
+        "Auto-start: enabled (Windows sign-in)  — outdated config, run 'npm install -g @getengram/cli && engram install' to update",
+        "  It should be running: start at login is on. It may have stopped after an error.",
+      ].join("\n"),
+    );
+    expect(text).toContain("  Run 'npx @getengram/cli start' to start it again.");
+    expect(text).not.toMatch(/'engram /);
+
+    registry.value = CLEARED;
+    await fromNpx(() => daemonStatus());
+    text = said();
+    expect(text).toContain(
+      "Auto-start: enabled (Windows sign-in)  — broken, run 'npm install -g @getengram/cli && engram install' to repair",
+    );
+    expect(text).not.toMatch(/'engram /);
+
+    // As yarn dlx runs it, from its temporary folder.
+    registry.value = FROM_NPX;
+    const yarnDlx = join(home.dir, "AppData", "Local", "Temp", "xfs-1a2b3c4d", "dlx-5678", "node_modules", "@getengram", "cli");
+    await fromNpx(() => daemonStatus(), join(yarnDlx, "dist", "daemon", "login-start.js"));
+    text = said();
+    expect(text).toContain("  Run 'yarn dlx @getengram/cli start' to start it again.");
+    expect(text).not.toMatch(/'engram /);
+  });
+
+  it("engram uninstall says the daemon keeps running until it is stopped as npx runs the CLI (engram#727)", async () => {
+    onWindows();
+    registry.value = FROM_NPX;
+    daemonRunning();
+    await fromNpx(() => daemonUninstall());
+    expect(registry.value).toBeNull();
+    expect(said()).toBe(
+      [
+        "Auto-start disabled — the Windows startup entry is removed",
+        "  The daemon keeps running until 'npx @getengram/cli stop' or sign-out.",
+      ].join("\n"),
+    );
+    expect(signalled).toEqual([]);
+    expect(process.exitCode).toBeUndefined();
+  });
+
   it("the installed CLI's engram start points such an entry at that CLI, once, and leaves the Startup apps switch", async () => {
     onWindows();
     registry.value = FROM_NPX;
@@ -1978,7 +2025,7 @@ describe("a CLI run from npx's cache, on Windows (engram#665)", () => {
         [
           "Auto-capture is on — conversations from supported agents on this machine save to your Engram.",
           WONT_START_AT_LOGIN,
-          "  Turn off anytime: engram stop && engram uninstall",
+          "  Turn off anytime: npx @getengram/cli stop && npx @getengram/cli uninstall",
         ].join("\n"),
       );
 
@@ -2083,7 +2130,7 @@ describe("the Windows sign-in launcher (engram#602)", () => {
    * import nothing at all: a module that seems to import nothing otherwise
    * means the pattern has stopped matching.
    */
-  const NO_IMPORTS = new Set(["output.ts", "package-runner.ts", "supervise.ts"]);
+  const NO_IMPORTS = new Set(["output.ts", "supervise.ts"]);
   function modulesLoaded(entries: string[], dynamic: boolean): string[] {
     const imports = dynamic ? /\b(?:from|import)\s*\(?\s*["']([^"']+)["']/g : /\b(?:from|import)\s+["']([^"']+)["']/g;
     const seen = new Set<string>();

@@ -1,6 +1,7 @@
 import { createRequire } from "node:module";
 import { execSync } from "node:child_process";
 import { dirname } from "node:path";
+import { engramCommand } from "./package-runner.js";
 
 // IMPORTANT: this module must never import better-sqlite3 (or anything
 // that does) statically — its whole job is to run before the native
@@ -85,7 +86,7 @@ export function ensureNativeSqlite(
       log(
         "Automatic rebuild failed. Fix manually with:\n" +
           `  cd ${ownerDir || "<the directory containing node_modules/better-sqlite3>"} && npm rebuild better-sqlite3\n` +
-          "then run 'engram start' again.",
+          `then run '${engramCommand("start")}' again.`,
       );
       return false;
     }

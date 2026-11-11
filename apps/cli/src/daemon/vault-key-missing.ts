@@ -20,6 +20,7 @@
  */
 
 import { plural } from "../output.js";
+import { engramCommand } from "./package-runner.js";
 import type { Account } from "./syncer.js";
 
 /** How many named secrets an account's vault holds. Throws when it can't be told. */
@@ -112,7 +113,7 @@ export class MissingVaultKey {
         this.log(
           `vault scrubber: off, and this account's vault has ${plural(secrets, "secret")} — with no ` +
             `vault key, ${values} removed from what is captured. Put the key in ~/.engram/vault-key ` +
-            "(engram vault save-key): it is read before the next send.",
+            `(${engramCommand("vault save-key")}): it is read before the next send.`,
         );
       } catch {
         // Recorded in status.json all the same.

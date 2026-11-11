@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { win32 } from "node:path";
 import { resolveBaseUrl } from "../config.js";
 import { loadConfigForUse } from "../config-guard.js";
+import { engramCommand } from "../daemon/package-runner.js";
 import { green, red, dim } from "../output.js";
 
 
@@ -60,7 +61,7 @@ export async function upgrade(
   const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
 
   if (!apiKey) {
-    console.error(red("Not authenticated. Run 'engram signup' first."));
+    console.error(red(`Not authenticated. Run '${engramCommand("signup")}' first.`));
     process.exit(1);
   }
 
@@ -86,9 +87,9 @@ export async function upgrade(
       console.error(
         red("Your account needs an email before upgrading.\n") +
           "\n  Link an email to this account:\n" +
-          "    engram link --email you@example.com --password <password>\n" +
+          `    ${engramCommand("link")} --email you@example.com --password <password>\n` +
           "\n  Or if you already have an account, sign in:\n" +
-          "    engram login --email you@example.com --password <password>\n",
+          `    ${engramCommand("login")} --email you@example.com --password <password>\n`,
       );
       process.exit(1);
     }

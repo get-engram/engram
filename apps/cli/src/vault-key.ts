@@ -22,6 +22,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMissing, readProblem } from "./config-file.js";
 import { lockedDir, lockedDirFix, lockedDirReason, OWNERSHIP_FIX } from "./daemon/ownership.js";
+import { engramCommand } from "./daemon/package-runner.js";
 
 export const VAULT_KEY_FILE = join(homedir(), ".engram", "vault-key");
 
@@ -275,8 +276,8 @@ export function vaultKeyFix(problem: VaultKeyUnreadable): string {
       return "Put your vault key back in it. If you don't use the vault, delete the empty file.";
     case "gone":
       return (
-        "Put your vault key back in it. If you don't use the vault, run 'engram stop', then " +
-        "'engram start': the daemon starts without a key, and sends what it held."
+        `Put your vault key back in it. If you don't use the vault, run '${engramCommand("stop")}', then ` +
+        `'${engramCommand("start")}': the daemon starts without a key, and sends what it held.`
       );
     default:
       return "Check the file, and the disk it is on.";

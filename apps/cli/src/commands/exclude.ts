@@ -3,6 +3,7 @@ import { ConfigUnreadable, excludePathsOf } from "../config-file.js";
 import { loadConfigForUpdate, lockedConfigDir, saveConfigOrExit } from "../config-guard.js";
 import { lockedDirFix, lockedDirReason } from "../daemon/ownership.js";
 import { normalizeExcludePath, samePath, IGNORE_MARKER } from "../daemon/exclusions.js";
+import { engramCommand } from "../daemon/package-runner.js";
 import { bold, dim, red } from "../output.js";
 
 // `engram exclude` — keep whole repos/directories out of capture (engram#462).
@@ -69,7 +70,7 @@ export async function excludeRemove(args: string[]): Promise<void> {
   const removed = paths.filter((p) => samePath(p, target));
   if (removed.length === 0) {
     console.error(`Not in the exclude list: ${target}`);
-    console.error(dim("Run 'engram exclude list' to see current exclusions."));
+    console.error(dim(`Run '${engramCommand("exclude list")}' to see current exclusions.`));
     process.exit(1);
   }
   config.excludePaths = paths.filter((p) => !samePath(p, target));
@@ -86,7 +87,7 @@ export async function excludeList(): Promise<void> {
     if (!(err instanceof ConfigUnreadable && err.empty)) cantUse(err, "listed");
     // Capture waits on it (engram#673), and what it listed is gone.
     console.error(red("~/.engram/config.json is empty, so capture waits. Add back any folders you had"));
-    console.error(red("  excluded ('engram exclude add <path>'), then sign in again ('engram login')."));
+    console.error(red(`  excluded ('${engramCommand("exclude add <path>")}'), then sign in again ('${engramCommand("login")}').`));
     console.error("");
     paths = [];
   }

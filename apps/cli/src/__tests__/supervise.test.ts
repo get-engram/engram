@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import {
   FIRST_DELAY_MS,
   MAX_DELAY_MS,
@@ -9,6 +9,7 @@ import {
   reportUntilArg,
   supervise,
   type SuperviseDeps,
+  type SuperviseOptions,
 } from "../daemon/supervise.js";
 
 /**
@@ -27,7 +28,7 @@ interface Worker {
   onExit?: () => void;
 }
 
-function harness(workers: Worker[], options: { reportUntil?: number } = {}) {
+function harness(workers: Worker[], options: { reportUntil?: number; command?: (rest: string) => string } = {}) {
   const state = {
     t: 1_000_000,
     stamp: null as string | null,
@@ -80,7 +81,12 @@ function harness(workers: Worker[], options: { reportUntil?: number } = {}) {
     state.stamps += 1;
     state.stamp = `stamp-${state.stamps}`;
   };
-  const run = () => supervise(deps, { reportUntil: options.reportUntil ?? 0 });
+  const run = () =>
+    supervise(deps, {
+      reportUntil: options.reportUntil ?? 0,
+      // As the installed CLI names it.
+      command: options.command ?? ((rest) => `engram ${rest}`),
+    });
   return { state, stop, run };
 }
 
@@ -123,6 +129,27 @@ describe("the Windows daemon's supervisor (engram#613)", () => {
     const total = waits(h.state, 1_000).reduce((a, b) => a + b, 0);
     expect(total).toBeGreaterThan(20 * 60_000);
     expect(total).toBeLessThan(30 * 60_000);
+  });
+
+  it("names the command that starts it as the CLI that runs it is run: npx's, from npx's cache (engram#727)", async () => {
+    const npx = (rest: string) => `npx @getengram/cli ${rest}`;
+    const h = harness(
+      Array.from({ length: MAX_FAILURES }, () => ({ code: 1, runsFor: 1_000 })),
+      { command: npx },
+    );
+    expect(await h.run()).toBe(1);
+    expect(h.state.logs.at(-1)).toBe(
+      `the daemon exited with code 1, ${MAX_FAILURES} times in a row; not starting it again until 'npx @getengram/cli start' or the next sign-in`,
+    );
+
+    const failed = harness([{ code: START_FAILED_EXIT, runsFor: 2_000 }], {
+      reportUntil: 1_000_000 + 8_000,
+      command: npx,
+    });
+    expect(await failed.run()).toBe(START_FAILED_EXIT);
+    expect(failed.state.logs).toEqual([
+      "the daemon couldn't start (exit code 3); 'npx @getengram/cli start' reports it, and it isn't started again",
+    ]);
   });
 
   it("counts an error after a long run as the first again", async () => {
@@ -256,5 +283,69 @@ describe("the Windows daemon's supervisor (engram#613)", () => {
     // already said had started down, and nobody reporting it.
     expect([0, 1]).not.toContain(START_FAILED_EXIT);
     expect(FIRST_DELAY_MS).toBe(10_000);
+  });
+});
+
+/**
+ * engram#727 — supervisor.ts, the process: what it logs names the command
+ * that starts the daemon as the CLI that runs it is run. Its processes and
+ * files are mocked; supervise() only records what it is given.
+ */
+describe("the supervisor process (engram#727)", () => {
+  const realPlatform = process.platform;
+  const FROM_NPX =
+    "C:\\Users\\u\\AppData\\Local\\npm-cache\\_npx\\f3920abdac2db749\\node_modules\\@getengram\\cli\\dist\\daemon\\login-start.js";
+  const INSTALLED = "C:\\Users\\u\\AppData\\Roaming\\npm\\node_modules\\@getengram\\cli\\dist\\daemon\\login-start.js";
+
+  afterEach(() => {
+    Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
+    vi.doUnmock("../daemon/supervise.js");
+    vi.doUnmock("../daemon/launch.js");
+    vi.doUnmock("../daemon/instance.js");
+    vi.resetModules();
+    vi.restoreAllMocks();
+  });
+
+  /** Run supervisor.ts, its sign-in entry at `entry`: what it gave supervise(). */
+  async function supervisorFrom(entry: string): Promise<SuperviseOptions> {
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    vi.resetModules();
+    const given: SuperviseOptions[] = [];
+    vi.doMock("../daemon/supervise.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("../daemon/supervise.js")>()),
+      supervise: async (_deps: SuperviseDeps, options: SuperviseOptions) => {
+        given.push(options);
+        return 0;
+      },
+    }));
+    vi.doMock("../daemon/launch.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("../daemon/launch.js")>()),
+      loginStartPath: () => entry,
+      workerPath: () => entry.replace("login-start.js", "worker.js"),
+      spawnWorker: () => {
+        throw new Error("the test starts no worker");
+      },
+    }));
+    vi.doMock("../daemon/instance.js", () => ({
+      probeDaemon: async () => ({ state: "none" }),
+      readStopFile: () => null,
+      removeStopFileIf: () => false,
+    }));
+    const exits: (number | undefined)[] = [];
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => void exits.push(code)) as never);
+    await import("../daemon/supervisor.js");
+    expect(exits).toEqual([0]);
+    expect(given).toHaveLength(1);
+    return given[0];
+  }
+
+  it("names the command that starts the daemon as npx runs the CLI, from npx's cache", async () => {
+    const { command } = await supervisorFrom(FROM_NPX);
+    expect(command("start")).toBe("npx @getengram/cli start");
+  });
+
+  it("names it engram start when the CLI is installed", async () => {
+    const { command } = await supervisorFrom(INSTALLED);
+    expect(command("start")).toBe("engram start");
   });
 });

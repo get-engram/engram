@@ -9,6 +9,7 @@ import {
   saveConfigOrExit,
 } from "../config-guard.js";
 import { lockedDirFix, lockedDirReason } from "../daemon/ownership.js";
+import { engramCommand } from "../daemon/package-runner.js";
 import { green, red, dim, bold } from "../output.js";
 import { Engram } from "@getengram/sdk";
 import { autoEnableCapture } from "../daemon/commands.js";
@@ -47,9 +48,9 @@ async function saveNewKey(key: string, command: string, lost: string[]): Promise
       for (const line of lost) console.error(`  ${line}`);
       if (locked) {
         console.error(`  ${lockedDirFix(locked)}`);
-        console.error(`  Then run 'engram ${command}' again.`);
+        console.error(`  Then run '${engramCommand(command)}' again.`);
       } else {
-        console.error(`  Fix the file, then run 'engram ${command}' again.`);
+        console.error(`  Fix the file, then run '${engramCommand(command)}' again.`);
       }
       process.exit(1);
     }
@@ -116,8 +117,8 @@ export async function signup(): Promise<void> {
   if (existing.apiKey) {
     console.error(
       "You already have an account. Your API key is saved in ~/.engram/config.json\n\n" +
-        "  engram auth status    # check your account\n" +
-        "  engram auth logout    # remove credentials before creating a new account\n",
+        `  ${engramCommand("auth status")}    # check your account\n` +
+        `  ${engramCommand("auth logout")}    # remove credentials before creating a new account\n`,
     );
     process.exit(1);
   }
@@ -154,7 +155,7 @@ export async function signup(): Promise<void> {
   console.log(`  API key saved to ~/.engram/config.json`);
   await autoEnableCapture({ after: "login" });
   console.log(
-    dim("  Tip: run 'engram link <email>' to claim your account for upgrades"),
+    dim(`  Tip: run '${engramCommand("link <email>")}' to claim your account for upgrades`),
   );
 }
 
@@ -167,7 +168,7 @@ export async function link(args: string[] = [], flags: Record<string, string> = 
   const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
 
   if (!apiKey) {
-    console.error(red("Not authenticated. Run 'engram signup' first."));
+    console.error(red(`Not authenticated. Run '${engramCommand("signup")}' first.`));
     process.exit(1);
   }
 
@@ -198,7 +199,7 @@ export async function link(args: string[] = [], flags: Record<string, string> = 
       console.error(
         red(`An account already exists for ${email.trim()}.\n`) +
           "\n  If that's your account, sign in instead:\n" +
-          `    engram login --email ${email.trim()} --password <your-password>\n`,
+          `    ${engramCommand("login")} --email ${email.trim()} --password <your-password>\n`,
       );
     } else {
       console.error(red(err.message || `Link failed: ${linkRes.status}`));
@@ -261,7 +262,7 @@ export async function whoami(): Promise<void> {
   const apiKey = process.env.ENGRAM_API_KEY ?? config.apiKey;
   if (!apiKey) {
     console.log("Not authenticated.");
-    console.log("\nRun: engram login   (or engram auth login <api-key>)");
+    console.log(`\nRun: ${engramCommand("login")}   (or ${engramCommand("auth login <api-key>")})`);
     process.exit(1);
   }
 
@@ -285,7 +286,7 @@ export async function whoami(): Promise<void> {
     console.log(`  Email: ${acct.email}`);
   } else {
     console.log(`  Email: ${dim("none — anonymous account")}`);
-    console.log(dim("  Add one (enables web login + billing): engram link <email>"));
+    console.log(dim(`  Add one (enables web login + billing): ${engramCommand("link <email>")}`));
   }
   console.log(`  Org:   ${acct.org_id}`);
   console.log(`  Key:   ${apiKey.slice(0, 20)}... ${dim(`(${source})`)}`);
@@ -311,21 +312,21 @@ async function confirmSavedKeyIsFor(
   } catch (err: unknown) {
     console.error(
       red(`Couldn't check which account the saved API key belongs to (${err instanceof Error ? err.message : String(err)}).\n`) +
-        "  Nothing was changed. Run 'engram whoami' to see the account in use.",
+        `  Nothing was changed. Run '${engramCommand("whoami")}' to see the account in use.`,
     );
     process.exit(1);
   }
   if (res.status === 401) {
     console.error(
       red("The API key saved in ~/.engram/config.json was rejected.\n") +
-        "  Get a key for this account at getengram.app/dashboard, then run 'engram auth login <key>'.",
+        `  Get a key for this account at getengram.app/dashboard, then run '${engramCommand("auth login <key>")}'.`,
     );
     process.exit(1);
   }
   if (!res.ok) {
     console.error(
       red(`Couldn't check which account the saved API key belongs to (HTTP ${res.status}).\n`) +
-        "  Nothing was changed. Run 'engram whoami' to see the account in use.",
+        `  Nothing was changed. Run '${engramCommand("whoami")}' to see the account in use.`,
     );
     process.exit(1);
   }
@@ -342,7 +343,7 @@ async function confirmSavedKeyIsFor(
         `${saved ? `another account (${saved})` : "another account (one with no email)"}, not ${email}.\n`,
     ) +
       "  Nothing was changed, and capture still goes to that account.\n" +
-      `  To switch: get a key for ${email} at getengram.app/dashboard, then run 'engram auth login <key>'.`,
+      `  To switch: get a key for ${email} at getengram.app/dashboard, then run '${engramCommand("auth login <key>")}'.`,
   );
   process.exit(1);
 }
@@ -393,7 +394,7 @@ export async function login(args: string[] = [], flags: Record<string, string> =
     }
     console.error(
       red("Your account already has an API key.\n") +
-        "  Use 'engram auth login <key>' to set it, or manage keys at getengram.app/dashboard",
+        `  Use '${engramCommand("auth login <key>")}' to set it, or manage keys at getengram.app/dashboard`,
     );
     process.exit(1);
   }

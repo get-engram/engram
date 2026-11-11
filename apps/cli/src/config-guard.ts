@@ -18,6 +18,7 @@
 import { configSaveProblem, loadConfigStrict, saveConfig, saveFailure, type Config } from "./config.js";
 import { ConfigUnreadable, excludePathsOf } from "./config-file.js";
 import { lockedDir, lockedDirFix, lockedDirReason, type LockedDir } from "./daemon/ownership.js";
+import { engramCommand } from "./daemon/package-runner.js";
 import { dim, red } from "./output.js";
 
 function asProblem(err: unknown): ConfigUnreadable {
@@ -97,7 +98,7 @@ export async function loadConfigForUpdate(hints: string[] = []): Promise<Config>
  */
 export function printEmptyConfigNote(): void {
   console.error(dim("Note: ~/.engram/config.json was empty, so any folders you had excluded from"));
-  console.error(dim("  capture are lost. Add them back with: engram exclude add <path>"));
+  console.error(dim(`  capture are lost. Add them back with: ${engramCommand("exclude add <path>")}`));
 }
 
 /**
@@ -162,7 +163,7 @@ export function exitConfigUnsaved(
   meaning: string[],
   again?: string,
 ): never {
-  const command = again === undefined ? "this" : `'engram ${again}'`;
+  const command = again === undefined ? "this" : `'${engramCommand(again)}'`;
   console.error(red(`Error: ${failure.problem}.`));
   for (const line of meaning) console.error(`  ${line}`);
   if (failure.fix) {

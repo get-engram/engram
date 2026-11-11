@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { checkWritableSync, ensurePrivateDirSync, writePrivateFileSync } from "./private-files.js";
 import { isMissing, parseConfigText, readFailure, writeProblem } from "./config-file.js";
 import { lockedDir, lockedDirReason } from "./daemon/ownership.js";
+import { engramCommand } from "./daemon/package-runner.js";
 
 // Where it always was, for the commands that import it from here.
 export { resolveBaseUrl } from "./server-url.js";
@@ -124,7 +125,7 @@ export function getApiKey(): string {
     console.error(
       "Error: No API key found.\n\n" +
         "Set your API key with:\n" +
-        "  engram auth login\n" +
+        `  ${engramCommand("auth login")}\n` +
         "  # or\n" +
         "  export ENGRAM_API_KEY=engram_sk_live_...\n",
     );

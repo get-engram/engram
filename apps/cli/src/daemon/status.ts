@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { writePrivateFileSync } from "../private-files.js";
 import { plural } from "../output.js";
+import { lockedDir, lockedDirFix, lockedDirReason, type LockedDir } from "./ownership.js";
 import { powerShellArgs, windowsPowerShellPath } from "./powershell.js";
 
 const STATUS_FILE = join(homedir(), ".engram", "status.json");
@@ -413,12 +414,27 @@ export function recordCaptureStall(
   writeStatus();
   if (!first) return;
 
-  const summary = captureErrorSummary(currentStatus.capture_error);
+  // A ~/.engram that can't be searched any more (engram#723): the file is
+  // fine, and the folder is what needs the fix. daemon.log, which the
+  // daemon opened before, still takes the warning; status.json, which is
+  // written anew, can't be, so the desktop is told too.
+  const locked = kind === "config" ? lockedDir() : null;
+  const summary = locked?.search
+    ? lockedCaptureSummary(locked, currentStatus.capture_error.files)
+    : captureErrorSummary(currentStatus.capture_error);
   console.error(`[engram] WARNING: ${summary}`);
   console.error(`[engram] Run 'engram status' for details.`);
   if (Date.now() - lastCaptureNotifyAt >= CAPTURE_NOTIFY_INTERVAL_MS) {
     lastCaptureNotifyAt = Date.now();
     if (kind === "config") {
+      if (locked?.search) {
+        notifyDesktop(
+          "Engram paused capture",
+          `${lockedDirReason("opening the files")}, so capture is paused. ${lockedDirFix(locked)}. ` +
+            `Capture then resumes where it stopped.`,
+        );
+        return;
+      }
       // The message is short and names the file; it isn't cut.
       notifyDesktop(
         "Engram paused capture",
@@ -733,18 +749,36 @@ export function syncErrorSummary(
  * log, the desktop notification, `engram status` and the CLI banner.
  */
 export function captureErrorSummary(c: CaptureError): string {
-  const files = c.files === 1 ? "1 transcript is" : `${n(c.files)} transcripts are`;
+  const waiting = transcriptsWaiting(c.files);
   if (c.kind === "config") {
     return (
-      `Engram can't read the folders you excluded from capture (${c.message}), so ${files} ` +
-      `waiting. Fix the file, and capture picks up where it stopped: nothing is skipped, ` +
+      `Engram can't read the folders you excluded from capture (${c.message}), so ${waiting}. ` +
+      `Fix the file, and capture picks up where it stopped: nothing is skipped, ` +
       `and nothing from an excluded folder is captured.`
     );
   }
   return (
-    `Engram can't queue new messages on this machine (${c.message}), so ${files} ` +
-    `waiting. Free up disk space, or check that ~/.engram/daemon.db can be ` +
+    `Engram can't queue new messages on this machine (${c.message}), so ${waiting}. ` +
+    `Free up disk space, or check that ~/.engram/daemon.db can be ` +
     `written. Capture picks up where it stopped, so nothing is skipped.`
+  );
+}
+
+/** "1 transcript is waiting", "1,234 transcripts are waiting". */
+function transcriptsWaiting(files: number): string {
+  return files === 1 ? "1 transcript is waiting" : `${n(files)} transcripts are waiting`;
+}
+
+/**
+ * captureErrorSummary's words for config.json, when what keeps it from
+ * being read is a ~/.engram that can't be searched (engram#723): the
+ * folder and its chmod, not "Fix the file", which nothing is wrong with.
+ */
+function lockedCaptureSummary(locked: LockedDir, files: number): string {
+  return (
+    `Engram can't read the folders you excluded from capture: ${lockedDirReason("opening the files")}, ` +
+    `so ${transcriptsWaiting(files)}. ${lockedDirFix(locked)}. Capture then picks up where it ` +
+    `stopped: nothing is skipped, and nothing from an excluded folder is captured.`
   );
 }
 

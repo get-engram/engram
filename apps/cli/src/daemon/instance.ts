@@ -42,7 +42,9 @@ import { dirname, join } from "node:path";
 import { rootForAnotherUser } from "./as-root.js";
 import { ENGRAM_DIR, PID_FILE } from "./launch.js";
 import { systemJob, type SystemJob } from "./launchd.js";
+import { lockedDir, lockedDirFix, lockedDirProblem } from "./ownership.js";
 import { powerShellArgs, windowsPowerShellPath } from "./powershell.js";
+import { notifyDesktopBeforeExit } from "./status.js";
 import { ensurePrivateDirSync, readSmallFileSync, writePrivateFileSync } from "../private-files.js";
 
 /** This package's version, which the daemon gives when it answers. */
@@ -924,7 +926,8 @@ export type Claim =
    */
   | { state: "stopped" }
   /**
-   * Running as root for another user (engram#680): never the daemon. It
+   * Running as root for another user (engram#680), or in a ~/.engram its
+   * permissions keep the user out of (engram#723): never the daemon. It
    * took nothing, and should exit 0, so launchd doesn't start it again.
    */
   | { state: "refused"; message: string };
@@ -936,6 +939,8 @@ let released = false;
 let checkTimer: NodeJS.Timeout | null = null;
 let checking = false;
 let warnedSocket = false;
+/** Whether checkDaemonLock said ~/.engram can't be searched (engram#723). */
+let warnedLocked = false;
 /** Whether this daemon looks for stop requests: set when it claims the lock. */
 let watchStopFile = false;
 let stopTimer: NodeJS.Timeout | null = null;
@@ -1022,6 +1027,22 @@ export async function checkDaemonLock(): Promise<void> {
   if (checking || released || self.stopping) return;
   checking = true;
   try {
+    // ~/.engram can't be searched any more (engram#723): neither the socket
+    // nor the PID file can be looked at, which isn't another daemon having
+    // them, and a PID file written every 30 seconds would only fail. Said
+    // once, and checked again once it can be. The daemon goes on with what
+    // it opened, and holds capture while config.json can't be read.
+    const locked = lockedDir({ dir: ENGRAM_DIR });
+    if (locked?.search) {
+      if (!warnedLocked) {
+        warnedLocked = true;
+        log(
+          `~/.engram's permissions keep this daemon from opening the files in it, so it can't check its socket and PID file. ${lockedDirFix(locked)}`,
+        );
+      }
+      return;
+    }
+    warnedLocked = false;
     const h = held;
     if (h && !h.endpoint.pipe) {
       const st = lstatOrNull(h.endpoint.path);
@@ -1142,6 +1163,22 @@ async function claimOnce(options: ClaimOptions): Promise<Claim> {
   process.on("SIGHUP", onStop);
   // Ctrl-Break, in a console on Windows.
   if (process.platform === "win32") process.on("SIGBREAK", onStop);
+  // A ~/.engram its own permissions keep the user out of (engram#723), as
+  // `chmod -R 600 ~/.engram` leaves it. The daemon can't open, or make,
+  // anything in it: not its socket, so it would run without the lock, and
+  // not its database, which it then dies at. It takes nothing, and exits
+  // with 0, so launchd and systemd leave it stopped. Its log is in that
+  // folder too, so the desktop is told; a signal while that is shown is
+  // swallowed (deciding), not taken for a crash.
+  const locked = lockedDir({ dir: ENGRAM_DIR });
+  if (locked) {
+    const message = `daemon exiting: ${lockedDirProblem(locked, "stopped")}`;
+    log(message);
+    log(lockedDirFix(locked));
+    log("Then run: engram start");
+    await notifyDesktopBeforeExit("Engram capture has stopped", `${lockedDirProblem(locked)} ${lockedDirFix(locked)}`);
+    return { state: "refused", message };
+  }
   const endpoint = options.endpoint ?? daemonEndpoint();
   const result: LockResult =
     "unavailable" in endpoint

@@ -1,5 +1,6 @@
 import { dim } from "../output.js";
 import { daemonStatus } from "../daemon/index.js";
+import { lockedDir } from "../daemon/ownership.js";
 import { fetchUsage, printUsage, printUsageError, usage } from "./usage.js";
 
 /**
@@ -40,8 +41,15 @@ export async function status(
       console.log(dim(`\nPlan and usage: unavailable right now (${result.status}).`));
       return;
     case "config":
-      // What is wrong with it is said above, with the daemon (engram#673).
-      console.log(dim("\nPlan and usage: can't be shown until ~/.engram/config.json can be read."));
+      // What is wrong with it is said above, with the daemon (engram#673),
+      // or with ~/.engram, when nothing in it can be opened (engram#723).
+      console.log(
+        dim(
+          lockedDir()?.search
+            ? "\nPlan and usage: can't be shown until the files in ~/.engram can be opened."
+            : "\nPlan and usage: can't be shown until ~/.engram/config.json can be read.",
+        ),
+      );
       process.exitCode = 1;
       return;
     default:

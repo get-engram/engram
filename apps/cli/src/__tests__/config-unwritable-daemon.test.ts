@@ -121,7 +121,7 @@ writeFileSync(WORKER, "");
 mkdirSync(NO_BIN);
 
 const { autoEnableCapture, daemonInstall, daemonStart, daemonStop, daemonUninstall } = await import("../daemon/commands.js");
-const { saveFailure } = await import("../config.js");
+const { configSaveProblem, saveFailure } = await import("../config.js");
 
 const KEY = "engram_sk_live_test_681_fine";
 const SETTINGS = JSON.stringify({ apiKey: KEY, excludePaths: ["/work"] });
@@ -400,6 +400,28 @@ describe.skipIf(HOST === "win32" || process.geteuid?.() === 0)("a config.json th
       expect(saveFailure(errno("EACCES"))).toEqual({ problem: DENIED, fix: "chmod u+w ~/.engram/config.json" });
       Object.defineProperty(process, "platform", { value: "win32", configurable: true });
       expect(saveFailure(errno("EACCES"))).toEqual({ problem: DENIED, fix: null });
+    });
+
+    // engram#723: no file in a ~/.engram the user can't search can be
+    // opened, and the folder is what's wrong, not the file.
+    it.each([
+      ["600", 0o600, "chmod u+x ~/.engram"],
+      ["400", 0o400, "chmod u+wx ~/.engram"],
+      ["000", 0o000, "chmod u+rwx ~/.engram"],
+    ])("a ~/.engram at %s: says it's the folder, with its chmod", (_, mode, fix) => {
+      config(SETTINGS);
+      chmodSync(ENGRAM_DIR, mode);
+      try {
+        const locked = { problem: "~/.engram's permissions keep you from saving config.json in it", fix };
+        expect(saveFailure(errno("EACCES"))).toEqual(locked);
+        // What a save would find, found without writing.
+        expect(configSaveProblem()).toEqual(locked);
+        // Not what isn't the permissions.
+        expect(saveFailure(errno("ENOSPC")).problem).not.toContain("permissions");
+      } finally {
+        chmodSync(ENGRAM_DIR, 0o700);
+      }
+      expectUnchanged(SETTINGS, 0o600);
     });
   });
 

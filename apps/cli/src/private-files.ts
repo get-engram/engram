@@ -340,6 +340,11 @@ export interface PrivateDirReport {
   skipped: string[];
   /** Temp files of config.json, status.json, daemon.pid, daemon.stop and vault-changed that a write cut short left behind. */
   removed: string[];
+  /**
+   * Why `dir` couldn't be listed ("EACCES"), when it couldn't: its files
+   * were then left as they are (engram#723).
+   */
+  unlisted?: string;
 }
 
 /**
@@ -350,11 +355,21 @@ export interface PrivateDirReport {
  * write of config.json, status.json, daemon.pid, daemon.stop or
  * vault-changed left behind are removed once they are STALE_TEMP_MS old.
  *
- * Throws only when `dir` can't be created or read.
+ * Throws only when `dir` can't be created or looked at. One that can't be
+ * listed, as a `chmod u-r` leaves it, has its files left as they are, and
+ * `unlisted` says why (engram#723): the daemon needs to open its files, not
+ * to list them, so that is no reason for it not to start.
  */
 export function makeDirPrivateSync(dir: string, now = Date.now()): PrivateDirReport {
   const report: PrivateDirReport = { dir: ensurePrivateDirSync(dir), changed: [], skipped: [], removed: [] };
-  for (const name of readdirSync(dir)) {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch (err) {
+    report.unlisted = (err as NodeJS.ErrnoException).code ?? "unknown error";
+    return report;
+  }
+  for (const name of names) {
     const path = join(dir, name);
     let st: BigIntStats;
     try {

@@ -602,6 +602,32 @@ describe("makeDirPrivateSync: the daemon's start (engram#627)", () => {
     expect(readdirSync(engram).sort()).toEqual([writing, ...kept].sort());
   });
 
+  // engram#723: `chmod u-r ~/.engram` leaves a folder whose files can still
+  // be opened by name, which is all the daemon needs: no reason not to start.
+  // Root can list any folder.
+  it.skipIf(!posix || root)("leaves the files in a folder it can't list as they are, and says why (engram#723)", () => {
+    const engram = join(dir, ".engram");
+    mkdirSync(engram, { mode: 0o700 });
+    const config = join(engram, "config.json");
+    writeFileSync(config, "{}");
+    chmodSync(config, 0o644);
+    chmodSync(engram, 0o300);
+    try {
+      expect(makeDirPrivateSync(engram)).toEqual({
+        dir: "private",
+        changed: [],
+        skipped: [],
+        removed: [],
+        unlisted: "EACCES",
+      });
+      expect(mode(engram)).toBe(0o300);
+    } finally {
+      chmodSync(engram, 0o700);
+    }
+    // Not listed, so not seen: left as it was.
+    expect(mode(config)).toBe(0o644);
+  });
+
   // engram#612: the daemon's socket is in ~/.engram. A plain stat of a
   // socket made Node resolve the next package it loaded to its symlink, not
   // to where it is, and that package then couldn't find its own

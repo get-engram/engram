@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -91,6 +91,8 @@ describe("the banner before a command (engram#673)", () => {
   });
 
   afterEach(() => {
+    // A ~/.engram a test locked (engram#723), open again to clean up.
+    if (existsSync(ENGRAM_DIR)) chmodSync(ENGRAM_DIR, 0o700);
     process.argv = argv;
     process.exitCode = undefined;
     vi.unstubAllEnvs();
@@ -185,4 +187,102 @@ describe("the banner before a command (engram#673)", () => {
     expect(errs).toEqual([]);
     expect(out).toHaveLength(2);
   });
+
+  // engram#723: a ~/.engram its own permissions keep the user out of, as
+  // `chmod -R 600 ~/.engram` leaves it. Every file in it is fine, and
+  // config.json's banner would say what is wrong with the file: the folder
+  // is said instead, with the chmod that fixes it. POSIX, and not as root,
+  // whom a folder's bits don't keep out.
+  describe.skipIf(process.platform === "win32" || process.geteuid?.() === 0)(
+    "for a ~/.engram that keeps the user out (engram#723)",
+    () => {
+      const OPENING = [
+        "engram: ~/.engram is yours, but its permissions keep you from opening the files in it, so the daemon can't start.",
+        "  To fix it, run: chmod u+x ~/.engram",
+        "",
+      ];
+      const MAKING = [
+        "engram: ~/.engram is yours, but its permissions keep you from making files in it, so the daemon can't start.",
+        "  To fix it, run: chmod u+w ~/.engram",
+        "",
+      ];
+
+      /** `engram <words>` with ~/.engram at `mode`, open again after. */
+      async function engramIn(mode: number, ...words: string[]): Promise<void> {
+        chmodSync(ENGRAM_DIR, mode);
+        try {
+          await engram(...words);
+        } finally {
+          chmodSync(ENGRAM_DIR, 0o700);
+        }
+      }
+
+      it("says the folder and its chmod before any other command, not config.json or status.json", async () => {
+        writeFileSync(CONFIG_FILE, BROKEN);
+        daemonRecorded({ message: "database or disk is full" });
+        await engramIn(0o600, "version");
+        expect(errs).toEqual(OPENING);
+        expect(out).toEqual([expect.stringMatching(/^engram \S+$/)]);
+      });
+
+      it("gives back every bit it lacks, as `chmod 000` leaves it", async () => {
+        await engramIn(0o000, "link");
+        expect(ran).toEqual(["link"]);
+        expect(errs).toEqual([OPENING[0], "  To fix it, run: chmod u+rwx ~/.engram", ""]);
+      });
+
+      it.each(["start", "daemon start", "install", "daemon install", "status", "daemon status"])(
+        "isn't shown before `engram %s`, which says it itself",
+        async (command) => {
+          // Nor config.json's, which can't be read. In a ~/.engram that only
+          // can't be written, a config.json that can't be parsed is said
+          // before start and install, as ever.
+          writeFileSync(CONFIG_FILE, BROKEN);
+          await engramIn(0o600, ...command.split(" "));
+          writeFileSync(CONFIG_FILE, GOOD);
+          await engramIn(0o500, ...command.split(" "));
+          expect(ran).toHaveLength(2);
+          expect(errs).toEqual([]);
+        },
+      );
+
+      it.each([
+        "signup", "login", "auth login", "auth logout",
+        "stop", "daemon stop", "uninstall", "daemon uninstall",
+        "exclude", "exclude add /work", "exclude remove /work", "exclude rm /work", "exclude list", "exclude ls",
+      ])("isn't shown before `engram %s`, which says why it can't open config.json", async (command) => {
+        await engramIn(0o600, ...command.split(" "));
+        expect(ran).toHaveLength(1);
+        expect(errs).toEqual([]);
+      });
+
+      // Only nothing can be made in it, as `chmod u-w ~/.engram` leaves it:
+      // the files in it can still be read, and what they say is said too.
+      it("one that only can't be written: the folder, then what config.json and status.json say", async () => {
+        writeFileSync(CONFIG_FILE, BROKEN);
+        await engramIn(0o500, "version");
+        expect(errs).toEqual([...MAKING, ...banner("isn't valid JSON")]);
+
+        errs.length = 0;
+        writeFileSync(CONFIG_FILE, GOOD);
+        daemonRecorded({ message: "database or disk is full" });
+        await engramIn(0o500, "stop");
+        expect(ran).toEqual(["stop"]);
+        expect(errs.slice(0, 3)).toEqual(MAKING);
+        expect(errs[3]).toMatch(/^engram: Engram can't queue new messages on this machine \(database or disk is full\)/);
+      });
+
+      it("is nothing once the folder is open again, or with no ~/.engram", async () => {
+        writeFileSync(CONFIG_FILE, GOOD);
+        await engramIn(0o600, "version");
+        expect(errs).toEqual(OPENING);
+        errs.length = 0;
+        await engram("version");
+        rmSync(ENGRAM_DIR, { recursive: true, force: true });
+        await engram("version");
+        expect(errs).toEqual([]);
+        expect(out).toHaveLength(3);
+      });
+    },
+  );
 });

@@ -1,5 +1,7 @@
 /**
- * engram#659 — files in ~/.engram that aren't the user's.
+ * engram#659 — files in ~/.engram that aren't the user's. engram#723 — a
+ * ~/.engram that is the user's, and that its own permissions keep them out
+ * of (lockedDir).
  *
  * Run with sudo, a CLI from before engram#653 started the daemon as root
  * and wrote config.json as root. What root makes in the user's ~/.engram is
@@ -82,6 +84,8 @@ export interface OwnershipCheck {
   ownerOf?: (path: string) => number | null;
   /** Whether this process has `mode` (R_OK, W_OK, X_OK) on `path`. */
   canAccess?: (path: string, mode: number) => boolean;
+  /** The permission bits of `path`, through a symlink: null when nothing is there, or it can't be looked at. */
+  modeOf?: (path: string) => number | null;
 }
 
 export interface ForeignFiles {
@@ -117,6 +121,14 @@ function access(path: string, mode: number): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+function permissions(path: string): number | null {
+  try {
+    return Number(statSync(path, { bigint: true }).mode) & 0o777;
+  } catch {
+    return null;
   }
 }
 
@@ -211,4 +223,98 @@ export function foreignFilesProblem(f: ForeignFiles, daemon?: "running" | "stopp
 /** "Make it yours with: sudo chown …". `then`: "Then make it yours …", after another step. */
 export function foreignFilesFix(f: ForeignFiles, then = false): string {
   return `${then ? "Then make" : "Make"} ${foreignAreMany(f) ? "them" : "it"} yours with: ${OWNERSHIP_FIX}`;
+}
+
+/**
+ * ~/.engram is the user's, and its own permissions keep them out of it
+ * (engram#723), as `chmod -R 600 ~/.engram` leaves it: every file in it is
+ * still theirs and whole.
+ */
+export interface LockedDir {
+  /** It can't be searched (no x): nothing in it can be opened, or even looked at. */
+  search: boolean;
+  /** Nothing can be made in it (no w): no socket, PID file, -wal or -shm, and no file replaced. */
+  write: boolean;
+  /** The command that gives the user back what is missing: "chmod u+x ~/.engram". */
+  command: string;
+}
+
+/**
+ * Whether ~/.engram is the user's and its permissions keep them out of it,
+ * or null when they don't (or ~/.engram isn't there yet, or is another
+ * user's: foreignFiles). A folder that can't be searched hides every file
+ * in it, so what fails is each file the CLI and the daemon open, and what
+ * they said was about the file: "config.json can't be read", "Fix the
+ * file", a chmod of the file, which can't reach it either.
+ *
+ * Only what the owner's own bits keep from them counts, so the command
+ * that is given, a chmod of their own folder, is sure to fix it. An ACL or
+ * a read-only disk is something else, and chmod wouldn't help. A folder
+ * that only can't be listed (no r) isn't counted: nothing in Engram needs
+ * that but the daemon's tidy-up at start, which goes without it. The
+ * command adds r back with the rest, though.
+ *
+ * Never on Windows, and never as root: root can open anything.
+ */
+export function lockedDir({
+  platform = process.platform,
+  euid = process.geteuid?.() ?? null,
+  dir = join(homedir(), ".engram"),
+  ownerOf = owner,
+  canAccess = access,
+  modeOf = permissions,
+}: OwnershipCheck = {}): LockedDir | null {
+  if (platform === "win32" || euid === null || euid === 0) return null;
+  if (ownerOf(dir) !== euid) return null;
+  const mode = modeOf(dir);
+  if (mode === null) return null;
+  const search = (mode & 0o100) === 0 && !canAccess(dir, X_OK);
+  const write = (mode & 0o200) === 0 && !canAccess(dir, W_OK);
+  if (!search && !write) return null;
+  const missing = (
+    [
+      [0o400, "r"],
+      [0o200, "w"],
+      [0o100, "x"],
+    ] as const
+  )
+    .filter(([bit]) => (mode & bit) === 0)
+    .map(([, letter]) => letter)
+    .join("");
+  return { search, write, command: `chmod u+${missing} ~/.engram` };
+}
+
+/**
+ * Why `doing` failed, in a ~/.engram that can't be searched (search):
+ * "~/.engram's permissions keep you from opening config.json in it". Said
+ * instead of what is wrong with the file, which nothing is.
+ */
+export function lockedDirReason(doing: string): string {
+  return `~/.engram's permissions keep you from ${doing} in it`;
+}
+
+/**
+ * What ~/.engram's permissions keep the user from, and what that stops.
+ * "~/.engram is yours, but its permissions keep you from opening the files
+ * in it, so the daemon can't start, and nothing new is captured."
+ * `daemon`: whether the daemon runs now, where that is known. One that
+ * runs was started before, and has what it opened then; one that can't
+ * open the files in it any more can't read config.json either, so it holds
+ * what it would capture until it can (engram#673), and then goes on from
+ * where it stopped.
+ */
+export function lockedDirProblem(l: LockedDir, daemon?: "running" | "stopped"): string {
+  const kept = `~/.engram is yours, but its permissions keep you from ${l.search ? "opening the files in it" : "making files in it"}`;
+  if (daemon === "running") {
+    return l.search
+      ? `${kept}, so capture is paused, and the daemon can't start again once it stops.`
+      : `${kept}, so the daemon can't start again once it stops.`;
+  }
+  if (daemon === "stopped") return `${kept}, so the daemon can't start, and nothing new is captured.`;
+  return `${kept}, so the daemon can't start.`;
+}
+
+/** "To fix it, run: chmod u+x ~/.engram" */
+export function lockedDirFix(l: LockedDir): string {
+  return `To fix it, run: ${l.command}`;
 }

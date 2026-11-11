@@ -82,6 +82,7 @@ function logPrivacy(made: PrivateDirReport): void {
     log(`left ${made.skipped.length} file(s) in ~/.engram readable by others (not yours, or the change failed): ${made.skipped.join(", ")}`);
   }
   if (made.removed.length > 0) log(`removed ${made.removed.length} temp file(s) left by an interrupted write`);
+  if (made.unlisted) log(`couldn't list ~/.engram (${made.unlisted}), so the files in it were left as they are`);
 }
 
 async function main(): Promise<void> {

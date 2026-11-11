@@ -5,7 +5,7 @@ import { dirname, join, win32 } from "node:path";
 import { bold, dim, plural, red } from "../output.js";
 import { loadConfigStrict, saveConfig, saveFailure, type Config } from "../config.js";
 import { ConfigUnreadable } from "../config-file.js";
-import { inspectConfig, printEmptyConfigNote } from "../config-guard.js";
+import { inspectConfig, lockedConfigDir, printEmptyConfigNote } from "../config-guard.js";
 import { writePrivateFileSync } from "../private-files.js";
 import {
   readStatus,
@@ -24,8 +24,13 @@ import {
   foreignFiles,
   foreignFilesFix,
   foreignFilesProblem,
+  lockedDir,
+  lockedDirFix,
+  lockedDirProblem,
+  lockedDirReason,
   OWNERSHIP_FIX,
   type ForeignFiles,
+  type LockedDir,
 } from "./ownership.js";
 import { envVaultKeySaved, envVaultKeyState, vaultKeyFileState, vaultKeyFix, VaultKeyUnreadable } from "../vault-key.js";
 import {
@@ -298,15 +303,15 @@ export async function daemonStart(
     process.exitCode = 1;
     return;
   }
-  // Files in ~/.engram that are another user's (engram#659).
+  // Files in ~/.engram that are another user's (engram#659), and a
+  // ~/.engram whose own permissions keep the user out of it (engram#723).
   const foreign = foreignFiles();
+  const locked = lockedDir();
+  const again = "install" in flags ? "engram start --install" : "engram start";
   if (found.state === "root") {
     // A daemon started beside it would exit at once (engram#680), and with
     // --install, so would the one start at login starts.
-    printRootDaemon(found, "No daemon of yours starts while it runs.", {
-      foreign,
-      again: "install" in flags ? "engram start --install" : "engram start",
-    });
+    printRootDaemon(found, "No daemon of yours starts while it runs.", { foreign, again });
     process.exitCode = 1;
     return;
   }
@@ -314,6 +319,16 @@ export async function daemonStart(
     printAlreadyRunning(found);
     // It runs, so they haven't stopped it: only said.
     if (foreign) printForeignFiles(foreign, "running");
+    if (locked) {
+      // It goes on with what it opened as it started (engram#723). Start at
+      // login isn't turned on: the daemon launchd or systemd would start,
+      // now and at each login, would stop at once.
+      const install = "install" in flags;
+      printLockedDir(locked, "running", install ? again : undefined);
+      // One that can't open the files in its folder captures nothing now.
+      if (install || locked.search) process.exitCode = 1;
+      if (install) return;
+    }
     // --install still asks for start at login (engram#602). On macOS,
     // loading the launchd agent starts a worker there and then, which finds
     // this daemon and exits (engram#612).
@@ -322,12 +337,15 @@ export async function daemonStart(
     return;
   }
 
-  if (foreign) {
+  if (foreign || locked) {
     // A daemon started now would stop at once: none is started. Not in the
     // foreground either: the fix is the same, and takes a moment. A log
-    // that is another user's only costs the log (engram#679).
-    const stops = stopsCapture(foreign);
-    printForeignFiles(foreign, "stopped", stops ? "start" : undefined);
+    // that is another user's only costs the log (engram#679). One in a
+    // ~/.engram that keeps them out would stop too (engram#723): said
+    // last, with the command to run again once both are fixed.
+    const stops = stopsCapture(foreign) || locked !== null;
+    if (foreign) printForeignFiles(foreign, "stopped", stops && !locked ? "start" : undefined);
+    if (locked) printLockedDir(locked, "stopped", again);
     if (stops) {
       process.exitCode = 1;
       return;
@@ -447,6 +465,19 @@ function printForeignFiles(foreign: ForeignFiles, daemon: "running" | "stopped",
   if (again) console.error(dim(`  Then run 'engram ${again}' again.`));
 }
 
+/**
+ * Say that ~/.engram's own permissions keep the user out of it, what that
+ * stops, and what fixes it (engram#723). `daemon`: whether it runs.
+ * `again`: the command that did nothing because of it, to run again then.
+ * `engram start` and `engram install` say it themselves, as for
+ * printForeignFiles.
+ */
+function printLockedDir(locked: LockedDir, daemon: "running" | "stopped", again?: string): void {
+  console.error(red(lockedDirProblem(locked, daemon)));
+  console.error(dim(`  ${lockedDirFix(locked)}`));
+  if (again) console.error(dim(`  Then run '${again}' again.`));
+}
+
 /** Whether they stop the daemon. */
 function stopsCapture(foreign: ForeignFiles | null): boolean {
   return foreign !== null && foreign.stopsDaemon;
@@ -457,9 +488,10 @@ function stopsCapture(foreign: ForeignFiles | null): boolean {
  * log is, or that it can't be written, so the daemon runs without it
  * (engram#679), and what fixes that. `running`: whether a daemon runs,
  * and `pid`, its PID where that is known: systemd keeps what one it
- * started writes in the journal.
+ * started writes in the journal. `said`: a fix said above it, for
+ * ~/.engram (engram#723), which isn't said again.
  */
-function printLog(running: boolean, pid: number | null = null): void {
+function printLog(running: boolean, pid: number | null = null, said?: string): void {
   const problem = logProblem();
   if (problem === null) {
     console.log(`${dim("Log:")} ${LOG_FILE}`);
@@ -472,7 +504,7 @@ function printLog(running: boolean, pid: number | null = null): void {
     console.log(dim("  systemd keeps its output in the journal: journalctl --user -u engram"));
   }
   const fix = logFix(problem);
-  if (fix !== null) console.log(dim(`  To fix it, run: ${fix}`));
+  if (fix !== null && fix !== said) console.log(dim(`  To fix it, run: ${fix}`));
   // One that runs keeps the output it was started with.
   if (running) {
     console.log(dim("  Once it can be written, 'engram stop' and then 'engram start' have the daemon write to it again."));
@@ -844,13 +876,24 @@ async function recordCaptureIntent(v: "on" | "off", command: string): Promise<vo
       if (v === "off") {
         // The daemon still stops, but capture comes back on with the next
         // command once the file is fixed: not all that was asked, so the
-        // exit says so to a script that runs `engram stop`.
+        // exit says so to a script that runs `engram stop`. In a ~/.engram
+        // that can't be searched, it is the folder that needs the fix, not
+        // the file (engram#723).
         process.exitCode = 1;
-        const why = err instanceof ConfigUnreadable ? err.message : "~/.engram/config.json can't be read";
+        const locked = err instanceof ConfigUnreadable ? lockedConfigDir(err) : null;
+        const why = locked
+          ? lockedDirReason("opening config.json")
+          : err instanceof ConfigUnreadable
+            ? err.message
+            : "~/.engram/config.json can't be read";
         console.error(red(`Couldn't record that capture is off: ${why}.`));
-        console.error(
-          dim(`  Once it's fixed, run 'engram ${command}' again, or the next engram command turns capture back on.`),
-        );
+        const again = `run 'engram ${command}' again, or the next engram command turns capture back on.`;
+        if (locked) {
+          console.error(dim(`  ${lockedDirFix(locked)}`));
+          console.error(dim(`  Then ${again}`));
+        } else {
+          console.error(dim(`  Once it's fixed, ${again}`));
+        }
       }
       return;
     }
@@ -871,7 +914,9 @@ async function recordCaptureIntent(v: "on" | "off", command: string): Promise<vo
       } else {
         console.error(dim(`  Once it's fixed, ${again}`));
       }
-    } else if (was === "off") {
+    } else if (was === "off" && !lockedDir()) {
+      // In a ~/.engram that keeps them out (engram#723), `engram start` and
+      // `engram install` start nothing, and say so with the fix.
       console.error(dim(`Note: couldn't record that capture is on: ${problem}.`));
       console.error(dim("  Until it is, other engram commands won't start the daemon again if it stops."));
       if (fix) {
@@ -915,7 +960,16 @@ export async function daemonStop(): Promise<void> {
     // A supervisor waiting to start the daemon again after an error finds
     // this, and doesn't (engram#613).
     if (process.platform === "win32") writeStopRequest({ pid: null });
-    console.log("Daemon is not running.");
+    if (lockedDir()?.search) {
+      // What finds one can't be looked at (engram#723). The fix was said
+      // with capture off, which couldn't be recorded either.
+      console.error(
+        red("No daemon was found, but one may still be running: ~/.engram's permissions keep you from opening its socket and PID file."),
+      );
+      process.exitCode = 1;
+    } else {
+      console.log("Daemon is not running.");
+    }
     printUntiedRootWorkers([], foreignFiles());
     return;
   }
@@ -1092,6 +1146,11 @@ async function printDbStats(foreign: ForeignFiles | null, config: Config | null)
     if (foreign?.files.some((name) => name.startsWith("daemon.db"))) {
       // engram#659: not the native module, and no start repairs it.
       console.log(dim("Local capture DB unreadable: it isn't yours, see below."));
+    } else if (lockedDir()) {
+      // engram#723: nor the native module. To read the database, SQLite
+      // needs its -wal and -shm files beside it, and makes them when they
+      // aren't there, as a stopped daemon leaves it.
+      console.log(dim("Local capture DB unreadable: ~/.engram's own permissions get in the way."));
     } else {
       console.log(dim("Local capture DB unreadable (native module mismatch?) — the daemon rebuilds it on start."));
     }
@@ -1100,13 +1159,27 @@ async function printDbStats(foreign: ForeignFiles | null, config: Config | null)
 
 /**
  * engram#659, in `engram status`. `stopped`: the daemon isn't running, so
- * once they are the user's, it has to be started.
+ * once they are the user's, it has to be started. `thenStart`: false when
+ * that is said after the next warning instead, as ~/.engram keeps them out
+ * too (engram#723), and it can't be started until both are fixed.
  */
-function printForeignFilesWarning(foreign: ForeignFiles, stopped: boolean, blankBefore = true): void {
+function printForeignFilesWarning(foreign: ForeignFiles, stopped: boolean, blankBefore = true, thenStart = true): void {
   if (blankBefore) console.log("");
   console.log(red(`  ${foreignFilesProblem(foreign, stopped ? "stopped" : "running")}`));
   console.log(dim(`  ${foreignFilesFix(foreign)}`));
-  if (stopped && stopsCapture(foreign)) console.log(dim("  Then run: engram start"));
+  if (thenStart && stopped && stopsCapture(foreign)) console.log(dim("  Then run: engram start"));
+  console.log("");
+}
+
+/**
+ * engram#723, in `engram status`. `stopped`: the daemon isn't running, or
+ * can't be told to be, so once ~/.engram lets them in, it has to be started.
+ */
+function printLockedDirWarning(locked: LockedDir, stopped: boolean, blankBefore = true): void {
+  if (blankBefore) console.log("");
+  console.log(red(`  ${lockedDirProblem(locked, stopped ? "stopped" : "running")}`));
+  console.log(dim(`  ${lockedDirFix(locked)}`));
+  if (stopped) console.log(dim("  Then run: engram start"));
   console.log("");
 }
 
@@ -1151,26 +1224,39 @@ export async function daemonStatus(): Promise<void> {
   const found = await findDaemon();
   // Files in ~/.engram that are another user's (engram#659).
   const foreign = foreignFiles();
+  // A ~/.engram whose own permissions keep the user out of it (engram#723).
+  // One that can't be searched hides everything in it: that is said, not
+  // what can't be read in it, which is every file. Nor can it be told
+  // whether a daemon runs, unless launchd runs it: the exit says so.
+  const locked = lockedDir();
+  if (locked?.search) process.exitCode = 1;
   // A config.json that can't be read (engram#673): capture waits on it.
-  const { config, problem } = await inspectConfig();
+  const { config, problem: unread } = await inspectConfig();
+  const problem = locked?.search ? null : unread;
   // A vault key that can't be read (engram#677): sends wait on it.
-  const key = await keyFile(foreign);
+  const key = await keyFile(foreign, locked);
 
   if (found.state === "stopped") {
-    console.log(`${bold("Status:")} stopped`);
+    // Its socket and PID file are how a daemon is found.
+    console.log(
+      locked?.search
+        ? `${bold("Status:")} unknown — ~/.engram's permissions keep you from opening the files that say whether the daemon runs`
+        : `${bold("Status:")} stopped`,
+    );
 
     // Still show DB stats if available
     await printDbStats(foreign, config);
     const saidRoot = printRootWarnings(found, foreign);
-    if (foreign) printForeignFilesWarning(foreign, true, !saidRoot);
+    if (foreign) printForeignFilesWarning(foreign, true, !saidRoot, !locked);
+    if (locked) printLockedDirWarning(locked, true, !saidRoot && !foreign);
     if (problem) printConfigWarning(problem);
     if (key instanceof VaultKeyUnreadable) printVaultKeyWarning(key, null);
     // A broken start-at-login entry is often why it's stopped. Files that
-    // aren't the user's, said above, are why, when they stop it. With
-    // config.json unreadable, whether 'engram stop' recorded capture off
-    // can't be told.
+    // aren't the user's, said above, are why, when they stop it, and so is
+    // a ~/.engram that keeps them out. With config.json unreadable, whether
+    // 'engram stop' recorded capture off can't be told.
     const startsAtLogin = printAutoStart();
-    if (startsAtLogin && !stopsCapture(foreign) && config !== null && config.autocapture !== "off") {
+    if (startsAtLogin && !stopsCapture(foreign) && !locked && config !== null && config.autocapture !== "off") {
       // Not stopped by 'engram stop', which records autocapture "off", and
       // started at sign-in, so it stopped by itself (engram#613).
       console.log(dim("  It should be running: start at login is on. It may have stopped after an error."));
@@ -1189,7 +1275,9 @@ export async function daemonStatus(): Promise<void> {
       console.log(dim("  Run 'engram start' to start it again."));
     }
     if (startsAtLogin) await printLoginVaultKeyWarning();
-    if (logProblem() !== null) printLog(false);
+    // Not "will run without it": in a ~/.engram that keeps them out, it
+    // doesn't run at all, which is said above.
+    if (logProblem() !== null && !locked) printLog(false);
     return;
   }
 
@@ -1214,11 +1302,21 @@ export async function daemonStatus(): Promise<void> {
   await printDbStats(foreign, config);
   // With one running as root, what it made is said with it.
   const saidRoot = printRootWarnings(found, foreign);
-  if (foreign && found.state !== "root") printForeignFilesWarning(foreign, false, !saidRoot);
+  const ownDaemon = found.state !== "root";
+  if (foreign && ownDaemon) printForeignFilesWarning(foreign, false, !saidRoot);
+  if (locked && ownDaemon) printLockedDirWarning(locked, false, !saidRoot && !foreign);
 
+  // status.json can't be read either in a ~/.engram that can't be
+  // searched: what it says is the same as with none.
   const syncStatus = readStatus();
   printHostStatus(
-    problem ? "config.json, see below" : syncStatus.signed_out_at ? "signed out" : undefined,
+    locked?.search && ownDaemon
+      ? "~/.engram, see above"
+      : problem
+        ? "config.json, see below"
+        : syncStatus.signed_out_at
+          ? "signed out"
+          : undefined,
   );
 
   // The daemon has no vault key, and the vault holds secrets (engram#698):
@@ -1228,9 +1326,11 @@ export async function daemonStatus(): Promise<void> {
   // Show sync health warnings
   printSyncWarnings(syncStatus, problem, key, keyMissing);
 
-  // One running as root can write to it, and does.
-  if (found.state === "root") console.log(`${dim("Log:")} ${LOG_FILE}`);
-  else printLog(true, found.pid);
+  // One running as root can write to it, and does. One running in a
+  // ~/.engram that can't be searched opened it as it started, and goes on
+  // writing to it: no one else can open it then (engram#723).
+  if (found.state === "root" || locked?.search) console.log(`${dim("Log:")} ${LOG_FILE}`);
+  else printLog(true, found.pid, ownDaemon ? locked?.command : undefined);
 
   if (printAutoStart(found) && !keyMissing) await printLoginVaultKeyWarning();
 }
@@ -1374,12 +1474,16 @@ function printConfigWarning(problem: ConfigUnreadable): void {
  * What ~/.engram/vault-key holds, read as the daemon reads it (engram#677):
  * a key, nothing, or why no key can be read from it. "foreign": it can't be
  * read, and is another user's, which printForeignFilesWarning says.
+ * "locked": nothing in ~/.engram can be opened, nor told to be there, which
+ * printLockedDirWarning says (engram#723).
  */
-type KeyFile = "key" | "none" | "foreign" | VaultKeyUnreadable;
+type KeyFile = "key" | "none" | "foreign" | "locked" | VaultKeyUnreadable;
 
-async function keyFile(foreign: ForeignFiles | null): Promise<KeyFile> {
+async function keyFile(foreign: ForeignFiles | null, locked: LockedDir | null): Promise<KeyFile> {
   const state = await vaultKeyFileState();
-  return state instanceof VaultKeyUnreadable && foreign?.files.includes("vault-key") ? "foreign" : state;
+  if (!(state instanceof VaultKeyUnreadable)) return state;
+  if (locked?.search) return "locked";
+  return foreign?.files.includes("vault-key") ? "foreign" : state;
 }
 
 /**
@@ -2512,8 +2616,12 @@ export async function daemonInstall(): Promise<void> {
   const running = found.state === "running" || found.state === "unresponsive";
   // Files in ~/.engram that are another user's (engram#659). Unless one
   // runs already, start at login would start a daemon that stops at once:
-  // it isn't turned on.
+  // it isn't turned on. Nor, whether one runs or not, in a ~/.engram whose
+  // own permissions keep the user out of it (engram#723): the daemon
+  // launchd or systemd would start, now and at each login, would stop at
+  // once.
   const foreign = foreignFiles();
+  const locked = lockedDir();
   if (found.state === "root") {
     // The daemon start at login started would exit at once (engram#680).
     printRootDaemon(found, "Start at login wasn't turned on: no daemon of yours starts while it runs.", {
@@ -2523,9 +2631,10 @@ export async function daemonInstall(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  if (foreign) {
-    const stops = !running && stopsCapture(foreign);
-    printForeignFiles(foreign, running ? "running" : "stopped", stops ? "install" : undefined);
+  if (foreign || locked) {
+    const stops = (!running && stopsCapture(foreign)) || locked !== null;
+    if (foreign) printForeignFiles(foreign, running ? "running" : "stopped", stops && !locked ? "install" : undefined);
+    if (locked) printLockedDir(locked, running ? "running" : "stopped", "engram install");
     if (stops) {
       process.exitCode = 1;
       return;
@@ -2583,6 +2692,16 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
         console.log(
           dim(`  Auto-capture wasn't turned on: files in ~/.engram aren't yours. Make them yours with: ${OWNERSHIP_FIX}`),
         );
+      }
+      return;
+    }
+    // A ~/.engram whose own permissions keep the user out of it
+    // (engram#723): likewise, and the daemon would say so in a desktop
+    // notification as it stops, after every command.
+    const locked = lockedDir();
+    if (locked) {
+      if (after === "login") {
+        console.log(dim(`  Auto-capture wasn't turned on: ${lockedDirProblem(locked)} ${lockedDirFix(locked)}`));
       }
       return;
     }

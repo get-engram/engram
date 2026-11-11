@@ -17,10 +17,22 @@
 
 import { configSaveProblem, loadConfigStrict, saveConfig, saveFailure, type Config } from "./config.js";
 import { ConfigUnreadable, excludePathsOf } from "./config-file.js";
+import { lockedDir, lockedDirFix, lockedDirReason, type LockedDir } from "./daemon/ownership.js";
 import { dim, red } from "./output.js";
 
 function asProblem(err: unknown): ConfigUnreadable {
   return err instanceof ConfigUnreadable ? err : new ConfigUnreadable("can't be read");
+}
+
+/**
+ * A ~/.engram the user can't search (engram#723), when that is why
+ * config.json couldn't be read: then the folder is what's wrong, and
+ * nothing in the file. Null for an empty file, which was read.
+ */
+export function lockedConfigDir(problem: ConfigUnreadable): LockedDir | null {
+  if (problem.empty) return null;
+  const locked = lockedDir();
+  return locked?.search ? locked : null;
 }
 
 /**
@@ -49,6 +61,9 @@ export async function configProblem(): Promise<ConfigUnreadable | null> {
  * config.json's settings, for a command that changes one and saves them
  * back. When they can't be read, the command stops with nothing changed.
  * `hints` are said after the fix, e.g. another way to do what was asked.
+ * They aren't said when ~/.engram itself is what's in the way (engram#723):
+ * a way around the file reaches into the folder too, and once the folder
+ * is fixed, the command does what was asked.
  */
 export async function loadConfigForUpdate(hints: string[] = []): Promise<Config> {
   try {
@@ -58,6 +73,13 @@ export async function loadConfigForUpdate(hints: string[] = []): Promise<Config>
     if (problem.empty) {
       printEmptyConfigNote();
       return {};
+    }
+    const locked = lockedConfigDir(problem);
+    if (locked) {
+      console.error(red(`Error: ${lockedDirReason("opening config.json")}, so nothing was changed.`));
+      console.error(`  ${lockedDirFix(locked)}`);
+      console.error("  Then run this again.");
+      process.exit(1);
     }
     console.error(red(`Error: ${problem.message}.`));
     console.error("  Saving now would replace everything in it, your API key and the folders you");
@@ -97,6 +119,15 @@ export async function configForUse(): Promise<{ config: Config } | { problem: Co
 
 /** Say on stderr that a command can't run because config.json can't be read. */
 export function printConfigProblemForUse(problem: ConfigUnreadable): void {
+  const locked = lockedConfigDir(problem);
+  if (locked) {
+    console.error(
+      red(`Error: ${lockedDirReason("opening config.json")}, so Engram can't tell which account or server to use.`),
+    );
+    console.error(`  ${lockedDirFix(locked)}`);
+    console.error("  Then run this again.");
+    return;
+  }
   console.error(red(`Error: ${problem.message}, so Engram can't tell which account or server to use.`));
   console.error("  Fix the file, then run this again.");
 }

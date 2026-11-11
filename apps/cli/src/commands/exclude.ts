@@ -1,6 +1,7 @@
 import { loadConfigStrict, type Config } from "../config.js";
 import { ConfigUnreadable, excludePathsOf } from "../config-file.js";
-import { loadConfigForUpdate, saveConfigOrExit } from "../config-guard.js";
+import { loadConfigForUpdate, lockedConfigDir, saveConfigOrExit } from "../config-guard.js";
+import { lockedDirFix, lockedDirReason } from "../daemon/ownership.js";
 import { normalizeExcludePath, samePath, IGNORE_MARKER } from "../daemon/exclusions.js";
 import { bold, dim, red } from "../output.js";
 
@@ -8,11 +9,25 @@ import { bold, dim, red } from "../output.js";
 // The daemon checks config.json for changes before each captured batch, so
 // changes apply to the next one with no restart.
 
-/** Stop, saying why the excluded folders can't be `what` (engram#673). */
+/**
+ * Stop, saying why the excluded folders can't be `what` (engram#673): what
+ * is wrong with config.json, or that ~/.engram itself keeps it from being
+ * opened (engram#723), when nothing in the file needs fixing.
+ */
 function cantUse(err: unknown, what: string): never {
-  const why = err instanceof ConfigUnreadable ? err.message : "~/.engram/config.json can't be read";
+  const locked = err instanceof ConfigUnreadable ? lockedConfigDir(err) : null;
+  const why = locked
+    ? lockedDirReason("opening config.json")
+    : err instanceof ConfigUnreadable
+      ? err.message
+      : "~/.engram/config.json can't be read";
   console.error(red(`Error: ${why}, so the folders excluded from capture can't be ${what}.`));
-  console.error("  Fix the file, then run this again.");
+  if (locked) {
+    console.error(`  ${lockedDirFix(locked)}`);
+    console.error("  Then run this again.");
+  } else {
+    console.error("  Fix the file, then run this again.");
+  }
   process.exit(1);
 }
 

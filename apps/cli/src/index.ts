@@ -26,7 +26,15 @@ import { readVaultKey, vaultKeyFileState, vaultKeyFix, VaultKeyUnreadable } from
 import { excludeAdd, excludeRemove, excludeList } from "./commands/exclude.js";
 import { bold, dim, red } from "./output.js";
 import { readStatus, syncErrorSummary, captureErrorSummary, configProblemSummary } from "./daemon/status.js";
-import { foreignFiles, foreignFilesFix, foreignFilesProblem } from "./daemon/ownership.js";
+import {
+  foreignFiles,
+  foreignFilesFix,
+  foreignFilesProblem,
+  lockedDir,
+  lockedDirFix,
+  lockedDirProblem,
+  type LockedDir,
+} from "./daemon/ownership.js";
 import { findRootDaemon, rootDaemonLines } from "./daemon/root-daemon.js";
 import { asRootRefusal, rootForAnotherUser } from "./daemon/as-root.js";
 import { alive, pidInFile } from "./daemon/instance.js";
@@ -346,6 +354,28 @@ function printForeignFilesBanner(commandSaysRoot: boolean): void {
 }
 
 /**
+ * A ~/.engram its own permissions keep the user out of (engram#723), as
+ * `chmod -R 600 ~/.engram` leaves it, or null. Every file in it is still
+ * theirs and whole, and what fails is each one opened, so what was said
+ * was about a file: that config.json can't be read, a chmod of the vault
+ * key that can't reach it. Looked at before every command, as the files
+ * that are another user's are. Never throws.
+ */
+function findLockedDir(): LockedDir | null {
+  try {
+    return lockedDir();
+  } catch {
+    return null;
+  }
+}
+
+function printLockedDirBanner(locked: LockedDir): void {
+  console.error(red(bold("engram:")) + ` ${lockedDirProblem(locked)}`);
+  console.error(dim(`  ${lockedDirFix(locked)}`));
+  console.error("");
+}
+
+/**
  * A ~/.engram/config.json that can't be read (engram#673): capture waits on
  * it, and commands that use or save settings stop. Read from the file here,
  * before every command, rather than from status.json: the daemon may not
@@ -428,7 +458,17 @@ async function main(): Promise<void> {
     "stop", "daemon stop", "uninstall", "daemon uninstall",
     "exclude", "exclude add", "exclude remove", "exclude rm", "exclude list", "exclude ls",
   ]);
-  if (!SAYS_CONFIG_PROBLEM.has(cmd)) await printConfigBanner();
+  // A ~/.engram the user is kept out of (engram#723): start, install and
+  // status say it themselves, and, with config.json in it out of reach,
+  // so do the commands that read or save it, saying why they can't. The
+  // banner for config.json would say what is wrong with the file, and
+  // nothing is.
+  const locked = findLockedDir();
+  const SAYS_LOCKED_DIR = new Set(["start", "daemon start", "install", "daemon install", "status", "daemon status"]);
+  if (locked && !SAYS_LOCKED_DIR.has(cmd) && !(locked.search && SAYS_CONFIG_PROBLEM.has(cmd))) {
+    printLockedDirBanner(locked);
+  }
+  if (!SAYS_CONFIG_PROBLEM.has(cmd) && !locked?.search) await printConfigBanner();
   if (cmd !== "status" && cmd !== "daemon status" && cmd !== "usage") {
     await printSyncBanner();
   }

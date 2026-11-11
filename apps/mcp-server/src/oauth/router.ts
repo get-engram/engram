@@ -31,6 +31,7 @@ import {
 import { verifySupabaseJwt } from "../utils/jwt.js";
 import { ipThrottle } from "../middleware/ip-throttle.js";
 import { requiresClaim, startClaim, claimMessage } from "../services/claim.js";
+import { websiteBearer } from "../services/secrets.js";
 import { seedWelcomeConversation } from "../routes/signup.js";
 import { DEFAULT_SCOPE, originOf } from "./metadata.js";
 import type { Env } from "../types.js";
@@ -382,14 +383,14 @@ oauth.post("/authorize/approve", async (c) => {
     } catch (err) {
       console.error(`[oauth] welcome seed failed for ${orgId}: ${err instanceof Error ? err.message : err}`);
     }
-    const adminSecret = (c.env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET;
-    if (c.env.APP_URL && adminSecret) {
+    const bearer = websiteBearer(c.env);
+    if (c.env.APP_URL && bearer) {
       c.executionCtx.waitUntil(
         fetch(`${c.env.APP_URL}/api/email/welcome`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            Authorization: `Bearer ${adminSecret}`,
+            Authorization: `Bearer ${bearer}`,
           },
           body: JSON.stringify({ to: email, name: email.split("@")[0] }),
         }).catch((err) =>

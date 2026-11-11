@@ -12,6 +12,10 @@ APP_URL = "https://getengram.app"
 #   STRIPE_WEBHOOK_SECRET   — Stripe webhook signing secret
 #   STRIPE_PRICE_ID_PRO     — Stripe price ID for Pro plan
 #   STRIPE_PRICE_ID_TEAM    — Stripe price ID for Team plan
+#   ADMIN_SECRET            — the owner's admin bearer (/admin routes, admin API calls), nothing else (src/services/secrets.ts)
+#   INTERNAL_CRON_SECRET    — bearer for engram-web's email and report routes (same value in engram-web)
+#   UNSUBSCRIBE_HMAC_KEY    — signs the unsubscribe links in lifecycle emails
+#   UNSUBSCRIBE_HMAC_KEY_PREVIOUS — the signing key before the last change, removed 60 days after it
 
 [[d1_databases]]
 binding = "DB"

@@ -1,4 +1,5 @@
 import type { Env } from "../types.js";
+import { websiteBearer } from "../services/secrets.js";
 
 /**
  * Finds organizations whose grace period has expired (grace_ends_at <= now)
@@ -22,6 +23,7 @@ export async function expireGracePeriods(env: Env): Promise<number> {
     grace_ends_at: string;
   }>();
 
+  const bearer = websiteBearer(env);
   let count = 0;
 
   for (const org of expired.results) {
@@ -33,13 +35,13 @@ export async function expireGracePeriods(env: Env): Promise<number> {
     console.log(`[grace] Expired grace for ${org.email ?? org.id}, downgraded to free`);
 
     // Send payment reminder email via the website API
-    if (org.email && env.APP_URL) {
+    if (org.email && env.APP_URL && bearer) {
       try {
         await fetch(`${env.APP_URL}/api/email/payment-reminder`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            Authorization: `Bearer ${(env as Env & { ADMIN_SECRET: string }).ADMIN_SECRET}`,
+            Authorization: `Bearer ${bearer}`,
           },
           body: JSON.stringify({
             to: org.email,

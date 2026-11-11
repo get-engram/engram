@@ -19,7 +19,19 @@ export interface Env {
   /** Team at academic pricing — used when the org has a verified university email. */
   STRIPE_PRICE_ID_EDU_TEAM: string;
   APP_URL: string; // e.g. "https://getengram.app"
-  ADMIN_SECRET: string; // wrangler secret for /api/admin/* routes
+  /** The owner's admin bearer for this worker (the /admin routes and admin
+   *  API calls), and nothing else once the secrets below are set
+   *  (services/secrets.ts, engram#456). */
+  ADMIN_SECRET: string;
+  /** The bearer the worker shows engram-web's email and report routes.
+   *  ADMIN_SECRET stands in until it is set. */
+  INTERNAL_CRON_SECRET?: string;
+  /** Signs the unsubscribe links in lifecycle emails. ADMIN_SECRET stands in
+   *  until it is set. */
+  UNSUBSCRIBE_HMAC_KEY?: string;
+  /** The signing key before the last change: links already mailed keep
+   *  working. Removed 60 days after the change. */
+  UNSUBSCRIBE_HMAC_KEY_PREVIOUS?: string;
   /** "1" pauses all writes for a maintenance window. Set and cleared with
    *  `wrangler secret put/delete WRITES_FROZEN` — takes effect on new
    *  requests without a redeploy, so a window can be opened and closed in

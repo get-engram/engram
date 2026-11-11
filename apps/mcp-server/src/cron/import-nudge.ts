@@ -1,5 +1,5 @@
 import type { Env } from "../types.js";
-import { unsubscribeSig } from "./weekly-digest.js";
+import { lifecycleMail } from "../services/secrets.js";
 
 /**
  * Import-first onboarding, email leg (engram#253): orgs that signed up
@@ -14,8 +14,8 @@ import { unsubscribeSig } from "./weekly-digest.js";
  */
 export async function sendImportNudges(env: Env): Promise<number> {
   if (!env.APP_URL) return 0;
-  const secret = (env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET;
-  if (!secret) return 0;
+  const mail = lifecycleMail(env);
+  if (!mail) return 0;
 
   const idle = await env.DB.prepare(
     `SELECT id, name, email FROM organizations
@@ -31,17 +31,17 @@ export async function sendImportNudges(env: Env): Promise<number> {
   let sent = 0;
   for (const org of idle.results ?? []) {
     try {
-      const sig = await unsubscribeSig(org.id, secret);
+      const unsubscribeUrl = await mail.unsubscribeUrl(org.id);
       const res = await fetch(`${env.APP_URL}/api/email/import-nudge`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${secret}`,
+          Authorization: `Bearer ${mail.bearer}`,
         },
         body: JSON.stringify({
           to: org.email,
           name: org.name,
-          unsubscribe_url: `https://mcp.getengram.app/email/unsubscribe?org=${encodeURIComponent(org.id)}&sig=${sig}`,
+          unsubscribe_url: unsubscribeUrl,
         }),
       });
       if (res.ok) sent++;

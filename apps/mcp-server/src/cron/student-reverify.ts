@@ -1,4 +1,5 @@
 import type { Env } from "../types.js";
+import { websiteBearer } from "../services/secrets.js";
 
 /**
  * Student re-verification reminders (engram#471).
@@ -15,8 +16,8 @@ import type { Env } from "../types.js";
  */
 export async function sendStudentReverifyReminders(env: Env): Promise<number> {
   if (!env.APP_URL) return 0;
-  const secret = (env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET;
-  if (!secret) return 0;
+  const bearer = websiteBearer(env);
+  if (!bearer) return 0;
 
   // Fires once per org: the 14-days-out window is one day wide.
   const due = await env.DB.prepare(
@@ -44,7 +45,7 @@ export async function sendStudentReverifyReminders(env: Env): Promise<number> {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${secret}`,
+          Authorization: `Bearer ${bearer}`,
         },
         body: JSON.stringify({ to, expires_at: org.student_expires_at }),
       });

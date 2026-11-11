@@ -1,5 +1,5 @@
 import type { Env } from "../types.js";
-import { unsubscribeSig } from "./weekly-digest.js";
+import { lifecycleMail } from "../services/secrets.js";
 import { TIER_LIMITS } from "@getengram/shared";
 
 /**
@@ -30,8 +30,8 @@ const FREE_MESSAGE_LIMIT = TIER_LIMITS.free.storage_messages;
 
 export async function sendActivationNudges(env: Env): Promise<number> {
   if (!env.APP_URL) return 0;
-  const secret = (env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET;
-  if (!secret) return 0;
+  const mail = lifecycleMail(env);
+  if (!mail) return 0;
 
   // messages_stored_total and the account age come along now: the email
   // states the reader's real numbers instead of asserting their memory is
@@ -60,17 +60,17 @@ export async function sendActivationNudges(env: Env): Promise<number> {
   let sent = 0;
   for (const org of dormant.results ?? []) {
     try {
-      const sig = await unsubscribeSig(org.id, secret);
+      const unsubscribeUrl = await mail.unsubscribeUrl(org.id);
       const res = await fetch(`${env.APP_URL}/api/email/activation-nudge`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${secret}`,
+          Authorization: `Bearer ${mail.bearer}`,
         },
         body: JSON.stringify({
           to: org.email,
           name: org.name,
-          unsubscribe_url: `https://mcp.getengram.app/email/unsubscribe?org=${encodeURIComponent(org.id)}&sig=${sig}`,
+          unsubscribe_url: unsubscribeUrl,
           saved_messages: org.saved ?? 0,
           days_since_signup: org.days_old ?? 0,
           limit: FREE_MESSAGE_LIMIT,

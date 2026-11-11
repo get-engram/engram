@@ -1,4 +1,5 @@
 import type { Env } from "../types.js";
+import { websiteBearer } from "../services/secrets.js";
 
 // Weekly share-drafts email (Mondays, piggybacking the 13:00 UTC cron):
 // read the blog's RSS feed, find posts published in the last 7 days, and
@@ -32,6 +33,8 @@ function unescapeXml(s: string): string {
 }
 
 export async function sendShareNudge(env: Env): Promise<number> {
+  const bearer = websiteBearer(env);
+  if (!env.APP_URL || !bearer) return 0;
   const res = await fetch(FEED_URL, { headers: { "User-Agent": "engram-share-nudge/1.0" } });
   if (!res.ok) throw new Error(`feed fetch failed: ${res.status}`);
   const xml = await res.text();
@@ -81,7 +84,7 @@ ${sections}
   const send = await fetch(`${env.APP_URL}/api/email/support-reply`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${(env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET ?? ""}`,
+      Authorization: `Bearer ${bearer}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({

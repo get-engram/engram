@@ -7,6 +7,7 @@ import {
   emailDomain,
 } from "@getengram/shared";
 import { audit } from "../services/audit.js";
+import { websiteBearer } from "../services/secrets.js";
 import { denyExternalOAuthClient, denyUnlessFirstPartyWrite, denyUnlessOwner } from "./guards.js";
 import type { Env, AuthContext } from "../types.js";
 
@@ -132,16 +133,16 @@ student.post("/verify", async (c) => {
 
   // Mail goes out via engram-web, which owns the Resend credentials and the
   // templates — same path every cron nudge uses.
-  const secret = (c.env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET;
+  const bearer = websiteBearer(c.env);
   const verifyUrl = `${c.env.APP_URL}/student/confirm?token=${encodeURIComponent(token)}`;
   let delivered = false;
-  if (secret && c.env.APP_URL) {
+  if (bearer && c.env.APP_URL) {
     try {
       const res = await fetch(`${c.env.APP_URL}/api/email/student-verify`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${secret}`,
+          Authorization: `Bearer ${bearer}`,
         },
         body: JSON.stringify({
           to: email,

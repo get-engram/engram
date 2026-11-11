@@ -78,13 +78,14 @@ const SECRET = "test-jwt-secret-claim";
 const APP_URL = "https://getengram.app";
 const ADMIN_SECRET = "admin-secret-test";
 
-function envWith(db: D1Database): Env {
+function envWith(db: D1Database, extra: Partial<Env> = {}): Env {
   return {
     DB: db,
     SUPABASE_JWT_SECRET: SECRET,
     SUPABASE_URL: "https://example.supabase.co",
     APP_URL,
     ADMIN_SECRET,
+    ...extra,
   } as unknown as Env;
 }
 
@@ -109,14 +110,20 @@ const EMAIL = "herman@example.com";
 const SUB = "sub_herman";
 const ORG = { id: "org_h", email: EMAIL, messages_stored_total: 424 };
 
-function app(db: D1Database) {
+function app(db: D1Database, extra: Partial<Env> = {}) {
   const a = new Hono<{ Bindings: Env }>();
   a.route("/signup", signup);
-  return { app: a, env: envWith(db) };
+  return { app: a, env: envWith(db, extra) };
 }
 
-async function post(path: string, db: D1Database, sub: string | null, body: unknown = {}) {
-  const { app: a, env } = app(db);
+async function post(
+  path: string,
+  db: D1Database,
+  sub: string | null,
+  body: unknown = {},
+  extra: Partial<Env> = {},
+) {
+  const { app: a, env } = app(db, extra);
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (sub) {
     headers.authorization = `Bearer ${await signJwt({ sub, email: EMAIL, role: "authenticated", exp: Math.floor(Date.now() / 1000) + 600 })}`;
@@ -253,6 +260,31 @@ describe("POST /signup with an existing org that holds data", () => {
     const body = (await (await post("/signup", db, "sub_stranger")).json()) as { message: string };
     expect(body.message).toMatch(/Too many connection links/);
     expect(body.message).not.toMatch(/open the link we just emailed/);
+  });
+});
+
+// ── the claim-link email's bearer (engram#456) ───────────────────────────
+
+describe("the claim-link email's bearer (engram#456)", () => {
+  it("is INTERNAL_CRON_SECRET once it is set, never the admin secret", async () => {
+    const { db } = stubDb({ identity: null, orgByEmail: ORG });
+    const res = await post("/signup", db, "sub_stranger", {}, { INTERNAL_CRON_SECRET: "internal-secret-test" });
+    expect(res.status).toBe(403);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`${APP_URL}/api/email/claim-link`);
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer internal-secret-test");
+    expect(JSON.stringify(init)).not.toContain(ADMIN_SECRET);
+  });
+
+  it("with no secret to send it with: no email, delivery_failed, and the row removed", async () => {
+    const { db, writes } = stubDb({ identity: null, orgByEmail: ORG });
+    const res = await post("/signup", db, "sub_stranger", {}, { ADMIN_SECRET: "" });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { claim: { reason: string; sent: boolean } };
+    expect(body.claim).toMatchObject({ reason: "delivery_failed", sent: false });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(has(writes, /DELETE FROM org_claims WHERE id/i)).toBe(true);
   });
 });
 

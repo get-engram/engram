@@ -40,7 +40,8 @@ import { pruneStripeWebhookEvents } from "./cron/prune-stripe-events.js";
 import { reconcileStripeToD1 } from "./cron/reconcile-stripe.js";
 export { DrainerDO } from "./services/drainer-do.js";
 export { ChunkMoverDO } from "./services/chunk-mover-do.js";
-import { sendWeeklyDigests, unsubscribeSig } from "./cron/weekly-digest.js";
+import { sendWeeklyDigests } from "./cron/weekly-digest.js";
+import { unsubscribeSigValid } from "./services/secrets.js";
 import { sendShareNudge } from "./cron/share-nudge.js";
 import { sendDailyReport } from "./services/daily-report.js";
 import { oauth } from "./oauth/router.js";
@@ -188,13 +189,11 @@ app.route("/signup", signup);
 
 // One-click digest unsubscribe (engram#256) — signed link from the
 // weekly email; no login required. GET so it works from any mail client.
+// The link is signed with UNSUBSCRIBE_HMAC_KEY (services/secrets.ts, engram#456).
 app.get("/email/unsubscribe", async (c) => {
   const org = c.req.query("org") ?? "";
   const sig = c.req.query("sig") ?? "";
-  const secret = (c.env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET;
-  if (!org || !sig || !secret) return c.text("Invalid link.", 400);
-  const expected = await unsubscribeSig(org, secret);
-  if (sig !== expected) return c.text("Invalid link.", 400);
+  if (!org || !sig || !(await unsubscribeSigValid(c.env, org, sig))) return c.text("Invalid link.", 400);
   await c.env.DB.prepare(
     "UPDATE organizations SET digest_opt_out = 1, digest_opt_out_at = COALESCE(digest_opt_out_at, datetime('now')) WHERE id = ?",
   )

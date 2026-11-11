@@ -137,7 +137,7 @@ describe("sendDailyReport — when every attempt fails", () => {
   });
 
   it("does not retry a refusal, and says so in the notice", async () => {
-    // A 401 (wrong ADMIN_SECRET) or 400 (malformed report) is the same
+    // A 401 (a wrong bearer) or 400 (malformed report) is the same
     // answer every time: one report attempt, then the notice.
     const posts = webApp(401);
     const sleep = sleeper();
@@ -178,6 +178,36 @@ describe("sendDailyReport — when every attempt fails", () => {
       sendDailyReport(env(reportDb(99)), { delays: [0], notifyOnFailure: false }),
     ).rejects.toThrow(/failed after 1 attempt/);
     expect(posts).toHaveLength(0);
+  });
+});
+
+describe("sendDailyReport — the bearer it shows engram-web (engram#456)", () => {
+  const INTERNAL = "internal-secret-for-reports";
+
+  it("is INTERNAL_CRON_SECRET once it is set, never the admin secret", async () => {
+    const posts = webApp(200);
+    await sendDailyReport({ ...env(reportDb()), INTERNAL_CRON_SECRET: INTERNAL }, { sleep: sleeper() });
+    expect(posts.map((p) => p.auth)).toEqual([`Bearer ${INTERNAL}`]);
+    expect(JSON.stringify(posts)).not.toContain(SECRET);
+  });
+
+  it("is the admin secret while INTERNAL_CRON_SECRET is empty, as when it is unset", async () => {
+    const posts = webApp(200);
+    await sendDailyReport({ ...env(reportDb()), INTERNAL_CRON_SECRET: "" }, { sleep: sleeper() });
+    expect(posts.map((p) => p.auth)).toEqual([`Bearer ${SECRET}`]);
+  });
+
+  it("with neither set: posts nothing, waits for nothing, and says why", async () => {
+    const posts = webApp(200);
+    const sleep = sleeper();
+    const errors: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((m: string) => void errors.push(m));
+    await expect(sendDailyReport({ ...env(reportDb()), ADMIN_SECRET: "" }, { sleep })).rejects.toThrow(
+      /neither INTERNAL_CRON_SECRET nor ADMIN_SECRET is set/,
+    );
+    expect(posts).toEqual([]);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(errors.some((m) => /the failure notice failed too/.test(m))).toBe(true);
   });
 });
 

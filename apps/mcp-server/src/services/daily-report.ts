@@ -1,8 +1,10 @@
 // Daily ops report (engram#226): computed here (the worker owns the data),
 // emailed by engram-web (which owns SMTP). The scheduled handler POSTs the
-// JSON to `${APP_URL}/api/reports/daily` authenticated with ADMIN_SECRET.
+// JSON to `${APP_URL}/api/reports/daily` authenticated with INTERNAL_CRON_SECRET
+// (ADMIN_SECRET until that is set; services/secrets.ts).
 import type { Env } from "../types.js";
 import { computeMrr, committedCents, committedSubscriptions } from "./mrr.js";
+import { websiteBearer } from "./secrets.js";
 import { PRIORITY_SUPPORT_TIERS, sqlTierList } from "@getengram/shared";
 
 export interface DailyReport {
@@ -232,13 +234,21 @@ class DeliveryError extends Error {
 
 /** POST to engram-web, which owns SMTP. Throws a DeliveryError. */
 async function deliver(env: Env, body: unknown): Promise<void> {
+  const bearer = websiteBearer(env);
+  // Not retried: it is the same answer every time.
+  if (!bearer) {
+    throw new DeliveryError(
+      "delivery failed: neither INTERNAL_CRON_SECRET nor ADMIN_SECRET is set",
+      false,
+    );
+  }
   let res: Response;
   try {
     res = await fetch(`${env.APP_URL}/api/reports/daily`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        Authorization: `Bearer ${env.ADMIN_SECRET}`,
+        Authorization: `Bearer ${bearer}`,
       },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(DELIVERY_TIMEOUT_MS),

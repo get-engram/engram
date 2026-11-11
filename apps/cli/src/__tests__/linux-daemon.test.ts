@@ -134,7 +134,7 @@ mkdirSync(NO_BIN);
 writeFileSync(SYSTEMCTL, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
 
 const { LOG_FILE } = await import("../daemon/launch.js");
-const { loadConfigStrict } = await import("../config.js");
+const { loadConfigStrict, saveConfig } = await import("../config.js");
 const {
   autoEnableCapture,
   daemonInstall,
@@ -1209,7 +1209,7 @@ describe("engram start on Linux (engram#615)", () => {
     writeUnit(old);
     for (const platform of ["darwin", "win32"]) {
       Object.defineProperty(process, "platform", { value: platform, configurable: true });
-      expect(repairSystemdUnitIfStale()).toBe(false);
+      expect(repairSystemdUnitIfStale()).toBe("unchanged");
     }
     expect(readFileSync(UNIT, "utf-8")).toBe(old);
     expect(execFileSync).not.toHaveBeenCalled();
@@ -2313,6 +2313,292 @@ describe("a CLI and a Node installed with brew (engram#652)", () => {
       }
       expect(execFileSync).not.toHaveBeenCalled();
       expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(THROUGH_OPT));
+    });
+  });
+});
+
+describe("a CLI run from npx's cache (engram#665)", () => {
+  // As on macOS: npm clears npx's cache as it likes, and a unit naming the
+  // worker there would then stop starting the daemon at login, without a
+  // word. So would one pnpm dlx, bunx or yarn dlx left.
+  const NPX_WORKER = join(
+    home.dir,
+    ".npm",
+    "_npx",
+    "f3920abdac2db749",
+    "node_modules",
+    "@getengram",
+    "cli",
+    "dist",
+    "daemon",
+    "worker.js",
+  );
+  /** The unit an npx run wrote before engram#665: it works until npm clears its cache. */
+  const FROM_NPX: Partial<UnitPaths> = { worker: NPX_WORKER };
+  /** One npm cleared since: the worker it names is gone. */
+  const CLEARED: Partial<UnitPaths> = {
+    worker: join(home.dir, ".npm", "_npx", "0123456789abcdef", "node_modules", "@getengram", "cli", "dist", "daemon", "worker.js"),
+  };
+  /** One that can't start the daemon: the CLI it names has moved. */
+  const BROKEN: Partial<UnitPaths> = { worker: join(home.dir, "moved", "cli", "dist", "daemon", "worker.js") };
+  const CANT_TURN_ON = [
+    "Can't turn on start at login: this Engram runs from npx's cache, which can be cleared at any time.",
+    "  Install the CLI with: npm install -g @getengram/cli",
+  ];
+  const CANT_REPAIR = [
+    "Can't repair start at login: this Engram runs from npx's cache, which can be cleared at any time.",
+    "  Install the CLI with: npm install -g @getengram/cli",
+    "  Then run: engram install",
+  ].join("\n");
+  const WONT_START_AT_LOGIN = [
+    "  The daemon won't start at login: this Engram runs from npx's cache, which can be cleared at any time.",
+    "  To start it at login, install the CLI: npm install -g @getengram/cli && engram install",
+  ].join("\n");
+
+  beforeAll(() => {
+    mkdirSync(dirname(NPX_WORKER), { recursive: true });
+    writeFileSync(NPX_WORKER, "");
+  });
+
+  beforeEach(() => {
+    vi.mocked(saveConfig).mockClear();
+  });
+
+  /** Run as `npx @getengram/cli` does: this build, in npx's cache. */
+  async function fromNpx(run: () => unknown, worker = NPX_WORKER): Promise<void> {
+    cli.worker = worker;
+    try {
+      await run();
+    } finally {
+      cli.worker = null;
+    }
+  }
+
+  /** systemctl only looked: it reloaded, enabled and started nothing. */
+  function systemdLeftAlone(): void {
+    expect(systemctlCalls().filter((call) => !call.startsWith("show "))).toEqual([]);
+  }
+
+  it("engram install turns nothing on, records nothing, and says how to install the CLI", async () => {
+    await fromNpx(() => daemonInstall());
+    expect(existsSync(UNIT)).toBe(false);
+    expect(linked()).toBe(false);
+    expect(systemctlCalls()).toEqual([]);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(saveConfig).not.toHaveBeenCalled();
+    expect(said()).toBe([...CANT_TURN_ON, "  Then run: engram install"].join("\n"));
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("names the cache of the runner it runs from: bunx's", async () => {
+    const bunx = join(home.dir, "tmp", "bunx-1000-@getengram", "cli@latest", "node_modules", "@getengram", "cli");
+    await fromNpx(() => daemonInstall(), join(bunx, "dist", "daemon", "worker.js"));
+    expect(existsSync(UNIT)).toBe(false);
+    expect(said()).toContain(
+      "Can't turn on start at login: this Engram runs from bunx's cache, which can be cleared at any time.",
+    );
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("engram start --install starts nothing and changes nothing, a broken unit included", async () => {
+    writeUnit(unitWith(BROKEN));
+    await fromNpx(() => daemonStart([], { install: "" }));
+    expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(BROKEN));
+    expect(linked()).toBe(true);
+    expect(systemctlCalls()).toEqual([]);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(saveConfig).not.toHaveBeenCalled();
+    expect(said()).toBe([...CANT_TURN_ON, "  Then run: engram start --install"].join("\n"));
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("engram start starts the daemon, and says nothing of start at login when there is none", async () => {
+    await fromNpx(() => daemonStart([], {}));
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(existsSync(UNIT)).toBe(false);
+    systemdLeftAlone();
+    const text = said();
+    expect(text).toContain("Engram daemon started");
+    expect(text).not.toContain("start at login");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("engram start leaves a broken unit as it is, and says why it can't repair it", async () => {
+    for (const broken of [BROKEN, CLEARED]) {
+      writeUnit(unitWith(broken));
+      daemonGone();
+      spawn.mockClear();
+      execFileSync.mockClear();
+      await fromNpx(() => daemonStart([], {}));
+      expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(broken));
+      expect(linked()).toBe(true);
+      systemdLeftAlone();
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const text = said();
+      expect(text).toContain(CANT_REPAIR);
+      expect(text).toContain("Engram daemon started");
+      expect(text).not.toContain("Updated auto-start configuration");
+      expect(process.exitCode).toBeUndefined();
+    }
+  });
+
+  it("engram start says nothing of a broken one disabled with systemctl", async () => {
+    writeUnit(unitWith(BROKEN), false);
+    await fromNpx(() => daemonStart([], {}));
+    expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(BROKEN));
+    expect(linked()).toBe(false);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(said()).not.toContain("Can't repair start at login");
+  });
+
+  it("engram start leaves a unit that works as it is, without a word: an older CLI's, or an npx run's", async () => {
+    for (const text of [v1Unit(), unitWith(FROM_NPX)]) {
+      writeUnit(text);
+      daemonGone();
+      execFileSync.mockClear();
+      await fromNpx(() => daemonStart([], {}));
+      expect(readFileSync(UNIT, "utf-8")).toBe(text);
+      expect(linked()).toBe(true);
+      expect(systemctlCalls()).not.toContain("daemon-reload");
+      const out = said();
+      expect(out).toContain("Engram daemon started");
+      expect(out).not.toContain("Can't repair start at login");
+      expect(out).not.toContain("Updated auto-start configuration");
+    }
+  });
+
+  it("finds a unit naming the worker in npx's cache outdated, not broken, until npm clears it", () => {
+    writeUnit(unitWith(FROM_NPX));
+    expect(readUnit()).toEqual({ kind: "ours", enabled: true, broken: false, version: UNIT_VERSION, outdated: true });
+    writeUnit(unitWith(CLEARED));
+    expect(readUnit()).toEqual({ kind: "ours", enabled: true, broken: true, version: UNIT_VERSION, outdated: true });
+    // A newer CLI's is its own to judge.
+    writeUnit(unitWith(FROM_NPX, UNIT_VERSION + 1));
+    expect(readUnit()).toEqual({
+      kind: "ours",
+      enabled: true,
+      broken: false,
+      version: UNIT_VERSION + 1,
+      outdated: false,
+    });
+  });
+
+  it("engram status says such a unit is outdated, until the installed CLI's engram install rewrites it", async () => {
+    writeUnit(unitWith(FROM_NPX));
+    daemonRunning();
+    await daemonStatus();
+    expect(said()).toContain("Auto-start: enabled (systemd)  — outdated config, run 'engram install' to update");
+    await daemonInstall();
+    expect(readFileSync(UNIT, "utf-8")).toBe(unitWith());
+    said();
+    await daemonStatus();
+    const after = said();
+    expect(after).toContain("Auto-start: enabled (systemd)");
+    expect(after).not.toMatch(/broken|outdated/);
+  });
+
+  it("the installed CLI's engram start points it at that CLI, once, and systemd starts the daemon from it", async () => {
+    writeUnit(unitWith(FROM_NPX));
+    await daemonStart([], {});
+    expect(readFileSync(UNIT, "utf-8")).toBe(unitWith());
+    expect(linked()).toBe(true);
+    expect(systemctlCalls()).toEqual(["daemon-reload", ...THROUGH_SYSTEMD]);
+    expect(said()).toContain(`Updated auto-start configuration (systemd unit v${UNIT_VERSION})`);
+    expect(spawn).not.toHaveBeenCalled();
+
+    daemonGone();
+    execFileSync.mockClear();
+    await daemonStart([], {});
+    expect(readFileSync(UNIT, "utf-8")).toBe(unitWith());
+    expect(systemctlCalls()).toEqual(THROUGH_SYSTEMD);
+    expect(said()).not.toContain("Updated auto-start configuration");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  describe("auto-capture", () => {
+    signedInAtATerminal();
+
+    it("after sign-in starts the daemon, sets up no start at login, and says why, then nothing more", async () => {
+      await fromNpx(() => autoEnableCapture({ after: "login" }));
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(existsSync(UNIT)).toBe(false);
+      systemdLeftAlone();
+      expect(said()).toBe(
+        [
+          "Auto-capture is on — conversations from supported agents on this machine save to your Engram.",
+          WONT_START_AT_LOGIN,
+          "  Turn off anytime: engram stop && engram uninstall",
+        ].join("\n"),
+      );
+
+      for (let command = 0; command < 3; command++) {
+        await fromNpx(() => autoEnableCapture({ after: "command" }));
+        expect(said()).toBe("");
+      }
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(existsSync(UNIT)).toBe(false);
+      systemdLeftAlone();
+    });
+
+    it("says it after a command that had to start the daemon: what start at login would have done", async () => {
+      await fromNpx(() => autoEnableCapture({ after: "command" }));
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(existsSync(UNIT)).toBe(false);
+      const text = said();
+      expect(text).toContain("Auto-capture is on");
+      expect(text).toContain(WONT_START_AT_LOGIN);
+    });
+
+    it("says only that start at login isn't available, with no systemd user session to have it", async () => {
+      systemd.reachable = false;
+      await fromNpx(() => autoEnableCapture({ after: "login" }));
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const text = said();
+      expect(text).toContain(
+        "Start at login isn't available here (no systemd user session): run 'engram start' after a restart.",
+      );
+      expect(text).not.toContain("won't start at login");
+    });
+
+    it("leaves a broken unit as it is, and says why", async () => {
+      writeUnit(unitWith(BROKEN));
+      await fromNpx(() => autoEnableCapture({ after: "login" }));
+      expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(BROKEN));
+      expect(linked()).toBe(true);
+      systemdLeftAlone();
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const text = said();
+      expect(text).toContain(WONT_START_AT_LOGIN);
+      expect(text).not.toContain("Updated auto-start configuration");
+    });
+
+    it("leaves a unit that works as it is, and says nothing of start at login", async () => {
+      writeUnit(unitWith(FROM_NPX));
+      daemonRunning();
+      await fromNpx(() => autoEnableCapture({ after: "login" }));
+      expect(readFileSync(UNIT, "utf-8")).toBe(unitWith(FROM_NPX));
+      const text = said();
+      expect(text).toContain("Auto-capture is on");
+      expect(text).not.toContain("start at login");
+      expect(text).not.toContain("Updated auto-start configuration");
+    });
+
+    it("from the installed CLI, points an npx run's unit at that CLI after a command, says so once, then nothing", async () => {
+      writeUnit(unitWith(FROM_NPX));
+      daemonRunning();
+      await autoEnableCapture({ after: "command" });
+      expect(readFileSync(UNIT, "utf-8")).toBe(unitWith());
+      const text = said();
+      expect(text).toContain("Updated auto-start configuration");
+      expect(text).toContain("Auto-capture is on");
+
+      execFileSync.mockClear();
+      for (let command = 0; command < 3; command++) {
+        await autoEnableCapture({ after: "command" });
+        expect(said()).toBe("");
+      }
+      expect(execFileSync).not.toHaveBeenCalled();
+      expect(readFileSync(UNIT, "utf-8")).toBe(unitWith());
     });
   });
 });

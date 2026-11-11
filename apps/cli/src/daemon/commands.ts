@@ -20,6 +20,7 @@ import { ALL_ADAPTERS } from "./adapters.js";
 import { asRootRefusal, rootForAnotherUser } from "./as-root.js";
 import { commandFailure } from "./command-path.js";
 import { throughOptLink } from "./homebrew.js";
+import { INSTALL_CLI, runnerCacheOf } from "./package-runner.js";
 import {
   foreignFiles,
   foreignFilesFix,
@@ -298,11 +299,48 @@ function refusedAsRoot(command: "start" | "stop" | "install" | "uninstall"): boo
   return true;
 }
 
+/**
+ * Where this CLI runs from, as a message names it ("npx's cache"), when a
+ * package runner installed it there (engram#665); null when it is
+ * installed. Told by the path start at login would name: the worker, and on
+ * Windows the sign-in entry beside it.
+ */
+function runnerCacheOfThisCli(): string | null {
+  return runnerCacheOf(process.platform === "win32" ? loginStartPath() : workerPath());
+}
+
+/**
+ * Say that start at login can't be turned on or repaired from this CLI,
+ * which runs from a package runner's cache (`where`, engram#665), and how
+ * to install the CLI. `again`: the command to run then.
+ */
+function printRunnerRefusal(where: string, what: "turn on" | "repair", again: string): void {
+  console.error(red(`Can't ${what} start at login: this Engram runs from ${where}, which can be cleared at any time.`));
+  console.error(dim(`  Install the CLI with: ${INSTALL_CLI}`));
+  console.error(dim(`  Then run: ${again}`));
+}
+
+/**
+ * `engram install` and `engram start --install` from a CLI that a package
+ * runner runs from its cache (engram#665): start at login would name the
+ * files there, and once the cache was cleared the daemon no longer started
+ * at login, without a word. Say so, and how to install the CLI, and change
+ * nothing: no start now either, as the command asked for both.
+ */
+function refusedFromRunnerCache(again: "engram install" | "engram start --install"): boolean {
+  const where = runnerCacheOfThisCli();
+  if (where === null) return false;
+  printRunnerRefusal(where, "turn on", again);
+  process.exitCode = 1;
+  return true;
+}
+
 export async function daemonStart(
   _args: string[],
   flags: Record<string, string>,
 ): Promise<void> {
   if (refusedAsRoot("start")) return;
+  if ("install" in flags && refusedFromRunnerCache("engram start --install")) return;
   await recordCaptureIntent("on", "start");
   // `engram stop` and then `engram start`: the last daemon may still be
   // finishing a send. A worker started now would only wait for it too.
@@ -378,9 +416,15 @@ export async function daemonStart(
   // only at install time (engram#469), and a broken one too (engram#616).
   // The Windows entry and the systemd unit likewise. With --install, start
   // at login is turned on below, which says what stops it (engram#715).
-  repairLaunchdIfStale(undefined, { quiet: "install" in flags });
-  repairRunEntryIfBroken();
-  repairSystemdUnitIfStale();
+  // From a package runner's cache, a broken one stays broken: said, as the
+  // daemon then starts only when they start it (engram#665).
+  const repairs = [
+    repairLaunchdIfStale(undefined, { quiet: "install" in flags }),
+    repairRunEntryIfStale(),
+    repairSystemdUnitIfStale(),
+  ];
+  const runner = repairs.includes("runner") ? runnerCacheOfThisCli() : null;
+  if (runner !== null) printRunnerRefusal(runner, "repair", "engram install");
 
   // Start at login first where the service manager starts the daemon then:
   // on macOS, loading the agent has launchd start it (engram#641); on Linux,
@@ -1429,7 +1473,12 @@ function autoStart(): AutoStart {
       line: `${dim("Auto-start:")} enabled (Windows sign-in)` + red("  — broken, run 'engram install' to repair"),
     };
   }
-  return { on: true, line: `${dim("Auto-start:")} enabled (Windows sign-in)` };
+  return {
+    on: true,
+    line:
+      `${dim("Auto-start:")} enabled (Windows sign-in)` +
+      (runEntryOutdated(entry) ? red("  — outdated config, run 'engram install' to update") : ""),
+  };
 }
 
 /** autoStart for the launchd agent: nothing when there is none. */
@@ -1929,7 +1978,12 @@ export type LaunchdRepair =
   /** Nothing: the plist is current, or left as it is. */
   | "unchanged"
   /** The plist needs rewriting, and ~/Library/LaunchAgents isn't the user's (engram#715). */
-  | "refused";
+  | "refused"
+  /**
+   * Nothing, and it is broken: this CLI runs from a package runner's cache,
+   * which nothing is pointed at (engram#665).
+   */
+  | "runner";
 
 /**
  * Rewrite and reload a plist of ours that an older CLI wrote (engram#469),
@@ -1950,12 +2004,17 @@ export type LaunchdRepair =
  * without a word, while `engram status` said to run `engram install`,
  * which failed on it too. Auto-capture says it with the rest, and `engram
  * start --install` as it turns start at login on.
+ *
+ * From a CLI that a package runner runs from its cache, it is left as it
+ * is (engram#665): the cache can be cleared at any time. "runner" when it
+ * is broken, and not switched off, for the caller to say.
  */
 export function repairLaunchdIfStale(plist?: PlistState, { quiet = false }: { quiet?: boolean } = {}): LaunchdRepair {
   if (process.platform !== "darwin") return "unchanged";
   const state = plist ?? readPlist();
   if (state.kind !== "ours") return "unchanged";
   if (!state.broken && !state.outdated) return "unchanged";
+  if (runnerCacheOfThisCli() !== null) return state.broken && agentDisabled() !== true ? "runner" : "unchanged";
   // Only a source checkout run through tsx has no worker.js: the build ships it.
   if (!existsSync(workerPath())) return "unchanged";
   // Never fails the command it runs in: a plist that can't be made or
@@ -2076,15 +2135,18 @@ async function enableLaunchdStartAtLogin(start = false, again = "engram install"
  *
  * "changed": it added or repaired the agent, and said so. "failed": it
  * couldn't add one, which autoEnableCapture says along with the rest.
+ * "runner": there is none that works, and this CLI runs from a package
+ * runner's cache, which nothing is pointed at (engram#665).
  */
-function autoEnableLaunchdStartAtLogin(): "changed" | "unchanged" | "failed" {
+function autoEnableLaunchdStartAtLogin(): "changed" | "unchanged" | "failed" | "runner" {
   const plist = readPlist();
   if (plist.kind === "ours") {
     const repair = repairLaunchdIfStale(plist, { quiet: true });
-    return repair === "repaired" ? "changed" : repair === "refused" ? "failed" : "unchanged";
+    return repair === "repaired" ? "changed" : repair === "refused" ? "failed" : repair;
   }
   // Only a source checkout run through tsx has no worker.js: the build ships it.
   if (!existsSync(workerPath())) return "unchanged";
+  if (runnerCacheOfThisCli() !== null) return "runner";
   const made = plistForThisCli();
   if ("error" in made) return "failed";
   try {
@@ -2278,10 +2340,23 @@ function clearStartupSwitch(): void {
   }
 }
 
+/** The command line runEntryCommand writes: Node, then the sign-in entry. */
+const RUN_ENTRY = /^"([^"]+)"\s+"([^"]+)"$/;
+
 /** Either program the entry names is gone (Node moved, CLI uninstalled). */
 function runEntryBroken(entry: string): boolean {
-  const m = entry.match(/^"([^"]+)"\s+"([^"]+)"$/);
+  const m = entry.match(RUN_ENTRY);
   return !m || !existsSync(m[1]) || !existsSync(m[2]);
+}
+
+/**
+ * The entry starts the CLI from a package runner's cache, which can be
+ * cleared at any time (engram#665): a CLI run that way wrote it, before
+ * none did.
+ */
+function runEntryOutdated(entry: string): boolean {
+  const m = entry.match(RUN_ENTRY);
+  return m !== null && runnerCacheOf(m[2]) !== null;
 }
 
 /** Add the entry, or point it at this CLI. Null when reg did; else what reg said, to print. */
@@ -2310,13 +2385,19 @@ function deleteRunEntry(): string | null {
 /**
  * Point a broken entry at this CLI, the counterpart of repairLaunchdIfStale:
  * an entry naming a Node or a CLI that has since moved fails at every
- * sign-in without a word. A working entry is left as it is.
+ * sign-in without a word. And one naming a package runner's cache, which
+ * can be cleared at any time (engram#665). A working entry is left as it
+ * is. So is any, from a CLI that runs from such a cache: "runner" when it
+ * is broken, and not switched off in Startup apps, for the caller to say.
  */
-export function repairRunEntryIfBroken(entry: string | null = readRunEntry()): boolean {
-  if (entry === null || !runEntryBroken(entry)) return false;
-  if (!existsSync(loginStartPath()) || writeRunEntry() !== null) return false;
+export function repairRunEntryIfStale(entry: string | null = readRunEntry()): Exclude<LaunchdRepair, "refused"> {
+  if (entry === null) return "unchanged";
+  const broken = runEntryBroken(entry);
+  if (!broken && !runEntryOutdated(entry)) return "unchanged";
+  if (runnerCacheOfThisCli() !== null) return broken && !switchedOffInStartupApps() ? "runner" : "unchanged";
+  if (!existsSync(loginStartPath()) || writeRunEntry() !== null) return "unchanged";
   console.log(bold("Updated the start-at-login entry"));
-  return true;
+  return "repaired";
 }
 
 /** The plist CLIs before engram#602 wrote off macOS too. */
@@ -2384,21 +2465,24 @@ function systemdRunsThisCli(): boolean {
 /**
  * Rewrite an enabled unit of ours that names a Node or a CLI that has since
  * moved, or that an older CLI wrote, or that names them in a Homebrew version
- * (engram#652): the counterpart of repairLaunchdIfStale and
- * repairRunEntryIfBroken. One the user disabled is left as it is.
+ * (engram#652) or a package runner's cache (engram#665): the counterpart of
+ * repairLaunchdIfStale and repairRunEntryIfStale. One the user disabled is
+ * left as it is. So is any, from a CLI that runs from such a cache:
+ * "runner" when it is broken, for the caller to say.
  */
-export function repairSystemdUnitIfStale(unit: UnitState = readUnit()): boolean {
-  if (process.platform !== "linux") return false;
-  if (unit.kind !== "ours" || !unit.enabled) return false;
-  if (!unit.broken && !unit.outdated) return false;
+export function repairSystemdUnitIfStale(unit: UnitState = readUnit()): Exclude<LaunchdRepair, "refused"> {
+  if (process.platform !== "linux") return "unchanged";
+  if (unit.kind !== "ours" || !unit.enabled) return "unchanged";
+  if (!unit.broken && !unit.outdated) return "unchanged";
+  if (runnerCacheOfThisCli() !== null) return unit.broken ? "runner" : "unchanged";
   // Only a source checkout run through tsx has no worker.js: the build ships it.
-  if (!existsSync(workerPath())) return false;
+  if (!existsSync(workerPath())) return "unchanged";
   // Never fails the command it runs in: a unit that can't be made or written
   // is left as it is, and `engram install` says why.
   const made = unitForThisCli();
-  if ("error" in made || !rewriteUnit(made.text)) return false;
+  if ("error" in made || !rewriteUnit(made.text)) return "unchanged";
   console.log(`${bold("Updated auto-start configuration")} ${dim(`(systemd unit v${UNIT_VERSION})`)}`);
-  return true;
+  return "repaired";
 }
 
 /** A systemd user session: there is a user service manager, and it answers. */
@@ -2469,15 +2553,21 @@ async function enableSystemdStartAtLogin(running: boolean, start = !running): Pr
  *
  * "changed": it added or repaired the unit, and said so. "failed": it
  * couldn't add one. "unavailable": there is no systemd user session to add
- * one to. autoEnableCapture says either along with the rest.
+ * one to. "runner": there is none that works, and this CLI runs from a
+ * package runner's cache, which nothing is pointed at (engram#665).
+ * autoEnableCapture says any of them along with the rest.
  */
-function autoEnableSystemdStartAtLogin(): "changed" | "unchanged" | "failed" | "unavailable" {
+function autoEnableSystemdStartAtLogin(): "changed" | "unchanged" | "failed" | "unavailable" | "runner" {
   const unit = readUnit();
   if (unit.kind === "foreign") return "unchanged";
-  if (unit.kind === "ours") return repairSystemdUnitIfStale(unit) ? "changed" : "unchanged";
+  if (unit.kind === "ours") {
+    const repair = repairSystemdUnitIfStale(unit);
+    return repair === "repaired" ? "changed" : repair;
+  }
   if (!existsSync(workerPath())) return "unchanged";
   const systemctl = systemctlPath();
   if (systemctl === null || !systemdReachable(systemctl)) return "unavailable";
+  if (runnerCacheOfThisCli() !== null) return "runner";
   const made = unitForThisCli();
   if ("error" in made || installUnit(systemctl, made.text) !== null) return "failed";
   console.log(`${bold("Auto-start enabled")} — daemon will start when you log in (systemd)`);
@@ -2572,12 +2662,18 @@ async function enableWindowsStartAtLogin(running: boolean): Promise<void> {
  *
  * "changed": it added or repaired the entry, and said so. "failed": it
  * couldn't add one, which autoEnableCapture says along with the rest.
+ * "runner": there is none that works, and this CLI runs from a package
+ * runner's cache, which nothing is pointed at (engram#665).
  */
-function autoEnableWindowsStartAtLogin(): "changed" | "unchanged" | "failed" {
+function autoEnableWindowsStartAtLogin(): "changed" | "unchanged" | "failed" | "runner" {
   const entry = readRunEntry();
-  if (entry !== null) return repairRunEntryIfBroken(entry) ? "changed" : "unchanged";
+  if (entry !== null) {
+    const repair = repairRunEntryIfStale(entry);
+    return repair === "repaired" ? "changed" : repair;
+  }
   // Only a source checkout run through tsx has no login-start.js: the build ships it.
   if (!existsSync(loginStartPath())) return "unchanged";
+  if (runnerCacheOfThisCli() !== null) return "runner";
   if (writeRunEntry() !== null) return "failed";
   if (switchedOffInStartupApps()) {
     console.log(`${bold("Start at login is switched off")} in Windows Startup apps`);
@@ -2645,6 +2741,7 @@ async function disableStartAtLogin(): Promise<void> {
 
 export async function daemonInstall(): Promise<void> {
   if (refusedAsRoot("install")) return;
+  if (refusedFromRunnerCache("engram install")) return;
   await recordCaptureIntent("on", "install");
   // A daemon that is stopping isn't counted: on Windows a new worker is
   // started, which takes over once that one has gone. On macOS and Linux
@@ -2769,7 +2866,7 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
     // When launchd's start at login couldn't be set up because
     // ~/Library/LaunchAgents isn't the user's (engram#678): whose it is.
     let launchAgents = null as { root: boolean } | null;
-    const autoEnableStartAtLogin = (): "changed" | "unchanged" | "failed" | "unavailable" => {
+    const autoEnableStartAtLogin = (): "changed" | "unchanged" | "failed" | "unavailable" | "runner" => {
       if (platform === "win32") return autoEnableWindowsStartAtLogin();
       if (platform !== "darwin") return autoEnableSystemdStartAtLogin();
       const result = autoEnableLaunchdStartAtLogin();
@@ -2795,6 +2892,8 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
     if (startAtLogin === "changed") changed = true;
     const startAtLoginFailed = startAtLogin === "failed";
     const startAtLoginUnavailable = startAtLogin === "unavailable";
+    // A CLI a package runner runs from its cache sets none up (engram#665).
+    const runner = startAtLogin === "runner" ? runnerCacheOfThisCli() : null;
     if (after === "command" && !changed) return;
     // Said with the rest, not after every command while it keeps failing:
     // after a command, that is when the daemon had to be started, which is
@@ -2818,6 +2917,12 @@ export async function autoEnableCapture({ after }: { after: "login" | "command" 
       console.log(
         dim("  Start at login isn't available here (no systemd user session): run 'engram start' after a restart."),
       );
+    }
+    if (runner !== null) {
+      console.log(
+        dim(`  The daemon won't start at login: this Engram runs from ${runner}, which can be cleared at any time.`),
+      );
+      console.log(dim(`  To start it at login, install the CLI: ${INSTALL_CLI} && engram install`));
     }
     console.log(dim("  Turn off anytime: engram stop && engram uninstall"));
     // When start at login is on: the daemon it starts reads the file

@@ -14,6 +14,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { commandFailure, commandPath } from "./command-path.js";
 import { pinnedToKeg } from "./homebrew.js";
+import { runnerCacheOf } from "./package-runner.js";
 
 // Start at login on Linux (engram#615): a systemd user unit,
 // ~/.config/systemd/user/engram.service. `systemctl --user enable` links it
@@ -214,7 +215,9 @@ export type UnitState =
       /**
        * An older CLI wrote it: an older version, or one that starts Node or
        * the worker in a Homebrew version, which the next `brew upgrade`
-       * removes (engram#652). `engram start` and auto-capture rewrite it.
+       * removes (engram#652), or the worker in a package runner's cache,
+       * which can be cleared at any time (engram#665). `engram start` and
+       * auto-capture rewrite it, from a CLI that isn't.
        */
       outdated: boolean;
     };
@@ -244,7 +247,7 @@ export function readUnit(): UnitState {
       version < UNIT_VERSION ||
       (version === UNIT_VERSION &&
         programs !== null &&
-        (pinnedToKeg(programs.node) || pinnedToKeg(programs.worker))),
+        (pinnedToKeg(programs.node) || pinnedToKeg(programs.worker) || runnerCacheOf(programs.worker) !== null)),
   };
 }
 

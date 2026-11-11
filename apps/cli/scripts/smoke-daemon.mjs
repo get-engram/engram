@@ -20,6 +20,10 @@
  * daemon doesn't write to it, and what has it write there. A log moved or
  * deleted while the daemon runs is said too (engram#720).
  *
+ * On Linux and Windows, this build copied where npx puts a package turns
+ * no start at login on: `install` and `start --install` from there say how
+ * to install the CLI, exit 1, and change nothing (engram#665).
+ *
  * On Windows it also checks the supervisor (engram#613): every way of
  * starting the daemon runs the worker under one, `engram stop` asks the
  * worker to stop through ~/.engram/daemon.stop and it shuts down as it does
@@ -169,7 +173,12 @@ function check(ok, what) {
  * asks the server for usage, which is unreachable here (engram#609).
  */
 function engram(...args) {
-  const r = spawnSync(node, [CLI, ...args], {
+  return engramAt(CLI, ...args);
+}
+
+/** engram(), with the CLI at `cli`. */
+function engramAt(cli, ...args) {
+  const r = spawnSync(node, [cli, ...args], {
     env,
     cwd: root,
     encoding: "utf-8",
@@ -180,6 +189,27 @@ function engram(...args) {
   console.log(`\n$ engram ${args.join(" ")}  (exit ${r.status ?? r.signal ?? r.error?.message})`);
   for (const line of out.trimEnd().split("\n")) console.log(`  │ ${line}`);
   return { status: r.status, out };
+}
+
+/**
+ * This build where npx puts a package (engram#665),
+ * <npm cache>/_npx/<hash>/node_modules/@getengram/cli, its dependencies
+ * linked in: its CLI.
+ */
+function npxCopy() {
+  const pkg = join(root, "npm-cache", "_npx", "f3920abdac2db749", "node_modules", "@getengram", "cli");
+  const copy = (from, to) => {
+    mkdirSync(to, { recursive: true });
+    for (const entry of readdirSync(from, { withFileTypes: true })) {
+      if (entry.isDirectory()) copy(join(from, entry.name), join(to, entry.name));
+      else copyFileSync(join(from, entry.name), join(to, entry.name));
+    }
+  };
+  copy(DIST, join(pkg, "dist"));
+  copyFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), join(pkg, "package.json"));
+  const deps = realpathSync(fileURLToPath(new URL("../node_modules", import.meta.url)));
+  symlinkSync(deps, join(pkg, "node_modules"), WINDOWS ? "junction" : "dir");
+  return join(pkg, "dist", "index.js");
 }
 
 function alive(pid) {
@@ -361,6 +391,29 @@ function checkPrivate(when) {
 }
 
 try {
+  // ── from npx's cache, no start at login (engram#665) ──
+  // Not on macOS, where this never runs `install` (see above).
+  if (process.platform !== "darwin") {
+    const npxCli = npxCopy();
+    for (const args of [["install"], ["start", "--install"]]) {
+      const r = engramAt(npxCli, ...args);
+      const what = `${args.join(" ")} from npx's cache`;
+      check(r.status === 1, `${what} exits 1`);
+      check(
+        r.out.includes("Can't turn on start at login: this Engram runs from npx's cache, which can be cleared at any time."),
+        `${what} says it can't turn on start at login from there`,
+      );
+      check(r.out.includes("Install the CLI with: npm install -g @getengram/cli"), `${what} says how to install the CLI`);
+    }
+    await new Promise((res) => setTimeout(res, 1_000));
+    check(daemonPid() === null, "from npx's cache, neither starts the daemon");
+    if (WINDOWS) check(regValue(RUN_KEY, "string") === null, "from npx's cache, neither adds the Run entry");
+    else {
+      check(!existsSync(SYSTEMCTL_CALLS), "from npx's cache, neither runs systemctl");
+      check(!existsSync(join(env.XDG_CONFIG_HOME, "systemd")), "from npx's cache, neither writes a unit");
+    }
+  }
+
   // ── engram start: the background start #602 reported broken ──
   let r = engram("start");
   check(r.status === 0, "start exits 0");

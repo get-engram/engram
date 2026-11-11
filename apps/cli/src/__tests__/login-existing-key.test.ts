@@ -32,6 +32,8 @@ async function runLogin(opts: {
   vi.doMock("../config.js", () => ({
     loadConfigStrict: async () => (opts.savedKey ? { apiKey: opts.savedKey } : {}),
     saveConfig,
+    // config.json can be written (engram#717 has the rest).
+    configSaveProblem: () => null,
     resolveBaseUrl: () => "http://127.0.0.1:9",
   }));
   vi.doMock("../daemon/commands.js", () => ({ autoEnableCapture }));

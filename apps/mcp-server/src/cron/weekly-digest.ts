@@ -1,4 +1,5 @@
 import type { Env } from "../types.js";
+import { lifecycleMail } from "../services/secrets.js";
 
 /**
  * Weekly memory digest (engram#256), sent Mondays from the 13:00 cron.
@@ -6,19 +7,6 @@ import type { Env } from "../types.js";
  * haven't opted out get one — a quiet week sends nothing, so the digest
  * can't become spam. engram-web renders and sends the branded email.
  */
-
-/** HMAC-signed opt-out token so the unsubscribe link needs no login. */
-export async function unsubscribeSig(orgId: string, secret: string): Promise<string> {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`digest:${orgId}`));
-  return Array.from(new Uint8Array(sig), (b) => b.toString(16).padStart(2, "0")).join("");
-}
 
 interface WeeklyRow {
   id: string;
@@ -29,8 +17,8 @@ interface WeeklyRow {
 
 export async function sendWeeklyDigests(env: Env): Promise<number> {
   if (!env.APP_URL) return 0;
-  const secret = (env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET;
-  if (!secret) return 0;
+  const mail = lifecycleMail(env);
+  if (!mail) return 0;
 
   // Orgs with activity in the last 7 days, an email, and no opt-out.
   const active = await env.DB.prepare(
@@ -67,12 +55,12 @@ export async function sendWeeklyDigests(env: Env): Promise<number> {
           .all<{ title: string }>(),
       ]);
 
-      const sig = await unsubscribeSig(org.id, secret);
+      const unsubscribeUrl = await mail.unsubscribeUrl(org.id);
       const res = await fetch(`${env.APP_URL}/api/email/weekly-digest`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${secret}`,
+          Authorization: `Bearer ${mail.bearer}`,
         },
         body: JSON.stringify({
           to: org.email,
@@ -80,7 +68,7 @@ export async function sendWeeklyDigests(env: Env): Promise<number> {
           saved: org.saved,
           searches: searches?.n ?? 0,
           highlights: (titles.results ?? []).map((t) => t.title),
-          unsubscribe_url: `https://mcp.getengram.app/email/unsubscribe?org=${encodeURIComponent(org.id)}&sig=${sig}`,
+          unsubscribe_url: unsubscribeUrl,
         }),
       });
       if (res.ok) sent++;

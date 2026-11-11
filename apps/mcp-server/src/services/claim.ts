@@ -1,5 +1,6 @@
 import { generateId, hashApiKey } from "@getengram/shared";
 import { audit } from "./audit.js";
+import { websiteBearer } from "./secrets.js";
 import type { Env } from "../types.js";
 
 /**
@@ -108,14 +109,14 @@ export async function startClaim(
 
   // Mail goes out via engram-web, which owns the Resend credentials and the
   // templates — the same path student verification and every nudge use.
-  const secret = (env as Env & { ADMIN_SECRET?: string }).ADMIN_SECRET;
+  const bearer = websiteBearer(env);
   const claimUrl = `${env.APP_URL}/claim?token=${encodeURIComponent(token)}`;
   let delivered = false;
-  if (secret && env.APP_URL) {
+  if (bearer && env.APP_URL) {
     try {
       const res = await fetch(`${env.APP_URL}/api/email/claim-link`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret}` },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${bearer}` },
         body: JSON.stringify({
           to: email,
           claim_url: claimUrl,

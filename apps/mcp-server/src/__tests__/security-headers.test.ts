@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import app from "../index.js";
 import { createMockD1, createMockEnv } from "./helpers.js";
-import { unsubscribeSig } from "../cron/weekly-digest.js";
+import { unsubscribeSig } from "../services/secrets.js";
 import {
   BASE_SECURITY_HEADERS,
   HTML_CONTENT_SECURITY_POLICY,

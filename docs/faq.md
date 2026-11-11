@@ -64,7 +64,7 @@ When messages are appended, they're grouped into overlapping chunks (windows of 
 | Vectorize vectors | 5M |
 | Messages per append | 200 |
 | Search results | 50 max |
-| Message content | No hard limit (practical limit ~100KB) |
+| Message content | 100,000 characters per message — longer bodies are clipped with a visible marker; screenshots and other base64 files are stored as a short note |
 
 ### How fast is search?
 

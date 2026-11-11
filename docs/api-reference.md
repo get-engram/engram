@@ -56,7 +56,7 @@ Append messages to a conversation. Messages are stored verbatim and automaticall
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `role` | string | Yes | One of: `user`, `assistant`, `system`, `tool` |
-| `content` | string | Yes | The message content (stored verbatim) |
+| `content` | string | Yes | The message content (stored verbatim, apart from the bounds in step 1 of [What happens on append](#what-happens-on-append)) |
 | `tool_call_id` | string | No | ID of the tool call this message responds to |
 | `tool_name` | string | No | Name of the tool that was called |
 | `metadata` | object | No | Arbitrary key-value metadata |
@@ -93,11 +93,12 @@ append_messages
 
 ### What happens on append
 
-1. Messages are inserted into the database with sequential ordering
-2. If `vault_entries` are provided, encrypted blobs are stored in the secrets vault
-3. New messages are grouped into overlapping chunks (window of 5 messages, stride of 3)
-4. Each chunk is embedded using `bge-base-en-v1.5` (768 dimensions)
-5. Vectors are upserted to the search index with conversation and organization metadata
+1. Each message body is bounded first: a screenshot or other base64-encoded file is replaced with a short note such as `[image not stored: PNG, 234 KB]`, a body still longer than 100,000 characters is clipped and ends with a visible `…[truncated: …]` marker, and text that matches a known secret pattern is replaced with `[REDACTED]`
+2. Messages are inserted into the database with sequential ordering
+3. If `vault_entries` are provided, encrypted blobs are stored in the secrets vault
+4. New messages are grouped into overlapping chunks (window of 5 messages, stride of 3)
+5. Each chunk is embedded using `bge-base-en-v1.5` (768 dimensions)
+6. Vectors are upserted to the search index with conversation and organization metadata
 
 ---
 
@@ -524,7 +525,7 @@ All requests require the same `Authorization: Bearer engram_sk_live_...` header.
 | `GET /api/v1/conversations/:id` | `get_conversation` | Fetch a conversation with messages. Query: `message_limit`, `message_offset` |
 | `DELETE /api/v1/conversations/:id` | `delete_conversation` | Delete a conversation, its messages, and embeddings |
 | `POST /api/v1/messages` | `append_messages` | Store messages. Body: `{ conversation_id?, messages: [{ role, content, ... }] }` — omit `conversation_id` to use the default memory |
-| `PATCH /api/v1/conversations/:id/messages/:messageId` | — (REST only) | Update a message's content. Body: `{ content }` → `200 { updated, message }`. The edit runs the same redaction pipeline as append, and the affected slice of the search index is rebuilt so recall matches the stored text. **The superseded body is kept** — see the revisions endpoint below. Requires the `write` scope. |
+| `PATCH /api/v1/conversations/:id/messages/:messageId` | — (REST only) | Update a message's content. Body: `{ content }` → `200 { updated, message }`. The edit is bounded and redacted exactly like append (step 1 of [What happens on append](#what-happens-on-append)), and the affected slice of the search index is rebuilt so recall matches the stored text. **The superseded body is kept** — see the revisions endpoint below. Requires the `write` scope. |
 | `GET /api/v1/conversations/:id/messages/:messageId/revisions` | — (REST only) | Full edit history for one message → `200 { message_id, conversation_id, current, revisions[], total }`, oldest revision first. Every body a message has ever had is retained; nothing is pruned. Honours the org's "share full message bodies" privacy setting — with it off, revision metadata is returned without text. Requires the `read` scope. |
 | `GET /api/v1/search` | `search` | Hybrid search. Query: `q` (required), `limit`, `conversation_id`, `tags`, `project` |
 | `GET /api/v1/export` | — (REST only) | Everything the key can see as JSON, one page per request (GDPR Art. 20 portability). Query: `limit` (messages per page, 1–400, default 400), `cursor` (the previous page's `next_cursor`). Not metered as API usage. Requires the `read` scope. See [Export](#export) |

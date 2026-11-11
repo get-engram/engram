@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, type Mock } from "vitest";
 import { Hono } from "hono";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { MAX_SEARCH_QUERY_CHARS, TIER_LIMITS } from "@getengram/shared";
+import { MAX_MESSAGE_CONTENT_CHARS, MAX_SEARCH_QUERY_CHARS, TIER_LIMITS } from "@getengram/shared";
 import { insertOrganization, getUsage, getCurrentPeriod } from "@getengram/db";
 import { v1 } from "../routes/v1.js";
 import { usage } from "../routes/usage.js";
@@ -413,6 +413,113 @@ describe("edit and delete re-index (engram#445)", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+describe("screenshots and other file payloads (engram#386)", () => {
+  /** A base64 PNG of `bytes` bytes: the file signature, then deterministic noise. */
+  function pngBase64(bytes: number): string {
+    const out = new Uint8Array(bytes);
+    let x = 11;
+    for (let i = 0; i < bytes; i++) {
+      x = (Math.imul(x, 1103515245) + 12345) >>> 0;
+      out[i] = x >>> 24;
+    }
+    out.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    return Buffer.from(out).toString("base64");
+  }
+
+  const AFTER = "The save button is greyed out until the form is valid.";
+
+  /** A captured tool result carrying a screenshot, then what the user wrote next. */
+  function withScreenshot(bytes: number): string {
+    const blocks = [
+      { type: "text", text: "Captured screenshot" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: pngBase64(bytes) } },
+    ];
+    return `${JSON.stringify(blocks)}\n${AFTER}`;
+  }
+
+  async function storedBodies(app: Hono<HonoEnv>, env: Env, conversationId: string) {
+    const res = await app.request(`/api/v1/conversations/${conversationId}`, {}, env);
+    expect(res.status).toBe(200);
+    const { messages } = (await res.json()) as { messages: Array<{ content: string }> };
+    return messages.map((m) => m.content);
+  }
+
+  it("a REST save keeps the words after a screenshot and is charged for the note", async () => {
+    const org = "org_cb_b1";
+    const { db, env, ai } = await setup(org);
+    const app = restApp(authFor(org));
+    const messages = [{ role: "user", content: withScreenshot(300_000) }];
+    // Longer than the clip: before engram#386 the clip cut the screenshot
+    // in half and dropped AFTER, and the estimate charged ~200 chunks.
+    expect(messages[0].content.length).toBeGreaterThan(MAX_MESSAGE_CONTENT_CHARS);
+    expect(estimateIndexingUnits(messages)).toBe(1);
+
+    const res = await app.request(
+      "/api/v1/messages",
+      { method: "POST", body: JSON.stringify({ messages }), headers: JSON_HEADERS },
+      env,
+    );
+    expect(res.status).toBe(200);
+    const { conversation_id } = (await res.json()) as { conversation_id: string };
+    expect((await usageRow(db, org))?.chunks_indexed).toBe(1);
+    expect(ai.run).toHaveBeenCalledTimes(1);
+    const texts = (ai.run.mock.calls[0][1] as { text: string[] }).text;
+    expect(texts).toHaveLength(1);
+    expect(texts[0]).toContain("[image not stored: PNG, 293 KB]");
+    expect(texts[0]).toContain(AFTER);
+
+    const [body] = await storedBodies(app, env, conversation_id);
+    expect(body).toContain("[image not stored: PNG, 293 KB]");
+    expect(body).toContain(AFTER);
+    expect(body).not.toContain("[REDACTED]");
+    expect(body).not.toContain("truncated");
+  });
+
+  it("the MCP save tool stores the note too", async () => {
+    const org = "org_cb_b2";
+    const { db, env } = await setup(org);
+    const { server, tools } = captureTools();
+    registerAppendMessages(server, env, authFor(org, "free", "oauth:conn_2"));
+
+    const { data, isError } = toolJson(
+      await tools.get("append_messages")!({
+        messages: [{ role: "user", content: withScreenshot(60_000) }],
+      }),
+    );
+    expect(isError).toBe(false);
+    expect(data.appended).toBe(1);
+    expect((await usageRow(db, org))?.chunks_indexed).toBe(1);
+    const [body] = await storedBodies(restApp(authFor(org)), env, data.conversation_id as string);
+    expect(body).toContain("[image not stored: PNG, 59 KB]");
+    expect(body).toContain(AFTER);
+    expect(body).not.toContain("[REDACTED]");
+  });
+
+  it("an edit that pastes a screenshot stores and indexes the note", async () => {
+    const org = "org_cb_b3";
+    const { env, ai } = await setup(org);
+    const app = restApp(authFor(org));
+    const { conversationId, messageIds } = await seedConversation(app, env, ["short"]);
+    ai.run.mockClear();
+
+    const res = await app.request(
+      `/api/v1/conversations/${conversationId}/messages/${messageIds[0]}`,
+      { method: "PATCH", body: JSON.stringify({ content: withScreenshot(300_000) }), headers: JSON_HEADERS },
+      env,
+    );
+    expect(res.status).toBe(200);
+    const { message } = (await res.json()) as { message: { content: string } };
+    expect(message.content).toContain("[image not stored: PNG, 293 KB]");
+    expect(message.content).toContain(AFTER);
+    expect(message.content).not.toContain("[REDACTED]");
+    expect(message.content).not.toContain("truncated");
+    expect(ai.run).toHaveBeenCalledTimes(1);
+    const texts = (ai.run.mock.calls[0][1] as { text: string[] }).text;
+    expect(texts.join("\n")).toContain("[image not stored: PNG, 293 KB]");
+    expect(await storedBodies(app, env, conversationId)).toEqual([message.content]);
   });
 });
 

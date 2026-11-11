@@ -6,6 +6,7 @@ import {
   type Tier,
   type Message,
 } from "@getengram/shared";
+import { stripBinaryPayloads } from "./binary-payloads.js";
 import {
   getCurrentPeriod,
   getOrCreateUsage,
@@ -174,17 +175,22 @@ export async function checkAndTrackSearch(
 }
 
 /**
- * Clip one message body to MAX_MESSAGE_CONTENT_CHARS with a visible marker
- * — the single rule every write path (append, edit) and the indexing
- * estimate share, so what is charged is what is chunked. The marker keeps
- * the clip honest: the reader sees the memory was cut, not silently
- * altered. Enormous single messages are tool-output dumps (Claude Code),
- * where the tail is the least useful part.
+ * Bound one message body — the single rule every write path (append, edit)
+ * and the indexing estimate share, so what is charged is what is chunked.
+ *
+ * First, base64 file payloads (screenshots, PDFs) become a short note
+ * ("[image not stored: PNG, 312 KB]", engram#386): an encoded screenshot
+ * is not text, and counted as text it pushed the words after it past the
+ * clip and was charged as dozens of chunks. Then the body is clipped to
+ * MAX_MESSAGE_CONTENT_CHARS with a visible marker, so the reader sees the
+ * memory was cut, not silently altered. Enormous single messages are
+ * tool-output dumps (Claude Code), where the tail is the least useful part.
  */
 export function boundContent(content: string): string {
-  if (content.length <= MAX_MESSAGE_CONTENT_CHARS) return content;
+  const text = stripBinaryPayloads(content);
+  if (text.length <= MAX_MESSAGE_CONTENT_CHARS) return text;
   return (
-    content.slice(0, MAX_MESSAGE_CONTENT_CHARS) +
+    text.slice(0, MAX_MESSAGE_CONTENT_CHARS) +
     `\n\n…[truncated: message exceeded ${MAX_MESSAGE_CONTENT_CHARS.toLocaleString()} characters]`
   );
 }
@@ -194,7 +200,8 @@ export function boundContent(content: string): string {
  * real chunker so the number charged is the number generated. Only order
  * and body length matter (windows of 5 messages, stride 3; oversized
  * bodies split), so the placeholder ids and sequences are irrelevant.
- * Bodies are clipped exactly the way append clips them before chunking.
+ * Bodies are bounded exactly the way append bounds them before chunking
+ * (file payloads replaced, then clipped).
  */
 export function estimateIndexingUnits(
   messages: ReadonlyArray<{ role: string; content: string }>,

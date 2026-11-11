@@ -20,17 +20,23 @@ export async function sendWeeklyDigests(env: Env): Promise<number> {
   const mail = lifecycleMail(env);
   if (!mail) return 0;
 
-  // Orgs with activity in the last 7 days, an email, and no opt-out.
+  // Orgs with activity in the last 7 days, an email, and no opt-out. The
+  // week's messages are counted per org first, read through
+  // idx_messages_created, and only then joined to organizations. Joined
+  // directly, SQLite with statistics read each org's messages through
+  // idx_messages_org, which is every message ever stored (engram#743).
+  // message-window-plans.d1.test.ts checks the plan with and without
+  // statistics.
   const active = await env.DB.prepare(
-    `SELECT o.id, o.name, o.email, COUNT(m.id) AS saved
-     FROM organizations o
-     JOIN messages m ON m.organization_id = o.id
-       AND m.created_at >= datetime('now', '-7 days')
+    `SELECT o.id, o.name, o.email, w.saved
+     FROM (SELECT organization_id, COUNT(*) AS saved
+           FROM messages INDEXED BY idx_messages_created
+           WHERE created_at >= datetime('now', '-7 days')
+           GROUP BY organization_id) w
+     JOIN organizations o ON o.id = w.organization_id
      WHERE o.deleted_at IS NULL
        AND o.email IS NOT NULL
        AND o.digest_opt_out = 0
-     GROUP BY o.id
-     HAVING saved > 0
      LIMIT 500`,
   ).all<WeeklyRow>();
 

@@ -62,9 +62,10 @@ function insertMessageStatements(
  * convention" class that miscounted ~984 orgs' storage totals. One batch means
  * they can never diverge.
  *
- * `extra` statements commit in the same batch: rows that must exist exactly
- * when these messages do (the append's vault entries, engram#591). Either
- * everything is written or nothing is.
+ * `extra` statements commit in the same batch: writes that must exist
+ * exactly when these messages do (the append's vault entries, engram#591;
+ * an import's progress marker, engram#751). Either everything is written or
+ * nothing is.
  */
 export function insertMessagesWithCount(
   db: D1Database,

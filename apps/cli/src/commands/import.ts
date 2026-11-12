@@ -1,11 +1,27 @@
 import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import { Engram, type MessageInput } from "@getengram/sdk";
+import type { Engram, Message, MessageInput } from "@getengram/sdk";
 import { resolveBaseUrl } from "../config.js";
 import { configForUse } from "../config-guard.js";
 import { engramCommand } from "../daemon/package-runner.js";
 import { green, dim, bold, plural } from "../output.js";
 import { boundContent } from "../message-bounds.js";
+import {
+  classifyError,
+  isConversationGone,
+  isImportMoved,
+  isNotFound,
+} from "../daemon/status.js";
+import {
+  ImportDigest,
+  markBatch,
+  patientCaller,
+  planFromStored,
+  planResume,
+  PATIENCE_MS,
+  StillRefused,
+  type SettledPlan,
+} from "../import-resume.js";
 
 import { parseStorageFullError } from "../storage-error.js";
 // Re-exported for backwards compatibility: this parser moved to a shared module
@@ -29,6 +45,12 @@ export { parseStorageFullError, type StorageFullError } from "../storage-error.j
  * remaining lifetime storage is checked (engram#275) and a warning is
  * shown if the export won't fit; if memory fills up mid-import, the
  * import stops gracefully — everything already imported stays saved.
+ *
+ * Running it again finishes what an earlier run didn't (engram#751): a
+ * conversation cut off partway, by a full memory, a plan limit, a lost
+ * connection or Ctrl+C, gets the messages it is missing, as does one that
+ * went on after it was imported, and nothing is stored twice. See
+ * import-resume.ts.
  */
 
 // --- ChatGPT export shapes ---
@@ -518,84 +540,307 @@ export async function importHistory(
     }
   }
 
-  let imported = 0;
-  let messageTotal = 0;
-  let skipped = 0;
-  let failed = 0;
+  const tally: ImportTally = {
+    imported: 0,
+    messages: 0,
+    updated: 0,
+    already: 0,
+    empty: 0,
+    left: [],
+    failed: 0,
+  };
+  let stop: Stop | null = null;
+  // Conversations in a row that couldn't be saved because Engram couldn't be
+  // reached, or had a problem of its own: any answer from it starts again.
+  let unreachable = 0;
+  const call = patientCaller((kind) => console.error(dim(`  ${WAITING[kind]}`)));
 
   for (const [i, convo] of toImport.entries()) {
     if (convo.messages.length === 0) {
-      skipped++;
+      tally.empty++;
       continue;
     }
 
     const label = `[${i + 1}/${toImport.length}] ${convo.title} ${dim(`(${convo.messages.length} msgs)`)}`;
     if (dryRun) {
       console.log(`  ${dim("would import")} ${label}`);
-      imported++;
-      messageTotal += convo.messages.length;
+      tally.imported++;
+      tally.messages += convo.messages.length;
       continue;
     }
 
+    // Messages of this conversation saved by this run.
+    let saved = 0;
+    const stored = (n: number) => {
+      saved += n;
+      tally.messages += n;
+    };
     try {
       const tags = [source, ...(extraTag ? [extraTag] : [])];
-      const { conversationId, existing } = await engram.createConversation({
-        title: convo.title,
-        agentId: source,
-        tags,
-        metadata: {
-          source: `${format}-export`,
-          original_create_time: convo.created,
-          // Stable fingerprint → re-imports reuse the same conversation
-          // instead of duplicating it (engram#254).
-          ...(convo.sourceId ? { import_fingerprint: `${format}:${convo.sourceId}` } : {}),
-        },
-      });
-      if (existing) {
-        console.log(`  ${dim("↷ already imported")} ${label}`);
-        skipped++;
-        continue;
+      const created = await call(() =>
+        engram.createConversation({
+          title: convo.title,
+          agentId: source,
+          tags,
+          metadata: {
+            source: `${format}-export`,
+            original_create_time: convo.created,
+            // Stable fingerprint → re-imports reuse the same conversation
+            // instead of duplicating it (engram#254).
+            ...(convo.sourceId ? { import_fingerprint: `${format}:${convo.sourceId}` } : {}),
+          },
+        }),
+      );
+      const { conversationId } = created;
+      if (!created.existing) {
+        await sendFrom(engram, call, conversationId, convo.messages, 0, stored);
+        console.log(`  ${green("✓")} ${label}`);
+        tally.imported++;
+      } else {
+        const plan = await planExisting(engram, call, conversationId, created.messageCount, convo.messages);
+        if (plan.kind === "done") {
+          console.log(`  ${dim("↷ already imported")} ${label}`);
+          tally.already++;
+        } else if (plan.kind === "send") {
+          await sendFrom(engram, call, conversationId, convo.messages, plan.from, stored);
+          console.log(`  ${green("✓")} ${label} ${dim(`— added the ${plural(saved, "message")} Engram didn't have yet`)}`);
+          tally.updated++;
+        } else {
+          console.log(`  ${dim("↷ left as it is")} ${label} ${dim(`— ${leftReason(plan)}`)}`);
+          tally.left.push({ conversationId, title: convo.title });
+        }
       }
-      for (const messages of storeBatches(convo.messages)) {
-        await engram.store({ conversationId, messages });
-      }
-      console.log(`  ${green("✓")} ${label}`);
-      imported++;
-      messageTotal += convo.messages.length;
+      unreachable = 0;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      tally.failed++;
+      const kind = classifyError(err);
+      const partly = saved > 0 ? ` ${dim(`(${plural(saved, "message")} of it saved first)`)}` : "";
+      const fail = (why: string) => console.error(`  ✗ ${label} — ${why}${partly}`);
 
       // Lifetime storage cap (engram#275): the server rejected the append
       // because memory is full. Everything imported so far is saved.
-      const storageFull = parseStorageFullError(msg);
+      const storageFull = parseStorageFullError(messageOf(err));
       if (storageFull) {
-        console.error(`  ✗ ${label} — memory full`);
+        fail("memory full");
         console.error(`\n${storageFull.message}`);
-        console.error(
-          dim(
-            `\nStopped with ${plural(imported, "conversation")} (${plural(messageTotal, "message")}) imported — everything imported stays saved forever.`,
-          ),
-        );
-        process.exit(1);
+        stop = "storage";
+        break;
       }
-
-      failed++;
-      console.error(`  ✗ ${label} — ${msg}`);
-      if (/limit/i.test(msg)) {
+      if (err instanceof StillRefused) {
+        const minutes = PATIENCE_MS[err.kind] / 60_000;
+        fail(`${err.message} after ${minutes} minutes of waiting`);
+        stop = "waited";
+        break;
+      }
+      if (isImportMoved(err)) {
+        // Refused whole: nothing from that request was stored (engram#751).
+        // Most often a second import of the same file; the same batch sent
+        // again after its answer was lost reads the same, so the line
+        // doesn't claim which.
+        fail("it changed while this import ran: another import may be adding to it");
+        unreachable = 0;
+        continue;
+      }
+      if (isConversationGone(err) || isNotFound(err)) {
+        fail("it was deleted from Engram while this import ran");
+        unreachable = 0;
+        continue;
+      }
+      if (kind === "auth") {
+        fail(`Engram refused this API key: ${errorText(err)}`);
+        stop = "auth";
+        break;
+      }
+      if (kind === "billing") {
+        fail(errorText(err));
+        console.error(dim(`\nHit a plan limit: upgrade at ${PRICING_URL} for more.`));
+        stop = "billing";
+        break;
+      }
+      fail(errorText(err));
+      // Any other answer shows Engram can be reached.
+      unreachable = kind === "network" || kind === "server" ? unreachable + 1 : 0;
+      if (unreachable >= UNREACHABLE_STOP) {
         console.error(
-          dim(
-            "\nHit a plan limit. Upgrade at https://getengram.app/pricing to import the rest, then re-run (already-imported conversations will duplicate — clear them first if needed).",
-          ),
+          dim(`\n${UNREACHABLE_STOP} conversations in a row couldn't be saved: Engram can't be reached, or is having a problem.`),
         );
+        stop = "unreachable";
         break;
       }
     }
   }
 
-  console.log(
-    `\n${bold("Done.")} ${imported} imported, ${plural(messageTotal, "message")}` +
-      `${skipped ? `, ${skipped} empty skipped` : ""}` +
-      `${failed ? `, ${failed} failed` : ""}.`,
-  );
+  const parts = [`${tally.imported} imported`, plural(tally.messages, "message")];
+  if (tally.updated) parts.push(`${tally.updated} updated`);
+  if (tally.already) parts.push(`${tally.already} already imported`);
+  if (tally.empty) parts.push(`${tally.empty} empty skipped`);
+  if (tally.left.length) parts.push(`${tally.left.length} left as ${tally.left.length === 1 ? "it is" : "they are"}`);
+  if (tally.failed) parts.push(`${tally.failed} failed`);
+  console.log(`\n${bold(stop ? "Stopped." : "Done.")} ${parts.join(", ")}.`);
   if (dryRun) console.log(dim("Dry run — nothing was written. Re-run without --dry-run to import."));
+
+  if (tally.left.length) {
+    console.log(
+      `\n${tally.left.length === 1 ? "One conversation was" : `${tally.left.length} conversations were`} left as ${tally.left.length === 1 ? "it is" : "they are"}: ` +
+        "what Engram has doesn't match this file, so nothing was added. To replace Engram's copy with this file's, " +
+        "delete it (everything in Engram's copy goes with it), then run the same command again:",
+    );
+    for (const { conversationId, title } of tally.left) {
+      console.log(`  ${title}`);
+      console.log(`    ${engramCommand(`conversations delete ${conversationId} --force`)}`);
+    }
+  }
+
+  if (stop || tally.failed) {
+    console.error(`\n${again(stop ?? "failed")}`);
+    process.exitCode = 1;
+  }
+}
+
+/** What a run did, for its summary. */
+interface ImportTally {
+  /** New conversations, every message saved. */
+  imported: number;
+  /** Messages saved by this run. */
+  messages: number;
+  /**
+   * Conversations Engram had only the first messages of: an earlier run
+   * was cut off, or the conversation went on after it was imported.
+   */
+  updated: number;
+  already: number;
+  empty: number;
+  /** Conversations Engram's copy of which doesn't match the file's. */
+  left: { conversationId: string; title: string }[];
+  failed: number;
+}
+
+/** Why the import stopped before the end of the file. */
+type Stop = "storage" | "billing" | "auth" | "waited" | "unreachable";
+
+const PRICING_URL = "https://getengram.app/pricing";
+
+/** Conversations in a row Engram can't be reached for before the import stops. */
+const UNREACHABLE_STOP = 3;
+
+const AGAIN_REST = "run the same command again: it skips what's already imported and sends only what's missing.";
+
+/** What to do once the import stopped, or some conversations failed. */
+function again(why: Stop | "failed"): string {
+  const when: Record<Stop | "failed", string> = {
+    storage: "Once there's room",
+    billing: "Once you've upgraded",
+    // Made when said: the command depends on how this CLI was run.
+    auth: `Once the key works (${engramCommand("login")} makes a new one)`,
+    waited: "Later",
+    unreachable: "Once Engram can be reached",
+    failed: "To retry what failed",
+  };
+  return `${when[why]}, ${AGAIN_REST}${why === "storage" ? " Everything imported stays saved." : ""}`;
+}
+
+/** Said once, the first time the import waits for each. */
+const WAITING = {
+  rate_limit: "Engram is limiting how fast this account can save: slowing down and trying again…",
+  paused: "Engram paused saving for maintenance: waiting, and nothing is lost meanwhile…",
+} as const;
+
+/** An error's message as it came: for Engram's refusals, its JSON answer. */
+function messageOf(err: unknown): string {
+  return err instanceof Error ? err.message : String(err ?? "");
+}
+
+/**
+ * What to say of an error, never blank: the reason Engram gave, where its
+ * answer is a JSON body with one (`{"error": "<code>", "message": "..."}`),
+ * else the message, else the HTTP status.
+ */
+function errorText(err: unknown): string {
+  const text = messageOf(err).trim();
+  if (text.startsWith("{")) {
+    try {
+      const said = (JSON.parse(text) as { message?: unknown } | null)?.message;
+      if (typeof said === "string" && said.trim()) return said.trim();
+    } catch {
+      // Not JSON after all: said as it is.
+    }
+  }
+  if (text) return text;
+  const status = (err as { status?: unknown } | null)?.status;
+  return typeof status === "number" ? `Engram answered HTTP ${status}` : "no reason given";
+}
+
+/** Why a conversation was left as it is, for its line. */
+function leftReason(plan: Extract<SettledPlan, { kind: "changed" | "kept" }>): string {
+  if (plan.kind === "changed") return "this file's copy of it differs from the one imported before";
+  if (plan.stored === 0) return "Engram's copy is empty, but was changed after the import made it";
+  return `Engram has ${plural(plan.stored, "message")} of it that can't be matched to this file's first ones`;
+}
+
+type Patient = ReturnType<typeof patientCaller>;
+
+/** Messages read per request when checking what an earlier import stored: get_conversation's most. */
+const READ_PAGE = 500;
+
+/**
+ * What to do with a conversation an earlier import made, from what Engram
+ * says of it (engram#751): finish it, leave it, or nothing (done).
+ */
+async function planExisting(
+  engram: Engram,
+  call: Patient,
+  conversationId: string,
+  messageCount: number | undefined,
+  source: readonly MessageInput[],
+): Promise<SettledPlan> {
+  // Engram has at least as many of its messages as the file: nothing to
+  // send, and no need to ask for more.
+  if (typeof messageCount === "number" && messageCount >= source.length) return { kind: "done" };
+  const { conversation } = await call(() =>
+    engram.getConversation({ conversationId, messageLimit: 1, messageOffset: 0 }),
+  );
+  const plan = planResume(conversation, source);
+  if (plan.kind !== "check") return plan;
+  // Imported before there was a cursor: read every message Engram has of it.
+  const stored: Message[] = [];
+  let latest = conversation;
+  for (;;) {
+    const page = await call(() =>
+      engram.getConversation({ conversationId, messageLimit: READ_PAGE, messageOffset: stored.length }),
+    );
+    latest = page.conversation;
+    stored.push(...page.messages);
+    if (page.messages.length < READ_PAGE || stored.length >= source.length) break;
+  }
+  return planFromStored(stored, latest, source);
+}
+
+/**
+ * Store the file's messages from `from` on (engram#751). The last message
+ * of each batch carries the import cursor: how many of the file's messages
+ * Engram has once that batch is stored, and the digest of them. Engram
+ * records it in the same write as the messages, and stores a batch only
+ * where the import is, so no message is stored twice. `stored` hears of
+ * each batch once Engram has it.
+ */
+async function sendFrom(
+  engram: Engram,
+  call: Patient,
+  conversationId: string,
+  source: readonly MessageInput[],
+  from: number,
+  stored: (count: number) => void,
+): Promise<void> {
+  const digest = new ImportDigest();
+  for (const m of source.slice(0, from)) digest.add(m);
+  let next = from;
+  for (const batch of storeBatches(source.slice(from))) {
+    // The digest covers the file's messages as they are, not as sent:
+    // bounding them is the CLI's business, and may change between versions.
+    for (const m of source.slice(next, next + batch.length)) digest.add(m);
+    next += batch.length;
+    const messages = markBatch(batch, { v: 1, next, digest: digest.hex() });
+    await call(() => engram.store({ conversationId, messages }));
+    stored(batch.length);
+  }
 }

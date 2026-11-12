@@ -4,6 +4,7 @@ import {
   isQueueRejection,
   isTransientD1Error,
   isMutation,
+  type RetryOptions,
 } from "../services/resilient-d1.js";
 
 const OVERLOAD = "D1_ERROR: D1 DB is overloaded. Requests queued for too long.";
@@ -258,5 +259,170 @@ describe("withD1Retry", () => {
     const wrapped = withD1Retry(db, fast);
     await expect(wrapped.exec("CREATE TABLE t(x)")).rejects.toThrow(/overloaded/);
     expect(execMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── engram#742: a slow statement is not run again ──
+
+const RESOURCES =
+  "D1_ERROR: D1 DB is overloaded. Too many resources consumed within a 10 second window.";
+const QUEUE_FULL = "D1_ERROR: D1 DB is overloaded. Too many requests queued.";
+
+/** flakyStmt whose every try takes `ms` on `clock`. */
+function timedStmt(failures: number, message: string, ms: number, clock: { t: number }) {
+  const flaky = flakyStmt(failures, message);
+  const taking =
+    <T>(f: () => Promise<T>) =>
+    async () => {
+      clock.t += ms;
+      return f();
+    };
+  return {
+    calls: flaky.calls,
+    stmt: {
+      ...flaky.stmt,
+      first: taking(flaky.stmt.first),
+      run: taking(flaky.stmt.run),
+      all: taking(flaky.stmt.all),
+    },
+  };
+}
+
+/** Retry options on `clock`: sleeping moves it, as it would in a Worker. */
+function on(clock: { t: number }, extra: RetryOptions = {}): RetryOptions {
+  return {
+    sleep: async (ms) => {
+      clock.t += ms;
+    },
+    random: () => 0.5,
+    now: () => clock.t,
+    ...extra,
+  };
+}
+
+/** A database whose batch() fails `failures` times with `message`, then succeeds. */
+function batchDb(failures: number, message: string) {
+  let calls = 0;
+  const db = {
+    prepare: vi.fn(),
+    batch: vi.fn(async () => {
+      calls++;
+      if (calls <= failures) throw new Error(message);
+      return [];
+    }),
+  } as unknown as D1Database;
+  return { db, calls: () => calls };
+}
+
+describe("a slow statement is not run again (#742)", () => {
+  it("does not take 'Too many resources consumed' to mean D1 never ran the statement", () => {
+    expect(isQueueRejection(new Error(RESOURCES))).toBe(false);
+    // Still back-pressure: the error handler answers 503 with Retry-After.
+    expect(isTransientD1Error(new Error(RESOURCES))).toBe(true);
+  });
+
+  it("still takes a timed-out or full queue to mean the statement never ran", () => {
+    for (const m of [OVERLOAD, QUEUE_FULL, "D1_ERROR: Requests queued for too long"]) {
+      expect(isQueueRejection(new Error(m)), m).toBe(true);
+    }
+  });
+
+  it("runs a read that took 2 s and failed with it once, not six times", async () => {
+    const clock = { t: 0 };
+    const { stmt, calls } = timedStmt(99, RESOURCES, 2000, clock);
+    const db = withD1Retry(dbWith(stmt), on(clock));
+    await expect(
+      db.prepare("SELECT COUNT(DISTINCT organization_id) AS n FROM messages").first(),
+    ).rejects.toThrow(/Too many resources consumed/);
+    expect(calls.first).toBe(1);
+  });
+
+  it("never retries a write that failed with it, however quickly", async () => {
+    for (const sql of [
+      "INSERT INTO t VALUES (1)",
+      "UPDATE organizations SET messages_stored_total = messages_stored_total + ? RETURNING x",
+    ]) {
+      const clock = { t: 0 };
+      const { stmt, calls } = timedStmt(1, RESOURCES, 5, clock);
+      const db = withD1Retry(dbWith(stmt), on(clock));
+      await expect(db.prepare(sql).bind(1).run()).rejects.toThrow(/Too many resources/);
+      await expect(db.prepare(sql).bind(1).first()).rejects.toThrow(/Too many resources/);
+      expect(calls.run, sql).toBe(1);
+      expect(calls.first, sql).toBe(1);
+    }
+  });
+
+  it("never retries a batch that failed with it, and still retries one the queue turned away", async () => {
+    const resources = batchDb(1, RESOURCES);
+    await expect(withD1Retry(resources.db, fast).batch([])).rejects.toThrow(/Too many resources/);
+    expect(resources.calls()).toBe(1);
+
+    const full = batchDb(1, QUEUE_FULL);
+    await expect(withD1Retry(full.db, fast).batch([])).resolves.toEqual([]);
+    expect(full.calls()).toBe(2);
+  });
+
+  it("retries a read that failed quickly with it: another statement was the load", async () => {
+    const clock = { t: 0 };
+    const { stmt, calls } = timedStmt(2, RESOURCES, 20, clock);
+    const db = withD1Retry(dbWith(stmt), on(clock));
+    await expect(db.prepare("SELECT 1").first()).resolves.toEqual({ ok: 1 });
+    expect(calls.first).toBe(3);
+  });
+
+  it("draws the line at a second: a 999 ms try is retried, a 1000 ms one isn't", async () => {
+    for (const [ms, tries] of [
+      [999, 2],
+      [1000, 1],
+    ] as const) {
+      const clock = { t: 0 };
+      const { stmt, calls } = timedStmt(1, RESOURCES, ms, clock);
+      const db = withD1Retry(dbWith(stmt), on(clock));
+      const read = db.prepare("SELECT 1").first();
+      if (tries === 2) await expect(read).resolves.toEqual({ ok: 1 });
+      else await expect(read).rejects.toThrow(/Too many resources/);
+      expect(calls.first, `${ms} ms`).toBe(tries);
+    }
+  });
+
+  it("applies to every transient error that may have run, not only that one", async () => {
+    const clock = { t: 0 };
+    const { stmt, calls } = timedStmt(99, "D1_ERROR: Network connection lost.", 1500, clock);
+    const db = withD1Retry(dbWith(stmt), on(clock));
+    await expect(db.prepare("SELECT 1").all()).rejects.toThrow(/Network connection lost/);
+    expect(calls.all).toBe(1);
+  });
+
+  it("retries a slow queue rejection: D1 never ran it, so the time went on waiting", async () => {
+    const clock = { t: 0 };
+    const { stmt, calls } = timedStmt(1, OVERLOAD, 1500, clock);
+    const db = withD1Retry(dbWith(stmt), on(clock));
+    await expect(db.prepare("INSERT INTO t VALUES (1)").run()).resolves.toEqual({ success: true });
+    await expect(db.prepare("SELECT 1").first()).resolves.toEqual({ ok: 1 });
+    expect(calls.run).toBe(2);
+    expect(calls.first).toBe(2);
+  });
+
+  it("counts the time tries took against the budget, not only the sleeps", async () => {
+    // 1200 + 50 + 1200 + 100 + 1200 is past 3000 before the third sleep. The
+    // sleeps alone (50, 100, 200, 400, 800) would have allowed all five retries.
+    const clock = { t: 0 };
+    const { stmt, calls } = timedStmt(99, OVERLOAD, 1200, clock);
+    const db = withD1Retry(dbWith(stmt), on(clock));
+    await expect(db.prepare("SELECT 1").first()).rejects.toThrow(/queued for too long/);
+    expect(calls.first).toBe(3);
+  });
+
+  it("takes the threshold and the budget from the options", async () => {
+    const clock = { t: 0 };
+    const slow = timedStmt(1, RESOURCES, 300, clock);
+    const strict = withD1Retry(dbWith(slow.stmt), on(clock, { slowTryMs: 300 }));
+    await expect(strict.prepare("SELECT 1").first()).rejects.toThrow(/Too many resources/);
+    expect(slow.calls.first).toBe(1);
+
+    const queued = timedStmt(99, OVERLOAD, 1200, clock);
+    const roomy = withD1Retry(dbWith(queued.stmt), on(clock, { totalBudgetMs: 60_000 }));
+    await expect(roomy.prepare("SELECT 1").first()).rejects.toThrow(/queued for too long/);
+    expect(queued.calls.first).toBe(6); // the first try and maxRetries' five
   });
 });

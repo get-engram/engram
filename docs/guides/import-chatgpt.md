@@ -54,9 +54,11 @@ your imported history is now part of your memory.
 
 - **Plan limits.** A full export can be large. If you hit your monthly message
   limit mid-import, the CLI stops and tells you — [upgrade](https://getengram.app/pricing)
-  and re-run. Already-imported conversations will duplicate on a re-run, so clear
-  them first if needed (filter by the `chatgpt-import` tag).
-- **Re-running** imports everything again; it does not de-duplicate. Use
+  and run the same command again. There's no need to delete anything first.
+- **Re-running** the same file never stores a message twice. Conversations
+  Engram already has are skipped, and from CLI 0.7.0 one an earlier run stopped
+  partway through gets only the messages it's missing. If what Engram has no
+  longer matches the file, the CLI leaves it as it is and says so. Use
   `--limit` to test on a small slice first.
 - **Going forward**, you don't need this — connected clients append new
   conversations to Engram live.

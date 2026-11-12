@@ -14,8 +14,9 @@
  *
  *   QUEUE_REJECTED — D1 refused the query before executing it. Nothing was
  *                    applied, so retrying is safe even for a write.
- *   TRANSIENT      — busy / timeout / connection lost / storage-layer reset.
- *                    The statement MAY have committed and only the reply was
+ *   TRANSIENT      — busy / timeout / connection lost / storage-layer reset /
+ *                    rate-limited for using too much CPU or memory. The
+ *                    statement MAY have committed and only the reply was
  *                    lost. Safe for reads; retrying a write here double-applies.
  *
  * And we classify statements by their SQL, NOT by which terminal method the
@@ -32,6 +33,17 @@
  * read is treated as a mutation, because the cost of guessing wrong in that
  * direction is only a missed retry.
  *
+ * A SLOW STATEMENT IS NOT RUN AGAIN (engram#742). D1 runs one statement at a
+ * time, so a statement that takes seconds holds up every other query, and
+ * a failure that long into a try may come after the statement ran. On
+ * 2026-11-11 a report query that read every message row failed with "Too
+ * many resources consumed", and this layer ran it five more times, each as
+ * slow as the first. So a try that ran a second or more (slowTryMs) before
+ * failing is not tried again, read or not, unless D1 said it never ran it:
+ * after a queue rejection the time went on waiting, not running. And the
+ * time budget counts how long the tries took, not only the sleeps between
+ * them.
+ *
  * WHAT THIS DOES NOT FIX: the observed incident took ~20 seconds to clear. A
  * request cannot sit still that long, so the budget here (~3s worst case)
  * absorbs a brief collision, not a sustained overload. Sustained pressure
@@ -40,13 +52,21 @@
  */
 
 /**
- * D1 refused the query before running it — provably not applied.
+ * D1 refused the query before running it — provably not applied: the
+ * request waited in D1's queue for too long, or the queue was full.
  *
- * Deliberately narrow. "storage operation exceeded timeout" is NOT here: it
- * is a storage-layer reset that can fire after a commit, so treating it as
- * pre-execution would make write retries unsafe.
+ * Deliberately narrow. Two errors that sound alike are NOT here, and
+ * treating either as pre-execution would make write retries unsafe:
+ * - "storage operation exceeded timeout" is a storage-layer reset that can
+ *   fire after a commit.
+ * - "D1 DB is overloaded. Too many resources consumed within a 10 second
+ *   window": D1 sends it after rate-limiting a database that used too much
+ *   CPU or memory, and the statement it ends may already have run. On
+ *   2026-11-11 the runs it ended had each read every message row. This
+ *   pattern used to match any "D1 DB is overloaded", so a write that failed
+ *   with it was tried again (engram#742).
  */
-const QUEUE_REJECTED = /D1 DB is overloaded|Requests queued for too long/i;
+const QUEUE_REJECTED = /Requests queued for too long|Too many requests queued/i;
 
 /**
  * May or may not have been applied — reads only.
@@ -100,10 +120,19 @@ export interface RetryOptions {
   baseDelayMs?: number;
   /** Upper bound on any single sleep. Default 2000. */
   maxDelayMs?: number;
-  /** Give up once cumulative sleep exceeds this, so a request can't hang. */
+  /**
+   * Give up once the time spent, in tries and in the sleeps between them,
+   * would pass this, so a request can't hang. Default 3000.
+   */
   totalBudgetMs?: number;
+  /**
+   * A try that ran at least this long before failing is not tried again,
+   * unless D1 said it never ran it. Default 1000.
+   */
+  slowTryMs?: number;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
+  /** The clock tries are timed by, in ms. Default Date.now. */
   now?: () => number;
   onRetry?: (attempt: number, delayMs: number, err: unknown) => void;
 }
@@ -113,6 +142,7 @@ const DEFAULTS = {
   baseDelayMs: 100,
   maxDelayMs: 2000,
   totalBudgetMs: 3000,
+  slowTryMs: 1000,
 };
 
 async function runWithRetry<T>(
@@ -126,26 +156,37 @@ async function runWithRetry<T>(
   const totalBudgetMs = opts.totalBudgetMs ?? DEFAULTS.totalBudgetMs;
   const sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const random = opts.random ?? Math.random;
+  const slowTryMs = opts.slowTryMs ?? DEFAULTS.slowTryMs;
+  const now = opts.now ?? Date.now;
 
-  let slept = 0;
+  // Time spent so far, in tries and in sleeps. (In a Worker, Date.now()
+  // moves on I/O, and a D1 call is I/O, so a try's time is measured.)
+  let spent = 0;
   for (let attempt = 0; ; attempt++) {
+    const started = now();
     try {
       return await op();
     } catch (err) {
+      const took = now() - started;
+      spent += took;
+      const neverRan = isQueueRejection(err);
       // A statement that may have been applied is never retried when it
       // mutates — at-most-once beats at-least-once for an INSERT.
-      const retryable = mutation
-        ? isQueueRejection(err)
-        : isTransientD1Error(err);
+      const retryable = mutation ? neverRan : isTransientD1Error(err);
       if (!retryable || attempt >= maxRetries) throw err;
+      // This long into a try, the statement may have run, and a statement
+      // this slow is the load: running it again holds up every other query
+      // again. Only a queue rejection, where it waited and never ran, is
+      // tried again after a slow failure.
+      if (took >= slowTryMs && !neverRan) throw err;
 
       // Full jitter: sleep uniformly in [0, ceiling). The failure mode is N
       // callers colliding, and un-jittered backoff would reconverge on the
       // same instant and collide again.
       const ceiling = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
       const delay = Math.floor(random() * ceiling);
-      if (slept + delay > totalBudgetMs) throw err;
-      slept += delay;
+      if (spent + delay > totalBudgetMs) throw err;
+      spent += delay;
       opts.onRetry?.(attempt + 1, delay, err);
       await sleep(delay);
     }

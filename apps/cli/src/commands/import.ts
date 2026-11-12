@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import type { Engram, Message, MessageInput } from "@getengram/sdk";
+import type { Conversation, Engram, Message, MessageInput } from "@getengram/sdk";
 import { resolveBaseUrl } from "../config.js";
 import { configForUse } from "../config-guard.js";
 import { engramCommand } from "../daemon/package-runner.js";
@@ -15,6 +15,7 @@ import {
 import {
   ImportDigest,
   markBatch,
+  mostToSend,
   patientCaller,
   planFromStored,
   planResume,
@@ -383,14 +384,25 @@ export function storagePrecheck(
   return { fits: false, remaining, used: storage.used, limit: storage.limit };
 }
 
-/** Human-readable warning for an export that won't fit in remaining memory. */
+/**
+ * Human-readable warning for an import that won't fit in remaining memory.
+ * `messageCount` is the most the import sends. `exportCount`, when it is
+ * more, is how many messages the export has: an earlier import stored part
+ * of it, and a re-run doesn't send that again (engram#754).
+ */
 export function storageWarning(
   messageCount: number,
   check: { remaining: number; limit: number },
+  exportCount = messageCount,
 ): string {
   const n = (x: number) => x.toLocaleString("en-US");
+  const sends =
+    exportCount > messageCount
+      ? `Your export contains ${plural(exportCount, "message")}. An earlier import stored part of it, ` +
+        `so this import sends at most ${n(messageCount)} of them, but`
+      : `Your export contains ${plural(messageCount, "message")}, but`;
   return (
-    `Your export contains ${plural(messageCount, "message")}, but your engram plan has ` +
+    `${sends} your engram plan has ` +
     `${n(check.remaining)} of ${n(check.limit)} messages of memory remaining. ` +
     `Importing will stop when memory is full — everything imported stays saved forever. ` +
     `Upgrade for more space: https://getengram.app/pricing`
@@ -427,6 +439,84 @@ async function fetchStorageUsage(): Promise<StorageUsage | null> {
   } catch {
     return null;
   }
+}
+
+/** Conversations listed per request while counting what an import sends: list_conversations' most. */
+const LIST_PAGE = 100;
+
+/** Most conversations listed while counting what an import sends. Any past them count in full. */
+const LIST_MOST = 10_000;
+
+/**
+ * At most how many messages importing `conversations` sends (engram#754).
+ * An import sends a conversation an earlier one made only what it is
+ * missing, so such a conversation counts only that (mostToSend), from what
+ * Engram's list of the conversations imported from this format says of it.
+ * One the list doesn't show counts in full, as does one whose fingerprint
+ * two conversations have, in the file or in Engram: the import could send
+ * it all.
+ *
+ * The list is read only while it matters: newest first, which finds the
+ * conversations of an import that was cut off soonest, and only until
+ * what's left fits in `room`. A page that can't be read ends it, and what
+ * wasn't found by then counts in full.
+ */
+async function countToSend(
+  engram: Engram,
+  agentId: string,
+  format: SourceFormat,
+  conversations: readonly NormalizedConversation[],
+  room: number,
+): Promise<number> {
+  let toSend = 0;
+  // The file's conversations an earlier import could have made, by fingerprint.
+  const inFile = new Map<string, readonly MessageInput[]>();
+  const twice = new Set<string>();
+  for (const c of conversations) {
+    toSend += c.messages.length;
+    if (!c.sourceId || c.messages.length === 0) continue;
+    const fingerprint = `${format}:${c.sourceId}`;
+    if (inFile.has(fingerprint)) twice.add(fingerprint);
+    inFile.set(fingerprint, c.messages);
+  }
+  for (const fingerprint of twice) inFile.delete(fingerprint);
+  if (inFile.size === 0) return toSend;
+
+  console.log(dim("Checking what Engram already has of this export…"));
+  // Each fingerprint found: the conversation it was found on, and what it took off.
+  const found = new Map<string, { id: string; less: number }>();
+  for (let offset = 0; toSend > room && offset < LIST_MOST; offset += LIST_PAGE) {
+    let page: Conversation[];
+    try {
+      ({ conversations: page } = await engram.listConversations({
+        agentId,
+        sort: "created_at",
+        order: "desc",
+        limit: LIST_PAGE,
+        offset,
+      }));
+    } catch {
+      break;
+    }
+    for (const listed of page) {
+      const fingerprint = listed.metadata?.import_fingerprint;
+      if (typeof fingerprint !== "string") continue;
+      const source = inFile.get(fingerprint);
+      if (!source) continue;
+      const before = found.get(fingerprint);
+      if (!before) {
+        const less = source.length - mostToSend(listed, source);
+        found.set(fingerprint, { id: listed.id, less });
+        toSend -= less;
+      } else if (before.id !== listed.id) {
+        // Two conversations have it: the import may send to either.
+        toSend += before.less;
+        inFile.delete(fingerprint);
+      }
+    }
+    if (page.length < LIST_PAGE) break;
+  }
+  return toSend;
 }
 
 /** y/N confirmation prompt. EOF (Ctrl+D) counts as "no". */
@@ -521,10 +611,18 @@ export async function importHistory(
   // storage (engram#275). A failed usage fetch never blocks — the
   // server enforces the cap anyway.
   if (!dryRun && !("force" in flags)) {
-    const messagesToImport = toImport.reduce((n, c) => n + c.messages.length, 0);
-    const check = storagePrecheck(messagesToImport, await fetchStorageUsage());
+    const inExport = toImport.reduce((n, c) => n + c.messages.length, 0);
+    const usage = await fetchStorageUsage();
+    let messagesToImport = inExport;
+    let check = storagePrecheck(messagesToImport, usage);
     if (!check.fits) {
-      console.error(`\n${storageWarning(messagesToImport, check)}\n`);
+      // A re-run sends only what Engram doesn't have yet (engram#754):
+      // count only that.
+      messagesToImport = await countToSend(engram, source, format, toImport, check.remaining);
+      check = storagePrecheck(messagesToImport, usage);
+    }
+    if (!check.fits) {
+      console.error(`\n${storageWarning(messagesToImport, check, inExport)}\n`);
       if (process.stdin.isTTY) {
         const proceed = await confirm("Continue anyway? [y/N] ");
         if (!proceed) {

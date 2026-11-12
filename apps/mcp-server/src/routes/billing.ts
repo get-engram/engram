@@ -7,6 +7,7 @@ import {
   releaseStripeWebhookEvent,
   setOrganizationTier,
 } from "@getengram/db";
+import { TIER_LIMITS } from "@getengram/shared";
 import {
   createCheckoutSession,
   createOrGetCustomer,
@@ -17,6 +18,7 @@ import {
   resolvePlanPrice,
 } from "../services/stripe.js";
 import { bindStripeCustomer, resolveCachedCustomer } from "../services/stripe-customer.js";
+import { websiteBearer } from "../services/secrets.js";
 import { denyUnlessOwner } from "./guards.js";
 import type { Env, AuthContext } from "../types.js";
 
@@ -408,10 +410,123 @@ async function resolveOrgIdFromEvent(
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Billing notices (engram#747): emails about a failed renewal, sent by
+// engram-web from hello@getengram.app.
+// ---------------------------------------------------------------------------
+
+type BillingNotice = "payment-failed" | "plan-ended";
+
 /**
- * Apply one verified, claimed event to D1. Every branch is idempotent (the
+ * Hand a billing notice to engram-web. One that could not be handed over
+ * throws: the webhook then gives its claim back and answers 500, so Stripe's
+ * redelivery sends it again instead of the customer never hearing. Both
+ * callers are safe to run twice.
+ */
+async function sendBillingNotice(
+  env: Env,
+  notice: BillingNotice,
+  body: { to: string; org_id: string } & Record<string, unknown>,
+): Promise<void> {
+  const bearer = websiteBearer(env);
+  if (!env.APP_URL || !bearer) {
+    console.error(`[billing] ${notice} email for org ${body.org_id}: no APP_URL or website bearer, not sent`);
+    return;
+  }
+  const res = await fetch(`${env.APP_URL}/api/email/${notice}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${bearer}` },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw new Error(`[billing] ${notice} email for org ${body.org_id}: website answered ${res.status}`);
+  }
+}
+
+type NoticeOrg = {
+  email: string | null;
+  tier: string | null;
+  deleted_at: string | null;
+  stripe_subscription_id: string | null;
+  messages_stored_total: number | null;
+};
+
+/**
+ * A renewal charge was declined. Stripe retries it for about two weeks before
+ * it cancels the plan; this tells the customer while there is still time to
+ * fix it. Only a renewal's first failure is announced (the retries after it
+ * stay quiet), and the email links Stripe's own page for paying that invoice.
+ */
+async function notifyPaymentFailed(env: Env, invoice: Record<string, unknown>): Promise<void> {
+  if (invoice.billing_reason !== "subscription_cycle" || invoice.attempt_count !== 1) return;
+
+  // The endpoint runs API 2026-04-22.dahlia, which carries the subscription
+  // (and the metadata checkout stamped on it) under parent.subscription_details.
+  const details = (
+    invoice.parent as
+      | { subscription_details?: { subscription?: unknown; metadata?: Record<string, unknown> } | null }
+      | null
+      | undefined
+  )?.subscription_details;
+  const subscriptionId = typeof details?.subscription === "string" ? details.subscription : null;
+  const metaOrgId = details?.metadata?.organization_id;
+  const orgId =
+    typeof metaOrgId === "string" && metaOrgId ? metaOrgId : await resolveOrgIdFromEvent(env, invoice);
+  if (!orgId) return;
+
+  const org = (await getOrganizationById(env.DB, orgId)) as NoticeOrg | null;
+  // The email tells them they are still on their plan, so it goes only to an
+  // org that is.
+  if (!org || org.deleted_at || !org.tier || org.tier === "free") return;
+  // A renewal of a subscription the org has since replaced is not theirs to fix.
+  if (org.stripe_subscription_id && subscriptionId && org.stripe_subscription_id !== subscriptionId) return;
+
+  const to = org.email ?? (typeof invoice.customer_email === "string" ? invoice.customer_email : null);
+  if (!to) return;
+
+  const next = invoice.next_payment_attempt;
+  await sendBillingNotice(env, "payment-failed", {
+    to,
+    tier: org.tier,
+    amount_due: invoice.amount_due,
+    currency: invoice.currency,
+    next_payment_attempt: typeof next === "number" && next > 0 ? new Date(next * 1000).toISOString() : null,
+    hosted_invoice_url: invoice.hosted_invoice_url,
+    org_id: orgId,
+  });
+}
+
+/**
+ * Stripe gave up on a renewal and cancelled the plan, and the org has just
+ * been moved to Free. Tell them what that means for what they have saved.
+ * Called only after churnIfCurrentSub did the downgrade. A subscription that
+ * never started (incomplete_expired) has nothing to announce. The plan name
+ * comes from the cancelled subscription, not the org: on a redelivery the
+ * org already reads Free.
+ */
+async function notifyPlanEnded(env: Env, orgId: string, subscription: Record<string, unknown>): Promise<void> {
+  const reason = (subscription.cancellation_details as { reason?: unknown } | null | undefined)?.reason;
+  if (subscription.status !== "canceled" || reason !== "payment_failed") return;
+
+  const org = (await getOrganizationById(env.DB, orgId)) as NoticeOrg | null;
+  if (!org || org.deleted_at || !org.email) return;
+
+  const items = (subscription.items as { data?: Array<{ price?: { id?: string } }> } | undefined)?.data;
+  await sendBillingNotice(env, "plan-ended", {
+    to: org.email,
+    tier: priceToTier(env, items?.[0]?.price?.id),
+    stored_messages: typeof org.messages_stored_total === "number" ? org.messages_stored_total : null,
+    free_limit: TIER_LIMITS.free.storage_messages,
+    org_id: orgId,
+  });
+}
+
+/**
+ * Apply one verified, claimed event to D1. Every D1 write is idempotent (the
  * ledger in front of it makes that a defence in depth rather than the only
- * guard), and an unknown type is a no-op so Stripe stops retrying it.
+ * guard), and an unknown type is a no-op so Stripe stops retrying it. The
+ * billing notices lean on the ledger alone: running one again sends the email
+ * again, which is what a send that failed wants.
  */
 async function applyStripeEvent(env: Env, event: StripeEvent): Promise<void> {
   const obj = event.data.object;
@@ -485,11 +600,17 @@ async function applyStripeEvent(env: Env, event: StripeEvent): Promise<void> {
 
     case "customer.subscription.deleted": {
       const orgId = await resolveOrgIdFromEvent(env, obj);
-      if (orgId) {
-        await churnIfCurrentSub(env.DB, orgId, obj.id as string);
+      if (orgId && (await churnIfCurrentSub(env.DB, orgId, obj.id as string))) {
+        // Cancelled for non-payment: say so (engram#747).
+        await notifyPlanEnded(env, orgId, obj);
       }
       break;
     }
+
+    case "invoice.payment_failed":
+      // A declined renewal: tell the customer while Stripe retries (engram#747).
+      await notifyPaymentFailed(env, obj);
+      break;
 
     default:
       // Acknowledge unknown events with 200 so Stripe doesn't keep retrying

@@ -701,6 +701,20 @@ export function isConversationGone(err: unknown): boolean {
 }
 
 /**
+ * True only when Engram's append tool refused a batch of an import because
+ * it doesn't start where the conversation's import is (engram#751):
+ * another import of the same file, or the same batch sent again, got there
+ * first. Nothing from the request was stored. Read from the code of the
+ * body the SDK passes on, like isConversationGone, and never from an error
+ * that carries a status: that came from whatever answered at the URL.
+ */
+export function isImportMoved(err: unknown): boolean {
+  const { status, message } = errorParts(err);
+  if (status !== undefined) return false;
+  return bodyCode(message) === "import_moved";
+}
+
+/**
  * True when the server accepted the key but refused it a permission it
  * doesn't have: its `insufficient_scope` code. Only a different key can
  * fix that (engram#597). Read from the code, not the text: a message that

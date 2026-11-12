@@ -57,6 +57,7 @@ import {
 import { deleteVectorsByIds } from "./vectorize.js";
 import type { Env, AuthContext } from "../types.js";
 import { canAccessConversation } from "./spaces.js";
+import { importStartsAt, recordImportCursorStatement, takeImportCursor } from "./import-cursor.js";
 
 export async function createConversation(
   db: D1Database,
@@ -228,6 +229,24 @@ function conversationNotFound(): HTTPException {
   });
 }
 
+const IMPORT_MOVED =
+  "This conversation has changed since the import planned what to send to it: " +
+  "another import may be adding to it. Nothing from this request was saved; " +
+  "run the import again to pick up where the conversation is now.";
+
+/**
+ * An import's batch that doesn't start where the conversation's import is
+ * (engram#751): the same batch sent again, or one planned before another
+ * import of the same file added to the conversation. Storing it would store
+ * messages twice. `import_moved` is the code the CLI branches on.
+ */
+function importMoved(): HTTPException {
+  return new HTTPException(409, {
+    message: IMPORT_MOVED,
+    res: Response.json({ error: "import_moved", message: IMPORT_MOVED }, { status: 409 }),
+  });
+}
+
 /**
  * Store `messageInputs` (and their vault entries) in a conversation.
  *
@@ -253,7 +272,12 @@ export async function appendMessages(
 ): Promise<Message[]> {
   assertWritesEnabled(env);
 
-  messageInputs = boundMessageContent(messageInputs);
+  // An import's progress marker (engram#751) describes the conversation, not
+  // a message: it comes off before anything stores or indexes the messages,
+  // and is written to the conversation in the batch that stores them.
+  const taken = takeImportCursor(boundMessageContent(messageInputs));
+  messageInputs = taken.messages;
+  const importCursor = taken.cursor;
 
   // The lookup is org-scoped, so another tenant's id is indistinguishable
   // from a nonexistent one — the correct answer either way.
@@ -265,6 +289,13 @@ export async function appendMessages(
   ) {
     throw conversationNotFound();
   }
+
+  // An import's batch is stored only where the import is (engram#751), so a
+  // batch sent again, or planned before another import of the same file
+  // added to the conversation, can't store messages twice. Checked before
+  // anything is stored; the batch checks again as it commits.
+  const importFrom = importCursor ? importCursor.next - messageInputs.length : 0;
+  if (importCursor && !importStartsAt(conv, importFrom)) throw importMoved();
 
   // Get current max sequence
   const seqResult = await getMaxSequence(env.DB, conversationId);
@@ -319,26 +350,42 @@ export async function appendMessages(
       : [];
 
   // Insert message rows (content lives in R2; D1 row carries the pointer),
-  // bump the conversation's message_count, and store the vault entries in
-  // the SAME atomic batch: the count can never drift from the actual rows,
-  // and no message can be kept while the secrets it points at are lost.
-  await insertMessagesWithCount(
-    env.DB,
-    redacted.map((m, i) => ({
-      id: m.id,
-      conversationId: m.conversation_id,
-      organizationId: m.organization_id,
-      role: m.role,
-      content: stored[i].content,
-      contentEncoding: stored[i].encoding,
-      toolCallId: m.tool_call_id,
-      toolName: m.tool_name,
-      sequence: m.sequence,
-      metadata: m.metadata,
-    })),
-    conversationId,
-    vaultStatements,
-  );
+  // bump the conversation's message_count, and store the vault entries and
+  // an import's progress marker in the SAME atomic batch: the count can
+  // never drift from the actual rows, no message can be kept while the
+  // secrets it points at are lost, and an import's marker is recorded
+  // exactly when the messages it counts are.
+  try {
+    await insertMessagesWithCount(
+      env.DB,
+      redacted.map((m, i) => ({
+        id: m.id,
+        conversationId: m.conversation_id,
+        organizationId: m.organization_id,
+        role: m.role,
+        content: stored[i].content,
+        contentEncoding: stored[i].encoding,
+        toolCallId: m.tool_call_id,
+        toolName: m.tool_name,
+        sequence: m.sequence,
+        metadata: m.metadata,
+      })),
+      conversationId,
+      importCursor
+        ? [
+            ...vaultStatements,
+            recordImportCursorStatement(env.DB, conversationId, organizationId, importCursor, importFrom),
+          ]
+        : vaultStatements,
+    );
+  } catch (err) {
+    // The batch undoes itself when another got in after the check above.
+    if (importCursor) {
+      const now = await getConversationById(env.DB, conversationId, organizationId).catch(() => null);
+      if (now && !importStartsAt(now, importFrom)) throw importMoved();
+    }
+    throw err;
+  }
   if (vaultStatements.length > 0) {
     console.log(
       `[vault] Stored ${vaultStatements.length} encrypted vault entry(ies) for ${conversationId}`

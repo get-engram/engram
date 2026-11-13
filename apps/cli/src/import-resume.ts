@@ -193,6 +193,21 @@ export function planFromStored(
   return { kind: "send", from: stored.length };
 }
 
+/**
+ * At most how many of the file's messages an import sends to a conversation
+ * Engram already has, from what Engram says of the conversation without
+ * reading its messages (engram#754): what planExisting plans, and for one
+ * imported before there was a cursor, the messages past the ones Engram
+ * has, which is what it sends when those are the file's first ones.
+ */
+export function mostToSend(conversation: Conversation, source: readonly MessageInput[]): number {
+  if (conversation.messageCount >= source.length) return 0;
+  const plan = planResume(conversation, source);
+  if (plan.kind === "send") return source.length - plan.from;
+  if (plan.kind === "check") return source.length - conversation.messageCount;
+  return 0;
+}
+
 /** What stands in for text Engram didn't store: Engram's redaction, and the vault's reference to a secret it encrypted. */
 const STAND_IN = /\[REDACTED\]|\[VAULT:[^\]\s]{1,100}\]/g;
 

@@ -13,6 +13,8 @@ import {
   type Engram,
   type GetConversationParams,
   type GetConversationResponse,
+  type ListConversationsParams,
+  type ListConversationsResponse,
   type Message,
   type MessageInput,
   type MessageRole,
@@ -27,6 +29,7 @@ import {
   ImportDigest,
   importTiming,
   markBatch,
+  mostToSend,
   parseImportCursor,
   patientCaller,
   planFromStored,
@@ -48,12 +51,17 @@ import {
 // to decide what it stores, so these tests fail if the CLI and the worker
 // stop agreeing on what a cursor is.
 
-// The import runs with --force (or --dry-run), so no usage check runs. Were
-// one to run, it must not read the developer's own ~/.engram/config.json.
+/** The config.json the usage check reads, set only by the tests of the check (engram#754). */
+const usage = vi.hoisted(() => ({ config: null as null | { apiKey: string; baseUrl: string } }));
+
+// Most tests import with --force (or --dry-run), so no usage check runs. A
+// check never reads the developer's own ~/.engram/config.json: only the
+// one a test sets, else it fails.
 vi.mock("../config-guard.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../config-guard.js")>()),
   configForUse: async () => {
-    throw new Error("a test asked for ~/.engram/config.json");
+    if (!usage.config) throw new Error("a test asked for ~/.engram/config.json");
+    return { config: { ...usage.config } };
   },
 }));
 
@@ -133,6 +141,7 @@ interface Row {
 interface FakeConversation {
   id: string;
   title: string | null;
+  agentId: string | null;
   metadata: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
@@ -153,10 +162,15 @@ class FakeEngram {
   readonly creates: CreateConversationParams[] = [];
   readonly gets: GetConversationParams[] = [];
   readonly stores: StoreParams[] = [];
+  readonly lists: ListConversationsParams[] = [];
   /** Answer create_conversation without message_count, as an older Engram does. */
   omitCount = false;
   /** Leave message bodies out, as an account's privacy setting can. */
   hideBodies = false;
+  /** List no conversations, as an account's privacy setting can. */
+  hideList = false;
+  /** The most messages the account's memory holds, or null for no limit. */
+  memory: number | null = null;
   /** Hooks, each told how many calls of its kind there have been, this one included. */
   on: {
     create?: (n: number) => void;
@@ -164,6 +178,7 @@ class FakeEngram {
     store?: (n: number, req: StoreParams) => void;
     /** After the request is stored, before its answer. */
     stored?: (n: number, req: StoreParams) => void;
+    list?: (n: number) => void;
   } = {};
 
   tick(ms = 1000): number {
@@ -204,25 +219,58 @@ class FakeEngram {
         createdAt: r.createdAt,
       }),
     );
+    return { conversation: this.view(c), messages };
+  }
+
+  /**
+   * The account's conversations, as list_conversations gives them: of one
+   * agent if asked, sorted, a page of them. Refuses a page of more than 100,
+   * as Engram does.
+   */
+  async listConversations(params: ListConversationsParams = {}): Promise<ListConversationsResponse> {
+    this.lists.push({ ...params });
+    this.on.list?.(this.lists.length);
+    const limit = params.limit ?? 20;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw refusal("invalid_params", "limit must be 1 to 100");
+    if (this.hideList) return { conversations: [], total: 0 };
+    const sort = params.sort ?? "updated_at";
+    const key = (c: FakeConversation): string | number =>
+      sort === "message_count" ? c.rows.length : sort === "created_at" ? c.createdAt : c.updatedAt;
+    const sign = (params.order ?? "desc") === "desc" ? -1 : 1;
+    const all = [...this.conversations.values()]
+      .filter((c) => params.agentId === undefined || c.agentId === params.agentId)
+      .sort((a, b) => (key(a) < key(b) ? -sign : key(a) > key(b) ? sign : 0));
+    const offset = params.offset ?? 0;
+    return { conversations: all.slice(offset, offset + limit).map((c) => this.view(c)), total: all.length };
+  }
+
+  /** A conversation as Engram describes it. */
+  private view(c: FakeConversation): Conversation {
     return {
-      conversation: {
-        id: c.id,
-        title: c.title,
-        agentId: null,
-        tags: [],
-        metadata: structuredClone(c.metadata),
-        messageCount: c.rows.length,
-        createdAt: c.createdAt,
-        updatedAt: c.updatedAt,
-      },
-      messages,
+      id: c.id,
+      title: c.title,
+      agentId: c.agentId,
+      tags: [],
+      metadata: structuredClone(c.metadata),
+      messageCount: c.rows.length,
+      createdAt: c.createdAt,
+      updatedAt: c.updatedAt,
     };
+  }
+
+  /** How many messages the account's memory holds now. */
+  used(): number {
+    let n = 0;
+    for (const c of this.conversations.values()) n += c.rows.length;
+    return n;
   }
 
   async store(req: StoreParams): Promise<StoreResponse> {
     this.stores.push(structuredClone(req));
     const n = this.stores.length;
     this.on.store?.(n, req);
+    // Engram refuses a request that doesn't fit whole.
+    if (this.memory !== null && this.used() + req.messages.length > this.memory) throw full();
     const appended = this.apply(req);
     this.on.stored?.(n, req);
     return { appended, messageIds: [] };
@@ -258,6 +306,7 @@ class FakeEngram {
     const c: FakeConversation = {
       id: `conv_${++this.ids}`,
       title: params.title ?? null,
+      agentId: params.agentId ?? null,
       metadata: structuredClone(params.metadata ?? {}),
       createdAt: t,
       updatedAt: t,
@@ -287,6 +336,7 @@ class FakeEngram {
   seedLegacy(fingerprint: string, rows: readonly MessageInput[], title = "Alpha"): string {
     const { id } = this.make({
       title,
+      agentId: "claude-import",
       metadata: { source: "claude-export", original_create_time: "2026-01-01T00:00:00Z", import_fingerprint: fingerprint },
     });
     for (let i = 0; i < rows.length; i += 100) this.apply({ conversationId: id, messages: rows.slice(i, i + 100) });
@@ -305,7 +355,8 @@ class FakeEngram {
 }
 
 interface Source {
-  uuid: string;
+  /** None: a conversation the export gives no id. */
+  uuid?: string;
   name: string;
   messages: MessageInput[];
 }
@@ -1409,5 +1460,364 @@ describe("engram import, otherwise", () => {
       [1, 0],
     ]);
     expect(fake.stores.length).toBe(stores);
+  });
+});
+
+describe("mostToSend: what an import sends to a conversation Engram has, from its description (engram#754)", () => {
+  const source = talk(5, "Alpha");
+  const at = (next: number, digest = prefixDigest(source, next)) => ({ import_cursor: { v: 1, next, digest } });
+  const later = "2026-11-01 00:00:09";
+
+  it("sends nothing to one with at least as many messages as the file", () => {
+    expect(mostToSend(described({ messageCount: 5, updatedAt: later }), source)).toBe(0);
+    expect(mostToSend(described({ messageCount: 9, metadata: at(2) }), source)).toBe(0);
+    expect(mostToSend(described({ messageCount: 5, metadata: at(2) }), source)).toBe(0);
+  });
+
+  it("goes by the cursor, whatever the count: a deleted message isn't sent again", () => {
+    expect(mostToSend(described({ messageCount: 2, metadata: at(2) }), source)).toBe(3);
+    expect(mostToSend(described({ messageCount: 1, metadata: at(3) }), source)).toBe(2);
+    expect(mostToSend(described({ messageCount: 4, metadata: at(5) }), source)).toBe(0);
+  });
+
+  it("sends nothing to one that differs from the file's", () => {
+    expect(mostToSend(described({ messageCount: 2, metadata: at(2, DIGEST) }), source)).toBe(0);
+    const longer = talk(6, "Alpha");
+    const ahead = { import_cursor: { v: 1, next: 6, digest: prefixDigest(longer, 6) } };
+    expect(mostToSend(described({ messageCount: 2, metadata: ahead }), source)).toBe(0);
+  });
+
+  it("sends all of an empty one only if nothing was ever written to it", () => {
+    expect(mostToSend(described(), source)).toBe(5);
+    expect(mostToSend(described({ updatedAt: later }), source)).toBe(0);
+  });
+
+  it("counts, for one imported before there was a cursor, the messages past the ones Engram has", () => {
+    expect(mostToSend(described({ messageCount: 2, updatedAt: later }), source)).toBe(3);
+  });
+
+  it("sends nothing to one whose count can't be read", () => {
+    for (const messageCount of [Number.NaN, -1, 1.5]) {
+      expect(mostToSend(described({ messageCount, updatedAt: later }), source), String(messageCount)).toBe(0);
+    }
+  });
+});
+
+/** process.exit, in a test: the import ends there. */
+class Exited extends Error {
+  constructor(readonly code: number | undefined) {
+    super(`exit ${code}`);
+  }
+}
+
+describe("the usage check counts only what the import sends (engram#754)", () => {
+  const SERVER = "http://127.0.0.1:9";
+  const USAGE = `${SERVER}/api/usage`;
+  const CHARLIE: Source = { uuid: "uuid-charlie", name: "Charlie", messages: talk(120, "Charlie") };
+  const DELTA: Source = { uuid: "uuid-delta", name: "Delta", messages: talk(60, "Delta") };
+  const realIsTTY = process.stdin.isTTY;
+  const PAGE = { agentId: "claude-import", sort: "created_at", order: "desc", limit: 100 };
+  const NO_ROOM = "Re-run with --force to import anyway (it will stop when memory is full).";
+  const TAIL =
+    "Importing will stop when memory is full — everything imported stays saved forever. " +
+    "Upgrade for more space: https://getengram.app/pricing";
+  let fake: FakeEngram;
+  let fetched: string[];
+
+  beforeEach(() => {
+    fake = new FakeEngram();
+    fetched = [];
+    usage.config = { apiKey: "eng_test_not_a_real_key", baseUrl: SERVER };
+    vi.stubEnv("ENGRAM_API_KEY", undefined);
+    vi.stubEnv("ENGRAM_BASE_URL", undefined);
+    vi.stubGlobal("fetch", async (input: string | URL) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url !== USAGE) throw new Error("a test asked for a server other than the fake one");
+      return new Response(JSON.stringify({ storage: { used: fake.used(), limit: fake.memory ?? -1 } }));
+    });
+    // As from a script: no one to ask whether to go on anyway.
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Exited(code);
+    }) as never);
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process.stdin, "isTTY", { value: realIsTTY, configurable: true });
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    usage.config = null;
+  });
+
+  /** Import without --force: the usage check runs. */
+  async function check(file: string, flags: Record<string, string> = {}) {
+    said.length = 0;
+    let exited: number | undefined;
+    try {
+      await importHistory(fake as unknown as Engram, [file], flags);
+    } catch (err) {
+      if (!(err instanceof Exited)) throw err;
+      exited = err.code;
+    }
+    const exitCode = process.exitCode;
+    process.exitCode = undefined;
+    const text = said.join("\n");
+    return { text, lines: text.split("\n"), exitCode, exited };
+  }
+
+  /** A file of Alpha, Charlie and Delta: 430 messages. */
+  const three = () => exportFile(ALPHA, CHARLIE, DELTA);
+
+  /**
+   * Import Alpha, Charlie and Delta with room for 300 more messages: Alpha's
+   * 250 are stored, Charlie is made but memory is full before any of its
+   * messages fit, and the import stops.
+   */
+  async function stoppedWhenFull(): Promise<void> {
+    const before = fake.used();
+    fake.memory = before + 300;
+    const first = await run(fake, three());
+    expect(first.lines.slice(1, 3)).toEqual(["  ✓ [1/3] Alpha (250 msgs)", "  ✗ [2/3] Charlie (120 msgs) — memory full"]);
+    expect(fake.used()).toBe(before + 250);
+  }
+
+  /** Conversations from another export (written over the file), imported whole, newer than the ones before. */
+  async function importChats(n: number): Promise<void> {
+    const memory = fake.memory;
+    fake.memory = null;
+    await run(fake, exportFile(...chats(n)));
+    fake.memory = memory;
+  }
+
+  const imported = (...convs: Source[]) => {
+    for (const [i, c] of convs.entries()) expect(fake.copy(`conv_${i + 1}`), c.name).toEqual(c.messages);
+  };
+
+  it("doesn't stop a re-run for the messages an earlier import stored", async () => {
+    await stoppedWhenFull();
+    fake.memory = 450; // 200 left: the file's 430 messages don't fit, the 180 the import sends do
+    const r = await check(three());
+    expect(r.lines.slice(0, 5)).toEqual([
+      "claude import (3 of 3 conversations)",
+      "Checking what Engram already has of this export…",
+      "  ↷ already imported [1/3] Alpha (250 msgs)",
+      "  ✓ [2/3] Charlie (120 msgs) — added the 120 messages Engram didn't have yet",
+      "  ✓ [3/3] Delta (60 msgs)",
+    ]);
+    expect(r.text).not.toContain("Your export contains");
+    expect([r.exited, r.exitCode]).toEqual([undefined, undefined]);
+    expect(fetched).toEqual([USAGE]);
+    expect(fake.lists).toEqual([{ ...PAGE, offset: 0 }]);
+    expect(fake.used()).toBe(430);
+    imported(ALPHA, CHARLIE, DELTA);
+  });
+
+  it("says how much a re-run sends when even that doesn't fit, and stores nothing", async () => {
+    await stoppedWhenFull();
+    fake.memory = 400; // 150 left
+    const stores = fake.stores.length;
+    const r = await check(three());
+    expect(r.lines).toEqual([
+      "claude import (3 of 3 conversations)",
+      "Checking what Engram already has of this export…",
+      "",
+      "Your export contains 430 messages. An earlier import stored part of it, so this import sends at most 180 of them, " +
+        `but your engram plan has 150 of 400 messages of memory remaining. ${TAIL}`,
+      "",
+      NO_ROOM,
+    ]);
+    expect(r.exited).toBe(1);
+    expect(fake.stores.length).toBe(stores);
+
+    fake.memory = 430; // exactly the 180 it sends
+    const again = await check(three());
+    expect([again.exited, again.exitCode]).toEqual([undefined, undefined]);
+    expect(fake.used()).toBe(430);
+    imported(ALPHA, CHARLIE, DELTA);
+  });
+
+  it("counts, for a conversation imported before there was a cursor, the messages past the ones Engram has", async () => {
+    fake.seedLegacy("claude:uuid-alpha", ALPHA.messages.slice(0, 100));
+    const file = exportFile(ALPHA, BRAVO);
+    fake.memory = 250; // 150 left: neither the file's 253 messages fit, nor the 153 the import sends
+    const r = await check(file);
+    expect(r.lines[3]).toBe(
+      "Your export contains 253 messages. An earlier import stored part of it, so this import sends at most 153 of them, " +
+        `but your engram plan has 150 of 250 messages of memory remaining. ${TAIL}`,
+    );
+    expect(r.exited).toBe(1);
+
+    fake.memory = 253;
+    const again = await check(file);
+    expect(again.lines.slice(1, 4)).toEqual([
+      "Checking what Engram already has of this export…",
+      "  ✓ [1/2] Alpha (250 msgs) — added the 150 messages Engram didn't have yet",
+      "  ✓ [2/2] Bravo (3 msgs)",
+    ]);
+    expect(fake.used()).toBe(253);
+    imported(ALPHA, BRAVO);
+  });
+
+  it("counts the whole file when Engram doesn't say what it has", async () => {
+    const cases: [string, () => void][] = [
+      ["privacy setting", () => void (fake.hideList = true)],
+      ["network", () => void (fake.on = { list: script(network) })],
+      ["rate limit", () => void (fake.on = { list: script(rateLimit) })],
+      ["server error", () => void (fake.on = { list: script(serverError) })],
+    ];
+    for (const [why, cannot] of cases) {
+      fake = new FakeEngram();
+      await stoppedWhenFull();
+      fake.memory = 450;
+      cannot();
+      const stores = fake.stores.length;
+      const r = await check(three());
+      expect(r.lines.slice(1), why).toEqual([
+        "Checking what Engram already has of this export…",
+        "",
+        `Your export contains 430 messages, but your engram plan has 200 of 450 messages of memory remaining. ${TAIL}`,
+        "",
+        NO_ROOM,
+      ]);
+      expect([r.exited, fake.lists.length, fake.stores.length], why).toEqual([1, 1, stores]);
+    }
+  });
+
+  it("lists nothing when the file fits, or when no check runs", async () => {
+    const file = exportFile(ALPHA, BRAVO);
+    const runs: [number | null, Record<string, string>][] = [
+      [253, {}],
+      [null, {}],
+      [100, { "dry-run": "" }],
+      [100, { force: "" }],
+    ];
+    for (const [memory, flags] of runs) {
+      fake = new FakeEngram();
+      fake.memory = memory;
+      const r = await check(file, flags);
+      const what = `${memory} ${JSON.stringify(flags)}`;
+      expect(r.exited, what).toBeUndefined();
+      expect(r.text, what).not.toContain("Checking");
+      expect(fake.lists, what).toEqual([]);
+    }
+    expect(fetched).toEqual([USAGE, USAGE]);
+  });
+
+  it("stops listing once what's left fits", async () => {
+    await importChats(150);
+    await stoppedWhenFull();
+    const before = fake.used();
+    fake.memory = before + 180; // exactly the 180 it sends
+    const r = await check(three());
+    expect([r.exited, r.exitCode]).toEqual([undefined, undefined]);
+    expect(fake.lists).toEqual([{ ...PAGE, offset: 0 }]);
+    expect(fake.used()).toBe(before + 180);
+  });
+
+  it("lists newest first, page by page, until it finds them", async () => {
+    await stoppedWhenFull();
+    await importChats(150);
+    fake.memory = fake.used() + 200;
+    const r = await check(three());
+    expect(r.exited).toBeUndefined();
+    expect(fake.lists).toEqual([
+      { ...PAGE, offset: 0 },
+      { ...PAGE, offset: 100 },
+    ]);
+    expect(fake.used()).toBe(450 + 430);
+  });
+
+  it("counts in full what it hadn't found when a page can't be read", async () => {
+    await stoppedWhenFull();
+    await importChats(150);
+    fake.memory = fake.used() + 200;
+    fake.on = { list: script(undefined, network) };
+    const r = await check(three());
+    expect(r.lines[3]).toBe(
+      `Your export contains 430 messages, but your engram plan has 200 of 900 messages of memory remaining. ${TAIL}`,
+    );
+    expect([r.exited, fake.lists.length]).toEqual([1, 2]);
+  });
+
+  it("counts in full a conversation two of Engram's have: the import may add to either", async () => {
+    for (const copies of [2, 3]) {
+      fake = new FakeEngram();
+      // Charlie whole, and Alpha whole more than once (as imports running
+      // at once could leave it before engram#254).
+      fake.seedLegacy("claude:uuid-charlie", CHARLIE.messages, "Charlie");
+      for (let i = 0; i < copies; i++) fake.seedLegacy("claude:uuid-alpha", ALPHA.messages);
+      fake.memory = fake.used() + 200;
+      const r = await check(exportFile(ALPHA, CHARLIE, BRAVO));
+      expect(r.lines[3], `${copies} copies`).toMatch(
+        /^Your export contains 373 messages\. An earlier import stored part of it, so this import sends at most 253 of them, /,
+      );
+      expect(r.exited, `${copies} copies`).toBe(1);
+    }
+  });
+
+  it("counts in full a conversation the file has twice", async () => {
+    fake.seedLegacy("claude:uuid-alpha", ALPHA.messages);
+    fake.memory = 550; // 300 left
+    const r = await check(exportFile(ALPHA, ALPHA, BRAVO));
+    expect(r.lines[3]).toBe(
+      `Your export contains 503 messages, but your engram plan has 300 of 550 messages of memory remaining. ${TAIL}`,
+    );
+    expect(r.exited).toBe(1);
+
+    // An empty copy isn't sent at all: it doesn't count as a second one.
+    fake.memory = 350; // 100 left: Bravo's 3 fit
+    const empty = await check(exportFile(ALPHA, { ...ALPHA, messages: [] }, BRAVO));
+    expect(empty.lines.slice(1, 4)).toEqual([
+      "Checking what Engram already has of this export…",
+      "  ↷ already imported [1/3] Alpha (250 msgs)",
+      "  ✓ [3/3] Bravo (3 msgs)",
+    ]);
+    expect([empty.exited, empty.exitCode]).toEqual([undefined, undefined]);
+  });
+
+  it("lists nothing when no conversation in the file is one it could find", async () => {
+    fake.seedLegacy("claude:uuid-alpha", ALPHA.messages);
+    fake.memory = fake.used() + 200;
+    const noIds: Source[] = [ALPHA, BRAVO].map(({ uuid: _, ...c }) => c);
+    const cases: [string, Source[], number][] = [
+      // The import may send either copy whole.
+      ["twice in the file", [ALPHA, ALPHA], 500],
+      ["no ids", noIds, 253],
+    ];
+    for (const [why, convs, count] of cases) {
+      const r = await check(exportFile(...convs));
+      expect(r.lines.slice(1), why).toEqual([
+        "",
+        `Your export contains ${count} messages, but your engram plan has 200 of 450 messages of memory remaining. ${TAIL}`,
+        "",
+        NO_ROOM,
+      ]);
+      expect([r.exited, fake.lists.length], why).toEqual([1, 0]);
+    }
+  });
+
+  it("counts a conversation once when the list moves under it and shows it on two pages", async () => {
+    await cutAfterFirstBatch(fake, ALPHA);
+    await importChats(99);
+    fake.memory = fake.used() + 200;
+    // A conversation made between the two pages pushes Alpha, the first
+    // page's last, onto the second.
+    fake.on = { list: (n) => void (n === 2 && fake.seedLegacy("claude:uuid-other", [], "Other")) };
+    const r = await check(exportFile(ALPHA, DELTA));
+    expect(r.lines[3]).toMatch(/^Your export contains 310 messages\. An earlier import stored part of it, so this import sends at most 210 of them, /);
+    expect(fake.lists.map((l) => l.offset)).toEqual([0, 100]);
+  });
+
+  it("lists at most 10,000 conversations", async () => {
+    await cutAfterFirstBatch(fake, ALPHA);
+    for (let i = 0; i < 10_000; i++) fake.seedLegacy(`claude:uuid-newer-${i}`, [], "Newer");
+    fake.memory = fake.used() + 200; // Alpha's 150 would fit, its 250 don't
+    const r = await check(exportFile(ALPHA));
+    expect(r.lines[3]).toBe(
+      `Your export contains 250 messages, but your engram plan has 200 of 300 messages of memory remaining. ${TAIL}`,
+    );
+    expect(fake.lists.length).toBe(100);
+    expect(fake.lists.at(-1)).toEqual({ ...PAGE, offset: 9_900 });
   });
 });

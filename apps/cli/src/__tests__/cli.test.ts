@@ -147,6 +147,27 @@ describe("import — lifetime storage pre-check (engram#275)", () => {
     expect(warning).toContain("Importing will stop when memory is full");
     expect(warning).toContain("https://getengram.app/pricing");
   });
+
+  it("says how much of the export a re-run sends when an earlier import stored part of it (engram#754)", () => {
+    const tail =
+      "your engram plan has 150 of 400 messages of memory remaining. " +
+      "Importing will stop when memory is full — everything imported stays saved forever. " +
+      "Upgrade for more space: https://getengram.app/pricing";
+    expect(storageWarning(180, { remaining: 150, limit: 400 }, 430)).toBe(
+      "Your export contains 430 messages. An earlier import stored part of it, " +
+        `so this import sends at most 180 of them, but ${tail}`,
+    );
+    expect(storageWarning(1, { remaining: 150, limit: 400 }, 1_250)).toBe(
+      "Your export contains 1,250 messages. An earlier import stored part of it, " +
+        `so this import sends at most 1 of them, but ${tail}`,
+    );
+    // The whole export is sent: the wording from before.
+    for (const exportCount of [undefined, 180, 179]) {
+      expect(storageWarning(180, { remaining: 150, limit: 400 }, exportCount), String(exportCount)).toBe(
+        `Your export contains 180 messages, but ${tail}`,
+      );
+    }
+  });
 });
 
 describe("import — storage_full error parsing", () => {

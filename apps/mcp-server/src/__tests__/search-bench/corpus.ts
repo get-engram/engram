@@ -26,7 +26,7 @@ export interface BenchConversation {
 export interface BenchQuery {
   id: string;
   /** What the case is there to measure. */
-  scenario: "semantic" | "keyword" | "tool-noise" | "title-recency" | "freshness" | "duplicate" | "filter" | "no-answer";
+  scenario: "semantic" | "keyword" | "tool-noise" | "tool-answer" | "title-recency" | "freshness" | "duplicate" | "filter" | "no-answer";
   query: string;
   /**
    * Groups of conversation ids. Each group is one thing the search should
@@ -646,6 +646,13 @@ export const QUERIES: BenchQuery[] = [
   { id: "tool-port", scenario: "tool-noise", query: "which port does the dev server run on", relevant: [["conv_port"]] },
   { id: "tool-seat", scenario: "tool-noise", query: "how much do we charge per seat", relevant: [["conv_pricing"]] },
 
+  // Only tool output holds the answer. Ranking tool output lower must not
+  // hide it when nothing spoken competes.
+  { id: "toolans-startup", scenario: "tool-answer", query: "worker startup time", relevant: [["conv_tool_deploy"]] },
+  { id: "toolans-mailhog", scenario: "tool-answer", query: "which image does mailhog use", relevant: [["conv_tool_ports"]] },
+  { id: "toolans-tests", scenario: "tool-answer", query: "how many search-service tests passed", relevant: [["conv_tool_search"]] },
+  { id: "toolans-storage", scenario: "tool-answer", query: "storageMb for the pro plan", relevant: [["conv_tool_pricing"]] },
+
   // The answer is old or plainly titled; newer conversations have titles that
   // contain a query word.
   { id: "title-email", scenario: "title-recency", query: "email to Antonia", relevant: [["conv_antonia"]] },
@@ -683,6 +690,14 @@ export const QUERIES: BenchQuery[] = [
   { id: "none-k8s", scenario: "no-answer", query: "kubernetes ingress certificate renewal", relevant: [] },
   { id: "none-dentist", scenario: "no-answer", query: "when is my dentist appointment", relevant: [] },
   { id: "none-guitar", scenario: "no-answer", query: "guitar chord progression for the chorus", relevant: [] },
+  { id: "none-visa", scenario: "no-answer", query: "visa requirements for travelling to Japan", relevant: [] },
+  { id: "none-tax", scenario: "no-answer", query: "when is the quarterly tax payment due", relevant: [] },
+  { id: "none-recipe", scenario: "no-answer", query: "recipe for chicken soup", relevant: [] },
+  { id: "none-car", scenario: "no-answer", query: "what did the mechanic say about the brakes", relevant: [] },
+  { id: "none-python", scenario: "no-answer", query: "python asyncio event loop is closed error", relevant: [] },
+  { id: "none-wifi", scenario: "no-answer", query: "wifi password for the office", relevant: [] },
+  { id: "none-flight", scenario: "no-answer", query: "flight number for the trip to Berlin", relevant: [] },
+  { id: "none-lease", scenario: "no-answer", query: "when does the apartment lease end", relevant: [] },
 ];
 
 /** The instruction bge-base-en-v1.5 expects in front of a retrieval query. */

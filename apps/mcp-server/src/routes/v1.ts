@@ -25,7 +25,7 @@ import {
   releaseAppendCharges,
   IndexingQuotaError,
 } from "../services/tier.js";
-import { searchConversations } from "../services/search.js";
+import { isWeakPage, searchConversations, WEAK_PAGE_NOTICE } from "../services/search.js";
 import {
   loadPrivacy,
   PRIVACY_BODIES_NOTICE,
@@ -623,9 +623,10 @@ v1.get("/search", async (c) => {
     source: "rest",
   });
 
+  const notice = isWeakPage(results) ? { notice: WEAK_PAGE_NOTICE } : {};
   return c.json(
     privacy.canReadBodies
-      ? { results, total: results.length }
-      : { results, total: results.length, privacy_notice: PRIVACY_BODIES_NOTICE },
+      ? { results, total: results.length, ...notice }
+      : { results, total: results.length, privacy_notice: PRIVACY_BODIES_NOTICE, ...notice },
   );
 });

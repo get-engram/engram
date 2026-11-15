@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { searchConversations } from "../../services/search.js";
+import { isWeakPage, searchConversations, WEAK_PAGE_NOTICE } from "../../services/search.js";
 import { checkAndTrackSearch } from "../../services/tier.js";
 import { audit } from "../../services/audit.js";
 import { isExternalOAuthClient } from "../auth-kind.js";
@@ -61,6 +61,7 @@ export function registerSearch(
                 start_sequence: z.number().optional(),
                 end_sequence: z.number().optional(),
                 tags: z.array(z.string()).optional(),
+                match: z.enum(["strong", "weak"]).optional(),
               })
               .loose(),
           )
@@ -160,6 +161,7 @@ export function registerSearch(
         total: results.length,
         ...(privacy.canReadBodies ? {} : { privacy_notice: PRIVACY_BODIES_NOTICE }),
         ...(emptyTip ? { tip: emptyTip } : {}),
+        ...(isWeakPage(results) ? { notice: WEAK_PAGE_NOTICE } : {}),
         ...(activation ? { activation } : {}),
       };
 

@@ -136,6 +136,16 @@ export interface SearchResult {
    */
   chunk_summary?: string;
   score: number;
+  /**
+   * Whether this result looks like an answer to the query. "weak" means a
+   * second model read the query against the text and found them unrelated,
+   * and neither the keywords nor the conversation title matched: the result
+   * is the closest thing stored, not necessarily about the query. Advisory
+   * only, since that model is sometimes wrong about a real answer, so weak
+   * results are still returned. Absent when the check did not run (a search
+   * inside one conversation, the check switched off or failed).
+   */
+  match?: "strong" | "weak";
   start_sequence: number;
   end_sequence: number;
 }

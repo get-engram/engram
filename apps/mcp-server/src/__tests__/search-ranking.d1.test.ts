@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Miniflare } from "miniflare";
 import { insertChunks, insertConversation } from "@getengram/db";
 import { summarizeChunk } from "@getengram/shared";
@@ -11,8 +12,14 @@ import {
   semanticContribution,
   titleMultiplier,
   titleTerms,
+  WEAK_PAGE_NOTICE,
 } from "../services/search.js";
 import { CHUNK_R2_ENCODING, chunkObjectKey } from "../services/chunk-store.js";
+import { RERANK_MODEL } from "../services/relevance-check.js";
+import { registerSearch } from "../mcp/tools/search.js";
+import { Hono } from "hono";
+import { v1 } from "../routes/v1.js";
+import type { AuthContext, Env } from "../types.js";
 
 /**
  * How search ranks (engram#758). The numbers are tuned on the relevance
@@ -81,6 +88,23 @@ describe("ranking, end to end (engram#758)", () => {
   /** What the vector index answers for the next search. */
   let matches: { id: string; score: number }[] = [];
   let lastTopK = 0;
+  /** What the relevance model answers. Down by default: the ranking tests
+   *  below then see pages without labels, as when the check fails. */
+  type RerankInput = { query: string; contexts: { text: string }[]; top_k: number };
+  const rerankDown = (): unknown => {
+    throw new Error("reranker down");
+  };
+  let rerank: (input: RerankInput) => unknown = rerankDown;
+  let rerankInputs: RerankInput[] = [];
+  /** Score each text by the first rule whose words it contains, else 0.0004. */
+  const rerankBy =
+    (rules: [string, number][]) =>
+    (input: RerankInput): unknown => ({
+      response: input.contexts.map((c, id) => ({
+        id,
+        score: rules.find(([needle]) => c.text.includes(needle))?.[1] ?? 0.0004,
+      })),
+    });
 
   const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString();
 
@@ -142,9 +166,13 @@ describe("ranking, end to end (engram#758)", () => {
     await db.prepare("INSERT INTO organizations (id, name) VALUES (?, ?)").bind(ORG, "ranking").run();
     env = createMockEnv(db);
     const mocks = env as unknown as { AI: { run: unknown }; VECTORIZE: { query: unknown } };
-    mocks.AI.run = async (_model: string, input: { text: string[] }) => ({
-      data: input.text.map(() => new Array(768).fill(0.1)),
-    });
+    mocks.AI.run = async (model: string, input: { text: string[] } & RerankInput) => {
+      if (model === RERANK_MODEL) {
+        rerankInputs.push(input);
+        return rerank(input);
+      }
+      return { data: input.text.map(() => new Array(768).fill(0.1)) };
+    };
     mocks.VECTORIZE.query = async (_vector: number[], opts: { topK: number }) => {
       lastTopK = opts.topK;
       return { count: matches.length, matches: matches.slice(0, opts.topK) };
@@ -169,6 +197,13 @@ describe("ranking, end to end (engram#758)", () => {
 
   afterAll(async () => {
     await mf?.dispose();
+  });
+
+  afterEach(() => {
+    rerank = rerankDown;
+    rerankInputs = [];
+    delete (env as unknown as { SEARCH_RELEVANCE_CHECK?: string }).SEARCH_RELEVANCE_CHECK;
+    vi.restoreAllMocks();
   });
 
   it("does not let a recent conversation outrank a clearly better match in an old one", async () => {
@@ -320,5 +355,195 @@ describe("ranking, end to end (engram#758)", () => {
     } finally {
       (env as unknown as { DB: D1Database }).DB = real;
     }
+  });
+  // The relevance check (engram#758, stage 2).
+
+  it("labels what the second model calls unrelated as weak, and an answer as strong", async () => {
+    matches = [
+      { id: "chk_conv_old_best", score: 0.8 },
+      { id: "chk_conv_third", score: 0.79 },
+    ];
+    rerank = rerankBy([["the old, best answer", 0.93]]);
+    const results = await search("nothing in common with either");
+    expect(results.map((r) => [r.conversation_id, r.match])).toEqual([
+      ["conv_old_best", "strong"],
+      ["conv_third", "weak"],
+    ]);
+    // Labelled, not dropped, and in the order ranking chose.
+    expect(results).toHaveLength(2);
+  });
+
+  it("does not call a result weak at the threshold, only under it", async () => {
+    matches = [
+      { id: "chk_conv_old_best", score: 0.8 },
+      { id: "chk_conv_third", score: 0.79 },
+    ];
+    rerank = rerankBy([
+      ["the old, best answer", 0.02],
+      ["something else again", 0.0199],
+    ]);
+    const results = await search("nothing in common with either");
+    expect(results.map((r) => r.match)).toEqual(["strong", "weak"]);
+  });
+
+  it("never calls a keyword match or a title match weak, whatever the model says", async () => {
+    matches = [
+      { id: "chk_conv_old_best", score: 0.8 },
+      { id: "chk_conv_third", score: 0.79 },
+    ];
+    rerank = rerankBy([]);
+    // "zzdelta" is a word of conv_third's text.
+    const byKeyword = await search("zzdelta");
+    expect(byKeyword.find((r) => r.conversation_id === "conv_third")?.match).toBe("strong");
+    expect(byKeyword.find((r) => r.conversation_id === "conv_old_best")?.match).toBe("weak");
+    // "Kitchen" is conv_old_best's title.
+    const byTitle = await search("kitchen");
+    expect(byTitle.find((r) => r.conversation_id === "conv_old_best")?.match).toBe("strong");
+    expect(byTitle.find((r) => r.conversation_id === "conv_third")?.match).toBe("weak");
+  });
+
+  it("returns the page unlabelled when the model fails or answers nonsense", async () => {
+    matches = [
+      { id: "chk_conv_old_best", score: 0.8 },
+      { id: "chk_conv_third", score: 0.79 },
+    ];
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    for (const broken of [rerankDown, () => ({}), () => ({ data: [[0.1]] }), () => null]) {
+      rerank = broken;
+      const results = await search("nothing in common with either");
+      expect(results.map((r) => r.conversation_id)).toEqual(["conv_old_best", "conv_third"]);
+      expect(results.every((r) => r.match === undefined)).toBe(true);
+    }
+    expect(warn.mock.calls.map((c) => c[0])).toEqual([
+      '[search] relevance check skipped {"reason":"error"}',
+      '[search] relevance check skipped {"reason":"shape"}',
+      '[search] relevance check skipped {"reason":"shape"}',
+      '[search] relevance check skipped {"reason":"shape"}',
+    ]);
+  });
+
+  it("reads the whole text, from the bucket too, and leaves a result it cannot read unlabelled", async () => {
+    matches = [
+      { id: "chk_conv_lost", score: 0.8 },
+      { id: "chk_conv_twin_b", score: 0.79 },
+    ];
+    rerank = rerankBy([]);
+    const results = await searchConversations(env as unknown as SearchEnv, ORG, "nothing in common", 5, undefined, undefined, 10);
+    expect(rerankInputs).toHaveLength(1);
+    // conv_twin_b's text lives only in the bucket; the caller asked for a
+    // 10-character snippet; the model still gets all of it. conv_lost's text
+    // cannot be read, so it is not sent.
+    expect(rerankInputs[0].contexts).toEqual([{ text: "[user]: zzgamma three\n[assistant]: the very same words" }]);
+    expect(rerankInputs[0].query).toBe("nothing in common");
+    expect(results.find((r) => r.conversation_id === "conv_twin_b")?.match).toBe("weak");
+    expect(results.find((r) => r.conversation_id === "conv_lost")?.match).toBeUndefined();
+  });
+
+  it("does not run inside one conversation, or when switched off, or for an empty page", async () => {
+    matches = [{ id: "chk_conv_old_best", score: 0.8 }];
+    rerank = rerankBy([]);
+    const scoped = await searchConversations(env as unknown as SearchEnv, ORG, "nothing in common", 5, "conv_old_best");
+    expect(scoped).toHaveLength(1);
+    expect(scoped[0].match).toBeUndefined();
+
+    (env as unknown as { SEARCH_RELEVANCE_CHECK?: string }).SEARCH_RELEVANCE_CHECK = "off";
+    const off = await search("nothing in common");
+    expect(off).toHaveLength(1);
+    expect(off[0].match).toBeUndefined();
+    delete (env as unknown as { SEARCH_RELEVANCE_CHECK?: string }).SEARCH_RELEVANCE_CHECK;
+
+    matches = [];
+    expect(await search("qqnothing")).toEqual([]);
+    expect(rerankInputs).toEqual([]);
+  });
+
+  it("logs counts, never the query or the text", async () => {
+    matches = [
+      { id: "chk_conv_old_best", score: 0.8 },
+      { id: "chk_conv_third", score: 0.79 },
+    ];
+    rerank = rerankBy([["the old, best answer", 0.93]]);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    await search("a very private question");
+    const lines = log.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("relevance check"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/^\[search\] relevance check \{"results":2,"checked":2,"weak":1,"ms":\d+\}$/);
+    const everything = [...log.mock.calls, ...[]].flat().join(" ");
+    expect(everything).not.toContain("private question");
+    expect(everything).not.toContain("best answer");
+  });
+
+  it("tells the caller of the search tool when nothing strong matched, and only then", async () => {
+    const handlers = new Map<string, (params: Record<string, unknown>) => Promise<{ content: { text: string }[] }>>();
+    const server = {
+      registerTool: (name: string, _config: unknown, handler: (params: Record<string, unknown>) => Promise<{ content: { text: string }[] }>) => {
+        handlers.set(name, handler);
+      },
+    } as unknown as McpServer;
+    registerSearch(server, env as unknown as SearchEnv, {
+      organizationId: ORG,
+      apiKeyId: "key_test",
+      tier: "enterprise",
+      scopes: ["read", "write", "search", "delete"],
+    });
+    const call = async (query: string) =>
+      JSON.parse((await handlers.get("search")!({ query, limit: 5 })).content[0].text) as {
+        results: { conversation_id: string; match?: string }[];
+        notice?: string;
+      };
+    matches = [
+      { id: "chk_conv_old_best", score: 0.8 },
+      { id: "chk_conv_third", score: 0.79 },
+    ];
+
+    rerank = rerankBy([]);
+    const nothing = await call("nothing in common with either");
+    expect(nothing.results.map((r) => r.match)).toEqual(["weak", "weak"]);
+    expect(nothing.notice).toBe(WEAK_PAGE_NOTICE);
+
+    rerank = rerankBy([["the old, best answer", 0.93]]);
+    const something = await call("nothing in common with either");
+    expect(something.results.map((r) => r.match)).toEqual(["strong", "weak"]);
+    expect(something.notice).toBeUndefined();
+
+    // The check failed: no labels, so no claim either way.
+    rerank = rerankDown;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const unknown = await call("nothing in common with either");
+    expect(unknown.results).toHaveLength(2);
+    expect(unknown.notice).toBeUndefined();
+  });
+  it("tells the caller of the REST search the same thing", async () => {
+    const app = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>();
+    app.use("*", async (c, next) => {
+      c.set("auth", {
+        organizationId: ORG,
+        apiKeyId: "key_test",
+        tier: "enterprise",
+        scopes: ["read", "write", "search", "delete"],
+      });
+      await next();
+    });
+    app.route("/api/v1", v1);
+    const call = async () => {
+      const res = await app.request("/api/v1/search?q=nothing+in+common+with+either", { method: "GET" }, env as unknown as Env);
+      expect(res.status).toBe(200);
+      return (await res.json()) as { results: { match?: string }[]; total: number; notice?: string };
+    };
+    matches = [
+      { id: "chk_conv_old_best", score: 0.8 },
+      { id: "chk_conv_third", score: 0.79 },
+    ];
+
+    rerank = rerankBy([]);
+    const nothing = await call();
+    expect(nothing.total).toBe(2);
+    expect(nothing.results.map((r) => r.match)).toEqual(["weak", "weak"]);
+    expect(nothing.notice).toBe(WEAK_PAGE_NOTICE);
+
+    rerank = rerankBy([["the old, best answer", 0.93]]);
+    const something = await call();
+    expect(something.results.map((r) => r.match)).toEqual(["strong", "weak"]);
+    expect(something.notice).toBeUndefined();
   });
 });

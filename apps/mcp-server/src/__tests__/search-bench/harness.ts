@@ -3,10 +3,19 @@ import { insertChunks, insertConversation } from "@getengram/db";
 import { summarizeChunk, type SearchResult } from "@getengram/shared";
 import { applyAllMigrations } from "../miniflare.js";
 import { createMockEnv } from "../helpers.js";
-import { searchConversations } from "../../services/search.js";
+import { isWeakPage, searchConversations } from "../../services/search.js";
 import { CHUNK_R2_ENCODING, chunkObjectKey } from "../../services/chunk-store.js";
+import { RERANK_MODEL } from "../../services/relevance-check.js";
 import { CONVERSATIONS, QUERIES, type BenchQuery } from "./corpus.js";
-import { corpusChunks, cosine, decodeVector, readEmbeddingsFile, textKey } from "./vectors.js";
+import {
+  corpusChunks,
+  cosine,
+  decodeVector,
+  readEmbeddingsFile,
+  readRerankFile,
+  recordedRelevance,
+  textKey,
+} from "./vectors.js";
 
 /**
  * The search relevance benchmark (engram#758).
@@ -14,8 +23,9 @@ import { corpusChunks, cosine, decodeVector, readEmbeddingsFile, textKey } from 
  * Runs the real searchConversations over the corpus in corpus.ts: the
  * keyword side is real SQLite FTS5 (Miniflare's D1, real migrations), the
  * vector side is a brute-force cosine search over embeddings recorded from
- * the production model. Half the conversations have their chunk text only in
- * the chunk bucket, as most production rows now do.
+ * the production model, and the relevance check replays the scores recorded
+ * from the production reranker. Half the conversations have their chunk text
+ * only in the chunk bucket, as most production rows now do.
  *
  * It measures ranking, not the size of the index: about a hundred chunks
  * stand in for an account's thousands.
@@ -46,6 +56,19 @@ export async function buildBench(): Promise<Bench> {
       );
     }
     return decodeVector(encoded);
+  };
+  const reranked = readRerankFile();
+  if (!reranked) {
+    throw new Error("search-bench/rerank.json is missing: run `pnpm --filter @getengram/mcp-server bench:record`");
+  }
+  const relevanceOf = (query: string, text: string): number => {
+    const score = recordedRelevance(reranked, query, text);
+    if (score === undefined) {
+      throw new Error(
+        "no recorded relevance score for a benchmark query and text: the corpus changed, run `pnpm --filter @getengram/mcp-server bench:record`",
+      );
+    }
+    return score;
   };
 
   const mf = new Miniflare({
@@ -102,7 +125,16 @@ export async function buildBench(): Promise<Bench> {
     AI: { run: unknown };
     VECTORIZE: { query: unknown };
   };
-  mocks.AI.run = async (_model: string, input: { text: string[] }) => ({ data: input.text.map(vectorOf) });
+  mocks.AI.run = async (
+    model: string,
+    input: { text?: string[]; query?: string; contexts?: { text: string }[] },
+  ) => {
+    if (model === RERANK_MODEL) {
+      const scored = input.contexts!.map((c, id) => ({ id, score: relevanceOf(input.query!, c.text) }));
+      return { response: scored.sort((a, b) => b.score - a.score) };
+    }
+    return { data: input.text!.map(vectorOf) };
+  };
   mocks.VECTORIZE.query = async (
     vector: number[],
     opts: { topK: number; filter?: { organization_id?: string; conversation_id?: string } },
@@ -143,6 +175,14 @@ export interface CaseOutcome {
   duplicates: number;
   /** Results that are nothing but tool output. */
   toolOnly: number;
+  /** Results from a relevant conversation. */
+  relevantCount: number;
+  /** Results the relevance check labelled weak. */
+  weak: number;
+  /** Results from a relevant conversation the relevance check labelled weak. */
+  relevantWeak: number;
+  /** Every result labelled weak: the caller is told nothing strong matched. */
+  flagged: boolean;
   /** Conversation of each result, in order. */
   order: string[];
 }
@@ -169,6 +209,10 @@ export function scoreCase(q: BenchQuery, results: SearchResult[]): CaseOutcome {
     returned: results.length,
     duplicates,
     toolOnly: results.filter((r) => isToolOnly(r.chunk_text)).length,
+    relevantCount: results.filter((r) => relevant.has(r.conversation_id)).length,
+    weak: results.filter((r) => r.match === "weak").length,
+    relevantWeak: results.filter((r) => r.match === "weak" && relevant.has(r.conversation_id)).length,
+    flagged: isWeakPage(results),
     order: results.map((r) => r.conversation_id),
   };
 }
@@ -191,6 +235,15 @@ export interface Summary {
   toolOnly: number;
   /** Mean results returned for queries nothing answers. */
   noAnswerReturned: number;
+  /** Share of queries nothing answers whose page comes back empty or flagged
+   *  as having no strong match. */
+  noAnswerFlagged: number;
+  /** Answerable queries wrongly flagged as having no strong match. */
+  answerableFlagged: number;
+  /** Results from a relevant conversation labelled weak. */
+  relevantWeak: number;
+  /** Share of the other results on answerable pages labelled weak. */
+  fillerWeak: number;
 }
 
 export function summarize(outcomes: CaseOutcome[]): Summary {
@@ -205,6 +258,14 @@ export function summarize(outcomes: CaseOutcome[]): Summary {
     duplicates: outcomes.reduce((n, o) => n + o.duplicates, 0),
     toolOnly: answerable.reduce((n, o) => n + o.toolOnly, 0),
     noAnswerReturned: mean(unanswerable.map((o) => o.returned)),
+    noAnswerFlagged: mean(unanswerable.map((o) => (o.returned === 0 || o.flagged ? 1 : 0))),
+    answerableFlagged: answerable.filter((o) => o.flagged).length,
+    relevantWeak: answerable.reduce((n, o) => n + o.relevantWeak, 0),
+    fillerWeak: (() => {
+      const filler = answerable.reduce((n, o) => n + o.returned - o.relevantCount, 0);
+      const weak = answerable.reduce((n, o) => n + o.weak - o.relevantWeak, 0);
+      return filler === 0 ? 0 : weak / filler;
+    })(),
   };
 }
 
@@ -217,10 +278,15 @@ export function formatReport(outcomes: CaseOutcome[]): string {
   const all = summarize(outcomes);
   lines.push(row("ALL answerable", { ...all, cases: outcomes.filter((o) => o.groups > 0).length }));
   lines.push(`no-answer: ${all.noAnswerReturned.toFixed(1)} results returned on average (ideal 0)`);
+  lines.push(
+    `relevance check: ${(all.noAnswerFlagged * 100).toFixed(0)}% of no-answer pages flagged "no strong match" (ideal 100), ` +
+      `${all.answerableFlagged} answerable pages flagged (ideal 0), ${all.relevantWeak} relevant results labelled weak (ideal 0), ` +
+      `${(all.fillerWeak * 100).toFixed(0)}% of the other results on answerable pages labelled weak`,
+  );
   lines.push("");
   for (const o of outcomes) {
     lines.push(
-      `${o.id.padEnd(20)} rank ${String(o.rank ?? "-").padStart(2)}  found ${o.groupsFound}/${o.groups}  n=${o.returned} dup=${o.duplicates} tool=${o.toolOnly}  ${o.order.map((c) => c.replace("conv_", "")).join(" > ")}`,
+      `${o.id.padEnd(20)} rank ${String(o.rank ?? "-").padStart(2)}  found ${o.groupsFound}/${o.groups}  n=${o.returned} dup=${o.duplicates} tool=${o.toolOnly} weak=${o.weak}${o.flagged ? " FLAGGED" : ""}  ${o.order.map((c) => c.replace("conv_", "")).join(" > ")}`,
     );
   }
   return lines.join("\n");

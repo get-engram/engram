@@ -100,3 +100,34 @@ export function textsToEmbed(): string[] {
   }
   return [...texts];
 }
+
+/**
+ * Recorded relevance-check scores (engram#758, stage 2): what the production
+ * reranker said about every query against every chunk text, recorded by the
+ * same script. `texts` holds the key of each distinct chunk text; each
+ * query's row holds one score per text, in that order, to four decimals.
+ */
+export const RERANK_FILE = join(dirname(fileURLToPath(import.meta.url)), "rerank.json");
+
+export interface RerankFile {
+  model: string;
+  texts: string[];
+  queries: Record<string, number[]>;
+}
+
+export function readRerankFile(): RerankFile | null {
+  if (!existsSync(RERANK_FILE)) return null;
+  return JSON.parse(readFileSync(RERANK_FILE, "utf8")) as RerankFile;
+}
+
+/** Every distinct chunk text, in corpus order. */
+export function chunkTexts(): string[] {
+  return [...new Set(corpusChunks().map((c) => c.text))];
+}
+
+/** Recorded score of a text for a query, or undefined when not recorded. */
+export function recordedRelevance(file: RerankFile, query: string, text: string): number | undefined {
+  const column = file.texts.indexOf(textKey(text));
+  if (column === -1) return undefined;
+  return file.queries[textKey(query)]?.[column];
+}

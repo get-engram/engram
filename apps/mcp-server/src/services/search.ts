@@ -3,6 +3,7 @@ import type { SearchResult } from "@getengram/shared";
 import { generateEmbedding } from "./embedding.js";
 import { getChunksByVectorizeIds, getChunksByIds, searchChunksFts, type ChunkKeywordHit } from "@getengram/db";
 import { isTextInR2Only, loadChunkTexts } from "./chunk-store.js";
+import { relevanceCheckEnabled, scoreRelevance, WEAK_MATCH_SCORE } from "./relevance-check.js";
 
 interface VectorizeMatch {
   id: string;
@@ -457,6 +458,7 @@ export async function searchConversations(
   // saved twice should not take two places on the page. A row whose text
   // could not be read is kept.
   const page: SearchResult[] = [];
+  const fullText = new Map<string, string>();
   const seenText = new Set<string>();
   let cursor = 0;
   for (let round = 0; round < PAGE_FILL_ROUNDS && page.length < limit && cursor < results.length; round++) {
@@ -479,9 +481,52 @@ export async function searchConversations(
         if (seenText.has(text)) continue;
         seenText.add(text);
       }
+      if (text) fullText.set(r.chunk_id, text);
       page.push(r);
+    }
+  }
+
+  // Label the page (engram#758, stage 2). Ranking always finds a nearest
+  // text, so a query about something never saved still fills the page. A
+  // second model reads the query against each result; one it calls unrelated
+  // is marked weak unless the keywords or the title matched, the two signals
+  // that model is known to miss. Labels only: nothing is dropped, because the
+  // model is occasionally wrong about a real answer. Not for a search inside
+  // one conversation, where the caller already chose what to read.
+  if (!conversationId && page.length > 0 && relevanceCheckEnabled(env)) {
+    const readable = page.filter((r) => fullText.has(r.chunk_id));
+    const started = Date.now();
+    const check = await scoreRelevance(
+      env.AI,
+      query,
+      readable.map((r) => fullText.get(r.chunk_id)!),
+    );
+    if (check.ok) {
+      let weak = 0;
+      readable.forEach((r, i) => {
+        const score = check.scores[i];
+        if (score === undefined) return;
+        const backed = ftsRank.has(r.chunk_id) || titleMultiplier(r.conversation_title, terms) > 1;
+        r.match = score < WEAK_MATCH_SCORE && !backed ? "weak" : "strong";
+        if (r.match === "weak") weak++;
+      });
+      // Counts only. Never the query or the text: both are user content.
+      console.log(
+        `[search] relevance check ${JSON.stringify({ results: page.length, checked: readable.length, weak, ms: Date.now() - started })}`,
+      );
+    } else {
+      console.warn(`[search] relevance check skipped ${JSON.stringify({ reason: check.reason })}`);
     }
   }
 
   return page;
 }
+
+/** True when the check ran and called every result on the page weak: the
+ *  page is the closest stored text, and probably not about the query. */
+export function isWeakPage(results: Pick<SearchResult, "match">[]): boolean {
+  return results.length > 0 && results.every((r) => r.match === "weak");
+}
+
+export const WEAK_PAGE_NOTICE =
+  "No strong match was found for this query. These are the closest saved items and may be unrelated: read them before relying on them, and if none answers the question, say that nothing saved covers it.";

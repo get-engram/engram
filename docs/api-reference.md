@@ -126,6 +126,7 @@ Semantic search across all stored conversations. Returns matching chunk snippets
       "conversation_id": "conv_abc123",
       "chunk_text": "[user]: Can you look up the billing?\n[assistant]: I'll check that now.\n...",
       "score": 0.89,
+      "match": "strong",
       "start_sequence": 1,
       "end_sequence": 5
     }
@@ -133,6 +134,10 @@ Semantic search across all stored conversations. Returns matching chunk snippets
   "total": 1
 }
 ```
+
+`match` says whether a result looks like an answer to the query. Search always returns the closest saved text, even when nothing saved covers the question, so after ranking a second model reads the query against each result. A result is `"weak"` when that model finds the two unrelated and neither the query's keywords nor the conversation title match; otherwise it is `"strong"`. It is advisory: no result is removed and the order does not change, because the check is occasionally wrong about a real answer worded differently from the question. `match` is absent when the check did not run (a search inside one conversation, or the check failed or timed out).
+
+When every result on the page is `"weak"`, the response also carries a top-level `notice` string saying no strong match was found. Treat such a page as "probably nothing saved about this" and read the results before relying on them.
 
 ### Example
 
@@ -142,7 +147,7 @@ search
   limit: 5
 ```
 
-Results are ranked by cosine similarity. Each result includes the matching chunk text and the full original messages from that section of the conversation.
+Results are ranked by a blend of meaning (vector similarity), keyword matches, the conversation title and recency. Each result includes the matching chunk text and the full original messages from that section of the conversation.
 
 ---
 

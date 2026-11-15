@@ -27,20 +27,49 @@ export function isSystemConversation(metadata: string | null | undefined): boole
   }
 }
 
-// RRF constant — dampens high-rank dominance. k=60 is standard.
+// Ranking (engram#215, retuned against the relevance benchmark in engram#758:
+// src/__tests__/search-bench, `pnpm bench:search`). Change a number here only
+// with the benchmark's before and after in hand.
+//
+// The two lists are fused into one score per chunk. The best hit of each list
+// is worth 1/RRF_K, so a chunk at the top of both scores 1.0 once normalised.
 const RRF_K = 60;
-// Max possible RRF score with 2 lists: 2 / (k + 0)
 const RRF_MAX = 2 / RRF_K;
-
-// Recall tuning (engram#215).
-// Recency: "remember when we were doing X" almost always means recently, so
-// boost recent conversations. Multiplier decays from (1 + weight) at age 0 to
-// 1.0 for old conversations, half-life 30 days — a tie-breaker, not an override.
-const RECENCY_WEIGHT = 0.5;
+// The keyword list is fused by rank. The semantic list is fused by how close
+// each hit is to the best one: (similarity / best similarity) ^ sharpness.
+// Rank alone makes fifteen candidates look almost equally good whether the
+// second one is a near-tie or far behind, and then any boost at all reorders
+// the page. With similarity kept, a near-tie is a near-tie and a clear winner
+// stays one. It also means a semantic-only hit far behind the best one falls
+// under the default min_score and is dropped, where it used to pad the page.
+const SIMILARITY_SHARPNESS = 2.5;
+// Recency: of two conversations that match about equally well, the newer one
+// is usually the one meant. At most +8%, halving every 30 days: enough to
+// settle a near-tie, never enough to lift a weaker match over a better one.
+// It was +50%, which put any recent conversation above the best match in an
+// old one.
+const RECENCY_WEIGHT = 0.08;
 const RECENCY_HALFLIFE_DAYS = 30;
-// Title/proper-noun match: names ("Antonia") get diluted in embedding space,
-// so boost results whose conversation title contains a query term.
-const TITLE_BOOST = 1.4;
+// Title match: names ("Antonia") get diluted in embedding space, so a result
+// whose conversation title contains the query's words gets up to +20%, scaled
+// by the share of the query's words the title has.
+const TITLE_BOOST = 1.2;
+// Words that say nothing about which conversation is meant. A title is
+// matched on whole words that are not in this list and are not bare numbers.
+const TITLE_STOP_WORDS = new Set(
+  (
+    "the and for from with what when where which who whom why how did does done was were are been being " +
+    "our ours about that this these those have has had you your yours into not but can will should would " +
+    "could their them they his her hers its out all any one two get got run use via per also just than then " +
+    "there here some more most much many over under again last next new old"
+  ).split(" "),
+);
+// D1 allows 100 bound values per statement; a page of 20 can bring 100
+// conversations here, plus the organization id.
+const CONVERSATION_LOOKUP_BATCH = 90;
+// Reads of the text bucket are bounded: the page, then up to two refills for
+// rows dropped as repeats.
+const PAGE_FILL_ROUNDS = 3;
 
 function truncateSnippet(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
@@ -57,9 +86,47 @@ export function recencyMultiplier(updatedAt?: string | null): number {
   return 1 + RECENCY_WEIGHT * Math.pow(0.5, ageDays / RECENCY_HALFLIFE_DAYS);
 }
 
-/** Distinct lowercased query terms of length >= 3 for title matching. */
+/** Distinct lowercased query terms of length >= 3. */
 export function queryTerms(query: string): string[] {
   return [...new Set(query.toLowerCase().match(/[a-z0-9]{3,}/g) ?? [])];
+}
+
+/** The query terms a title is matched on: no stop words, no bare numbers. */
+export function titleTerms(query: string): string[] {
+  return queryTerms(query).filter((t) => !TITLE_STOP_WORDS.has(t) && !/^[0-9]+$/.test(t));
+}
+
+/**
+ * Title multiplier in [1, TITLE_BOOST]: 1 plus the boost scaled by the share
+ * of `terms` that appear in the title as whole words. Whole words, because a
+ * substring match let "port" boost every "Report" and "the" boost nearly
+ * every title.
+ */
+export function titleMultiplier(title: string | null | undefined, terms: string[]): number {
+  if (!title || terms.length === 0) return 1;
+  const words = new Set(title.toLowerCase().match(/[a-z0-9]+/g) ?? []);
+  const hits = terms.filter((t) => words.has(t)).length;
+  return 1 + (TITLE_BOOST - 1) * (hits / terms.length);
+}
+
+/**
+ * What a semantic hit adds to its chunk's score: 1/RRF_K for the best
+ * visible hit, less for the others in proportion to their similarity. Falls
+ * back to rank when the best similarity is not a positive number.
+ */
+export function semanticContribution(similarity: number, bestSimilarity: number, rank: number): number {
+  if (!(bestSimilarity > 0) || !Number.isFinite(similarity)) return 1 / (RRF_K + rank);
+  const ratio = Math.min(Math.max(similarity, 0) / bestSimilarity, 1);
+  return Math.pow(ratio, SIMILARITY_SHARPNESS) / RRF_K;
+}
+
+/**
+ * How many candidates to take from each list. Three pages' worth normally;
+ * six when a tag or project filter will discard most of them, so the filter
+ * has something left to pick from. Capped at 50.
+ */
+export function candidatePoolSize(limit: number, filtered: boolean): number {
+  return Math.min(filtered ? limit * 6 : limit * 3, 50);
 }
 
 /** Why a keyword search failed, in words that are safe to log. */
@@ -118,7 +185,7 @@ export async function searchConversations(
   conversationId?: string,
   tags?: string[],
   snippetChars: number = DEFAULT_SNIPPET_CHARS,
-  minScore: number = DEFAULT_MIN_SCORE,
+  minScore?: number,
   dedupe: boolean = true,
   project?: string,
   viewerSeatId?: string | null
@@ -128,9 +195,9 @@ export async function searchConversations(
     MAX_SNIPPET_CHARS
   );
 
-  // Over-fetch for post-processing headroom. When a project filter is active,
-  // many results will be discarded so we fetch more aggressively.
-  const fetchK = Math.min(project ? limit * 6 : limit * 3, 50);
+  // Over-fetch for post-processing headroom. Tag and project filters run
+  // after ranking and discard most candidates, so they get a wider pool.
+  const fetchK = candidatePoolSize(limit, !!project || (tags?.length ?? 0) > 0);
 
   const filter: VectorizeVectorMetadataFilter = { organization_id: organizationId };
   if (conversationId) {
@@ -230,21 +297,6 @@ export async function searchConversations(
     vecIdToChunkId.set(chunk.vectorize_id, chunk.id);
   }
 
-  // Compute RRF scores for each unique chunk
-  const rrfScores = new Map<string, number>();
-
-  for (const [vecId, rank] of vectorRank) {
-    const chunkId = vecIdToChunkId.get(vecId);
-    if (!chunkId) continue;
-    const score = rrfScores.get(chunkId) ?? 0;
-    rrfScores.set(chunkId, score + 1 / (RRF_K + rank));
-  }
-
-  for (const [chunkId, rank] of ftsRank) {
-    const score = rrfScores.get(chunkId) ?? 0;
-    rrfScores.set(chunkId, score + 1 / (RRF_K + rank));
-  }
-
   // Hydrate conversation title + tags
   const uniqueConvIds = [...new Set([...chunkMap.values()].map((c) => c.conversation_id))];
   const convMeta = new Map<
@@ -256,12 +308,15 @@ export async function searchConversations(
   // also has no entry in convMeta and would be dropped by that rule alone.
   const blockedConvIds = new Set<string>();
 
-  if (uniqueConvIds.length > 0) {
-    const placeholders = uniqueConvIds.map(() => "?").join(",");
+  // In batches: both lists at their widest can name 100 conversations, and
+  // D1 takes 100 bound values per statement.
+  for (let i = 0; i < uniqueConvIds.length; i += CONVERSATION_LOOKUP_BATCH) {
+    const batch = uniqueConvIds.slice(i, i + CONVERSATION_LOOKUP_BATCH);
+    const placeholders = batch.map(() => "?").join(",");
     const rows = await env.DB.prepare(
       `SELECT id, title, tags, updated_at, visibility, seat_id, metadata FROM conversations WHERE id IN (${placeholders}) AND organization_id = ?`
     )
-      .bind(...uniqueConvIds, organizationId)
+      .bind(...batch, organizationId)
       .all<{ id: string; title: string; tags: string; updated_at: string | null; visibility?: string | null; seat_id?: string | null; metadata?: string | null }>();
 
     for (const row of rows.results) {
@@ -294,28 +349,46 @@ export async function searchConversations(
     }
   }
 
-  // Build results with normalized RRF scores, then apply recall boosts:
-  // recency (recent conversations) and title match (proper nouns). (engram#215)
-  const terms = queryTerms(query);
+  // A chunk is a candidate only if its conversation resolved inside this org
+  // and the caller may see it. Blocked: private to another seat (engram#264)
+  // or a system conversation. No conversation at all: an orphan of a deleted
+  // conversation, or something hydration should never have returned; either
+  // way its text is not a result (engram#452), which is also how a
+  // cross-tenant row would be stopped, had one ever reached chunkMap.
+  const visible = (chunk: ChunkRow | undefined): chunk is ChunkRow =>
+    !!chunk && !blockedConvIds.has(chunk.conversation_id) && convMeta.has(chunk.conversation_id);
+
+  // Fuse the two lists into one score per chunk. Semantic hits are measured
+  // against the best hit the caller can see, never against a hidden one, so
+  // a score says nothing about what else is in the index.
+  const fused = new Map<string, number>();
+  const semanticHits: { chunkId: string; similarity: number; rank: number }[] = [];
+  for (const [vecId, rank] of vectorRank) {
+    const chunkId = vecIdToChunkId.get(vecId);
+    if (!chunkId || !visible(chunkMap.get(chunkId))) continue;
+    semanticHits.push({ chunkId, similarity: vectorMatches[rank].score, rank });
+  }
+  const bestSimilarity = semanticHits.reduce((best, h) => Math.max(best, h.similarity), 0);
+  for (const h of semanticHits) {
+    fused.set(h.chunkId, (fused.get(h.chunkId) ?? 0) + semanticContribution(h.similarity, bestSimilarity, h.rank));
+  }
+  for (const [chunkId, rank] of ftsRank) {
+    if (!visible(chunkMap.get(chunkId))) continue;
+    fused.set(chunkId, (fused.get(chunkId) ?? 0) + 1 / (RRF_K + rank));
+  }
+
+  // Normalise, then apply the two boosts: recency and title match.
+  const terms = titleTerms(query);
   let results: SearchResult[] = [];
-  for (const [chunkId, rawScore] of rrfScores) {
+  for (const [chunkId, rawScore] of fused) {
     const chunk = chunkMap.get(chunkId);
-    if (!chunk) continue;
-    if (blockedConvIds.has(chunk.conversation_id)) continue; // private to another seat (engram#264)
+    if (!visible(chunk)) continue;
     const meta = convMeta.get(chunk.conversation_id);
-    // No conversation resolved inside this org means the chunk is an orphan
-    // of a deleted conversation, or something hydration should never have
-    // returned. Either way its text is not a result (engram#452). Until now
-    // such chunks passed through with no title — which is also how a
-    // cross-tenant row would have surfaced, had one ever reached chunkMap.
     if (!meta) continue;
-    const titleHit =
-      !!meta.title &&
-      terms.some((t) => meta.title.toLowerCase().includes(t));
     const boosted =
       (rawScore / RRF_MAX) *
       recencyMultiplier(meta.updatedAt) *
-      (titleHit ? TITLE_BOOST : 1);
+      titleMultiplier(meta.title, terms);
     results.push({
       chunk_id: chunk.id,
       conversation_id: chunk.conversation_id,
@@ -332,9 +405,12 @@ export async function searchConversations(
   // Sort by score descending
   results.sort((a, b) => b.score - a.score);
 
-  // Drop results below the minimum relevance threshold
-  if (minScore > 0) {
-    results = results.filter((r) => r.score >= minScore);
+  // Drop results below the minimum relevance threshold. A search scoped to
+  // one conversation has no default threshold: the caller is reading through
+  // that conversation and wants its best chunks, however far behind the first.
+  const floor = minScore ?? (conversationId ? 0 : DEFAULT_MIN_SCORE);
+  if (floor > 0) {
+    results = results.filter((r) => r.score >= floor);
   }
 
   // Filter by tags
@@ -371,23 +447,39 @@ export async function searchConversations(
     });
   }
 
-  const page = results.slice(0, limit);
-
-  // A row whose text lives only in R2 (engram#384) carries '' in
-  // chunk_text, so its snippet above is empty. Fetch the text for the rows
-  // actually returned — never for the whole candidate set. A copy that
+  // Fill the page. A row whose text lives only in R2 (engram#384) carries ''
+  // in chunk_text, so its snippet above is empty: fetch the text for the rows
+  // about to be returned, never for the whole candidate set. A copy that
   // cannot be read degrades to the summary rather than failing the search.
-  const inR2 = page
-    .map((r) => chunkMap.get(r.chunk_id))
-    .filter((row): row is ChunkRow => !!row && isTextInR2Only(row));
-  if (inR2.length > 0) {
-    const texts = await loadChunkTexts(env, inR2);
-    for (const r of page) {
+  //
+  // With the text in hand, a result that repeats an earlier result word for
+  // word is dropped and the next candidate takes its place: the same session
+  // saved twice should not take two places on the page. A row whose text
+  // could not be read is kept.
+  const page: SearchResult[] = [];
+  const seenText = new Set<string>();
+  let cursor = 0;
+  for (let round = 0; round < PAGE_FILL_ROUNDS && page.length < limit && cursor < results.length; round++) {
+    const batch = results.slice(cursor, cursor + (limit - page.length));
+    cursor += batch.length;
+    const inR2 = batch
+      .map((r) => chunkMap.get(r.chunk_id))
+      .filter((row): row is ChunkRow => !!row && isTextInR2Only(row));
+    const texts = inR2.length > 0 ? await loadChunkTexts(env, inR2) : new Map<string, string>();
+    for (const r of batch) {
       const row = chunkMap.get(r.chunk_id);
-      if (!row || !isTextInR2Only(row)) continue;
-      const text = texts.get(row.id);
-      r.chunk_text =
-        text !== undefined ? truncateSnippet(text, cappedSnippet) : (row.chunk_summary ?? "");
+      if (!row) continue;
+      let text: string | undefined = row.chunk_text;
+      if (isTextInR2Only(row)) {
+        text = texts.get(row.id);
+        r.chunk_text =
+          text !== undefined ? truncateSnippet(text, cappedSnippet) : (row.chunk_summary ?? "");
+      }
+      if (dedupe && text) {
+        if (seenText.has(text)) continue;
+        seenText.add(text);
+      }
+      page.push(r);
     }
   }
 

@@ -13,7 +13,9 @@
     "db:migrate:local": "wrangler d1 migrations apply engram-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply engram-db --remote",
     "seed": "node --loader tsx scripts/seed.ts",
-    "seed:demo": "node --loader tsx scripts/seed-demo.ts"
+    "seed:demo": "node --loader tsx scripts/seed-demo.ts",
+    "bench:search": "BENCH_REPORT=1 vitest run --project d1 search-relevance --silent=false --reporter=verbose",
+    "bench:record": "tsx scripts/record-search-bench.ts"
   },
   "dependencies": {
     "@getengram/db": "workspace:*",

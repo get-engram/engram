@@ -1,0 +1,8 @@
+# Used only by scripts/record-search-bench.ts: a Workers AI binding and
+# nothing else, so recording embeddings never touches the database, the
+# buckets or the vector index.
+name = "engram-search-bench-recorder"
+compatibility_date = "2024-12-01"
+
+[ai]
+binding = "AI"

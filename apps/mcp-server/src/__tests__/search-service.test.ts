@@ -20,7 +20,8 @@ describe("search recall helpers (#215)", () => {
     const stale = recencyMultiplier(old);
     expect(recent).toBeGreaterThan(stale);
     expect(recent).toBeGreaterThan(1);
-    expect(recent).toBeLessThanOrEqual(1.5);
+    // A tie-breaker, not an override (engram#758): it was 1.5.
+    expect(recent).toBeLessThanOrEqual(1.08);
     expect(stale).toBeGreaterThanOrEqual(1);
   });
 

@@ -132,8 +132,10 @@ export const TIER_LIMITS: Record<Tier, {
     conversations: -1,
     seats: 1,
     api_keys: -1,
-    webhooks: false,
-    usage_dashboard: false,
+    // Every paid plan has both (engram#766). What Team adds is seats and
+    // shared, pooled memory, not these.
+    webhooks: true,
+    usage_dashboard: true,
   },
   // Identical to pro by design — see the Tier comment above.
   student: {
@@ -144,8 +146,8 @@ export const TIER_LIMITS: Record<Tier, {
     conversations: -1,
     seats: 1,
     api_keys: -1,
-    webhooks: false,
-    usage_dashboard: false,
+    webhooks: true,
+    usage_dashboard: true,
   },
   team: {
     storage_messages: 1_000_000, // per seat, pooled across the org

@@ -81,14 +81,14 @@ usage.get("/", async (c) => {
   });
 });
 
-// Usage history (Team+ only)
+// Usage history (paid plans, engram#766)
 usage.get("/history", async (c) => {
   const auth = c.get("auth");
 
   if (!checkFeatureAccess(auth.tier, "usage_dashboard")) {
     return c.json({
       error: "feature_not_available",
-      message: "Usage dashboard is available on Team and Enterprise plans.",
+      message: "The usage dashboard is available on paid plans. Upgrade at https://getengram.app/pricing",
       tier: auth.tier,
     }, 403);
   }

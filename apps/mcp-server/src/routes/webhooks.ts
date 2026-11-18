@@ -15,7 +15,8 @@ type HonoEnv = { Bindings: Env; Variables: { auth: AuthContext } };
 
 const webhooks = new Hono<HonoEnv>();
 
-// Gate: webhooks are Team+ only, and owner-only within the org (the #441
+// Gate: webhooks are for paid plans (engram#766; they were Team and up
+// before that), and owner-only within the org (the #441
 // floor). A webhook is org-wide integration config: it is told about every
 // seat's activity, and its URL routinely carries the receiver's own secret.
 //
@@ -27,7 +28,7 @@ webhooks.use("*", async (c, next) => {
   if (!checkFeatureAccess(auth.tier, "webhooks")) {
     return c.json({
       error: "feature_not_available",
-      message: "Webhooks are available on Team and Enterprise plans. Upgrade at https://getengram.app/pricing",
+      message: "Webhooks are available on paid plans. Upgrade at https://getengram.app/pricing",
       tier: auth.tier,
     }, 403);
   }

@@ -29,7 +29,9 @@ import { unsubscribeUrl } from "../services/secrets.js";
 import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
 import { priceToTier } from "../services/stripe.js";
 import { findPriceByLookupKey, createRecurringPrice, createOneTimePrice, deactivatePrice, reconcileProduct } from "../services/stripe.js";
-import { computeMrr } from "../services/mrr.js";
+import { readSubscriptions } from "../services/mrr.js";
+import { holdsSubscription, summarizeAnnualPlans } from "../services/annual-plans.js";
+import { loadSales } from "../services/sales.js";
 import type { StripePrice } from "../services/stripe.js";
 import {
   BLACK_FRIDAY_ENDS_AT_MS,
@@ -63,7 +65,7 @@ export const admin = new Hono<AdminEnv>();
 // the page down (engram-web#274).
 // ---------------------------------------------------------------------------
 admin.get("/metrics", async (c) => {
-  const [{ fast, slow }, mrr] = await Promise.all([
+  const [{ fast, slow }, subscriptions, sales] = await Promise.all([
     (async () => {
       // Sequential on purpose: one D1 request in flight per call, not eight.
       const fast = await loadFastMetrics(c.env.DB);
@@ -72,11 +74,23 @@ admin.get("/metrics", async (c) => {
     })(),
     // Live MRR from Stripe. Shared with the daily report so the email and the
     // dashboard cannot drift apart — see services/mrr.ts for the at-risk logic.
-    computeMrr(c.env),
+    readSubscriptions(c.env),
+    // Every payment to date, from Stripe, kept for a minute (services/sales.ts).
+    loadSales(c.env),
   ]);
+  const mrr = subscriptions.mrr;
 
   return c.json({
     mrr,
+    // Accounts that paid once for a year (engram#768). The admin page counts
+    // paying customers as committed subscriptions plus these, so
+    // `also_monthly` is measured against the committed ones: an account
+    // holding both is counted once.
+    annual: summarizeAnnualPlans(
+      fast.annual_plans,
+      holdsSubscription(subscriptions.committedCustomers),
+    ),
+    sales,
     signups: fast.signups,
     active_users_30d: fast.active_users_30d,
     activation: slow.activation,
@@ -195,6 +209,13 @@ admin.get("/users", async (c) => {
       o.messages_stored_total,
       o.maxout_nudged_at,
       o.digest_opt_out,
+      -- When the account's prepaid plan runs out (engram#768): set only
+      -- while a plan it paid for is what puts it on its tier. One probe of
+      -- idx_prepaid_plans_org per account.
+      (
+        SELECT MAX(p.ends_at) FROM prepaid_plans p
+        WHERE p.org_id = o.id AND p.tier = o.tier AND p.ends_at > datetime('now')
+      ) as annual_ends_at,
       COUNT(c.id) as conversations,
       COALESCE(SUM(c.message_count), 0) as total_messages
     FROM organizations o
@@ -216,6 +237,7 @@ admin.get("/users", async (c) => {
       created_at: string;
       cancel_at_period_end: number;
       churned_at: string | null;
+      annual_ends_at: string | null;
       conversations: number;
       total_messages: number;
     }>();

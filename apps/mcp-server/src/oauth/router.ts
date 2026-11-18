@@ -123,6 +123,38 @@ export function normalizeClientName(raw: unknown): string | null {
   return cleaned.length > CLIENT_NAME_MAX ? cleaned.slice(0, CLIENT_NAME_MAX) : cleaned;
 }
 
+/** The one redirect URI Claude's hosted apps (web, desktop, mobile) register. */
+export const CLAUDE_APPS_CALLBACK = "https://claude.ai/api/mcp/auth_callback";
+
+/**
+ * referral_source for an org created during OAuth approval: the client's
+ * name, lowercased and hyphenated ("ChatGPT" -> "chatgpt"), "oauth" when it
+ * gave none.
+ *
+ * One exception (engram#761). Since the Claude connector directory listing
+ * went live on 2026-11-17, a new account arriving through the Claude apps'
+ * client is recorded as "claude-directory". That client is identified by its
+ * name AND by having exactly the claude.ai callback registered: the name
+ * alone is self-asserted (anyone can call themselves "Claude" with a
+ * callback of their own, and other tools register with the claude.ai
+ * callback under their own names), while an authorization code can only
+ * ever be delivered to a registered URI.
+ *
+ * This is an inference, not a fact the server is told: a directory connect
+ * and a custom connector added by URL register identically. Before the
+ * listing existed exactly one account was ever created this way, so the
+ * label is right for nearly all of them, but a custom-connector signup made
+ * after this shipped carries it too. Claude Code registers under its own
+ * name with a loopback callback and keeps its "claude-code-..." label.
+ */
+export function oauthReferralSource(clientName: string | null, redirectUris: readonly string[]): string {
+  const source = (clientName || "oauth").toLowerCase().replace(/\s+/g, "-");
+  if (source === "claude" && redirectUris.length === 1 && redirectUris[0] === CLAUDE_APPS_CALLBACK) {
+    return "claude-directory";
+  }
+  return source;
+}
+
 /**
  * Record which Supabase user an org belongs to (migration 0040). Until this
  * existed the connector path discarded `sub` and kept only the email string,
@@ -366,9 +398,7 @@ oauth.post("/authorize/approve", async (c) => {
     await recordIdentity(c.env.DB, orgId, claims.sub, email);
   } else {
     orgId = generateId("org");
-    // Derive referral source from the OAuth client name (e.g. "ChatGPT",
-    // "Cursor", "Claude Desktop") — lowercase, fallback to "oauth".
-    const ref = (client.client_name || "oauth").toLowerCase().replace(/\s+/g, "-");
+    const ref = oauthReferralSource(client.client_name, allowedUris);
     await insertOrganizationWithEmail(c.env.DB, orgId, email.split("@")[0], email, ref, requestCountry(c.req.raw));
     // Before the welcome seed, which sets messages_stored_total = 1 and would
     // otherwise gate this very user on a retry of a half-finished connect.

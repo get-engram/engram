@@ -123,8 +123,8 @@ searchable from the others:
 | [Cursor](./cursor.md) | Automatic, verbatim (local) |
 | [Claude Desktop](./claude-desktop.md) | On request (MCP) |
 | ChatGPT | On request + bulk import |
-| [Windsurf](./windsurf.md) | On request (MCP) |
-| [Codex CLI](./codex.md) | On request (MCP) |
+| [Windsurf](https://getengram.app/docs/guides/windsurf) | On request (MCP) |
+| [Codex CLI](https://getengram.app/docs/guides/codex) | On request (MCP) |
 
 ## Troubleshooting
 

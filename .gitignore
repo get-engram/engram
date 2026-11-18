@@ -8,9 +8,8 @@ dist/
 *.tsbuildinfo
 .env
 supabase/.temp/
-.claude/*
-!.claude/skills/
-docs/launch/handoff/
+.claude/
+docs/launch/
 supabase/.temp/
 mcpb/node_modules/
 mcpb/*.mcpb

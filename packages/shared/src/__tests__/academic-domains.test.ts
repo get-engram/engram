@@ -16,7 +16,7 @@ describe("emailDomain", () => {
 });
 
 describe("isAcademicEmail", () => {
-  it("accepts the address that prompted this feature", () => {
+  it("accepts the subdomain that prompted this feature", () => {
     // A flat allowlist would likely have missed this subdomain.
     expect(isAcademicEmail("student@leomail.tamuc.edu")).toBe(true);
   });

@@ -15,6 +15,8 @@ export interface Env {
   STRIPE_WEBHOOK_SECRET: string;
   STRIPE_PRICE_ID_PRO: string;
   STRIPE_PRICE_ID_TEAM: string;
+  /** Black Friday 2026: Pro at $27/year (engram#763). Unset = offer not sold. */
+  STRIPE_PRICE_ID_PRO_ANNUAL_BF?: string;
   STRIPE_PRICE_ID_STUDENT: string;
   /** Team at academic pricing — used when the org has a verified university email. */
   STRIPE_PRICE_ID_EDU_TEAM: string;

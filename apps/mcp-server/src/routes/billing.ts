@@ -9,8 +9,6 @@ import {
 } from "@getengram/db";
 import { TIER_LIMITS } from "@getengram/shared";
 import {
-  createCheckoutSession,
-  createOrGetCustomer,
   createPortalSession,
   priceToTier,
   verifyWebhookSignature,
@@ -18,6 +16,13 @@ import {
   resolvePlanPrice,
 } from "../services/stripe.js";
 import { bindStripeCustomer, resolveCachedCustomer } from "../services/stripe-customer.js";
+import { checkoutForOrg } from "../services/checkout.js";
+import {
+  BLACK_FRIDAY,
+  blackFridayState,
+  offerClosedBody,
+  offerSessionExpiry,
+} from "../services/black-friday.js";
 import { websiteBearer } from "../services/secrets.js";
 import { denyUnlessOwner } from "./guards.js";
 import type { Env, AuthContext } from "../types.js";
@@ -123,8 +128,38 @@ billing.post("/checkout", async (c) => {
       cancel_url?: string;
       plan?: "pro" | "team" | "student";
       quantity?: number;
+      offer?: string;
     }>()
     .catch(() => ({}) as Record<string, never>);
+
+  // Black Friday 2026 (engram#763): Pro billed $27 a year. The price and the
+  // deadline are decided here; the request only names the offer.
+  if (body.offer !== undefined) {
+    if (body.offer !== BLACK_FRIDAY) {
+      return c.json({ error: "unknown_offer", message: "That offer does not exist." }, 400);
+    }
+    const offer = blackFridayState(c.env);
+    if (!offer.open) {
+      return c.json(offerClosedBody(offer.reason), offer.reason === "offer_ended" ? 410 : 503);
+    }
+    const outcome = await checkoutForOrg(c.env, auth.organizationId, {
+      priceId: offer.priceId,
+      successUrl: `${c.env.APP_URL}/upgrade/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancelUrl: `${c.env.APP_URL}/black-friday?upgrade=cancelled`,
+      expiresAt: offerSessionExpiry(),
+      allowPromotionCodes: false,
+      offer: BLACK_FRIDAY,
+    });
+    if (outcome.kind === "error") return c.json(outcome.body, outcome.status);
+    if (outcome.kind === "already_subscribed") {
+      const portal = await createPortalSession(c.env.STRIPE_SECRET_KEY, {
+        customerId: outcome.customerId,
+        returnUrl: `${c.env.APP_URL}/dashboard`,
+      });
+      return c.json({ url: portal.url, already_subscribed: true, plan: "pro" });
+    }
+    return c.json({ url: outcome.url, session_id: outcome.sessionId, plan: "pro", offer: BLACK_FRIDAY });
+  }
 
   const requested =
     body.plan === "team" ? "team" : body.plan === "student" ? "student" : "pro";
@@ -161,71 +196,6 @@ billing.post("/checkout", async (c) => {
     );
   }
 
-  const org = (await getOrganizationById(c.env.DB, auth.organizationId)) as
-    | { id: string; email: string | null; stripe_customer_id: string | null }
-    | null;
-  if (!org) return c.json({ error: "organization_not_found" }, 404);
-  if (!org.email) {
-    return c.json(
-      {
-        error: "missing_email",
-        message:
-          "Organization has no email on file. Contact support to attach one.",
-      },
-      400,
-    );
-  }
-
-  // Ensure a Stripe customer exists and is cached on the org row. The cached
-  // one must be this org's own (engram#443): a foreign or vanished customer is
-  // unlinked and replaced, never checked out against.
-  const cached = await resolveCachedCustomer(c.env, org);
-  let customerId: string | null = cached.ok ? cached.customerId : null;
-  if (!customerId) {
-    const customer = await createOrGetCustomer(
-      c.env.STRIPE_SECRET_KEY,
-      org.email,
-      org.id,
-    );
-    customerId = customer.id;
-    // Refused when another org already holds this customer (engram#536):
-    // never create a checkout session against a customer that is not
-    // provably this org's alone.
-    if ((await bindStripeCustomer(c.env.DB, org.id, customerId)) === "conflict") {
-      return c.json(
-        {
-          error: "stripe_customer_conflict",
-          message:
-            "This billing identity is already attached to another organization. Contact support.",
-        },
-        409,
-      );
-    }
-  }
-
-  // One subscription per customer. If they already have any active or
-  // trialing subscription, send them to the billing portal to manage it.
-  // Without the trialing check, a user who starts a free trial and comes
-  // back the next day would bypass this guard and create a duplicate.
-  if (customerId) {
-    for (const status of ["active", "trialing"] as const) {
-      const subsRes = await fetch(
-        `https://api.stripe.com/v1/subscriptions?customer=${encodeURIComponent(customerId)}&status=${status}&limit=1`,
-        { headers: { Authorization: `Bearer ${c.env.STRIPE_SECRET_KEY}` } },
-      );
-      if (subsRes.ok) {
-        const subs = (await subsRes.json()) as { data: unknown[] };
-        if (subs.data.length > 0) {
-          const portal = await createPortalSession(c.env.STRIPE_SECRET_KEY, {
-            customerId,
-            returnUrl: `${c.env.APP_URL}/dashboard`,
-          });
-          return c.json({ url: portal.url, already_subscribed: true, plan });
-        }
-      }
-    }
-  }
-
   const successUrl =
     body.success_url ||
     `${c.env.APP_URL}/upgrade/success?session_id={CHECKOUT_SESSION_ID}`;
@@ -242,18 +212,27 @@ billing.post("/checkout", async (c) => {
   // says: more than one person sharing a memory.
   const quantity = Math.max(minSeats, body.quantity ?? minSeats);
 
-  const session = await createCheckoutSession(c.env.STRIPE_SECRET_KEY, {
-    customerId,
+  // The org's Stripe customer, the one-subscription guard and the session:
+  // services/checkout.ts.
+  const outcome = await checkoutForOrg(c.env, auth.organizationId, {
     priceId,
     quantity,
     adjustableQuantity: plan === "team",
     minQuantity: plan === "team" ? minSeats : undefined,
     successUrl,
     cancelUrl,
-    organizationId: org.id,
   });
+  if (outcome.kind === "error") return c.json(outcome.body, outcome.status);
+  if (outcome.kind === "already_subscribed") {
+    // Already subscribed: the billing portal is where a plan is managed.
+    const portal = await createPortalSession(c.env.STRIPE_SECRET_KEY, {
+      customerId: outcome.customerId,
+      returnUrl: `${c.env.APP_URL}/dashboard`,
+    });
+    return c.json({ url: portal.url, already_subscribed: true, plan });
+  }
 
-  return c.json({ url: session.url, session_id: session.id, plan });
+  return c.json({ url: outcome.url, session_id: outcome.sessionId, plan });
 });
 
 // POST /api/billing/portal

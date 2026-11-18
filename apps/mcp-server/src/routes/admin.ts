@@ -30,6 +30,13 @@ import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
 import { priceToTier } from "../services/stripe.js";
 import { findPriceByLookupKey, createRecurringPrice, reconcileProduct } from "../services/stripe.js";
 import { computeMrr } from "../services/mrr.js";
+import { getPrice, type StripePrice } from "../services/stripe.js";
+import {
+  BLACK_FRIDAY_ENDS_AT_MS,
+  BLACK_FRIDAY_LOOKUP_KEY,
+  BLACK_FRIDAY_UNIT_AMOUNT,
+} from "../services/black-friday.js";
+import { runBlackFridayCampaign } from "../services/black-friday-campaign.js";
 import {
   ADMIN_TZ_OFFSET,
   loadFastMetrics,
@@ -653,6 +660,92 @@ admin.post("/stripe/ensure-edu-team-price", async (c) => {
     console.error(`[admin] ensure-edu-team-price failed: ${message}`);
     return c.json({ error: "stripe_error", message }, 502);
   }
+});
+
+// ---------------------------------------------------------------------------
+// POST /admin/stripe/ensure-black-friday-price — Pro at $27/year (engram#763)
+//
+// A second price on the PRO product, so Checkout and the receipt say
+// "Engram Pro" and nothing else about the plan changes. Idempotent by
+// lookup key; never touches the monthly price. The returned id has to be set
+// as the STRIPE_PRICE_ID_PRO_ANNUAL_BF secret: until then the offer is not
+// sold, and after it priceToTier grants Pro for it.
+// ---------------------------------------------------------------------------
+admin.post("/stripe/ensure-black-friday-price", async (c) => {
+  const secretKey = c.env.STRIPE_SECRET_KEY;
+  if (!secretKey) return c.json({ error: "stripe_not_configured" }, 500);
+  if (!c.env.STRIPE_PRICE_ID_PRO) return c.json({ error: "pro_price_not_configured" }, 500);
+
+  try {
+    const describe = (price: StripePrice) => ({
+      price_id: price.id,
+      unit_amount: price.unit_amount,
+      currency: price.currency,
+      interval: price.recurring?.interval ?? null,
+      livemode: price.livemode,
+      product: price.product,
+      ends_at: new Date(BLACK_FRIDAY_ENDS_AT_MS).toISOString(),
+    });
+    const existing = await findPriceByLookupKey(secretKey, BLACK_FRIDAY_LOOKUP_KEY);
+    if (existing) {
+      return c.json({
+        created: false,
+        ...describe(existing),
+        configured: c.env.STRIPE_PRICE_ID_PRO_ANNUAL_BF === existing.id,
+      });
+    }
+    const pro = await getPrice(secretKey, c.env.STRIPE_PRICE_ID_PRO);
+    const price = await createRecurringPrice(secretKey, {
+      productId: pro.product,
+      productName: "Engram Pro",
+      productDescription: "",
+      tier: "pro",
+      unitAmount: BLACK_FRIDAY_UNIT_AMOUNT,
+      interval: "year",
+      lookupKey: BLACK_FRIDAY_LOOKUP_KEY,
+      nickname: "Pro annual, Black Friday 2026",
+    });
+    return c.json({
+      created: true,
+      ...describe(price),
+      configured: false,
+      next_step: "wrangler secret put STRIPE_PRICE_ID_PRO_ANNUAL_BF",
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[admin] ensure-black-friday-price failed: ${message}`);
+    return c.json({ error: "stripe_error", message }, 502);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /admin/campaigns/black-friday — the Black Friday email (engram#763)
+//
+// Body: { dry_run: true } counts who is still owed the email and sends
+// nothing. { test_to, test_org } sends one copy and records nothing.
+// { send: true, limit } sends the next batch (20 by default, 50 at most).
+// Anything else is refused, so an empty or mistyped body cannot send mail.
+// ---------------------------------------------------------------------------
+admin.post("/campaigns/black-friday", async (c) => {
+  const body = await c.req
+    .json<{ dry_run?: unknown; send?: unknown; limit?: unknown; test_to?: unknown; test_org?: unknown }>()
+    .catch(() => ({}) as Record<string, undefined>);
+  const isTest = body.test_to !== undefined || body.test_org !== undefined;
+  const modes = [body.dry_run === true, body.send === true, isTest].filter(Boolean).length;
+  if (modes !== 1) {
+    return c.json(
+      { error: "bad_request", message: "Send exactly one of: dry_run: true, send: true, or test_to with test_org." },
+      400,
+    );
+  }
+  const result = await runBlackFridayCampaign(c.env, {
+    dryRun: body.dry_run === true,
+    limit: typeof body.limit === "number" ? body.limit : undefined,
+    testTo: typeof body.test_to === "string" ? body.test_to : isTest ? "" : undefined,
+    testOrg: typeof body.test_org === "string" ? body.test_org : isTest ? "" : undefined,
+  });
+  if ("error" in result) return c.json({ error: result.error, message: result.message }, result.status);
+  return c.json(result);
 });
 
 admin.post("/stripe/ensure-student-price", async (c) => {

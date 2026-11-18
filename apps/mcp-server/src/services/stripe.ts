@@ -63,6 +63,11 @@ export interface StripePrice {
   recurring: { interval: string } | null;
 }
 
+/** One price by id: which product it belongs to. Throws when Stripe has none. */
+export function getPrice(secretKey: string, priceId: string): Promise<StripePrice> {
+  return stripeFetch<StripePrice>(secretKey, `/prices/${encodeURIComponent(priceId)}`);
+}
+
 export async function findPriceByLookupKey(
   secretKey: string,
   lookupKey: string,
@@ -125,18 +130,29 @@ export async function createRecurringPrice(
      * where `team_monthly` means the superseded amount.
      */
     transferLookupKey?: boolean;
+    /** Billing period. Every plan is monthly except a yearly offer. */
+    interval?: "month" | "year";
+    /**
+     * Put the price on this existing product instead of creating one, so a
+     * second price for the same plan shows the customer the same plan name.
+     */
+    productId?: string;
   },
 ): Promise<StripePrice> {
-  const product = await stripeFetch<{ id: string }>(secretKey, `/products`, {
-    name: params.productName,
-    description: params.productDescription,
-    "metadata[tier]": params.tier,
-  });
+  const productId =
+    params.productId ??
+    (
+      await stripeFetch<{ id: string }>(secretKey, `/products`, {
+        name: params.productName,
+        description: params.productDescription,
+        "metadata[tier]": params.tier,
+      })
+    ).id;
   return stripeFetch<StripePrice>(secretKey, `/prices`, {
-    product: product.id,
+    product: productId,
     unit_amount: params.unitAmount,
     currency: params.currency ?? "usd",
-    "recurring[interval]": "month",
+    "recurring[interval]": params.interval ?? "month",
     lookup_key: params.lookupKey,
     ...(params.transferLookupKey ? { transfer_lookup_key: "true" } : {}),
     nickname: params.nickname,
@@ -166,11 +182,16 @@ export function priceToTier(
     STRIPE_PRICE_ID_TEAM?: string;
     STRIPE_PRICE_ID_STUDENT?: string;
     STRIPE_PRICE_ID_EDU_TEAM?: string;
+    STRIPE_PRICE_ID_PRO_ANNUAL_BF?: string;
   },
   priceId: string | undefined,
 ): "pro" | "student" | "team" | null {
   if (!priceId) return null;
   if (priceId === env.STRIPE_PRICE_ID_PRO) return "pro";
+  // Black Friday 2026 (engram#763): Pro billed $27 a year. The same tier at
+  // a different price, exactly like Education Team below. Without this line
+  // someone who paid for the offer would stay on Free.
+  if (priceId === env.STRIPE_PRICE_ID_PRO_ANNUAL_BF) return "pro";
   if (priceId === env.STRIPE_PRICE_ID_TEAM) return "team";
   if (priceId === env.STRIPE_PRICE_ID_STUDENT) return "student";
   // Education Team is the TEAM tier at an academic price — deliberately not a
@@ -325,6 +346,15 @@ export async function createCheckoutSession(
     successUrl: string;
     cancelUrl: string;
     organizationId: string;
+    /**
+     * Unix seconds after which the session can no longer be paid. Stripe
+     * wants it 30 minutes to 24 hours from now. Unset = Stripe's 24 hours.
+     */
+    expiresAt?: number;
+    /** False for an offer that is already a discount. Default: codes allowed. */
+    allowPromotionCodes?: boolean;
+    /** Stamped on the session and the subscription, e.g. which offer sold it. */
+    offer?: string;
   },
 ): Promise<CheckoutSession> {
   const body: Record<string, string | number> = {
@@ -336,9 +366,15 @@ export async function createCheckoutSession(
     cancel_url: params.cancelUrl,
     "metadata[organization_id]": params.organizationId,
     "subscription_data[metadata][organization_id]": params.organizationId,
-    allow_promotion_codes: "true",
     billing_address_collection: "auto",
   };
+  // Left out when false: without the field Stripe shows no promotion-code box.
+  if (params.allowPromotionCodes !== false) body.allow_promotion_codes = "true";
+  if (params.expiresAt) body.expires_at = params.expiresAt;
+  if (params.offer) {
+    body["metadata[offer]"] = params.offer;
+    body["subscription_data[metadata][offer]"] = params.offer;
+  }
   if (params.adjustableQuantity) {
     body["line_items[0][adjustable_quantity][enabled]"] = "true";
     // Without this the customer could drop the picker back to 1 inside

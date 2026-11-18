@@ -86,6 +86,35 @@ export async function unsubscribeUrl(env: Env, orgId: string): Promise<string | 
   return key === null ? null : signedLink(orgId, key);
 }
 
+/** What an offer link's signature covers: the offer and the org it was mailed to. */
+function signedOffer(offer: string, orgId: string): Uint8Array {
+  return new TextEncoder().encode(`offer:${offer}:${orgId}`);
+}
+
+/**
+ * The signature in an emailed offer link (engram#763), so the person it was
+ * mailed to can start checkout for their account without signing in. Signed
+ * with the unsubscribe key over a different message (`offer:<offer>:<org>`
+ * against `digest:<org>`), so neither kind of link can stand in for the
+ * other. Null when no signing key is set.
+ */
+export async function offerSig(env: Env, offer: string, orgId: string): Promise<string | null> {
+  const key = signingKey(env);
+  if (key === null) return null;
+  const mac = await crypto.subtle.sign("HMAC", await hmacKey(key, "sign"), signedOffer(offer, orgId));
+  return Array.from(new Uint8Array(mac), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Whether `sig` signs an offer link for `orgId`. Constant-time; current key only. */
+export async function offerSigValid(env: Env, offer: string, orgId: string, sig: string): Promise<boolean> {
+  if (!/^[0-9a-f]{64}$/.test(sig)) return false;
+  const key = signingKey(env);
+  if (key === null) return false;
+  const mac = new Uint8Array(32);
+  for (let i = 0; i < mac.length; i++) mac[i] = parseInt(sig.slice(i * 2, i * 2 + 2), 16);
+  return crypto.subtle.verify("HMAC", await hmacKey(key, "verify"), mac, signedOffer(offer, orgId));
+}
+
 /** What the worker needs to ask engram-web for a lifecycle email. */
 export interface LifecycleMail {
   /** For the Authorization header. */
@@ -119,6 +148,7 @@ export const UNSUBSCRIBE_LINK_EMAILS: readonly string[] = [
   "maxout-nudge",
   "recall-nudge",
   "plan-changed",
+  "black-friday",
 ];
 
 /**

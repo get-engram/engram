@@ -14,12 +14,48 @@ import type { Env } from "../types.js";
  * batch, the activation funnel + chunk count come from a ten-minute cache
  * that serves its last good figures when D1 refuses the recompute, and the
  * JSON shape the admin page / daily report / stats skill read is unchanged.
+ * engram#768 added two fields beside `mrr`: `annual` and `sales`.
  */
 
 const MRR = { total_cents: 900, external_cents: 0, at_risk_cents: 0, customers: 1 };
 vi.mock("../services/mrr.js", () => ({
-  computeMrr: vi.fn(async () => MRR),
+  readSubscriptions: vi.fn(async () => ({
+    mrr: MRR,
+    // cus_both subscribes and is staying; cus_leaving subscribes and is
+    // scheduled to cancel, so the page's monthly count has dropped it.
+    externalCustomers: new Set(["cus_both", "cus_leaving"]),
+    committedCustomers: new Set(["cus_both"]),
+  })),
 }));
+
+const SALES = {
+  available: true,
+  external_cents: 12_300,
+  external_payments: 9,
+  external_customers: 5,
+  refunded_cents: 900,
+  internal_cents: 1_800,
+  internal_payments: 1,
+  first_paid_at: "2026-07-01T00:00:00.000Z",
+  disputed_payments: 0,
+  disputed_cents: 0,
+  other_currency_payments: 0,
+  computed_at: "2026-11-18T12:00:00.000Z",
+};
+vi.mock("../services/sales.js", () => ({
+  loadSales: vi.fn(async () => SALES),
+}));
+
+/** One running prepaid plan, as services/annual-plans.ts reads it. */
+const plan = (org: string, customer: string, hasSubscriptionId: number, ends: string) => ({
+  org_id: org,
+  stripe_customer_id: customer,
+  has_subscription_id: hasSubscriptionId,
+  offer: "black-friday",
+  amount_total: 2700,
+  currency: "usd",
+  ends_at: ends,
+});
 
 type Stmt = { sql: string; bind: () => Stmt };
 
@@ -58,6 +94,13 @@ function fakeDb(st: DbState): D1Database {
       ];
     }
     if (/FROM conversation_chunks/.test(sql)) return [{ chunks: 1_054_509 }];
+    if (/FROM prepaid_plans/.test(sql)) {
+      return [
+        plan("org_plan", "cus_plan", 0, "2027-11-18 10:03:28"),
+        plan("org_both", "cus_both", 1, "2027-11-20 08:00:00"),
+        plan("org_leaving", "cus_leaving", 1, "2027-11-21 08:00:00"),
+      ];
+    }
     if (/COUNT\(\*\) as total/.test(sql)) return [{ total: st.total, last_1d: 1, last_7d: 3, last_30d: 7 }];
     if (/as active\b/.test(sql)) return [{ active: 4 }];
     if (/GROUP BY tier/.test(sql)) return [{ tier: "free", count: 8 }, { tier: "pro", count: 2 }];
@@ -103,6 +146,15 @@ const funnelAttempts = (st: DbState) => st.log.filter((s) => /AS connected/.test
 
 interface MetricsBody {
   mrr: typeof MRR;
+  annual: {
+    plans: number;
+    also_monthly: number;
+    cents: number;
+    by_offer: Record<string, number>;
+    next_end: string | null;
+    other_currency_payments: number;
+  };
+  sales: typeof SALES;
   signups: { total: number; last_1d: number; last_7d: number; last_30d: number };
   active_users_30d: number;
   activation: Record<string, number>;
@@ -155,10 +207,42 @@ describe("GET /admin/metrics (engram#551)", () => {
     });
     expect(typeof data.activation_computed_at).toBe("string");
 
-    // Seven cheap statements in one batch, then the two expensive ones in
+    // Eight cheap statements in one batch, then the two expensive ones in
     // another — never the old eight parallel requests.
-    expect(st.log).toHaveLength(9);
+    expect(st.log).toHaveLength(10);
     expect(st.maxInFlight).toBe(1);
+  });
+
+  it("reports prepaid plans beside MRR, marking the accounts the monthly count already holds (engram#768)", async () => {
+    const st = state();
+    const data = await body(await app(fakeDb(st))());
+
+    expect(data.annual).toEqual({
+      plans: 3,
+      // org_both only. org_leaving's subscription is scheduled to cancel, so
+      // the page's monthly count no longer holds it and its plan is what
+      // makes it a paying customer.
+      also_monthly: 1,
+      cents: 3 * 2700,
+      by_offer: { "black-friday": 3 },
+      next_end: "2027-11-18 10:03:28",
+      other_currency_payments: 0,
+    });
+    // Money paid once stays out of the recurring figure.
+    expect(data.mrr).toEqual(MRR);
+    // The plans ride in the cheap batch: no request of their own.
+    expect(st.log.filter((s) => /FROM prepaid_plans/.test(s))).toHaveLength(1);
+    expect(st.maxInFlight).toBe(1);
+  });
+
+  it("reports total sales to date as the sales reader gives them (engram#768)", async () => {
+    const data = await body(await app(fakeDb(state()))());
+    expect(data.sales).toEqual(SALES);
+  });
+
+  it("keeps Stripe customer ids inside the worker", async () => {
+    const res = await app(fakeDb(state()))();
+    expect(await res.text()).not.toMatch(/cus_/);
   });
 
   it("keeps the funnel one scan of organizations with per-org index probes (engram#553)", async () => {

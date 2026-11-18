@@ -1,4 +1,5 @@
 import type { Env } from "../types.js";
+import { describeError, listRows, StripeListTooLong } from "./stripe-list.js";
 
 export interface Mrr {
   /**
@@ -29,15 +30,8 @@ export function committedSubscriptions(m: Mrr): number {
   return Math.max(0, m.external_subscriptions - m.at_risk_subscriptions);
 }
 
-/** Stripe's largest page. */
-const PAGE_SIZE = 100;
 /** Safety stop: 20 pages is 2,000 active subscriptions. */
 const MAX_PAGES = 20;
-/** Bounds a hung request. Stripe answers this list in well under a second. */
-const STRIPE_TIMEOUT_MS = 10_000;
-/** A transient failure (network, timeout, 429, 5xx) gets one more try. */
-const STRIPE_ATTEMPTS = 2;
-const RETRY_DELAY_MS = 500;
 
 interface StripeSubscription {
   id: string;
@@ -55,46 +49,35 @@ interface StripeSubscription {
   };
 }
 
-interface StripePage {
-  data: StripeSubscription[];
-  has_more?: boolean;
-}
-
-function describe(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+/**
+ * Stripe customers that belong to the owner's own accounts. They are tagged
+ * referral_source='internal' (see POST /admin/comp-internal), so the
+ * exclusion stays data-driven and no personal emails live in the code.
+ * Throws when D1 does not answer: a figure computed without this list
+ * would count the owner as a customer.
+ */
+export async function loadInternalCustomers(db: D1Database): Promise<Set<string>> {
+  const { results } = await db
+    .prepare(
+      "SELECT stripe_customer_id FROM organizations WHERE stripe_customer_id IS NOT NULL AND referral_source = 'internal'",
+    )
+    .all<{ stripe_customer_id: string }>();
+  return new Set((results ?? []).map((r) => r.stripe_customer_id));
 }
 
 /**
- * One page of active subscriptions. Retries a transient failure once; a
- * refusal such as 401 is not retried, since it would only be refused again.
- * Throws with a short reason.
+ * What one read of Stripe's active subscriptions came to: the figures, and
+ * the customers behind two of them. A caller that also counts paying
+ * customers from somewhere else (prepaid plans, services/annual-plans.ts)
+ * uses the sets to leave out the ones already counted here. Both are empty
+ * when Stripe did not answer.
  */
-async function fetchPage(key: string, startingAfter: string | null): Promise<StripePage> {
-  const url = new URL("https://api.stripe.com/v1/subscriptions");
-  url.searchParams.set("status", "active");
-  url.searchParams.set("limit", String(PAGE_SIZE));
-  if (startingAfter) url.searchParams.set("starting_after", startingAfter);
-
-  let reason = "";
-  for (let attempt = 1; attempt <= STRIPE_ATTEMPTS; attempt++) {
-    if (attempt > 1) await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-    let res: Response;
-    try {
-      res = await fetch(url.toString(), {
-        headers: { Authorization: `Bearer ${key}` },
-        signal: AbortSignal.timeout(STRIPE_TIMEOUT_MS),
-      });
-    } catch (err) {
-      reason = `Stripe request failed: ${describe(err)}`;
-      continue;
-    }
-    if (res.ok) return (await res.json()) as StripePage;
-    reason = `Stripe answered ${res.status}`;
-    // Drain the body so the connection is released before any retry.
-    await res.text().catch(() => "");
-    if (res.status !== 429 && res.status < 500) break;
-  }
-  throw new Error(reason);
+export interface SubscriptionRead {
+  mrr: Mrr;
+  /** The real customers behind `mrr.external_subscriptions`. */
+  externalCustomers: ReadonlySet<string>;
+  /** Of those, the ones behind `committedSubscriptions(mrr)`: a subscription not scheduled to cancel. */
+  committedCustomers: ReadonlySet<string>;
 }
 
 function zeros(): Mrr {
@@ -109,15 +92,20 @@ function zeros(): Mrr {
   };
 }
 
-function unavailable(reason: string): Mrr {
+function unavailable(reason: string): SubscriptionRead {
   console.error(`[mrr] revenue unavailable: ${reason}`);
-  return { ...zeros(), error: reason };
+  return {
+    mrr: { ...zeros(), error: reason },
+    externalCustomers: new Set(),
+    committedCustomers: new Set(),
+  };
 }
 
 /**
- * Live MRR from Stripe. Sums active subscription items and normalizes yearly
- * plans to monthly, rather than trusting hardcoded tier prices — a comped or
- * legacy-priced account would otherwise be counted at list price.
+ * Live MRR from Stripe, with the customers it counted. Sums active
+ * subscription items and normalizes yearly plans to monthly, rather than
+ * trusting hardcoded tier prices — a comped or legacy-priced account would
+ * otherwise be counted at list price.
  *
  * `at_risk_*` covers subscriptions Stripe still reports as active but which
  * are already scheduled to cancel (either `cancel_at_period_end` or a
@@ -130,44 +118,37 @@ function unavailable(reason: string): Mrr {
  * zeros, which the daily report printed as "$0/mo committed from 0
  * customers" on a morning Stripe failed to answer once (engram#569).
  */
-export async function computeMrr(env: Env): Promise<Mrr> {
+export async function readSubscriptions(env: Env): Promise<SubscriptionRead> {
   if (!env.STRIPE_SECRET_KEY) return unavailable("no STRIPE_SECRET_KEY");
 
   const subs: StripeSubscription[] = [];
   try {
-    let startingAfter: string | null = null;
-    for (let page = 0; ; page++) {
-      if (page === MAX_PAGES) {
-        return unavailable(`more than ${MAX_PAGES * PAGE_SIZE} active subscriptions`);
-      }
-      const batch = await fetchPage(env.STRIPE_SECRET_KEY, startingAfter);
-      subs.push(...(batch.data ?? []));
-      const last = batch.data?.[batch.data.length - 1];
-      if (!batch.has_more || !last) break;
-      startingAfter = last.id;
-    }
+    const list = listRows<StripeSubscription>(
+      env.STRIPE_SECRET_KEY,
+      "/v1/subscriptions",
+      { status: "active" },
+      MAX_PAGES,
+    );
+    for await (const s of list) subs.push(s);
   } catch (err) {
-    return unavailable(describe(err));
+    if (err instanceof StripeListTooLong) {
+      return unavailable(`more than ${err.limit} active subscriptions`);
+    }
+    return unavailable(describeError(err));
   }
 
-  // Owner's own accounts are tagged referral_source='internal' (see
-  // POST /admin/comp-internal), so the exclusion stays data-driven and no
-  // personal emails live in the code. Without it every figure would count
-  // them as customers, so a failed lookup is a failed read.
+  // Without the owner's accounts taken out every figure would count them
+  // as customers, so a failed lookup is a failed read.
   let internalCustomers: Set<string>;
   try {
-    internalCustomers = new Set(
-      (
-        await env.DB.prepare(
-          "SELECT stripe_customer_id FROM organizations WHERE stripe_customer_id IS NOT NULL AND referral_source = 'internal'",
-        ).all<{ stripe_customer_id: string }>()
-      ).results?.map((r) => r.stripe_customer_id) ?? [],
-    );
+    internalCustomers = await loadInternalCustomers(env.DB);
   } catch (err) {
-    return unavailable(`internal-account lookup failed: ${describe(err)}`);
+    return unavailable(`internal-account lookup failed: ${describeError(err)}`);
   }
 
   const mrr = zeros();
+  const externalCustomers = new Set<string>();
+  const committedCustomers = new Set<string>();
   for (const s of subs) {
     let cents = 0;
     for (const item of s.items?.data ?? []) {
@@ -182,15 +163,18 @@ export async function computeMrr(env: Env): Promise<Mrr> {
     if (!internalCustomers.has(s.customer)) {
       mrr.external_cents += Math.round(cents);
       mrr.external_subscriptions += 1;
+      externalCustomers.add(s.customer);
       const cancelling =
         Boolean(s.cancel_at_period_end) ||
         (typeof s.cancel_at === "number" && s.cancel_at > 0);
       if (cancelling) {
         mrr.at_risk_cents += Math.round(cents);
         mrr.at_risk_subscriptions += 1;
+      } else {
+        committedCustomers.add(s.customer);
       }
     }
   }
   mrr.available = true;
-  return mrr;
+  return { mrr, externalCustomers, committedCustomers };
 }

@@ -20,25 +20,39 @@ import type { Env } from "../types.js";
 
 const ORGS_WITH_SUB_ID = 14; // what the old query would have returned
 
-function mockDb(payingFallback: number) {
-  let lastSql = "";
-  const stmt = {
-    bind: () => stmt,
-    first: async () => {
-      if (/stripe_subscription_id IS NOT NULL/.test(lastSql)) return { n: payingFallback };
-      return { n: 0, id: "org_x" };
-    },
-    all: async () => ({ results: [] }),
+/** One running prepaid plan, as services/annual-plans.ts reads it. */
+function plan(org: string, customer: string | null, hasSubscriptionId = 0) {
+  return {
+    org_id: org,
+    stripe_customer_id: customer,
+    has_subscription_id: hasSubscriptionId,
+    offer: "black-friday",
+    amount_total: 2700,
+    currency: "usd",
+    ends_at: "2027-11-18 10:03:28",
+  };
+}
+
+/** The fallback count of paying accounts, among the report's statements. */
+const PAYING_FALLBACK = /AND stripe_subscription_id IS NOT NULL/;
+
+function mockDb(payingFallback: number, plans: Array<ReturnType<typeof plan>> = []) {
+  const statement = (sql: string) => {
+    const stmt = {
+      bind: () => stmt,
+      first: async () => (PAYING_FALLBACK.test(sql) ? { n: payingFallback } : { n: 0, id: "org_x" }),
+      all: async () => ({ results: /FROM prepaid_plans/.test(sql) ? plans : [] }),
+    };
+    return stmt;
   };
   return {
     prepare: (sql: string) => {
-      lastSql = sql;
       // The fallback must exclude internal accounts; if a future edit drops
       // that clause this throws rather than silently inflating the number.
-      if (/stripe_subscription_id IS NOT NULL/.test(sql) && !/!= 'internal'/.test(sql)) {
+      if (PAYING_FALLBACK.test(sql) && !/!= 'internal'/.test(sql)) {
         throw new Error("paying fallback query lost its internal exclusion");
       }
-      return stmt;
+      return statement(sql);
     },
   } as unknown as D1Database;
 }
@@ -118,10 +132,98 @@ describe("daily report — paying count", () => {
 });
 
 /**
+ * engram#768: an account that paid once for a year holds no subscription,
+ * so the count above never saw it and the report showed a customer who had
+ * paid as nobody. The plans travel in a field of their own; totals.paying
+ * stays the subscriber count the revenue line can be checked against, and
+ * the email adds the two with `also_monthly` taken off.
+ */
+describe("daily report — prepaid plans", () => {
+  it("reports them beside the subscriber count, which stays what Stripe says", async () => {
+    vi.stubGlobal("fetch", mockStripe([{ customer: "cus_a" }, { customer: "cus_b" }]));
+    const r = await buildDailyReport(env(mockDb(ORGS_WITH_SUB_ID, [plan("org_p", "cus_p")])));
+    expect(r.totals.paying).toBe(2);
+    expect(r.annual).toEqual({
+      plans: 1,
+      also_monthly: 0,
+      cents: 2700,
+      by_offer: { "black-friday": 1 },
+      next_end: "2027-11-18 10:03:28",
+      other_currency_payments: 0,
+    });
+  });
+
+  it("marks a plan holder who also subscribes as already counted, cancelling or not", async () => {
+    // totals.paying counts a cancelling subscription, so its holder is
+    // already in it; adding their plan would count them twice.
+    vi.stubGlobal("fetch", mockStripe([
+      { customer: "cus_a" },
+      { customer: "cus_both" },
+      { customer: "cus_leaving", cancelling: true },
+    ]));
+    const r = await buildDailyReport(env(mockDb(ORGS_WITH_SUB_ID, [
+      plan("org_p", "cus_p"),
+      plan("org_no_customer", null),
+      plan("org_both", "cus_both", 1),
+      plan("org_leaving", "cus_leaving", 1),
+    ])));
+    expect(r.totals.paying).toBe(3);
+    expect(r.annual.plans).toBe(4);
+    expect(r.annual.also_monthly).toBe(2);
+    // Five customers in all: the three subscribers, and the two plan
+    // holders who are none of them.
+    expect(r.totals.paying + r.annual.plans - r.annual.also_monthly).toBe(5);
+  });
+
+  it("does not take a leftover subscription id for a subscription when Stripe answered", async () => {
+    // The column outlives the subscription. This account cancelled its
+    // subscription and later bought the plan: one customer, through the plan.
+    vi.stubGlobal("fetch", mockStripe([{ customer: "cus_a" }]));
+    const r = await buildDailyReport(env(mockDb(ORGS_WITH_SUB_ID, [plan("org_old", "cus_old", 1)])));
+    expect(r.totals.paying).toBe(1);
+    expect(r.annual.plans).toBe(1);
+    expect(r.annual.also_monthly).toBe(0);
+  });
+
+  it("measures against the database's subscription ids when Stripe is unreachable", async () => {
+    // totals.paying is then the count of rows with a subscription id, so a
+    // plan holder with one is already in it.
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("stripe down"); }));
+    const r = await buildDailyReport(env(mockDb(7, [
+      plan("org_p", "cus_p"),
+      plan("org_both", "cus_both", 1),
+    ])));
+    expect(r.paying_source).toBe("database");
+    expect(r.totals.paying).toBe(7);
+    expect(r.annual.plans).toBe(2);
+    expect(r.annual.also_monthly).toBe(1);
+  });
+
+  it("reports zeros when nobody is on a prepaid plan", async () => {
+    vi.stubGlobal("fetch", mockStripe([{ customer: "cus_a" }]));
+    const r = await buildDailyReport(env(mockDb(ORGS_WITH_SUB_ID)));
+    expect(r.annual).toEqual({
+      plans: 0,
+      also_monthly: 0,
+      cents: 0,
+      by_offer: {},
+      next_end: null,
+      other_currency_payments: 0,
+    });
+  });
+
+  it("never sends a Stripe customer id in the report", async () => {
+    vi.stubGlobal("fetch", mockStripe([{ customer: "cus_both" }]));
+    const r = await buildDailyReport(env(mockDb(ORGS_WITH_SUB_ID, [plan("org_both", "cus_both", 1)])));
+    expect(JSON.stringify(r)).not.toMatch(/cus_/);
+  });
+});
+
+/**
  * engram#569: a morning Stripe did not answer, the report printed
  * "Revenue: $0/mo committed from 0 customers" beside a paying count of 14.
- * computeMrr returned zeros on failure and the report could not tell them
- * from a real zero. A failed read must reach the email as "unavailable".
+ * The revenue read returned zeros on failure and the report could not tell
+ * them from a real zero. A failed read must reach the email as "unavailable".
  */
 describe("daily report — revenue when Stripe fails", () => {
   it("sends no revenue figures, and the reason, when Stripe does not answer", async () => {

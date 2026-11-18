@@ -3,7 +3,14 @@
 // JSON to `${APP_URL}/api/reports/daily` authenticated with INTERNAL_CRON_SECRET
 // (ADMIN_SECRET until that is set; services/secrets.ts).
 import type { Env } from "../types.js";
-import { computeMrr, committedCents, committedSubscriptions } from "./mrr.js";
+import { readSubscriptions, committedCents, committedSubscriptions } from "./mrr.js";
+import {
+  annualPlansStatement,
+  holdsSubscription,
+  summarizeAnnualPlans,
+  type AnnualPlanRow,
+  type AnnualPlans,
+} from "./annual-plans.js";
 import { websiteBearer } from "./secrets.js";
 import { PRIORITY_SUPPORT_TIERS, sqlTierList } from "@getengram/shared";
 
@@ -55,6 +62,11 @@ export interface DailyReport {
   /** Where totals.paying came from: Stripe, or the D1 fallback on a run
    *  Stripe did not answer, which counts rows rather than payments. */
   paying_source: "stripe" | "database";
+  /** Accounts that paid once for a year (engram#768). They hold no
+   *  subscription, so totals.paying does not count them: paying customers
+   *  is totals.paying + annual.plans - annual.also_monthly. A field of its
+   *  own, so totals.paying keeps agreeing with the revenue line. */
+  annual: AnnualPlans;
 }
 
 export async function buildDailyReport(env: Env): Promise<DailyReport> {
@@ -79,6 +91,7 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
     newSignups,
     referrals,
     teamEmails,
+    annualPlans,
   ] = await Promise.all([
     db
       .prepare(
@@ -89,7 +102,7 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
       .prepare(
         // Fallback only — used when Stripe is unreachable. Two corrections
         // against the original: exclude the owner's internal accounts (the
-        // same data-driven rule computeMrr uses, tagged by
+        // same data-driven rule readSubscriptions uses, tagged by
         // POST /admin/comp-internal), and note that a non-null
         // stripe_subscription_id outlives the subscription — comping an
         // account deletes the Stripe sub but leaves this column set, so the
@@ -152,12 +165,14 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
         `SELECT email FROM organizations WHERE tier IN (${sqlTierList(PRIORITY_SUPPORT_TIERS)}) AND email IS NOT NULL AND deleted_at IS NULL`,
       )
       .all<{ email: string }>(),
+    annualPlansStatement(db).all<AnnualPlanRow>(),
   ]);
 
   // Fetched after the DB batch rather than inside it — it is an HTTP call to
   // Stripe, not a D1 query, and must not fail the whole report if Stripe is
-  // down (computeMrr never throws; it reports available: false).
-  const mrr = await computeMrr(env);
+  // down (readSubscriptions never throws; it reports available: false).
+  const subscriptions = await readSubscriptions(env);
+  const mrr = subscriptions.mrr;
 
   const byTier: Record<string, number> = {};
   for (const r of tiers.results ?? []) byTier[r.tier] = r.n;
@@ -204,6 +219,14 @@ export async function buildDailyReport(env: Env): Promise<DailyReport> {
         }
       : null,
     ...(mrr.available ? {} : { revenue_unavailable: mrr.error ?? "Stripe did not answer" }),
+    // also_monthly is measured against whatever totals.paying counted on
+    // this run: Stripe's subscribers, or the D1 fallback's subscription ids.
+    annual: summarizeAnnualPlans(
+      annualPlans.results ?? [],
+      mrr.available
+        ? holdsSubscription(subscriptions.externalCustomers)
+        : (plan) => plan.has_subscription_id === 1,
+    ),
   };
 }
 

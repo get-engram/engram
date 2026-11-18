@@ -3,7 +3,7 @@ import { isAcademicEmail, emailDomain } from "../academic-domains.js";
 
 describe("emailDomain", () => {
   it("extracts and lowercases", () => {
-    expect(emailDomain("Ali.Shah@LeoMail.TAMUC.edu")).toBe("leomail.tamuc.edu");
+    expect(emailDomain("First.Last@LeoMail.TAMUC.edu")).toBe("leomail.tamuc.edu");
   });
   it("rejects malformed addresses", () => {
     for (const bad of ["", "nope", "@x.edu", "a@", "a@b", "a b@c.edu"]) {
@@ -16,9 +16,9 @@ describe("emailDomain", () => {
 });
 
 describe("isAcademicEmail", () => {
-  it("accepts the address that prompted this feature", () => {
+  it("accepts the subdomain that prompted this feature", () => {
     // A flat allowlist would likely have missed this subdomain.
-    expect(isAcademicEmail("ashah24@leomail.tamuc.edu")).toBe(true);
+    expect(isAcademicEmail("student@leomail.tamuc.edu")).toBe(true);
   });
 
   it("accepts .edu at any subdomain depth", () => {

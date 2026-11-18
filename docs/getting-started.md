@@ -234,7 +234,7 @@ See [Secrets Vault](./vault.md) for the full guide.
 - [Secrets Vault](./vault.md) — Client-side encryption for sensitive data
 - [API Reference](./api-reference.md) — Every MCP tool with parameters and examples
 - [Integrations](./integrations.md) — Claude Desktop, Cursor, Windsurf, custom clients
-- [Concepts](./concepts.md) — How storage and search work under the hood
-- [Architecture](./architecture.md) — Deep dive into how everything works
-- [Use Cases](./use-cases.md) — Agent memory, support history, knowledge bases
+- [Concepts](https://getengram.app/docs/concepts) — How storage and search work under the hood
+- [Architecture](https://getengram.app/docs/architecture) — Deep dive into how everything works
+- [Use Cases](https://getengram.app/docs/use-cases) — Agent memory, support history, knowledge bases
 - [Self-Hosting](./self-hosting.md) — Deploy your own Engram instance on Cloudflare

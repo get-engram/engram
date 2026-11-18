@@ -38,10 +38,15 @@
    git checkout -b feat/your-feature
    ```
 
-2. Make your changes. The monorepo has three packages:
-   - `packages/shared` — Types, schemas, utilities (no Cloudflare dependencies)
+2. Make your changes. The monorepo has five workspace packages:
+   - `apps/mcp-server` — The Cloudflare Worker: MCP server and REST API
+   - `apps/cli` — The `engram` command line tool (`@getengram/cli`)
+   - `packages/sdk` — The TypeScript client (`@getengram/sdk`)
    - `packages/db` — Database migrations and query helpers
-   - `apps/mcp-server` — The MCP server Worker
+   - `packages/shared` — Types, schemas, utilities (no Cloudflare dependencies)
+
+   Two folders sit outside the workspace: `mcpb/` (the Claude Desktop
+   extension bundle) and `plugins/engram/` (the Claude Code plugin).
 
 3. Run tests:
    ```bash
@@ -89,18 +94,22 @@ engram/
 │   │   ├── src/types/   # Interface definitions
 │   │   ├── src/schemas/ # Zod validation schemas
 │   │   └── src/utils/   # ID generation, chunking, auth hashing
-│   └── db/
-│       ├── migrations/  # SQL migration files
-│       └── src/queries/ # Typed query helpers
+│   ├── db/
+│   │   ├── migrations/  # SQL migration files
+│   │   └── src/queries/ # Typed query helpers
+│   └── sdk/             # TypeScript client, published to npm
 └── apps/
-    └── mcp-server/
-        ├── src/
-        │   ├── index.ts           # Hono app entry point
-        │   ├── middleware/auth.ts  # API key validation
-        │   ├── mcp/server.ts      # MCP server factory
-        │   ├── mcp/tools/         # One file per tool
-        │   └── services/          # Business logic
-        └── scripts/seed.ts        # Test data generator
+    ├── mcp-server/
+    │   ├── src/
+    │   │   ├── index.ts           # Hono app entry point
+    │   │   ├── middleware/auth.ts  # API key validation
+    │   │   ├── mcp/server.ts      # MCP server factory
+    │   │   ├── mcp/tools/         # One file per tool
+    │   │   ├── routes/            # REST endpoints
+    │   │   └── services/          # Business logic
+    │   └── scripts/seed.ts        # Test data generator
+    └── cli/
+        └── src/commands/          # One file per `engram` command
 ```
 
 ### Build Order
@@ -108,10 +117,11 @@ engram/
 Turborepo handles this automatically, but for reference:
 
 ```
-@getengram/shared → @getengram/db → @getengram/mcp-server
+@getengram/shared, @getengram/db → @getengram/mcp-server
+@getengram/sdk → @getengram/cli
 ```
 
-Changes to `shared` require rebuilding `db` and `mcp-server`. Changes to `db` require rebuilding `mcp-server`. Changes to `mcp-server` are self-contained.
+Changes to `shared` or `db` require rebuilding `mcp-server`. Changes to `sdk` require rebuilding `cli`, and the worker's tests use the SDK too. Changes to `mcp-server` or `cli` are self-contained.
 
 ## Adding a New MCP Tool
 
@@ -123,9 +133,10 @@ Changes to `shared` require rebuilding `db` and `mcp-server`. Changes to `db` re
 
 ## Adding a Database Migration
 
-1. Create a new file in `packages/db/migrations/` with the next sequence number:
+1. Create a new file in `packages/db/migrations/` named with the next
+   four-digit sequence number after the highest one already there:
    ```
-   0003_your_migration.sql
+   NNNN_your_migration.sql
    ```
 2. Write standard SQL (SQLite-compatible)
 3. Add query helpers in `packages/db/src/queries/`
@@ -152,5 +163,5 @@ npm run seed
 The server starts at `http://localhost:8787`. Test with the MCP Inspector:
 
 ```bash
-npx @anthropic-ai/mcp-inspector
+npx @modelcontextprotocol/inspector
 ```

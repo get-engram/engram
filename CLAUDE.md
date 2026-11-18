@@ -4,9 +4,17 @@ Engram is a memory service for AI agents. It stores complete, verbatim conversat
 
 ## Project Structure
 
-- `packages/shared/` — Types, Zod schemas, utilities (ID generation, chunking, auth)
+- `apps/mcp-server/` — Cloudflare Worker: MCP server and REST API (Hono.js)
+- `apps/cli/` — the `engram` command line tool (`@getengram/cli`)
+- `packages/sdk/` — TypeScript client (`@getengram/sdk`)
 - `packages/db/` — D1 migrations and typed query helpers
-- `apps/mcp-server/` — Cloudflare Worker MCP server (Hono.js)
+- `packages/shared/` — Types, Zod schemas, utilities (ID generation, chunking, auth)
+- `mcpb/` — Claude Desktop extension bundle
+- `plugins/engram/` — Claude Code plugin
+
+This repository is public. Keep real names, email addresses, account ids and
+business figures out of code, comments, tests, commit messages, issues and
+pull requests. Examples use made-up values on `example.com`.
 
 ## Development
 
@@ -27,11 +35,12 @@ npm run seed               # generate test org + API key
 
 ## Deployment
 
-The MCP server is deployed as a Cloudflare Worker at `mcp.getengram.app`. Deploy with:
-```bash
-cd apps/mcp-server
-CLOUDFLARE_API_KEY=<key> CLOUDFLARE_EMAIL=maryjanis@yahoo.com CLOUDFLARE_API_TOKEN= npx wrangler deploy
-```
+The MCP server is deployed as a Cloudflare Worker at `mcp.getengram.app`.
+
+Merging to `main` deploys it. The `Main` workflow
+(`.github/workflows/main.yml`) runs typecheck, tests and build, does a deploy
+dry-run, applies any new D1 migrations, then runs `wrangler deploy` with
+credentials held in the repository's secrets. Do not deploy from a laptop.
 
 ## Git Workflow
 

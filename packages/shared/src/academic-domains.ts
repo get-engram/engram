@@ -4,9 +4,8 @@
  * Shipping a list of every academic domain on earth is the obvious approach
  * and the wrong one: the public datasets run to ~10k entries, they go stale
  * the moment a university adds a subdomain, and they skew heavily American.
- * Ali Shah — the student who prompted this — writes from
- * `leomail.tamuc.edu`, a Texas A&M Commerce subdomain that a flat allowlist
- * would very likely miss.
+ * The student who prompted this writes from `leomail.tamuc.edu`, a
+ * Texas A&M Commerce subdomain that a flat allowlist would very likely miss.
  *
  * Instead we match the structure institutions actually use. Nearly every
  * country reserves a second-level domain for higher education:

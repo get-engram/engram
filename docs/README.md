@@ -16,16 +16,20 @@ that is public. The 17 files that were pure duplicates have been deleted;
 What remains is here for a reason:
 
 - **No counterpart on the website at all** — `contributing.md`,
-  `self-hosting.md`, `stripe-profile.md`, `vault.md`,
-  `guides/import-chatgpt.md`.
+  `self-hosting.md`, `vault.md`, `guides/import-chatgpt.md`.
 - **Documents sections the website never got.** Most of these cover the
   Vault (`api-reference.md`, `cli.md`, `sdk.md`, `security.md`, `faq.md`),
   self-hosting (`troubleshooting.md`, `integrations.md`,
   `getting-started.md`), or Cloudflare platform limits (`limits.md`). The
-  rest are `index.md`, `roadmap.md`, and the `guides/` pages whose setup
-  steps are more detailed here.
+  rest are `index.md`, which lists what is here and links to the website
+  for everything else, and the `guides/` pages whose setup steps are more
+  detailed here.
 
 So treat a file here as either developer-facing documentation or a draft
 awaiting a home on the website — never as a second copy of a page that
 already exists there. If you publish one of these to `engram-web/content`,
 delete it here in the same change.
+
+Only product documentation belongs here. Business paperwork, launch and
+marketing drafts, and planning notes stay out of this repository, which is
+public.

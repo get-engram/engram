@@ -210,7 +210,7 @@ export function deactivatePrice(secretKey: string, priceId: string): Promise<Str
  * stripe-sync.ts (the 10-minute reconcile cron) did not — it read
  * `let tier = "pro"; if (priceId === STRIPE_PRICE_ID_TEAM) tier = "team";`
  * so every price that was not Team fell through to "pro". The result: a real
- * $3/month student subscriber (mwill002@odu.edu, verified 2026-10-12) was
+ * $3/month student subscriber (verified 2026-10-12) was
  * rewritten from "student" to "pro" within ten minutes of every correction,
  * which is why the admin dashboard never showed a student. Entitlements are
  * identical so nothing broke for the user, but the operator could not see

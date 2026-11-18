@@ -40,6 +40,30 @@ function maybeSweep(now: number, windowMs: number) {
 }
 
 /**
+ * Take one token from `key`'s bucket: `limit` per `windowMs`, refilled
+ * continuously. False means the bucket is empty and the caller should answer
+ * 429. For a route that has something better than the IP to key on (the
+ * offer links key on the account the link was signed for, because the
+ * website makes that call and every buyer would share its address).
+ */
+export function takeToken(key: string, limit: number, windowMs: number, now = Date.now()): boolean {
+  maybeSweep(now, windowMs);
+  let b = buckets.get(key);
+  if (!b) {
+    b = { tokens: limit, updated: now };
+    buckets.set(key, b);
+  }
+  // Refill proportionally to elapsed time. Never negative: a clock that
+  // steps backwards must not take tokens away.
+  const refill = (Math.max(0, now - b.updated) / windowMs) * limit;
+  b.tokens = Math.min(limit, b.tokens + refill);
+  b.updated = now;
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+
+/**
  * Generic over the router's Hono env so the same middleware mounts on routers
  * with and without the `auth` variable (signup vs. oauth). It reads only the
  * request headers, so any env with our Bindings is enough.
@@ -57,20 +81,7 @@ export function ipThrottle<E extends HonoEnv & { Bindings: Env } = { Bindings: E
       await next();
       return;
     }
-    const key = `${name}:${ip}`;
-    const now = Date.now();
-    maybeSweep(now, windowMs);
-    let b = buckets.get(key);
-    if (!b) {
-      b = { tokens: limit, updated: now };
-      buckets.set(key, b);
-    }
-    // Refill proportionally to elapsed time.
-    const refill = ((now - b.updated) / windowMs) * limit;
-    b.tokens = Math.min(limit, b.tokens + refill);
-    b.updated = now;
-
-    if (b.tokens < 1) {
+    if (!takeToken(`${name}:${ip}`, limit, windowMs)) {
       const retry = Math.ceil((windowMs / limit) / 1000);
       c.header("Retry-After", String(retry));
       return c.json(
@@ -78,7 +89,6 @@ export function ipThrottle<E extends HonoEnv & { Bindings: Env } = { Bindings: E
         429,
       );
     }
-    b.tokens -= 1;
     await next();
   };
 }

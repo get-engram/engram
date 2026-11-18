@@ -14,6 +14,7 @@ import { usage } from "./routes/usage.js";
 import { signup } from "./routes/signup.js";
 import { billing, billingSession, billingWebhook } from "./routes/billing.js";
 import { admin } from "./routes/admin.js";
+import { offers } from "./routes/offers.js";
 import { mergeOrgs } from "./routes/merge-orgs.js";
 import { adminConsoleSecurityPolicy, dashboardHtml } from "./routes/admin-dashboard.js";
 import { account } from "./routes/account.js";
@@ -313,6 +314,10 @@ app.use(
   }),
 );
 app.route("/invites", invites);
+
+// Emailed offer links (engram#763) — public, verified by the link's own
+// signature. Called by the website's server, so no CORS.
+app.route("/offers", offers);
 
 // Stripe webhook — public, verified by HMAC signature instead of API key.
 // Mounted BEFORE the /api/* auth middleware so it isn't gated.

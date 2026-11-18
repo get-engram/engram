@@ -1,16 +1,19 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { computeMrr } from "../services/mrr.js";
+import { committedSubscriptions, readSubscriptions } from "../services/mrr.js";
 import type { Env } from "../types.js";
 
 /**
- * computeMrr feeds the daily report and the admin dashboard. It used to
- * read one page of subscriptions with no timeout and no retry, and to
+ * readSubscriptions feeds the daily report and the admin dashboard. It used
+ * to read one page of subscriptions with no timeout and no retry, and to
  * return zeros on any failure — which the daily report printed as "$0/mo
  * committed from 0 customers" (engram#569). It now says whether Stripe
  * answered, retries a transient failure once, and reads every page.
  */
 
 const KEY = "sk_test_mrr_never_in_output_0123";
+
+/** The figures alone, as the dashboard and the report print them. */
+const figures = async (e: Env) => (await readSubscriptions(e)).mrr;
 
 function db(internal: string[] = [], fail = false): D1Database {
   return {
@@ -65,7 +68,7 @@ function stripe(...answers: Array<Response | string>) {
 
 afterEach(() => vi.unstubAllGlobals());
 
-describe("computeMrr — figures", () => {
+describe("readSubscriptions — figures", () => {
   it("sums subscriptions, leaves the owner's accounts out, and normalizes yearly plans", async () => {
     vi.stubGlobal("fetch", stripe(page([
       sub("sub_1", "cus_a"),
@@ -73,7 +76,7 @@ describe("computeMrr — figures", () => {
       sub("sub_3", "cus_c", { cents: 9600, interval: "year" }),
       sub("sub_4", "cus_owner"),
     ])));
-    const m = await computeMrr(env({ internal: ["cus_owner"] }));
+    const m = await figures(env({ internal: ["cus_owner"] }));
     expect(m).toEqual({
       available: true,
       total_cents: 900 + 900 + 800 + 900,
@@ -87,13 +90,13 @@ describe("computeMrr — figures", () => {
 
   it("counts a scheduled cancel_at as at risk", async () => {
     vi.stubGlobal("fetch", stripe(page([sub("sub_1", "cus_a", { cancelAt: 1_900_000_000 })])));
-    const m = await computeMrr(env());
+    const m = await figures(env());
     expect(m.at_risk_subscriptions).toBe(1);
   });
 
   it("reports a real zero when Stripe answers with no subscriptions", async () => {
     vi.stubGlobal("fetch", stripe(page([])));
-    const m = await computeMrr(env());
+    const m = await figures(env());
     expect(m.available).toBe(true);
     expect(m.external_subscriptions).toBe(0);
   });
@@ -101,7 +104,7 @@ describe("computeMrr — figures", () => {
   it("asks for active subscriptions, a full page at a time, with the key as a bearer token", async () => {
     const f = stripe(page([]));
     vi.stubGlobal("fetch", f);
-    await computeMrr(env());
+    await figures(env());
     const url = new URL(f.mock.calls[0][0]);
     expect(url.origin + url.pathname).toBe("https://api.stripe.com/v1/subscriptions");
     expect(url.searchParams.get("status")).toBe("active");
@@ -111,14 +114,60 @@ describe("computeMrr — figures", () => {
   });
 });
 
-describe("computeMrr — pages", () => {
+/**
+ * engram#768: an account on a prepaid plan may also subscribe. Whoever adds
+ * the two counts together needs to know who is already in this one.
+ */
+describe("readSubscriptions — the customers behind the figures", () => {
+  it("names the real customers, and apart from them the ones not scheduled to cancel", async () => {
+    vi.stubGlobal("fetch", stripe(page([
+      sub("sub_1", "cus_a"),
+      sub("sub_2", "cus_b", { cancelling: true }),
+      sub("sub_3", "cus_c", { cancelAt: 1_900_000_000 }),
+      sub("sub_4", "cus_owner"),
+    ])));
+    const r = await readSubscriptions(env({ internal: ["cus_owner"] }));
+    expect([...r.externalCustomers].sort()).toEqual(["cus_a", "cus_b", "cus_c"]);
+    expect([...r.committedCustomers]).toEqual(["cus_a"]);
+    expect(r.externalCustomers.size).toBe(r.mrr.external_subscriptions);
+    expect(r.committedCustomers.size).toBe(committedSubscriptions(r.mrr));
+  });
+
+  it("keeps a customer with one subscription staying and one cancelling among the committed", async () => {
+    vi.stubGlobal("fetch", stripe(page([
+      sub("sub_1", "cus_a", { cancelling: true }),
+      sub("sub_2", "cus_a"),
+    ])));
+    const r = await readSubscriptions(env());
+    expect([...r.externalCustomers]).toEqual(["cus_a"]);
+    expect([...r.committedCustomers]).toEqual(["cus_a"]);
+  });
+
+  it("names nobody when Stripe did not answer", async () => {
+    vi.stubGlobal("fetch", stripe(page([sub("sub_1", "cus_a")], true), "stripe down"));
+    const r = await readSubscriptions(env());
+    expect(r.mrr.available).toBe(false);
+    expect(r.externalCustomers.size).toBe(0);
+    expect(r.committedCustomers.size).toBe(0);
+  });
+
+  it("names nobody when the owner's accounts cannot be looked up", async () => {
+    vi.stubGlobal("fetch", stripe(page([sub("sub_1", "cus_a"), sub("sub_2", "cus_owner")])));
+    const r = await readSubscriptions(env({ internal: ["cus_owner"], dbFails: true }));
+    expect(r.mrr.available).toBe(false);
+    expect(r.externalCustomers.size).toBe(0);
+    expect(r.committedCustomers.size).toBe(0);
+  });
+});
+
+describe("readSubscriptions — pages", () => {
   it("reads every page, continuing after the last id", async () => {
     const f = stripe(
       page([sub("sub_1", "cus_a"), sub("sub_2", "cus_b")], true),
       page([sub("sub_3", "cus_c")], false),
     );
     vi.stubGlobal("fetch", f);
-    const m = await computeMrr(env());
+    const m = await figures(env());
     expect(m.available).toBe(true);
     expect(m.external_subscriptions).toBe(3);
     expect(f).toHaveBeenCalledTimes(2);
@@ -129,7 +178,7 @@ describe("computeMrr — pages", () => {
   it("stops on an empty page even if it claims more", async () => {
     const f = stripe(page([], true));
     vi.stubGlobal("fetch", f);
-    const m = await computeMrr(env());
+    const m = await figures(env());
     expect(m.available).toBe(true);
     expect(f).toHaveBeenCalledTimes(1);
   });
@@ -138,18 +187,18 @@ describe("computeMrr — pages", () => {
     let n = 0;
     const f = vi.fn(async () => page([sub(`sub_${n++}`, "cus_a")], true));
     vi.stubGlobal("fetch", f);
-    const m = await computeMrr(env());
+    const m = await figures(env());
     expect(m.available).toBe(false);
     expect(m.error).toMatch(/more than 2000/);
     expect(f).toHaveBeenCalledTimes(20);
   });
 });
 
-describe("computeMrr — failures", () => {
+describe("readSubscriptions — failures", () => {
   it("retries a 500 once", async () => {
     const f = stripe(new Response("oops", { status: 500 }), page([sub("sub_1", "cus_a")]));
     vi.stubGlobal("fetch", f);
-    const m = await computeMrr(env());
+    const m = await figures(env());
     expect(m.available).toBe(true);
     expect(m.external_subscriptions).toBe(1);
     expect(f).toHaveBeenCalledTimes(2);
@@ -158,21 +207,21 @@ describe("computeMrr — failures", () => {
   it("retries a 429 once", async () => {
     const f = stripe(new Response("slow down", { status: 429 }), page([sub("sub_1", "cus_a")]));
     vi.stubGlobal("fetch", f);
-    expect((await computeMrr(env())).available).toBe(true);
+    expect((await figures(env())).available).toBe(true);
     expect(f).toHaveBeenCalledTimes(2);
   });
 
   it("retries a request that never got an answer", async () => {
     const f = stripe("The operation was aborted due to timeout", page([sub("sub_1", "cus_a")]));
     vi.stubGlobal("fetch", f);
-    expect((await computeMrr(env())).available).toBe(true);
+    expect((await figures(env())).available).toBe(true);
     expect(f).toHaveBeenCalledTimes(2);
   });
 
   it("does not retry a refusal", async () => {
     const f = stripe(new Response('{"error":{}}', { status: 401 }));
     vi.stubGlobal("fetch", f);
-    const m = await computeMrr(env());
+    const m = await figures(env());
     expect(m.available).toBe(false);
     expect(m.error).toBe("Stripe answered 401");
     expect(f).toHaveBeenCalledTimes(1);
@@ -181,7 +230,7 @@ describe("computeMrr — failures", () => {
   it("is unavailable after a second failure, with every figure zero and the reason", async () => {
     const f = stripe("stripe down", "stripe down");
     vi.stubGlobal("fetch", f);
-    const m = await computeMrr(env());
+    const m = await figures(env());
     expect(m).toEqual({
       available: false,
       error: "Stripe request failed: stripe down",
@@ -197,7 +246,7 @@ describe("computeMrr — failures", () => {
 
   it("is unavailable when a later page fails, rather than counting part of the list", async () => {
     vi.stubGlobal("fetch", stripe(page([sub("sub_1", "cus_a")], true), "stripe down"));
-    const m = await computeMrr(env());
+    const m = await figures(env());
     expect(m.available).toBe(false);
     expect(m.external_subscriptions).toBe(0);
   });
@@ -205,7 +254,7 @@ describe("computeMrr — failures", () => {
   it("is unavailable without a key, and does not call Stripe", async () => {
     const f = stripe(page([]));
     vi.stubGlobal("fetch", f);
-    const m = await computeMrr(env({ key: null }));
+    const m = await figures(env({ key: null }));
     expect(m.available).toBe(false);
     expect(m.error).toMatch(/STRIPE_SECRET_KEY/);
     expect(f).not.toHaveBeenCalled();
@@ -214,7 +263,7 @@ describe("computeMrr — failures", () => {
   it("is unavailable when the owner's accounts cannot be looked up", async () => {
     // Without the exclusion every figure would count the owner as a customer.
     vi.stubGlobal("fetch", stripe(page([sub("sub_1", "cus_owner")])));
-    const m = await computeMrr(env({ internal: ["cus_owner"], dbFails: true }));
+    const m = await figures(env({ internal: ["cus_owner"], dbFails: true }));
     expect(m.available).toBe(false);
     expect(m.error).toMatch(/^internal-account lookup failed/);
     expect(m.external_subscriptions).toBe(0);
@@ -222,8 +271,8 @@ describe("computeMrr — failures", () => {
 
   it("never puts the key in its result", async () => {
     vi.stubGlobal("fetch", stripe(new Response("{}", { status: 401 })));
-    expect(JSON.stringify(await computeMrr(env()))).not.toContain(KEY);
+    expect(JSON.stringify(await figures(env()))).not.toContain(KEY);
     vi.stubGlobal("fetch", stripe("boom", "boom"));
-    expect(JSON.stringify(await computeMrr(env()))).not.toContain(KEY);
+    expect(JSON.stringify(await figures(env()))).not.toContain(KEY);
   });
 });

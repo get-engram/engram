@@ -1,5 +1,6 @@
 import { createTtlMemo } from "../utils/ttl-memo.js";
 import { RECALL_EVIDENCE, SEARCH_EVIDENCE } from "./activation-milestones.js";
+import { annualPlansStatement, type AnnualPlanRow } from "./annual-plans.js";
 
 /**
  * The queries behind GET /admin/metrics, split by cost (engram#551).
@@ -74,6 +75,12 @@ export interface FastMetrics {
   messages: number;
   api_keys: number;
   today_signups: TodaySignup[];
+  /**
+   * Running prepaid plans, a row per purchase (engram#768). Rows rather
+   * than a count: the route adds them up against Stripe's subscribers, so
+   * an account holding both is counted once.
+   */
+  annual_plans: AnnualPlanRow[];
 }
 
 export interface SlowMetrics {
@@ -97,7 +104,7 @@ function errorMessage(err: unknown): string {
 
 /** The cheap figures, as one D1 batch. Always live. */
 export async function loadFastMetrics(db: D1Database): Promise<FastMetrics> {
-  const [orgs, active, tiers, totals, keys, referrals, today] = await db.batch([
+  const [orgs, active, tiers, totals, keys, referrals, today, annual] = await db.batch([
     db.prepare(`
       SELECT
         COUNT(*) as total,
@@ -145,6 +152,8 @@ export async function loadFastMetrics(db: D1Database): Promise<FastMetrics> {
         AND deleted_at IS NULL
       ORDER BY created_at DESC
     `),
+
+    annualPlansStatement(db),
   ]);
 
   const o = row<{ total: number; last_1d: number; last_7d: number; last_30d: number }>(orgs);
@@ -171,6 +180,7 @@ export async function loadFastMetrics(db: D1Database): Promise<FastMetrics> {
     messages: t?.messages ?? 0,
     api_keys: row<{ api_keys: number }>(keys)?.api_keys ?? 0,
     today_signups: rows<TodaySignup>(today),
+    annual_plans: rows<AnnualPlanRow>(annual),
   };
 }
 

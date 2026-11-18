@@ -28,12 +28,13 @@ import { sendDailyReport } from "../services/daily-report.js";
 import { unsubscribeUrl } from "../services/secrets.js";
 import { syncOrganizationFromStripe } from "../services/stripe-sync.js";
 import { priceToTier } from "../services/stripe.js";
-import { findPriceByLookupKey, createRecurringPrice, reconcileProduct } from "../services/stripe.js";
+import { findPriceByLookupKey, createRecurringPrice, createOneTimePrice, deactivatePrice, reconcileProduct } from "../services/stripe.js";
 import { computeMrr } from "../services/mrr.js";
-import { getPrice, type StripePrice } from "../services/stripe.js";
+import type { StripePrice } from "../services/stripe.js";
 import {
   BLACK_FRIDAY_ENDS_AT_MS,
   BLACK_FRIDAY_LOOKUP_KEY,
+  BLACK_FRIDAY_RETIRED_LOOKUP_KEY,
   BLACK_FRIDAY_UNIT_AMOUNT,
 } from "../services/black-friday.js";
 import { runBlackFridayCampaign } from "../services/black-friday-campaign.js";
@@ -663,53 +664,60 @@ admin.post("/stripe/ensure-edu-team-price", async (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /admin/stripe/ensure-black-friday-price — Pro at $27/year (engram#763)
+// POST /admin/stripe/ensure-black-friday-price — one year of Pro, paid once
+// (engram#763)
 //
-// A second price on the PRO product, so Checkout and the receipt say
-// "Engram Pro" and nothing else about the plan changes. Idempotent by
-// lookup key; never touches the monthly price. The returned id has to be set
-// as the STRIPE_PRICE_ID_PRO_ANNUAL_BF secret: until then the offer is not
-// sold, and after it priceToTier grants Pro for it.
+// A one-time $27 price on a product of its own, so Checkout and the receipt
+// say "one year" and there is nothing that can renew. Idempotent by lookup
+// key. The returned id has to be set as the STRIPE_PRICE_ID_PRO_YEAR_BF
+// secret: until then the offer is not sold.
+//
+// It also switches off the offer's first form, a $27-a-year subscription
+// price that was never sold, so nothing can be bought at it by mistake.
 // ---------------------------------------------------------------------------
 admin.post("/stripe/ensure-black-friday-price", async (c) => {
   const secretKey = c.env.STRIPE_SECRET_KEY;
   if (!secretKey) return c.json({ error: "stripe_not_configured" }, 500);
-  if (!c.env.STRIPE_PRICE_ID_PRO) return c.json({ error: "pro_price_not_configured" }, 500);
 
   try {
     const describe = (price: StripePrice) => ({
       price_id: price.id,
       unit_amount: price.unit_amount,
       currency: price.currency,
+      // null = paid once. Anything else here would be a subscription price.
       interval: price.recurring?.interval ?? null,
       livemode: price.livemode,
       product: price.product,
       ends_at: new Date(BLACK_FRIDAY_ENDS_AT_MS).toISOString(),
     });
+
+    const retired = await findPriceByLookupKey(secretKey, BLACK_FRIDAY_RETIRED_LOOKUP_KEY);
+    if (retired) await deactivatePrice(secretKey, retired.id);
+    const retiredNote = { retired_subscription_price: retired?.id ?? null };
+
     const existing = await findPriceByLookupKey(secretKey, BLACK_FRIDAY_LOOKUP_KEY);
     if (existing) {
       return c.json({
         created: false,
         ...describe(existing),
-        configured: c.env.STRIPE_PRICE_ID_PRO_ANNUAL_BF === existing.id,
+        ...retiredNote,
+        configured: c.env.STRIPE_PRICE_ID_PRO_YEAR_BF === existing.id,
       });
     }
-    const pro = await getPrice(secretKey, c.env.STRIPE_PRICE_ID_PRO);
-    const price = await createRecurringPrice(secretKey, {
-      productId: pro.product,
-      productName: "Engram Pro",
-      productDescription: "",
-      tier: "pro",
+    const price = await createOneTimePrice(secretKey, {
+      productName: "Engram Pro, one year",
+      productDescription:
+        "One year of Engram Pro for a single payment. It does not renew: after a year the account goes back to the free plan unless you subscribe.",
       unitAmount: BLACK_FRIDAY_UNIT_AMOUNT,
-      interval: "year",
       lookupKey: BLACK_FRIDAY_LOOKUP_KEY,
-      nickname: "Pro annual, Black Friday 2026",
+      nickname: "Pro one year, paid once, Black Friday 2026",
     });
     return c.json({
       created: true,
       ...describe(price),
+      ...retiredNote,
       configured: false,
-      next_step: "wrangler secret put STRIPE_PRICE_ID_PRO_ANNUAL_BF",
+      next_step: "wrangler secret put STRIPE_PRICE_ID_PRO_YEAR_BF",
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

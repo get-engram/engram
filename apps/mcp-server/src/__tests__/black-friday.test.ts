@@ -2,22 +2,23 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { createHmac } from "node:crypto";
 import {
   BLACK_FRIDAY,
+  BLACK_FRIDAY_CHECKOUT_NOTE,
   BLACK_FRIDAY_ENDS_AT_MS,
   blackFridayState,
   offerSessionExpiry,
 } from "../services/black-friday.js";
-import { createCheckoutSession, createRecurringPrice, priceToTier } from "../services/stripe.js";
+import { createCheckoutSession, createOneTimePrice, createRecurringPrice, deactivatePrice, priceToTier } from "../services/stripe.js";
 import { offerSig, offerSigValid, unsubscribeSig } from "../services/secrets.js";
 import type { Env } from "../types.js";
 
 /**
- * Black Friday 2026 (engram#763): Pro for $27 a year until 00:00 Eastern on
- * November 28. The pieces with no database: the deadline, the Checkout
- * Session's expiry, the price's tier, the signed link and what is sent to
- * Stripe.
+ * Black Friday 2026 (engram#763): one year of Pro for one $27 payment, on
+ * sale until 00:00 Eastern on November 28. The pieces with no database: the
+ * deadline, the Checkout Session's expiry, the price's tier, the signed link
+ * and what is sent to Stripe.
  */
 
-const ENV = { STRIPE_PRICE_ID_PRO: "price_pro", STRIPE_PRICE_ID_TEAM: "price_team", STRIPE_PRICE_ID_PRO_ANNUAL_BF: "price_bf" };
+const ENV = { STRIPE_PRICE_ID_PRO: "price_pro", STRIPE_PRICE_ID_TEAM: "price_team", STRIPE_PRICE_ID_PRO_YEAR_BF: "price_bf" };
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -43,7 +44,7 @@ describe("the deadline", () => {
   it("does not sell it while the price is not configured", () => {
     const before = BLACK_FRIDAY_ENDS_AT_MS - 86_400_000;
     expect(blackFridayState({}, before)).toEqual({ open: false, reason: "offer_unavailable" });
-    expect(blackFridayState({ STRIPE_PRICE_ID_PRO_ANNUAL_BF: "" }, before)).toEqual({ open: false, reason: "offer_unavailable" });
+    expect(blackFridayState({ STRIPE_PRICE_ID_PRO_YEAR_BF: "" }, before)).toEqual({ open: false, reason: "offer_unavailable" });
   });
 });
 
@@ -80,8 +81,12 @@ describe("the Checkout Session's expiry", () => {
 });
 
 describe("the offer price's tier", () => {
-  it("grants Pro, so the webhook and the sync do not leave a buyer on Free", () => {
-    expect(priceToTier(ENV, "price_bf")).toBe("pro");
+  it("is not a subscription price: no subscription on it is ever given a plan", () => {
+    // The year is granted by the payment itself (applyOfferPayment). If the
+    // price ever appeared on a subscription, that would be a renewing plan
+    // nobody was offered, and it must not quietly become Pro.
+    expect(priceToTier(ENV, "price_bf")).toBeNull();
+    expect(priceToTier(ENV, "price_pro")).toBe("pro");
   });
 
   it("grants nothing for an unset price id", () => {
@@ -139,26 +144,71 @@ describe("what is sent to Stripe", () => {
 
   const session = { customerId: "cus_1", priceId: "price_bf", successUrl: "https://a/ok", cancelUrl: "https://a/no", organizationId: "org_a" };
 
-  it("an offer session carries its expiry and its name, and takes no promotion codes", async () => {
+  it("an offer session is one card payment: no subscription, its expiry, its name, no promotion codes", async () => {
     const calls = stripe();
-    await createCheckoutSession("sk", { ...session, expiresAt: 1795755600, allowPromotionCodes: false, offer: BLACK_FRIDAY });
+    await createCheckoutSession("sk", {
+      ...session,
+      expiresAt: 1795755600,
+      allowPromotionCodes: false,
+      offer: BLACK_FRIDAY,
+      mode: "payment",
+      submitMessage: BLACK_FRIDAY_CHECKOUT_NOTE,
+    });
     expect(calls).toHaveLength(1);
     const form = calls[0].form;
+    expect(form.mode).toBe("payment");
+    // Nothing that would create a subscription, so nothing that can renew.
+    expect(Object.keys(form).filter((k) => k.startsWith("subscription_data"))).toEqual([]);
+    expect(form["payment_method_types[0]"]).toBe("card");
+    expect(form["custom_text[submit][message]"]).toBe(BLACK_FRIDAY_CHECKOUT_NOTE);
     expect(form.expires_at).toBe("1795755600");
     expect(form["metadata[offer]"]).toBe("black-friday");
-    expect(form["subscription_data[metadata][offer]"]).toBe("black-friday");
+    expect(form["metadata[organization_id]"]).toBe("org_a");
+    expect(form["payment_intent_data[metadata][offer]"]).toBe("black-friday");
+    expect(form["payment_intent_data[metadata][organization_id]"]).toBe("org_a");
     expect(form).not.toHaveProperty("allow_promotion_codes");
     expect(form["line_items[0][price]"]).toBe("price_bf");
-    expect(form["metadata[organization_id]"]).toBe("org_a");
   });
 
-  it("a regular session is unchanged: promotion codes on, no expiry, no offer", async () => {
+  it("the line beside the pay button says one payment and no renewal", () => {
+    expect(BLACK_FRIDAY_CHECKOUT_NOTE).toBe(
+      "One payment of $27 for one year of Engram Pro. It does not renew: after a year your account goes back to the free plan unless you subscribe again.",
+    );
+  });
+
+  it("a regular session is unchanged: a subscription, promotion codes on, no expiry, no offer", async () => {
     const calls = stripe();
     await createCheckoutSession("sk", session);
     const form = calls[0].form;
+    expect(form.mode).toBe("subscription");
+    expect(form["subscription_data[metadata][organization_id]"]).toBe("org_a");
+    expect(Object.keys(form).filter((k) => k.startsWith("payment_intent_data"))).toEqual([]);
+    expect(form).not.toHaveProperty("payment_method_types[0]");
+    expect(form).not.toHaveProperty("custom_text[submit][message]");
     expect(form.allow_promotion_codes).toBe("true");
     expect(form).not.toHaveProperty("expires_at");
     expect(form).not.toHaveProperty("metadata[offer]");
+  });
+
+  it("the offer's price is paid once: no billing period, on a product of its own", async () => {
+    const calls = stripe();
+    await createOneTimePrice("sk", {
+      productName: "Engram Pro, one year",
+      productDescription: "d",
+      unitAmount: 2700,
+      lookupKey: "pro_one_year_bf2026",
+      nickname: "n",
+    });
+    expect(calls.map((c) => c.path)).toEqual(["/v1/products", "/v1/prices"]);
+    expect(calls[0].form).toMatchObject({ name: "Engram Pro, one year" });
+    expect(calls[1].form).toMatchObject({ product: "obj_1", unit_amount: "2700", currency: "usd", lookup_key: "pro_one_year_bf2026" });
+    expect(Object.keys(calls[1].form).filter((k) => k.startsWith("recurring"))).toEqual([]);
+  });
+
+  it("switching a price off changes nothing else about it", async () => {
+    const calls = stripe();
+    await deactivatePrice("sk", "price_old");
+    expect(calls).toEqual([{ path: "/v1/prices/price_old", form: { active: "false" } }]);
   });
 
   it("a yearly price on an existing product creates no new product", async () => {

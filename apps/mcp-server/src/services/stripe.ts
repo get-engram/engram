@@ -161,6 +161,49 @@ export async function createRecurringPrice(
 }
 
 /**
+ * A price that is paid once, on a product of its own.
+ *
+ * For a plan sold as a single payment (Black Friday 2026, engram#763: one
+ * year of Pro for one payment). It has no billing period, so it can never
+ * be put on a subscription and can never charge a second time. The product
+ * is separate from the plan's own so Checkout and the receipt name what was
+ * bought: a year, not a subscription.
+ */
+export async function createOneTimePrice(
+  secretKey: string,
+  params: {
+    productName: string;
+    productDescription: string;
+    unitAmount: number;
+    lookupKey: string;
+    nickname: string;
+    currency?: string;
+  },
+): Promise<StripePrice> {
+  const product = await stripeFetch<{ id: string }>(secretKey, `/products`, {
+    name: params.productName,
+    description: params.productDescription,
+  });
+  return stripeFetch<StripePrice>(secretKey, `/prices`, {
+    product: product.id,
+    unit_amount: params.unitAmount,
+    currency: params.currency ?? "usd",
+    lookup_key: params.lookupKey,
+    nickname: params.nickname,
+  });
+}
+
+/**
+ * Stop a price being sold. Stripe prices cannot be deleted or edited, only
+ * switched off: nothing new can be bought at an inactive price.
+ */
+export function deactivatePrice(secretKey: string, priceId: string): Promise<StripePrice> {
+  return stripeFetch<StripePrice>(secretKey, `/prices/${encodeURIComponent(priceId)}`, {
+    active: "false",
+  });
+}
+
+/**
  * The ONE price -> tier mapping.
  *
  * There used to be two. billing.ts (webhook) knew about the student price;
@@ -182,16 +225,11 @@ export function priceToTier(
     STRIPE_PRICE_ID_TEAM?: string;
     STRIPE_PRICE_ID_STUDENT?: string;
     STRIPE_PRICE_ID_EDU_TEAM?: string;
-    STRIPE_PRICE_ID_PRO_ANNUAL_BF?: string;
   },
   priceId: string | undefined,
 ): "pro" | "student" | "team" | null {
   if (!priceId) return null;
   if (priceId === env.STRIPE_PRICE_ID_PRO) return "pro";
-  // Black Friday 2026 (engram#763): Pro billed $27 a year. The same tier at
-  // a different price, exactly like Education Team below. Without this line
-  // someone who paid for the offer would stay on Free.
-  if (priceId === env.STRIPE_PRICE_ID_PRO_ANNUAL_BF) return "pro";
   if (priceId === env.STRIPE_PRICE_ID_TEAM) return "team";
   if (priceId === env.STRIPE_PRICE_ID_STUDENT) return "student";
   // Education Team is the TEAM tier at an academic price — deliberately not a
@@ -353,27 +391,44 @@ export async function createCheckoutSession(
     expiresAt?: number;
     /** False for an offer that is already a discount. Default: codes allowed. */
     allowPromotionCodes?: boolean;
-    /** Stamped on the session and the subscription, e.g. which offer sold it. */
+    /** Stamped on the session and what it creates, e.g. which offer sold it. */
     offer?: string;
+    /**
+     * "payment" takes the money once and creates no subscription, so nothing
+     * can renew. The price must be a one-time price. Default: a subscription.
+     */
+    mode?: "subscription" | "payment";
+    /** A line Checkout shows beside the pay button. */
+    submitMessage?: string;
   },
 ): Promise<CheckoutSession> {
+  const once = params.mode === "payment";
+  // Where the org and the offer are copied to: the subscription, or for a
+  // single payment the payment itself, so either can be traced back.
+  const child = once ? "payment_intent_data" : "subscription_data";
   const body: Record<string, string | number> = {
     customer: params.customerId,
-    mode: "subscription",
+    mode: once ? "payment" : "subscription",
     "line_items[0][price]": params.priceId,
     "line_items[0][quantity]": params.quantity ?? 1,
     success_url: params.successUrl,
     cancel_url: params.cancelUrl,
     "metadata[organization_id]": params.organizationId,
-    "subscription_data[metadata][organization_id]": params.organizationId,
+    [`${child}[metadata][organization_id]`]: params.organizationId,
     billing_address_collection: "auto",
   };
+  // Cards only for a single payment. A card is charged before Checkout
+  // completes, so `checkout.session.completed` always arrives paid; a bank
+  // debit completes first and pays days later, on an event the webhook
+  // endpoint is not subscribed to.
+  if (once) body["payment_method_types[0]"] = "card";
+  if (params.submitMessage) body["custom_text[submit][message]"] = params.submitMessage;
   // Left out when false: without the field Stripe shows no promotion-code box.
   if (params.allowPromotionCodes !== false) body.allow_promotion_codes = "true";
   if (params.expiresAt) body.expires_at = params.expiresAt;
   if (params.offer) {
     body["metadata[offer]"] = params.offer;
-    body["subscription_data[metadata][offer]"] = params.offer;
+    body[`${child}[metadata][offer]`] = params.offer;
   }
   if (params.adjustableQuantity) {
     body["line_items[0][adjustable_quantity][enabled]"] = "true";

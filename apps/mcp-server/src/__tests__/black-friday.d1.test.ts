@@ -33,6 +33,7 @@ const WEB = "https://web.example.test";
 const WORKER = "https://mcp.example.test";
 /** Ten days before the deadline: the offer is on sale. */
 const DURING = BLACK_FRIDAY_ENDS_AT_MS - 10 * 86_400_000;
+let clock = DURING;
 
 const offerSig = (org: string) => createHmac("sha256", KEY).update(`offer:black-friday:${org}`).digest("hex");
 const unsubscribeSig = (org: string) => createHmac("sha256", KEY).update(`digest:${org}`).digest("hex");
@@ -80,7 +81,10 @@ describe("Black Friday 2026 (engram#763), against real SQLite", () => {
     vi.mocked(createCheckoutSession).mockClear();
     vi.mocked(createOrGetCustomer).mockClear();
     vi.mocked(createPortalSession).mockClear();
-    vi.spyOn(Date, "now").mockReturnValue(DURING);
+    // Each test starts two minutes after the last, so the per-account
+    // throttle on the emailed link (kept in module memory) starts full.
+    clock += 120_000;
+    vi.spyOn(Date, "now").mockReturnValue(clock);
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -88,6 +92,14 @@ describe("Black Friday 2026 (engram#763), against real SQLite", () => {
         if (url.origin === "https://api.stripe.com" && url.pathname === "/v1/subscriptions") {
           const live = subscribed.has(url.searchParams.get("customer") ?? "") && url.searchParams.get("status") === "active";
           return new Response(JSON.stringify({ data: live ? [{ id: "sub_1" }] : [] }), { status: 200 });
+        }
+        // A second try finds the customer saved by the first and re-reads it.
+        const customer = /^\/v1\/customers\/cus_(.+)$/.exec(url.pathname);
+        if (url.origin === "https://api.stripe.com" && customer) {
+          return new Response(
+            JSON.stringify({ id: `cus_${customer[1]}`, metadata: { organization_id: customer[1] } }),
+            { status: 200 },
+          );
         }
         if (url.origin === WEB && url.pathname === "/api/email/black-friday") {
           expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer web-bearer");
@@ -184,7 +196,8 @@ describe("Black Friday 2026 (engram#763), against real SQLite", () => {
         adjustableQuantity: undefined,
         minQuantity: undefined,
         successUrl: `${WEB}/upgrade/success?session_id={CHECKOUT_SESSION_ID}`,
-        cancelUrl: `${WEB}/black-friday?upgrade=cancelled`,
+        // Back from Stripe lands on the page with the same link, still usable.
+        cancelUrl: `${WEB}/black-friday?org=org_a&sig=${offerSig("org_a")}&upgrade=cancelled`,
         organizationId: "org_a",
         expiresAt: undefined,
         allowPromotionCodes: false,
@@ -277,6 +290,32 @@ describe("Black Friday 2026 (engram#763), against real SQLite", () => {
       expect(createCheckoutSession).not.toHaveBeenCalled();
     });
 
+    it("allows five tries a minute per account, however many accounts share one address", async () => {
+      // The website makes this call, so every buyer comes from its address.
+      for (const id of ["org_a", "org_b", "org_c", "org_d", "org_e", "org_f", "org_g"]) await org(id);
+      for (let i = 0; i < 5; i++) {
+        expect((await take({ org: "org_a", sig: offerSig("org_a") })).status).toBe(200);
+      }
+      const sixth = await take({ org: "org_a", sig: offerSig("org_a") });
+      expect(sixth.status).toBe(429);
+      expect(sixth.body.error).toBe("rate_limited");
+      expect(createCheckoutSession).toHaveBeenCalledTimes(5);
+      for (const id of ["org_b", "org_c", "org_d", "org_e", "org_f", "org_g"]) {
+        expect((await take({ org: id, sig: offerSig(id) })).status).toBe(200);
+      }
+      // A minute later the account can try again.
+      vi.mocked(Date.now).mockReturnValue(clock + 60_000);
+      expect((await take({ org: "org_a", sig: offerSig("org_a") })).status).toBe(200);
+    });
+
+    it("spends none of an account's tries on a bad signature", async () => {
+      await org("org_a");
+      for (let i = 0; i < 20; i++) {
+        expect((await take({ org: "org_a", sig: "0".repeat(64) })).status).toBe(403);
+      }
+      expect((await take({ org: "org_a", sig: offerSig("org_a") })).status).toBe(200);
+    });
+
     it("does nothing on a GET, which is what a mail scanner sends", async () => {
       await org("org_a");
       const res = await app.fetch(
@@ -332,7 +371,7 @@ describe("Black Friday 2026 (engram#763), against real SQLite", () => {
       expect(late.status).toBe(410);
       expect(late.body.error).toBe("offer_ended");
 
-      vi.spyOn(Date, "now").mockReturnValue(DURING);
+      vi.spyOn(Date, "now").mockReturnValue(clock);
       const unknown = await checkout({ offer: "cyber-monday" });
       expect(unknown.status).toBe(400);
       expect(unknown.body.error).toBe("unknown_offer");
@@ -573,7 +612,7 @@ describe("Black Friday 2026 (engram#763), against real SQLite", () => {
       await org("org_a");
       vi.spyOn(Date, "now").mockReturnValue(BLACK_FRIDAY_ENDS_AT_MS);
       expect(await run({})).toMatchObject({ error: "offer_ended", status: 410 });
-      vi.spyOn(Date, "now").mockReturnValue(DURING);
+      vi.spyOn(Date, "now").mockReturnValue(clock);
       expect(await run({}, env({ STRIPE_PRICE_ID_PRO_ANNUAL_BF: undefined }))).toMatchObject({ error: "offer_unavailable" });
       expect(await run({}, env({ UNSUBSCRIBE_HMAC_KEY: undefined, ADMIN_SECRET: undefined, INTERNAL_CRON_SECRET: "web-bearer" }))).toMatchObject({
         error: "mail_not_configured",

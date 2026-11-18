@@ -19,6 +19,8 @@ import { bindStripeCustomer, resolveCachedCustomer } from "../services/stripe-cu
 import { checkoutForOrg } from "../services/checkout.js";
 import {
   BLACK_FRIDAY,
+  BLACK_FRIDAY_CHECKOUT_NOTE,
+  applyOfferPayment,
   blackFridayState,
   offerClosedBody,
   offerSessionExpiry,
@@ -132,8 +134,8 @@ billing.post("/checkout", async (c) => {
     }>()
     .catch(() => ({}) as Record<string, never>);
 
-  // Black Friday 2026 (engram#763): Pro billed $27 a year. The price and the
-  // deadline are decided here; the request only names the offer.
+  // Black Friday 2026 (engram#763): one year of Pro for one $27 payment. The
+  // price and the deadline are decided here; the request only names the offer.
   if (body.offer !== undefined) {
     if (body.offer !== BLACK_FRIDAY) {
       return c.json({ error: "unknown_offer", message: "That offer does not exist." }, 400);
@@ -142,6 +144,18 @@ billing.post("/checkout", async (c) => {
     if (!offer.open) {
       return c.json(offerClosedBody(offer.reason), offer.reason === "offer_ended" ? 410 : 503);
     }
+    // A single payment leaves no subscription behind for the guard in
+    // checkoutForOrg to find, so an account that already bought the year is
+    // stopped here, by its plan, before it can pay $27 twice.
+    const current = await c.env.DB.prepare("SELECT tier FROM organizations WHERE id = ?")
+      .bind(auth.organizationId)
+      .first<{ tier: string }>();
+    if (current && current.tier !== "free") {
+      return c.json(
+        { error: "already_subscribed", message: "This account already has a paid plan." },
+        409,
+      );
+    }
     const outcome = await checkoutForOrg(c.env, auth.organizationId, {
       priceId: offer.priceId,
       successUrl: `${c.env.APP_URL}/upgrade/success?session_id={CHECKOUT_SESSION_ID}`,
@@ -149,6 +163,8 @@ billing.post("/checkout", async (c) => {
       expiresAt: offerSessionExpiry(),
       allowPromotionCodes: false,
       offer: BLACK_FRIDAY,
+      mode: "payment",
+      submitMessage: BLACK_FRIDAY_CHECKOUT_NOTE,
     });
     if (outcome.kind === "error") return c.json(outcome.body, outcome.status);
     if (outcome.kind === "already_subscribed") {
@@ -521,6 +537,9 @@ async function applyStripeEvent(env: Env, event: StripeEvent): Promise<void> {
         // still completes — a 500 here would only make Stripe retry it.
         await bindStripeCustomer(env.DB, orgId, customer);
       }
+      // A plan paid for once (Black Friday 2026, engram#763) has no
+      // subscription events: this event is the payment, and grants the year.
+      await applyOfferPayment(env, obj);
       break;
     }
 

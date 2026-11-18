@@ -33,6 +33,8 @@ export async function checkoutForOrg(
     expiresAt?: number;
     allowPromotionCodes?: boolean;
     offer?: string;
+    mode?: "subscription" | "payment";
+    submitMessage?: string;
   },
 ): Promise<CheckoutOutcome> {
   const org = (await getOrganizationById(env.DB, organizationId)) as
@@ -99,6 +101,8 @@ export async function checkoutForOrg(
     expiresAt: params.expiresAt,
     allowPromotionCodes: params.allowPromotionCodes,
     offer: params.offer,
+    mode: params.mode,
+    submitMessage: params.submitMessage,
   });
   return { kind: "session", url: session.url, sessionId: session.id };
 }

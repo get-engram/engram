@@ -6,7 +6,8 @@ import app from "../index.js";
 import { billing } from "../routes/billing.js";
 import { createCheckoutSession, createOrGetCustomer, createPortalSession } from "../services/stripe.js";
 import { runBlackFridayCampaign, type CampaignResult } from "../services/black-friday-campaign.js";
-import { BLACK_FRIDAY_ENDS_AT_MS } from "../services/black-friday.js";
+import { BLACK_FRIDAY_CHECKOUT_NOTE, BLACK_FRIDAY_ENDS_AT_MS } from "../services/black-friday.js";
+import { expireGracePeriods } from "../cron/expire-grace.js";
 import { applyAllMigrations } from "./miniflare.js";
 import { createMockEnv } from "./helpers.js";
 import type { AuthContext, Env } from "../types.js";
@@ -129,7 +130,7 @@ describe("Black Friday 2026 (engram#763), against real SQLite", () => {
       STRIPE_SECRET_KEY: "sk_test_fake",
       STRIPE_PRICE_ID_PRO: "price_pro",
       STRIPE_PRICE_ID_TEAM: "price_team",
-      STRIPE_PRICE_ID_PRO_ANNUAL_BF: "price_bf",
+      STRIPE_PRICE_ID_PRO_YEAR_BF: "price_bf",
       ...over,
     } as unknown as Env;
   }
@@ -183,7 +184,7 @@ describe("Black Friday 2026 (engram#763), against real SQLite", () => {
       return { status: res.status, body: (await res.json()) as Record<string, unknown> };
     }
 
-    it("starts a $27/year checkout for the account the link was signed for, without a sign-in", async () => {
+    it("starts a one-time $27 checkout for the account the link was signed for, without a sign-in", async () => {
       await org("org_a");
       const res = await take({ org: "org_a", sig: offerSig("org_a") });
       expect(res.status).toBe(200);
@@ -202,6 +203,9 @@ describe("Black Friday 2026 (engram#763), against real SQLite", () => {
         expiresAt: undefined,
         allowPromotionCodes: false,
         offer: "black-friday",
+        // One payment, not a subscription: nothing is left that can renew.
+        mode: "payment",
+        submitMessage: BLACK_FRIDAY_CHECKOUT_NOTE,
       });
       const row = await db.prepare("SELECT stripe_customer_id AS c, tier FROM organizations WHERE id = 'org_a'").first();
       // Starting a checkout grants nothing: the tier changes only on Stripe's webhook.
@@ -260,7 +264,7 @@ describe("Black Friday 2026 (engram#763), against real SQLite", () => {
 
     it("is not sold while the price is not configured", async () => {
       await org("org_a");
-      const res = await take({ org: "org_a", sig: offerSig("org_a") }, env({ STRIPE_PRICE_ID_PRO_ANNUAL_BF: undefined }));
+      const res = await take({ org: "org_a", sig: offerSig("org_a") }, env({ STRIPE_PRICE_ID_PRO_YEAR_BF: undefined }));
       expect(res.status).toBe(503);
       expect(res.body.error).toBe("offer_unavailable");
       expect(createCheckoutSession).not.toHaveBeenCalled();
@@ -355,7 +359,20 @@ describe("Black Friday 2026 (engram#763), against real SQLite", () => {
         allowPromotionCodes: false,
         offer: "black-friday",
         organizationId: "org_a",
+        mode: "payment",
+        submitMessage: BLACK_FRIDAY_CHECKOUT_NOTE,
       });
+    });
+
+    it("does not sell the year twice: an account already on a paid plan is refused before Stripe is asked", async () => {
+      // Someone who bought the year has no subscription for the usual guard
+      // to find, so the plan itself has to stop a second $27.
+      await org("org_a", { tier: "pro" });
+      const res = await checkout({ offer: "black-friday" });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toBe("already_subscribed");
+      expect(createOrGetCustomer).not.toHaveBeenCalled();
+      expect(createCheckoutSession).not.toHaveBeenCalled();
     });
 
     it("sells Pro only: a team or student request with the offer still gets the offer price, one seat", async () => {
@@ -397,6 +414,186 @@ describe("Black Friday 2026 (engram#763), against real SQLite", () => {
       expect(params.allowPromotionCodes).toBeUndefined();
       expect(params.expiresAt).toBeUndefined();
       expect(params.offer).toBeUndefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  describe("the payment: one year of Pro, and no renewal", () => {
+    const WEBHOOK_SECRET = "whsec_bf_test";
+
+    /** Deliver a Stripe event to the real webhook route, signed as Stripe signs. */
+    async function deliver(id: string, type: string, object: Record<string, unknown>) {
+      const raw = JSON.stringify({ id, type, data: { object } });
+      const t = Math.floor(Date.now() / 1000);
+      const v1 = createHmac("sha256", WEBHOOK_SECRET).update(`${t}.${raw}`).digest("hex");
+      const res = await app.fetch(
+        new Request(`${WORKER}/billing/webhook`, {
+          method: "POST",
+          headers: { "stripe-signature": `t=${t},v1=${v1}`, "Content-Type": "application/json" },
+          body: raw,
+        }),
+        env({ STRIPE_WEBHOOK_SECRET: WEBHOOK_SECRET }),
+        ctx,
+      );
+      return res.status;
+    }
+
+    /** A completed Checkout Session for the offer, paid unless told otherwise. */
+    const paidSession = (orgId: string, over: Record<string, unknown> = {}) => ({
+      id: `cs_${orgId}`,
+      object: "checkout.session",
+      mode: "payment",
+      payment_status: "paid",
+      status: "complete",
+      amount_total: 2700,
+      currency: "usd",
+      customer: `cus_${orgId}`,
+      subscription: null,
+      metadata: { organization_id: orgId, offer: "black-friday" },
+      ...over,
+    });
+
+    const state = (id: string) =>
+      db
+        .prepare(
+          `SELECT tier, stripe_subscription_id AS sub,
+                  grace_ends_at > datetime('now', '+364 days') AND grace_ends_at <= datetime('now', '+366 days') AS a_year_out,
+                  grace_ends_at AS until
+             FROM organizations WHERE id = ?`,
+        )
+        .bind(id)
+        .first<{ tier: string; sub: string | null; a_year_out: number | null; until: string | null }>();
+    const plans = async () =>
+      (
+        await db
+          .prepare("SELECT session_id, org_id, offer, tier, amount_total, currency, ends_at FROM prepaid_plans ORDER BY session_id")
+          .all<Record<string, unknown>>()
+      ).results;
+
+    beforeEach(async () => {
+      await db.batch([db.prepare("DELETE FROM prepaid_plans"), db.prepare("DELETE FROM stripe_webhook_events")]);
+    });
+
+    it("a paid session gives Pro until a year from now, with no subscription", async () => {
+      await org("org_a");
+      expect(await deliver("evt_1", "checkout.session.completed", paidSession("org_a"))).toBe(200);
+      const after = await state("org_a");
+      expect(after).toMatchObject({ tier: "pro", sub: null, a_year_out: 1 });
+      expect(await plans()).toEqual([
+        { session_id: "cs_org_a", org_id: "org_a", offer: "black-friday", tier: "pro", amount_total: 2700, currency: "usd", ends_at: after!.until },
+      ]);
+    });
+
+    it("the same payment delivered again grants one year, and the end date does not move", async () => {
+      await org("org_a");
+      await deliver("evt_1", "checkout.session.completed", paidSession("org_a"));
+      // Move the end date back by hand: a second delivery must read the
+      // recorded date, not start a fresh year.
+      await db.batch([
+        db.prepare("UPDATE prepaid_plans SET ends_at = '2027-06-01 00:00:00' WHERE session_id = 'cs_org_a'"),
+        db.prepare("UPDATE organizations SET grace_ends_at = '2027-06-01 00:00:00' WHERE id = 'org_a'"),
+      ]);
+      // Stripe's own retry carries the same event id; a second event for the
+      // same session (it sends more than one kind) carries a new one.
+      expect(await deliver("evt_1", "checkout.session.completed", paidSession("org_a"))).toBe(200);
+      expect(await deliver("evt_2", "checkout.session.completed", paidSession("org_a"))).toBe(200);
+      expect(await plans()).toHaveLength(1);
+      expect(await state("org_a")).toMatchObject({ tier: "pro", until: "2027-06-01 00:00:00" });
+    });
+
+    it("grants nothing until the money is in", async () => {
+      await org("org_a");
+      await deliver("evt_1", "checkout.session.completed", paidSession("org_a", { payment_status: "unpaid" }));
+      expect(await state("org_a")).toMatchObject({ tier: "free", until: null });
+      expect(await plans()).toEqual([]);
+    });
+
+    it("grants nothing for a session that is not this offer's single payment", async () => {
+      await org("org_a");
+      await org("org_b");
+      // A regular subscription checkout: its plan comes from the subscription events.
+      await deliver("evt_1", "checkout.session.completed", paidSession("org_a", { mode: "subscription", metadata: { organization_id: "org_a" } }));
+      // A single payment for something else.
+      await deliver("evt_2", "checkout.session.completed", paidSession("org_b", { metadata: { organization_id: "org_b", offer: "something-else" } }));
+      expect(await state("org_a")).toMatchObject({ tier: "free", until: null });
+      expect(await state("org_b")).toMatchObject({ tier: "free", until: null });
+      expect(await plans()).toEqual([]);
+    });
+
+    it("leaves a Team or Student account's plan alone, and a deleted or unknown account untouched", async () => {
+      await org("org_team", { tier: "team" });
+      await org("org_student", { tier: "student" });
+      await org("org_gone", { deleted: true });
+      for (const id of ["org_team", "org_student", "org_gone", "org_never"]) {
+        expect(await deliver(`evt_${id}`, "checkout.session.completed", paidSession(id))).toBe(200);
+      }
+      expect(await state("org_team")).toMatchObject({ tier: "team", until: null });
+      expect(await state("org_student")).toMatchObject({ tier: "student", until: null });
+      expect(await state("org_gone")).toMatchObject({ tier: "free", until: null });
+      expect(await plans()).toEqual([]);
+    });
+
+    it("never shortens a later end date already on the account", async () => {
+      await org("org_a");
+      await db.prepare("UPDATE organizations SET tier = 'pro', grace_ends_at = '2126-01-01 00:00:00' WHERE id = 'org_a'").run();
+      await deliver("evt_1", "checkout.session.completed", paidSession("org_a"));
+      expect(await state("org_a")).toMatchObject({ tier: "pro", until: "2126-01-01 00:00:00" });
+      expect(await plans()).toHaveLength(1);
+    });
+
+    it("a stray cancellation event during the year does not take Pro away", async () => {
+      await org("org_a");
+      await deliver("evt_1", "checkout.session.completed", paidSession("org_a"));
+      // 200 also says no "your plan was cancelled" email was attempted for
+      // someone who paid: the fetch stub throws on any request it does not
+      // expect, and the webhook would answer 500.
+      expect(
+        await deliver("evt_2", "customer.subscription.deleted", {
+          id: "sub_old",
+          status: "canceled",
+          customer: "cus_org_a",
+          metadata: { organization_id: "org_a" },
+          items: { data: [{ price: { id: "price_pro" }, quantity: 1 }] },
+        }),
+      ).toBe(200);
+      expect(await state("org_a")).toMatchObject({ tier: "pro", a_year_out: 1 });
+    });
+
+    it("when the year is over the account goes back to Free and is told its paid year ended", async () => {
+      await org("org_a");
+      await org("org_gift");
+      await deliver("evt_1", "checkout.session.completed", paidSession("org_a"));
+      // A year later. org_gift was given Pro by an admin and never paid.
+      await db.batch([
+        db.prepare("UPDATE prepaid_plans SET ends_at = datetime('now', '-1 minute')"),
+        db.prepare("UPDATE organizations SET grace_ends_at = datetime('now', '-1 minute') WHERE id = 'org_a'"),
+        db.prepare("UPDATE organizations SET tier = 'pro', grace_ends_at = datetime('now', '-1 minute') WHERE id = 'org_gift'"),
+      ]);
+      const told: Array<Record<string, unknown>> = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+          expect(String(input)).toBe(`${WEB}/api/email/payment-reminder`);
+          told.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return new Response("{}", { status: 200 });
+        }),
+      );
+      expect(await expireGracePeriods(env())).toBe(2);
+      expect(await state("org_a")).toMatchObject({ tier: "free", until: null, sub: null });
+      expect(await state("org_gift")).toMatchObject({ tier: "free", until: null });
+      expect(told.sort((a, b) => String(a.to).localeCompare(String(b.to)))).toEqual([
+        { to: "org_a@example.test", name: "Name org_a", tier: "pro", reason: "prepaid_ended" },
+        { to: "org_gift@example.test", name: "Name org_gift", tier: "pro" },
+      ]);
+      // Nothing is left that could charge or re-grant: the next run finds nobody.
+      expect(await expireGracePeriods(env())).toBe(0);
+    });
+
+    it("the year is not ended early: an account still inside it is left on Pro", async () => {
+      await org("org_a");
+      await deliver("evt_1", "checkout.session.completed", paidSession("org_a"));
+      expect(await expireGracePeriods(env())).toBe(0);
+      expect(await state("org_a")).toMatchObject({ tier: "pro", a_year_out: 1 });
     });
   });
 
@@ -613,7 +810,7 @@ describe("Black Friday 2026 (engram#763), against real SQLite", () => {
       vi.spyOn(Date, "now").mockReturnValue(BLACK_FRIDAY_ENDS_AT_MS);
       expect(await run({})).toMatchObject({ error: "offer_ended", status: 410 });
       vi.spyOn(Date, "now").mockReturnValue(clock);
-      expect(await run({}, env({ STRIPE_PRICE_ID_PRO_ANNUAL_BF: undefined }))).toMatchObject({ error: "offer_unavailable" });
+      expect(await run({}, env({ STRIPE_PRICE_ID_PRO_YEAR_BF: undefined }))).toMatchObject({ error: "offer_unavailable" });
       expect(await run({}, env({ UNSUBSCRIBE_HMAC_KEY: undefined, ADMIN_SECRET: undefined, INTERNAL_CRON_SECRET: "web-bearer" }))).toMatchObject({
         error: "mail_not_configured",
       });

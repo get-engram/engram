@@ -118,7 +118,7 @@ export async function runBlackFridayCampaign(
   if (!offer.open) {
     return offer.reason === "offer_ended"
       ? { error: "offer_ended", message: "The offer has ended; nothing was sent.", status: 410 }
-      : { error: "offer_unavailable", message: "STRIPE_PRICE_ID_PRO_ANNUAL_BF is not set; nothing was sent.", status: 503 };
+      : { error: "offer_unavailable", message: "STRIPE_PRICE_ID_PRO_YEAR_BF is not set; nothing was sent.", status: 503 };
   }
   const mail = lifecycleMail(env);
   if (!mail || !env.APP_URL) {

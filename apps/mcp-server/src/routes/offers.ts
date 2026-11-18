@@ -4,6 +4,7 @@ import { checkoutForOrg } from "../services/checkout.js";
 import { offerSigValid } from "../services/secrets.js";
 import {
   BLACK_FRIDAY,
+  BLACK_FRIDAY_CHECKOUT_NOTE,
   blackFridayState,
   offerClosedBody,
   offerSessionExpiry,
@@ -80,6 +81,8 @@ offers.post("/black-friday/checkout", async (c) => {
     expiresAt: offerSessionExpiry(),
     allowPromotionCodes: false,
     offer: BLACK_FRIDAY,
+    mode: "payment",
+    submitMessage: BLACK_FRIDAY_CHECKOUT_NOTE,
   });
   if (outcome.kind === "error") return c.json(outcome.body, outcome.status);
   if (outcome.kind === "already_subscribed") {

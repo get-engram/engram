@@ -199,7 +199,7 @@ describe("/api/webhooks", () => {
     }
   });
 
-  it("stays gated to Team and above", async () => {
+  it("stays closed to the free plan", async () => {
     const { env } = world();
     const res = await appAs(FREE_OWNER).request("/api/webhooks", post(GOOD), env);
     expect(res.status).toBe(403);

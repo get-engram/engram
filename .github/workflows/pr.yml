@@ -127,10 +127,50 @@ jobs:
         working-directory: apps/mcp-server
         run: pnpm smoke:bundle
 
+  # Whether the pull request changes the CLI, what it is built from, or this
+  # workflow. Only such a change can break the Windows and macOS jobs below,
+  # so they run only then (engram#777). A run started by hand runs them, and
+  # so does a pull request whose changed files can't be listed.
+  cli-changed:
+    name: Does it change the CLI?
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      cli: ${{ steps.diff.outputs.cli }}
+
+    steps:
+      # A pull request is checked out as its merge commit, whose first parent
+      # is main: those two commits are enough to list what it changes. A file
+      # moved out of the CLI is listed under its old path too (--no-renames).
+      - name: Checkout
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: List the changed files
+        id: diff
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != "pull_request" ] || ! changed="$(git diff --name-only --no-renames HEAD^1 HEAD)"; then
+            echo "cli=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf '%s\n' "$changed"
+          if grep -qE '^(apps/cli/|packages/sdk/|package\.json$|pnpm-lock\.yaml$|pnpm-workspace\.yaml$|tsconfig\.base\.json$|turbo\.json$|\.github/workflows/pr\.yml$)' <<< "$changed"; then
+            echo "cli=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cli=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # The daemon has Windows-only code paths (the worker's path, start at login
   # through the Run key, reg.exe) that nothing else here runs (engram#602).
   cli-windows:
     name: CLI on Windows (daemon start, start at login)
+    needs: cli-changed
+    if: needs.cli-changed.outputs.cli == 'true'
     runs-on: windows-latest
     timeout-minutes: 15
 
@@ -187,6 +227,8 @@ jobs:
   # 100 bytes at most), so the daemon tests run under the runner's own.
   cli-macos:
     name: CLI on macOS (daemon start, start at login)
+    needs: cli-changed
+    if: needs.cli-changed.outputs.cli == 'true'
     runs-on: macos-latest
     timeout-minutes: 20
 

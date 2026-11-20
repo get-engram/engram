@@ -45,6 +45,7 @@ import { sendWeeklyDigests } from "./cron/weekly-digest.js";
 import { UNSUBSCRIBE_LINK_EMAILS, unsubscribeSigValid } from "./services/secrets.js";
 import { sendShareNudge } from "./cron/share-nudge.js";
 import { sendDailyReport } from "./services/daily-report.js";
+import { runCampaignTick } from "./services/campaign-runs.js";
 import { oauth } from "./oauth/router.js";
 import {
   originOf,
@@ -437,9 +438,22 @@ export default {
   async scheduled(event: ScheduledEvent, rawEnv: Env, _ctx: ExecutionContext) {
     const env = resilient(rawEnv);
     // Crons (see wrangler.toml [triggers]):
+    //   */2 * * * *  — campaign email started from /admin, one batch a tick
     //   */10 * * * * — Stripe->D1 tier reconcile (self-heals missed webhooks)
     //   03:00 UTC — GDPR purge of soft-deleted orgs
     //   13:00 UTC — daily ops report, emailed via engram-web
+    if (event.cron === "*/2 * * * *") {
+      // MUST return here, like every branch: anything that falls through
+      // runs the 03:00 jobs. Campaign email the worker sends by itself
+      // (engram#773): the next batch of each run started from /admin, and
+      // one small query when none is running.
+      try {
+        await runCampaignTick(env);
+      } catch (err) {
+        console.error(`[campaign] tick FAILED: ${err instanceof Error ? err.message : err}`);
+      }
+      return;
+    }
     if (event.cron === "*/10 * * * *") {
       // MUST return here — falling through would run the daily purge/nudge
       // branch every tick.

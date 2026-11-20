@@ -39,7 +39,13 @@ import {
   BLACK_FRIDAY_RETIRED_LOOKUP_KEY,
   BLACK_FRIDAY_UNIT_AMOUNT,
 } from "../services/black-friday.js";
-import { runBlackFridayCampaign } from "../services/black-friday-campaign.js";
+import {
+  BLACK_FRIDAY_RESEND,
+  blackFridayOpens,
+  runBlackFridayCampaign,
+  runBlackFridayResend,
+} from "../services/black-friday-campaign.js";
+import { campaignRun, pauseCampaignRun, startCampaignRun } from "../services/campaign-runs.js";
 import {
   ADMIN_TZ_OFFSET,
   loadFastMetrics,
@@ -776,6 +782,47 @@ admin.post("/campaigns/black-friday", async (c) => {
   });
   if ("error" in result) return c.json({ error: result.error, message: result.message }, result.status);
   return c.json(result);
+});
+
+// ---------------------------------------------------------------------------
+// /admin/campaigns/black-friday-resend — the Black Friday email again, to the
+// addresses the first one went to that have not opened it (engram#773).
+//
+// Nothing here sends mail. Once started, the worker's two-minute cron sends
+// it in batches until nobody is left (campaign-runs.ts).
+//
+// GET: who is still owed it, what has been sent, and the run.
+// POST { start: true }: start the run, or start it again after a pause.
+//   Refused once the offer has ended or while mail is not configured.
+// POST { pause: true }: stop after the batch being sent, if any.
+// Any other body is refused.
+// ---------------------------------------------------------------------------
+admin.get("/campaigns/black-friday-resend", async (c) => {
+  const count = await runBlackFridayResend(c.env, { dryRun: true });
+  if ("error" in count) return c.json({ error: count.error, message: count.message }, count.status);
+  const opens = await blackFridayOpens(c.env);
+  return c.json({
+    campaign: BLACK_FRIDAY_RESEND,
+    owed: count.owed,
+    first_send: opens.first_send,
+    opened: opens.opened,
+    recorded: count.recorded,
+    run: await campaignRun(c.env, BLACK_FRIDAY_RESEND),
+  });
+});
+
+admin.post("/campaigns/black-friday-resend", async (c) => {
+  const parsed: unknown = await c.req.json().catch(() => null);
+  const body = (parsed !== null && typeof parsed === "object" ? parsed : {}) as { start?: unknown; pause?: unknown };
+  const modes = [body.start === true, body.pause === true].filter(Boolean).length;
+  if (modes !== 1) {
+    return c.json({ error: "bad_request", message: "Send exactly one of: start: true or pause: true." }, 400);
+  }
+  if (body.pause === true) return c.json(await pauseCampaignRun(c.env, BLACK_FRIDAY_RESEND));
+  const started = await startCampaignRun(c.env, BLACK_FRIDAY_RESEND);
+  if ("error" in started) return c.json({ error: started.error, message: started.message }, started.status);
+  const count = await runBlackFridayResend(c.env, { dryRun: true });
+  return c.json({ run: started.run, owed: "error" in count ? null : count.owed });
 });
 
 admin.post("/stripe/ensure-student-price", async (c) => {

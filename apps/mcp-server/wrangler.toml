@@ -75,8 +75,11 @@ binding = "AI"
 pattern = "mcp.getengram.app/*"
 zone_name = "getengram.app"
 
-# Crons — every-minute content drain (D1 -> R2, no-op once drained);
-# 03:00 GDPR purge of soft-deleted orgs; 13:00 daily ops report (built
-# here, emailed by engram-web /api/reports/daily).
+# Crons. Each one is a branch of scheduled() in src/index.ts, and each
+# branch must return: anything unmatched runs the 03:00 jobs.
+#   */2   campaign email started from /admin, one batch a tick (engram#773)
+#   */10  Stripe -> D1 plan reconcile
+#   03:00 GDPR purge of soft-deleted orgs, grace expiry, retention, nudges
+#   13:00 daily ops report (built here, emailed by engram-web /api/reports/daily)
 [triggers]
-crons = ["*/10 * * * *", "0 3 * * *", "0 13 * * *"]
+crons = ["*/2 * * * *", "*/10 * * * *", "0 3 * * *", "0 13 * * *"]

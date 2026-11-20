@@ -20,6 +20,10 @@ import { BLACK_FRIDAY, blackFridayState } from "./black-friday.js";
  * value in campaign_sends, so it too goes once per address, and the
  * worker's cron sends it by itself once it is started from /admin
  * (campaign-runs.ts).
+ *
+ * The third send (engram#775) is the same email once more, to the same
+ * kind of address: one the first email went to that has opened neither
+ * email. It too has its own campaign value and is sent by the cron.
  */
 
 const BATCH_DEFAULT = 20;
@@ -36,8 +40,13 @@ export const SEND_TIMEOUT_MS = 25_000;
 
 /** The second send's campaign value in campaign_sends and campaign_runs. */
 export const BLACK_FRIDAY_RESEND = "black-friday-resend";
+/** The third send's campaign value in campaign_sends and campaign_runs. */
+export const BLACK_FRIDAY_THIRD = "black-friday-third";
+/** The sends that go again to the first send's addresses, in order. */
+export const BLACK_FRIDAY_RESENDS = [BLACK_FRIDAY_RESEND, BLACK_FRIDAY_THIRD] as const;
+export type BlackFridayResend = (typeof BLACK_FRIDAY_RESENDS)[number];
 /**
- * The type engram-web logs the email under in email_log, for both sends
+ * The type engram-web logs the email under in email_log, for every send
  * (src/app/api/email/black-friday/route.ts there). The tracking pixel
  * stamps opened_at on that row.
  */
@@ -62,9 +71,9 @@ const OWED = `
       SELECT email FROM campaign_sends WHERE campaign = ?1)`;
 
 /**
- * FROM/WHERE for the addresses owed the second email. Binds: ?1 the first
- * send's campaign, ?2 the email's type in email_log, ?3 the second send's
- * campaign.
+ * FROM/WHERE for the addresses owed the second or the third email. Binds:
+ * ?1 the first send's campaign, ?2 the email's type in email_log, ?3 the
+ * campaign being sent (one of BLACK_FRIDAY_RESENDS).
  *
  * Only addresses the first email went to, so accounts created since are
  * never included. The account it went to must still be on Free, not
@@ -114,7 +123,7 @@ export interface CampaignResult {
   recorded: Record<string, number>;
 }
 
-export type CampaignError = { error: string; message: string; status: 400 | 404 | 410 | 500 | 502 | 503 };
+export type CampaignError = { error: string; message: string; status: 400 | 404 | 409 | 410 | 500 | 502 | 503 };
 
 interface Recipient {
   id: string;
@@ -320,20 +329,21 @@ export async function runBlackFridayCampaign(
   return { dry_run: false, owed, ...result, recorded: await recorded(env, BLACK_FRIDAY) };
 }
 
-const RESEND_BINDS = [BLACK_FRIDAY, EMAIL_TYPE, BLACK_FRIDAY_RESEND] as const;
-
 /**
- * The second Black Friday email (engram#773): count who is owed it, or send
+ * The Black Friday email again: the second send (engram#773) unless
+ * `campaign` names the third (engram#775). Count who is owed it, or send
  * the next batch. `deadline` (ms since the epoch) stops a batch from
  * starting another send after it. Only the cron sends it, through
  * campaign-runs.ts; /admin can count it, start the run and pause it.
  */
 export async function runBlackFridayResend(
   env: Env,
-  opts: { dryRun?: boolean; limit?: number; now?: number; deadline?: number },
+  opts: { campaign?: BlackFridayResend; dryRun?: boolean; limit?: number; now?: number; deadline?: number },
 ): Promise<CampaignResult | CampaignError> {
+  const campaign = opts.campaign ?? BLACK_FRIDAY_RESEND;
+  const binds = [BLACK_FRIDAY, EMAIL_TYPE, campaign] as const;
   const owedRow = await env.DB.prepare(`SELECT COUNT(*) AS n ${RESEND_OWED}`)
-    .bind(...RESEND_BINDS)
+    .bind(...binds)
     .first<{ n: number }>();
   const owed = owedRow?.n ?? 0;
 
@@ -345,7 +355,7 @@ export async function runBlackFridayResend(
       skipped: 0,
       failed: 0,
       stopped: false,
-      recorded: await recorded(env, BLACK_FRIDAY_RESEND),
+      recorded: await recorded(env, campaign),
     };
   }
 
@@ -358,16 +368,16 @@ export async function runBlackFridayResend(
      ORDER BY s.email
      LIMIT ?4`,
   )
-    .bind(...RESEND_BINDS, batchLimit(opts.limit))
+    .bind(...binds, batchLimit(opts.limit))
     .all<Recipient>();
 
-  const result = await sendBatch(env, mail, BLACK_FRIDAY_RESEND, batch.results ?? [], opts.deadline);
-  return { dry_run: false, owed, ...result, recorded: await recorded(env, BLACK_FRIDAY_RESEND) };
+  const result = await sendBatch(env, mail, campaign, batch.results ?? [], opts.deadline);
+  return { dry_run: false, owed, ...result, recorded: await recorded(env, campaign) };
 }
 
 /**
  * For /admin: how many addresses the first email went to, and how many of
- * those have opened a Black Friday email (either send).
+ * those have opened a Black Friday email (any send).
  */
 export async function blackFridayOpens(env: Env): Promise<{ first_send: number; opened: number }> {
   const row = await env.DB.prepare(

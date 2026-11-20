@@ -5,6 +5,7 @@ import { Miniflare } from "miniflare";
 import app from "../index.js";
 import {
   BLACK_FRIDAY_RESEND,
+  BLACK_FRIDAY_THIRD,
   SEND_TIMEOUT_MS,
   blackFridayOpens,
   runBlackFridayResend,
@@ -26,7 +27,8 @@ import type { Env } from "../types.js";
 /**
  * The Black Friday email again (engram#773), against real SQLite with the
  * real migrations: who it goes to, the send itself, the cron that sends it
- * a batch at a time once /admin starts it, and the /admin switch.
+ * a batch at a time once /admin starts it, and the /admin switch. Then the
+ * third send (engram#775), which is the same send under its own campaign.
  */
 
 const KEY = "link-key-773-test";
@@ -682,6 +684,146 @@ describe("The Black Friday email again (engram#773), against real SQLite", () =>
       await tick();
       expect(mails).toHaveLength(2);
       expect((await admin("GET")).body).toMatchObject({ owed: 0, recorded: { sent: 2 }, run: { state: "running" } });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  describe("the third send (engram#775)", () => {
+    const thirds = () => sendsOf(BLACK_FRIDAY_THIRD);
+
+    async function admin(method: "GET" | "POST", body?: unknown, bearer = "admin-test") {
+      const res = await app.fetch(
+        new Request(`${WORKER}/admin/campaigns/black-friday-third`, {
+          method,
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${bearer}` },
+          body: method === "GET" ? undefined : JSON.stringify(body),
+        }),
+        env(),
+        ctx,
+      );
+      return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+    }
+
+    it("goes to the first email's addresses that opened neither email, whether or not the second went to them", async () => {
+      // Got both emails, opened neither.
+      await got("org_both");
+      await sendInsert(BLACK_FRIDAY_RESEND, "org_both@example.test", "org_both").run();
+      // Got only the first, never opened it.
+      await got("org_first");
+      // Opened the second email.
+      await got("org_open_second");
+      await sendInsert(BLACK_FRIDAY_RESEND, "org_open_second@example.test", "org_open_second").run();
+      await logged("org_open_second@example.test");
+      // Opened the first email.
+      await got("org_open_first");
+      await logged("org_open_first@example.test");
+      // Unsubscribed after the second email.
+      await got("org_out", { optOut: true });
+      await sendInsert(BLACK_FRIDAY_RESEND, "org_out@example.test", "org_out").run();
+      // Signed up after the first email went out.
+      await org("org_new");
+
+      expect(ok(await runBlackFridayResend(env(), { campaign: BLACK_FRIDAY_THIRD, dryRun: true }))).toMatchObject({
+        owed: 2,
+        sent: 0,
+      });
+      expect(mails).toEqual([]);
+
+      expect(ok(await runBlackFridayResend(env(), { campaign: BLACK_FRIDAY_THIRD, limit: 50 }))).toMatchObject({
+        owed: 2,
+        sent: 2,
+        failed: 0,
+        recorded: { sent: 2 },
+      });
+      expect(mails).toEqual(
+        ["org_both", "org_first"].map((id) => ({
+          to: `${id}@example.test`,
+          name: `Name ${id}`,
+          org_id: id,
+          unsubscribe_url: `https://mcp.getengram.app/email/unsubscribe?org=${id}&sig=${unsubscribeSig(id)}`,
+          offer_url: `${WEB}/black-friday?org=${id}&sig=${offerSig(id)}&utm_source=email&utm_campaign=blackfriday`,
+        })),
+      );
+      expect(await thirds()).toEqual([
+        { email: "org_both@example.test", org_id: "org_both", status: "sent" },
+        { email: "org_first@example.test", org_id: "org_first", status: "sent" },
+      ]);
+      // The second send's record is left as it was.
+      expect((await resends()).map((r) => r.org_id)).toEqual(["org_both", "org_open_second", "org_out"]);
+
+      expect(ok(await runBlackFridayResend(env(), { campaign: BLACK_FRIDAY_THIRD, limit: 50 }))).toMatchObject({
+        owed: 0,
+        sent: 0,
+      });
+      expect(mails).toHaveLength(2);
+    });
+
+    it("the cron sends it once started, and the finished second send stays finished", async () => {
+      const ids = await gotMany(3);
+      await db
+        .prepare("INSERT INTO campaign_runs (campaign, state, finished_at) VALUES (?, 'done', datetime('now'))")
+        .bind(BLACK_FRIDAY_RESEND)
+        .run();
+      expect(await startCampaignRun(env(), BLACK_FRIDAY_THIRD)).toMatchObject({
+        run: { campaign: BLACK_FRIDAY_THIRD, state: "running", sending: false, note: null },
+      });
+      expect(mails).toEqual([]);
+
+      expect(await tick()).toMatchObject([
+        { campaign: BLACK_FRIDAY_THIRD, outcome: "batch", state: "running", result: { owed: 3, sent: 3 } },
+      ]);
+      expect(await tick()).toMatchObject([
+        { campaign: BLACK_FRIDAY_THIRD, outcome: "batch", state: "done", result: { owed: 0 } },
+      ]);
+      expect(await tick()).toEqual([]);
+
+      expect(mails.map((m) => m.org_id).sort()).toEqual(ids);
+      expect(await thirds()).toHaveLength(3);
+      expect(await resends()).toEqual([]);
+      expect(await runRow(BLACK_FRIDAY_RESEND)).toMatchObject({ state: "done" });
+    });
+
+    it("starts only while no other campaign is running", async () => {
+      await got("org_1");
+      await start();
+      expect(await admin("POST", { start: true })).toMatchObject({
+        status: 409,
+        body: { error: "another_campaign_running" },
+      });
+      expect(await runRow(BLACK_FRIDAY_THIRD)).toBeNull();
+
+      await pauseCampaignRun(env(), BLACK_FRIDAY_RESEND);
+      expect(await admin("POST", { start: true })).toMatchObject({ status: 200, body: { run: { state: "running" } } });
+      expect(await startCampaignRun(env(), BLACK_FRIDAY_RESEND)).toMatchObject({
+        error: "another_campaign_running",
+        status: 409,
+      });
+      expect(await runRow(BLACK_FRIDAY_RESEND)).toMatchObject({ state: "paused" });
+      // Starting the run that is already running is not refused.
+      expect(await admin("POST", { start: true })).toMatchObject({ status: 200 });
+      expect(mails).toEqual([]);
+    });
+
+    it("has its own /admin switch, which needs the admin secret and sends nothing", async () => {
+      await got("org_1");
+      await got("org_2");
+      await logged("org_2@example.test");
+      expect((await admin("GET", undefined, "wrong")).status).toBe(401);
+      expect((await admin("POST", { start: true }, "wrong")).status).toBe(401);
+      expect(await admin("GET")).toEqual({
+        status: 200,
+        body: { campaign: BLACK_FRIDAY_THIRD, owed: 1, first_send: 2, opened: 1, recorded: {}, run: null },
+      });
+      expect((await admin("POST", {})).status).toBe(400);
+      expect(await runRow(BLACK_FRIDAY_THIRD)).toBeNull();
+
+      expect(await admin("POST", { start: true })).toMatchObject({
+        status: 200,
+        body: { owed: 1, run: { campaign: BLACK_FRIDAY_THIRD, state: "running" } },
+      });
+      expect(await runRow(BLACK_FRIDAY_RESEND)).toBeNull();
+      expect((await admin("POST", { pause: true })).body).toMatchObject({ paused: true, run: { state: "paused" } });
+      expect(mails).toEqual([]);
     });
   });
 

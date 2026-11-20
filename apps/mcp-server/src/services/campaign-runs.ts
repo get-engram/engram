@@ -2,6 +2,7 @@ import type { Env } from "../types.js";
 import {
   BATCH_MAX,
   BLACK_FRIDAY_RESEND,
+  BLACK_FRIDAY_THIRD,
   runBlackFridayResend,
   sendRefusal,
   type CampaignError,
@@ -23,6 +24,10 @@ import {
  * engram-web sends one email per request over SMTP and does not retry an
  * email the mail provider refuses for coming too fast, so two senders at
  * once would lose emails.
+ *
+ * One campaign runs at a time: a run cannot be started while another is
+ * running (engram#775). Two Black Friday sends running together could
+ * also mail one person twice within minutes.
  */
 
 interface CampaignSender {
@@ -34,13 +39,20 @@ interface CampaignSender {
 
 /**
  * The campaigns the cron may send. Only a send whose audience is fixed in
- * advance belongs here: the second Black Friday email goes only to
- * addresses the first one went to. The first send must never be listed:
- * its audience is every Free account, so it would now include accounts
- * created since it went out.
+ * advance belongs here: the second and third Black Friday emails go only
+ * to addresses the first one went to. The first send must never be
+ * listed: its audience is every Free account, so it would now include
+ * accounts created since it went out.
  */
 const SENDERS: Readonly<Record<string, CampaignSender>> = {
-  [BLACK_FRIDAY_RESEND]: { send: runBlackFridayResend, refusal: sendRefusal },
+  [BLACK_FRIDAY_RESEND]: {
+    send: (env, opts) => runBlackFridayResend(env, { ...opts, campaign: BLACK_FRIDAY_RESEND }),
+    refusal: sendRefusal,
+  },
+  [BLACK_FRIDAY_THIRD]: {
+    send: (env, opts) => runBlackFridayResend(env, { ...opts, campaign: BLACK_FRIDAY_THIRD }),
+    refusal: sendRefusal,
+  },
 };
 
 /** A tick starts no send after this long, well inside the cron's 2 minutes. */
@@ -96,8 +108,9 @@ export async function campaignRun(env: Env, campaign: string, now = Date.now()):
 
 /**
  * Start a run, or start it again after a pause. Refused while the campaign
- * may not be sent (the offer has ended, or mail is not configured), and
- * then nothing is written. Sends nothing itself: the next tick does.
+ * may not be sent (the offer has ended, or mail is not configured), or
+ * while another campaign's run is running, and then nothing is written.
+ * Sends nothing itself: the next tick does.
  */
 export async function startCampaignRun(
   env: Env,
@@ -108,6 +121,18 @@ export async function startCampaignRun(
   if (!sender) return { error: "unknown_campaign", message: "The worker has no sender for this campaign.", status: 404 };
   const refusal = sender.refusal(env, now);
   if (refusal) return refusal;
+  const other = await env.DB.prepare(
+    "SELECT campaign FROM campaign_runs WHERE state = 'running' AND campaign != ? ORDER BY campaign LIMIT 1",
+  )
+    .bind(campaign)
+    .first<{ campaign: string }>();
+  if (other) {
+    return {
+      error: "another_campaign_running",
+      message: `${other.campaign} is still running; start this one after it is done or paused.`,
+      status: 409,
+    };
+  }
   await env.DB.prepare(
     `INSERT INTO campaign_runs (campaign, state) VALUES (?, 'running')
      ON CONFLICT (campaign) DO UPDATE

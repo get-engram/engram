@@ -29,7 +29,7 @@ import { BLACK_FRIDAY, blackFridayState } from "./black-friday.js";
 const BATCH_DEFAULT = 20;
 export const BATCH_MAX = 50;
 /** Stop a batch after this many failures in a row: something is wrong. */
-const MAX_CONSECUTIVE_FAILURES = 3;
+export const MAX_CONSECUTIVE_FAILURES = 3;
 /**
  * Give up waiting for engram-web after this long. The email may still go
  * out, so the claim is kept ('unknown'), as for any request with no answer.
@@ -140,7 +140,8 @@ async function offerUrl(env: Env, orgId: string): Promise<string | null> {
   return `${env.APP_URL}/black-friday?org=${encodeURIComponent(orgId)}&sig=${sig}&utm_source=email&utm_campaign=blackfriday`;
 }
 
-async function recorded(env: Env, campaign: string): Promise<Record<string, number>> {
+/** What campaign_sends holds for a campaign so far, by status. */
+export async function recorded(env: Env, campaign: string): Promise<Record<string, number>> {
   const rows = await env.DB.prepare(
     "SELECT status, COUNT(*) AS n FROM campaign_sends WHERE campaign = ? GROUP BY status",
   )
@@ -166,7 +167,8 @@ export function sendRefusal(env: Env, now?: number): CampaignError | null {
   return null;
 }
 
-const batchLimit = (limit: number | undefined) => Math.max(1, Math.min(BATCH_MAX, Math.floor(limit ?? BATCH_DEFAULT)));
+/** How many to send in one batch: `limit`, kept between 1 and BATCH_MAX. */
+export const batchLimit = (limit: number | undefined) => Math.max(1, Math.min(BATCH_MAX, Math.floor(limit ?? BATCH_DEFAULT)));
 
 /** Ask engram-web to send one email. "refused" = it answered 4xx, before sending. */
 async function deliver(

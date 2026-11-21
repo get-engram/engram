@@ -8,6 +8,7 @@ import {
   type CampaignError,
   type CampaignResult,
 } from "./black-friday-campaign.js";
+import { FINISH_SIGNUP, finishSignupRefusal, runFinishSignup } from "./finish-signup-campaign.js";
 
 /**
  * Campaign email the worker sends by itself (engram#773).
@@ -42,7 +43,9 @@ interface CampaignSender {
  * advance belongs here: the second and third Black Friday emails go only
  * to addresses the first one went to. The first send must never be
  * listed: its audience is every Free account, so it would now include
- * accounts created since it went out.
+ * accounts created since it went out. The finish-sign-up email's audience
+ * is fixed too (engram#781): accounts made before the sign-up fix that
+ * never got in. Nobody can join it, and it only shrinks.
  */
 const SENDERS: Readonly<Record<string, CampaignSender>> = {
   [BLACK_FRIDAY_RESEND]: {
@@ -52,6 +55,10 @@ const SENDERS: Readonly<Record<string, CampaignSender>> = {
   [BLACK_FRIDAY_THIRD]: {
     send: (env, opts) => runBlackFridayResend(env, { ...opts, campaign: BLACK_FRIDAY_THIRD }),
     refusal: sendRefusal,
+  },
+  [FINISH_SIGNUP]: {
+    send: (env, opts) => runFinishSignup(env, opts),
+    refusal: finishSignupRefusal,
   },
 };
 

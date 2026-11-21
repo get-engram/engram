@@ -18,7 +18,7 @@ export function getOrganizationById(db: D1Database, id: string) {
     .first();
 }
 
-export function insertOrganizationWithEmail(
+export async function insertOrganizationWithEmail(
   db: D1Database,
   id: string,
   name: string,
@@ -26,12 +26,38 @@ export function insertOrganizationWithEmail(
   referralSource?: string,
   country?: string | null,
 ) {
-  return db
+  const result = await db
     .prepare(
       "INSERT INTO organizations (id, name, email, referral_source, country) VALUES (?, ?, ?, ?, ?)",
     )
     .bind(id, name, email, referralSource ?? null, country ?? null)
     .run();
+  await carryEmailOptOut(db, id, email);
+  return result;
+}
+
+/**
+ * Opt an org out of lifecycle email when its address unsubscribed before
+ * it had an org (email_opt_outs, engram#781): someone who unsubscribed from
+ * the finish-sign-up email and then made an account. Called when an org is
+ * made with an address or changes to one. Never fails the caller, so a
+ * sign-up never does: when email_opt_outs isn't there yet mid-deploy
+ * (migration 0051), nothing changes.
+ */
+export async function carryEmailOptOut(db: D1Database, orgId: string, email: string): Promise<void> {
+  try {
+    await db
+      .prepare(
+        `UPDATE organizations
+         SET digest_opt_out = 1, digest_opt_out_at = COALESCE(digest_opt_out_at, datetime('now'))
+         WHERE id = ? AND digest_opt_out = 0
+           AND EXISTS (SELECT 1 FROM email_opt_outs WHERE email = lower(trim(?)))`,
+      )
+      .bind(orgId, email)
+      .run();
+  } catch {
+    // The org is made or changed either way.
+  }
 }
 
 /**
@@ -63,15 +89,17 @@ export function getOrganizationByEmail(db: D1Database, email: string) {
     .first();
 }
 
-export function setOrganizationEmail(
+export async function setOrganizationEmail(
   db: D1Database,
   id: string,
   email: string,
 ) {
-  return db
+  const result = await db
     .prepare("UPDATE organizations SET email = ? WHERE id = ?")
     .bind(email, id)
     .run();
+  await carryEmailOptOut(db, id, email);
+  return result;
 }
 
 export function getOrganizationByStripeCustomer(

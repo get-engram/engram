@@ -56,6 +56,12 @@ function hmacKey(key: string, usage: "sign" | "verify"): Promise<CryptoKey> {
   ]);
 }
 
+/** The hex HMAC-SHA256 of `message` under `key`. */
+async function macHex(key: string, message: Uint8Array): Promise<string> {
+  const mac = await crypto.subtle.sign("HMAC", await hmacKey(key, "sign"), message);
+  return Array.from(new Uint8Array(mac), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 /** What a link's signature covers: the org it opts out of lifecycle email. */
 function signed(orgId: string): Uint8Array {
   return new TextEncoder().encode(`digest:${orgId}`);
@@ -67,8 +73,7 @@ function signed(orgId: string): Uint8Array {
  * have the same form, signed with ADMIN_SECRET.
  */
 export async function unsubscribeSig(orgId: string, key: string): Promise<string> {
-  const mac = await crypto.subtle.sign("HMAC", await hmacKey(key, "sign"), signed(orgId));
-  return Array.from(new Uint8Array(mac), (b) => b.toString(16).padStart(2, "0")).join("");
+  return macHex(key, signed(orgId));
 }
 
 /** An org's unsubscribe link, signed with `key`. */
@@ -86,6 +91,28 @@ export async function unsubscribeUrl(env: Env, orgId: string): Promise<string | 
   return key === null ? null : signedLink(orgId, key);
 }
 
+/**
+ * What a user link's signature covers: the website account it opts out of
+ * Engram's email (engram#781). The finish-sign-up email goes to people who
+ * made an account on the website but never got in, so they have no org for
+ * a link to name. A different message from an org link's (`user:<id>`
+ * against `digest:<org>`), so neither kind of link can stand in for the
+ * other.
+ */
+function signedUser(userId: string): Uint8Array {
+  return new TextEncoder().encode(`user:${userId}`);
+}
+
+/**
+ * The unsubscribe link for a website account with no org yet (engram#781),
+ * signed with the signing key. Null when no signing key is set.
+ */
+export async function userUnsubscribeUrl(env: Env, userId: string): Promise<string | null> {
+  const key = signingKey(env);
+  if (key === null) return null;
+  return `${UNSUBSCRIBE_URL}?user=${encodeURIComponent(userId)}&sig=${await macHex(key, signedUser(userId))}`;
+}
+
 /** What an offer link's signature covers: the offer and the org it was mailed to. */
 function signedOffer(offer: string, orgId: string): Uint8Array {
   return new TextEncoder().encode(`offer:${offer}:${orgId}`);
@@ -100,9 +127,7 @@ function signedOffer(offer: string, orgId: string): Uint8Array {
  */
 export async function offerSig(env: Env, offer: string, orgId: string): Promise<string | null> {
   const key = signingKey(env);
-  if (key === null) return null;
-  const mac = await crypto.subtle.sign("HMAC", await hmacKey(key, "sign"), signedOffer(offer, orgId));
-  return Array.from(new Uint8Array(mac), (b) => b.toString(16).padStart(2, "0")).join("");
+  return key === null ? null : macHex(key, signedOffer(offer, orgId));
 }
 
 /** Whether `sig` signs an offer link for `orgId`. Constant-time; current key only. */
@@ -140,6 +165,11 @@ export function lifecycleMail(env: Env): LifecycleMail | null {
  * each one under in email_log: the weekly digest, the nudges and the
  * plan-changed notice. An unsubscribe is credited only to one of these
  * (index.ts). A welcome email or a team invite has no link to click.
+ *
+ * The finish-sign-up email (engram#781) has a link too, but one that names
+ * a website account, not an org (userUnsubscribeUrl), and it is logged with
+ * no org. index.ts credits its unsubscribes by recipient instead, so it is
+ * not listed here.
  */
 export const UNSUBSCRIBE_LINK_EMAILS: readonly string[] = [
   "weekly-digest",
@@ -152,18 +182,28 @@ export const UNSUBSCRIBE_LINK_EMAILS: readonly string[] = [
 ];
 
 /**
- * Whether `sig` signs an unsubscribe link for `orgId`, with the signing key
- * or UNSUBSCRIBE_HMAC_KEY_PREVIOUS. WebCrypto's verify compares in constant
+ * Whether `sig` is the hex HMAC of `message` under the signing key or
+ * UNSUBSCRIBE_HMAC_KEY_PREVIOUS. WebCrypto's verify compares in constant
  * time. ADMIN_SECRET checks a link only while it is the signing key.
  */
-export async function unsubscribeSigValid(env: Env, orgId: string, sig: string): Promise<boolean> {
+async function signedByAnyKey(env: Env, message: Uint8Array, sig: string): Promise<boolean> {
   if (!/^[0-9a-f]{64}$/.test(sig)) return false;
   const mac = new Uint8Array(32);
   for (let i = 0; i < mac.length; i++) mac[i] = parseInt(sig.slice(i * 2, i * 2 + 2), 16);
   const keys = [signingKey(env), secret(env.UNSUBSCRIBE_HMAC_KEY_PREVIOUS)].filter((k): k is string => k !== null);
   // Every key, so how long this takes doesn't say which one signed it.
   const valid = await Promise.all(
-    keys.map(async (k) => crypto.subtle.verify("HMAC", await hmacKey(k, "verify"), mac, signed(orgId))),
+    keys.map(async (k) => crypto.subtle.verify("HMAC", await hmacKey(k, "verify"), mac, message)),
   );
   return valid.includes(true);
+}
+
+/** Whether `sig` signs an unsubscribe link for `orgId`, with either key. */
+export async function unsubscribeSigValid(env: Env, orgId: string, sig: string): Promise<boolean> {
+  return signedByAnyKey(env, signed(orgId), sig);
+}
+
+/** Whether `sig` signs a user unsubscribe link for `userId` (engram#781), with either key. */
+export async function userUnsubscribeSigValid(env: Env, userId: string, sig: string): Promise<boolean> {
+  return signedByAnyKey(env, signedUser(userId), sig);
 }

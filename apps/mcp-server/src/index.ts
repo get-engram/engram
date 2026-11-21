@@ -42,7 +42,8 @@ import { reconcileStripeToD1 } from "./cron/reconcile-stripe.js";
 export { DrainerDO } from "./services/drainer-do.js";
 export { ChunkMoverDO } from "./services/chunk-mover-do.js";
 import { sendWeeklyDigests } from "./cron/weekly-digest.js";
-import { UNSUBSCRIBE_LINK_EMAILS, unsubscribeSigValid } from "./services/secrets.js";
+import { UNSUBSCRIBE_LINK_EMAILS, unsubscribeSigValid, userUnsubscribeSigValid } from "./services/secrets.js";
+import { FINISH_SIGNUP } from "./services/finish-signup-campaign.js";
 import { sendShareNudge } from "./cron/share-nudge.js";
 import { sendDailyReport } from "./services/daily-report.js";
 import { runCampaignTick } from "./services/campaign-runs.js";
@@ -231,7 +232,81 @@ async function unsubscribeLinkOrg(env: Env, org: string | undefined, sig: string
   return org && sig && (await unsubscribeSigValid(env, org, sig)) ? org : null;
 }
 
+// A link can name a website account instead of an org (?user=, engram#781):
+// the finish-sign-up email goes to people who never got in, so they have no
+// org yet. The address it opts out is the one that email went to, found in
+// the campaign's claims by the account id. Opting it out writes it to
+// email_opt_outs, which an org made later with it inherits (packages/db,
+// queries/organizations.ts), and opts out any org that already has it.
+
+/** Whether a request's link names a website account (?user=) rather than an org. */
+function isUserLink(c: { req: { query(name: string): string | undefined } }): boolean {
+  return c.req.query("org") === undefined && c.req.query("user") !== undefined;
+}
+
+/**
+ * The account a user link names and the address the finish-sign-up email
+ * went to there: address null when none did (a test copy). Null when the
+ * link isn't signed.
+ */
+async function unsubscribeLinkUser(
+  env: Env,
+  user: string | undefined,
+  sig: string | undefined,
+): Promise<{ user: string; address: string | null } | null> {
+  if (!user || !sig || !(await userUnsubscribeSigValid(env, user, sig))) return null;
+  const row = await env.DB.prepare("SELECT email FROM campaign_sends WHERE campaign = ? AND org_id = ? LIMIT 1")
+    .bind(FINISH_SIGNUP, user)
+    .first<{ email: string }>();
+  return { user, address: row?.email ?? null };
+}
+
+/**
+ * Opt out the address a user link names, and any org with it. The
+ * unsubscribe is credited to the latest finish-sign-up email to that
+ * address, only when this request is what opted it out.
+ */
+async function optOutAddress(env: Env, user: string, address: string): Promise<void> {
+  const [recorded] = await env.DB.batch([
+    env.DB.prepare("INSERT OR IGNORE INTO email_opt_outs (email, user_id, source) VALUES (?, ?, ?)").bind(
+      address,
+      user,
+      FINISH_SIGNUP,
+    ),
+    env.DB.prepare(
+      "UPDATE organizations SET digest_opt_out = 1, digest_opt_out_at = COALESCE(digest_opt_out_at, datetime('now')) WHERE lower(trim(email)) = ? AND digest_opt_out = 0",
+    ).bind(address),
+  ]);
+  if ((recorded.meta.changes ?? 0) === 0) return;
+  try {
+    // engram-web logs this email with no org and the address it went to.
+    await env.DB.prepare(
+      `UPDATE email_log SET unsubscribed_at = datetime('now')
+       WHERE id = (SELECT id FROM email_log INDEXED BY idx_email_log_type
+                   WHERE type = ? AND lower(trim(recipient)) = ?
+                   ORDER BY sent_at DESC LIMIT 1)
+         AND unsubscribed_at IS NULL`,
+    )
+      .bind(FINISH_SIGNUP, address)
+      .run();
+  } catch {
+    // The opt-out already stuck; only the credit is lost.
+  }
+}
+
 app.get("/email/unsubscribe", async (c) => {
+  if (isUserLink(c)) {
+    const link = await unsubscribeLinkUser(c.env, c.req.query("user"), c.req.query("sig"));
+    if (link === null) return c.text("Invalid link.", 400);
+    if (link.address !== null) {
+      const out = await c.env.DB.prepare("SELECT 1 AS out FROM email_opt_outs WHERE email = ?")
+        .bind(link.address)
+        .first();
+      if (out) return c.html(UNSUBSCRIBED_PAGE);
+    }
+    c.header("Content-Security-Policy", UNSUBSCRIBE_PAGE_SECURITY_POLICY);
+    return c.html(UNSUBSCRIBE_CONFIRM_PAGE);
+  }
   const org = await unsubscribeLinkOrg(c.env, c.req.query("org"), c.req.query("sig"));
   if (org === null) return c.text("Invalid link.", 400);
   const row = await c.env.DB.prepare("SELECT digest_opt_out FROM organizations WHERE id = ?")
@@ -244,6 +319,12 @@ app.get("/email/unsubscribe", async (c) => {
 });
 
 app.post("/email/unsubscribe", async (c) => {
+  if (isUserLink(c)) {
+    const link = await unsubscribeLinkUser(c.env, c.req.query("user"), c.req.query("sig"));
+    if (link === null) return c.text("Invalid link.", 400);
+    if (link.address !== null) await optOutAddress(c.env, link.user, link.address);
+    return c.html(UNSUBSCRIBED_PAGE);
+  }
   const org = await unsubscribeLinkOrg(c.env, c.req.query("org"), c.req.query("sig"));
   if (org === null) return c.text("Invalid link.", 400);
   const optOut = await c.env.DB.prepare(

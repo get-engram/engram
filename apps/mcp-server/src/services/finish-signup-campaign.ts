@@ -2,12 +2,16 @@ import type { Env } from "../types.js";
 import {
   MAX_CONSECUTIVE_FAILURES,
   SEND_TIMEOUT_MS,
+  TEST_RECIPIENT,
   batchLimit,
   recorded,
   type CampaignError,
   type CampaignResult,
 } from "./black-friday-campaign.js";
 import { lifecycleMail, userUnsubscribeUrl } from "./secrets.js";
+
+/** The only address a test copy goes to. */
+export { TEST_RECIPIENT };
 
 /**
  * The finish-sign-up email (engram#781): one email to each person the
@@ -34,16 +38,24 @@ import { lifecycleMail, userUnsubscribeUrl } from "./secrets.js";
  * so org_id in those rows holds their account id on the website. The
  * email's unsubscribe link names that id, and index.ts finds the address
  * it opts out in those rows.
+ *
+ * The second send (engram#783) is the same email again, to the people the
+ * first one went to who are still stuck and have not opened it. It has its
+ * own campaign value, so it too goes once per address, and the cron sends
+ * it once it is started from /admin. engram-web logs both as FINISH_SIGNUP.
  */
 
 /** The campaign value in campaign_sends and campaign_runs, and the email's type in email_log. */
 export const FINISH_SIGNUP = "finish-signup";
+/** The second send's campaign value in campaign_sends and campaign_runs. */
+export const FINISH_SIGNUP_RESEND = "finish-signup-resend";
+/** The finish-sign-up sends, in order. */
+export const FINISH_SIGNUP_CAMPAIGNS = [FINISH_SIGNUP, FINISH_SIGNUP_RESEND] as const;
+export type FinishSignupCampaign = (typeof FINISH_SIGNUP_CAMPAIGNS)[number];
 /** engram-web's route: GET lists who is owed the email, POST sends it to one of them. */
 const ROUTE = "/api/email/finish-signup";
 /** Give up waiting for the list after this long (it pages through every account). */
 export const LIST_TIMEOUT_MS = 30_000;
-/** The only address a test copy goes to. */
-export const TEST_RECIPIENT = "hello@getengram.app";
 /** The account a test copy's unsubscribe link names: nobody's, so it opts out nobody. */
 export const TEST_USER = "00000000-0000-0000-0000-000000000000";
 
@@ -61,6 +73,18 @@ const OWED = `
   WHERE j.value NOT IN (SELECT email FROM campaign_sends WHERE campaign = ?2)
     AND j.value NOT IN (SELECT email FROM email_opt_outs)
     AND j.value NOT IN (SELECT lower(trim(email)) FROM organizations WHERE email IS NOT NULL)`;
+
+/**
+ * The second send's audience: OWED, less any address the first email
+ * (?3) did not reach, and less any that has opened it. recipient is never
+ * NULL. Opens are read again for every batch, so one during the send
+ * still counts.
+ */
+const RESEND_OWED = `${OWED}
+    AND j.value IN (SELECT email FROM campaign_sends WHERE campaign = ?3 AND status = 'sent')
+    AND j.value NOT IN (
+      SELECT lower(trim(recipient)) FROM email_log INDEXED BY idx_email_log_type
+      WHERE type = ?3 AND opened_at IS NOT NULL)`;
 
 export type FinishSignupResult = CampaignResult & {
   /** How many people engram-web listed before this call. */
@@ -102,12 +126,16 @@ async function listed(env: Env, bearer: string, timeoutMs: number): Promise<Pers
   return people;
 }
 
-/** The people still owed the email, in the order engram-web listed them. */
-async function owedOf(env: Env, people: Person[]): Promise<Person[]> {
+/** The people still owed this send, in the order engram-web listed them. */
+async function owedOf(env: Env, campaign: FinishSignupCampaign, people: Person[]): Promise<Person[]> {
   const owed = new Set<string>();
   for (let i = 0; i < people.length; i += OWED_CHUNK) {
-    const chunk = people.slice(i, i + OWED_CHUNK).map((p) => p.email);
-    const rows = await env.DB.prepare(OWED).bind(JSON.stringify(chunk), FINISH_SIGNUP).all<{ email: string }>();
+    const chunk = JSON.stringify(people.slice(i, i + OWED_CHUNK).map((p) => p.email));
+    const query =
+      campaign === FINISH_SIGNUP
+        ? env.DB.prepare(OWED).bind(chunk, campaign)
+        : env.DB.prepare(RESEND_OWED).bind(chunk, campaign, FINISH_SIGNUP);
+    const rows = await query.all<{ email: string }>();
     for (const row of rows.results ?? []) owed.add(row.email);
   }
   return people.filter((p) => owed.has(p.email));
@@ -172,6 +200,7 @@ async function deliver(
 async function sendBatch(
   env: Env,
   bearer: string,
+  campaign: FinishSignupCampaign,
   people: Person[],
   deadline: number,
 ): Promise<Pick<CampaignResult, "sent" | "skipped" | "failed" | "stopped">> {
@@ -193,7 +222,7 @@ async function sendBatch(
     const claim = await env.DB.prepare(
       "INSERT OR IGNORE INTO campaign_sends (campaign, email, org_id) VALUES (?, ?, ?)",
     )
-      .bind(FINISH_SIGNUP, person.email, person.id)
+      .bind(campaign, person.email, person.id)
       .run();
     if (!claim.meta.changes) {
       skipped++;
@@ -203,7 +232,7 @@ async function sendBatch(
     const outcome = await deliver(env, bearer, person, link);
     if (outcome === "sent") {
       await env.DB.prepare("UPDATE campaign_sends SET status = 'sent' WHERE campaign = ? AND email = ?")
-        .bind(FINISH_SIGNUP, person.email)
+        .bind(campaign, person.email)
         .run();
       sent++;
       nothingSentInARow = 0;
@@ -214,14 +243,14 @@ async function sendBatch(
       // No answer, or a server error: the email may have gone out. Keep the
       // claim so it is never sent twice.
       await env.DB.prepare("UPDATE campaign_sends SET status = 'unknown' WHERE campaign = ? AND email = ?")
-        .bind(FINISH_SIGNUP, person.email)
+        .bind(campaign, person.email)
         .run();
     } else {
       // Nothing was sent: release the claim. Someone no longer owed it drops
       // off engram-web's list by themselves; anyone else is tried again by
       // a later batch.
       await env.DB.prepare("DELETE FROM campaign_sends WHERE campaign = ? AND email = ? AND status = 'claimed'")
-        .bind(FINISH_SIGNUP, person.email)
+        .bind(campaign, person.email)
         .run();
     }
     if (outcome === "not_owed") skipped++;
@@ -240,27 +269,29 @@ async function sendBatch(
 }
 
 /**
- * Count (dryRun) or send the next batch. Throws when engram-web does not
- * list who is owed the email, or D1 fails; the cron tries again next tick.
+ * Count (dryRun) or send the next batch of one of the sends (the first by
+ * default). Throws when engram-web does not list who is owed the email, or
+ * D1 fails; the cron tries again next tick.
  */
 export async function runFinishSignup(
   env: Env,
-  opts: { dryRun?: boolean; limit?: number; deadline?: number } = {},
+  opts: { campaign?: FinishSignupCampaign; dryRun?: boolean; limit?: number; deadline?: number } = {},
 ): Promise<FinishSignupResult | CampaignError> {
   const mail = configured(env);
   if ("error" in mail) return mail;
   const { bearer } = mail;
+  const campaign = opts.campaign ?? FINISH_SIGNUP;
   const deadline = opts.deadline ?? Number.POSITIVE_INFINITY;
   const listTimeout = Math.max(1, Math.min(LIST_TIMEOUT_MS, deadline - Date.now()));
 
   const people = await listed(env, bearer, listTimeout);
-  const owed = await owedOf(env, people);
+  const owed = await owedOf(env, campaign, people);
   const counts = { listed: people.length, owed: owed.length };
   if (opts.dryRun) {
-    return { dry_run: true, ...counts, sent: 0, skipped: 0, failed: 0, stopped: false, recorded: await recorded(env, FINISH_SIGNUP) };
+    return { dry_run: true, ...counts, sent: 0, skipped: 0, failed: 0, stopped: false, recorded: await recorded(env, campaign) };
   }
-  const batch = await sendBatch(env, bearer, owed.slice(0, batchLimit(opts.limit)), deadline);
-  return { dry_run: false, ...counts, ...batch, recorded: await recorded(env, FINISH_SIGNUP) };
+  const batch = await sendBatch(env, bearer, campaign, owed.slice(0, batchLimit(opts.limit)), deadline);
+  return { dry_run: false, ...counts, ...batch, recorded: await recorded(env, campaign) };
 }
 
 /**

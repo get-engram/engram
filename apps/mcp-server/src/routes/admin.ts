@@ -44,9 +44,10 @@ import {
   blackFridayOpens,
   runBlackFridayCampaign,
   runBlackFridayResend,
+  sendBlackFridayResendTest,
 } from "../services/black-friday-campaign.js";
 import { campaignRun, pauseCampaignRun, startCampaignRun } from "../services/campaign-runs.js";
-import { FINISH_SIGNUP, runFinishSignup, sendFinishSignupTest } from "../services/finish-signup-campaign.js";
+import { FINISH_SIGNUP_CAMPAIGNS, runFinishSignup, sendFinishSignupTest } from "../services/finish-signup-campaign.js";
 import {
   ADMIN_TZ_OFFSET,
   loadFastMetrics,
@@ -790,15 +791,19 @@ admin.post("/campaigns/black-friday", async (c) => {
 // addresses the first one went to that have not opened it (engram#773).
 // /admin/campaigns/black-friday-third — the same email once more, to those
 // addresses that have opened neither email (engram#775).
+// /admin/campaigns/black-friday-fourth — and again, to those that have
+// opened none of the three (engram#783).
 //
-// Nothing here sends mail. Once started, the worker's two-minute cron sends
-// it in batches until nobody is left (campaign-runs.ts).
+// Only a test copy is sent from here. Once started, the worker's two-minute
+// cron sends the email in batches until nobody is left (campaign-runs.ts).
 //
 // GET: who is still owed it, what has been sent, and the run.
 // POST { start: true }: start the run, or start it again after a pause.
 //   Refused once the offer has ended, while mail is not configured, or
-//   while the other one is running.
+//   while another campaign is running.
 // POST { pause: true }: stop after the batch being sent, if any.
+// POST { test_to: "hello@getengram.app" }: one test copy, to that address
+//   only, with its own account's name and links. Recorded nowhere.
 // Any other body is refused.
 // ---------------------------------------------------------------------------
 for (const campaign of BLACK_FRIDAY_RESENDS) {
@@ -818,12 +823,24 @@ for (const campaign of BLACK_FRIDAY_RESENDS) {
 
   admin.post(`/campaigns/${campaign}`, async (c) => {
     const parsed: unknown = await c.req.json().catch(() => null);
-    const body = (parsed !== null && typeof parsed === "object" ? parsed : {}) as { start?: unknown; pause?: unknown };
-    const modes = [body.start === true, body.pause === true].filter(Boolean).length;
+    const body = (parsed !== null && typeof parsed === "object" ? parsed : {}) as {
+      start?: unknown;
+      pause?: unknown;
+      test_to?: unknown;
+    };
+    const modes = [body.start === true, body.pause === true, typeof body.test_to === "string"].filter(Boolean).length;
     if (modes !== 1) {
-      return c.json({ error: "bad_request", message: "Send exactly one of: start: true or pause: true." }, 400);
+      return c.json(
+        { error: "bad_request", message: "Send exactly one of: start: true, pause: true or test_to: <address>." },
+        400,
+      );
     }
     if (body.pause === true) return c.json(await pauseCampaignRun(c.env, campaign));
+    if (typeof body.test_to === "string") {
+      const test = await sendBlackFridayResendTest(c.env, body.test_to);
+      if ("error" in test) return c.json({ error: test.error, message: test.message }, test.status);
+      return c.json(test);
+    }
     const started = await startCampaignRun(c.env, campaign);
     if ("error" in started) return c.json({ error: started.error, message: started.message }, started.status);
     const count = await runBlackFridayResend(c.env, { campaign, dryRun: true });
@@ -836,6 +853,9 @@ for (const campaign of BLACK_FRIDAY_RESENDS) {
 // the website's old sign-up page left stuck (engram#781). engram-web lists
 // them and sends each email; the worker's cron sends it in batches once it
 // is started here, until nobody is left (finish-signup-campaign.ts).
+// /admin/campaigns/finish-signup-resend — the same email again, to the
+// people the first one went to who are still stuck and have not opened it
+// (engram#783).
 //
 // GET: how many engram-web lists, how many are still owed it, what has been
 //   sent, and the run. 502 when engram-web does not answer with the list.
@@ -846,56 +866,58 @@ for (const campaign of BLACK_FRIDAY_RESENDS) {
 //   only. Recorded nowhere.
 // Any other body is refused.
 // ---------------------------------------------------------------------------
-admin.get(`/campaigns/${FINISH_SIGNUP}`, async (c) => {
-  let count: Awaited<ReturnType<typeof runFinishSignup>>;
-  try {
-    count = await runFinishSignup(c.env, { dryRun: true });
-  } catch (err) {
-    console.error("[finish-signup] counting failed:", err);
-    return c.json({ error: "list_failed", message: err instanceof Error ? err.message : String(err) }, 502);
-  }
-  if ("error" in count) return c.json({ error: count.error, message: count.message }, count.status);
-  return c.json({
-    campaign: FINISH_SIGNUP,
-    listed: count.listed,
-    owed: count.owed,
-    recorded: count.recorded,
-    run: await campaignRun(c.env, FINISH_SIGNUP),
+for (const campaign of FINISH_SIGNUP_CAMPAIGNS) {
+  admin.get(`/campaigns/${campaign}`, async (c) => {
+    let count: Awaited<ReturnType<typeof runFinishSignup>>;
+    try {
+      count = await runFinishSignup(c.env, { campaign, dryRun: true });
+    } catch (err) {
+      console.error(`[${campaign}] counting failed:`, err);
+      return c.json({ error: "list_failed", message: err instanceof Error ? err.message : String(err) }, 502);
+    }
+    if ("error" in count) return c.json({ error: count.error, message: count.message }, count.status);
+    return c.json({
+      campaign,
+      listed: count.listed,
+      owed: count.owed,
+      recorded: count.recorded,
+      run: await campaignRun(c.env, campaign),
+    });
   });
-});
 
-admin.post(`/campaigns/${FINISH_SIGNUP}`, async (c) => {
-  const parsed: unknown = await c.req.json().catch(() => null);
-  const body = (parsed !== null && typeof parsed === "object" ? parsed : {}) as {
-    start?: unknown;
-    pause?: unknown;
-    test_to?: unknown;
-  };
-  const modes = [body.start === true, body.pause === true, typeof body.test_to === "string"].filter(Boolean).length;
-  if (modes !== 1) {
-    return c.json(
-      { error: "bad_request", message: "Send exactly one of: start: true, pause: true or test_to: <address>." },
-      400,
-    );
-  }
-  if (body.pause === true) return c.json(await pauseCampaignRun(c.env, FINISH_SIGNUP));
-  if (typeof body.test_to === "string") {
-    const test = await sendFinishSignupTest(c.env, body.test_to);
-    if ("error" in test) return c.json({ error: test.error, message: test.message }, test.status);
-    return c.json(test);
-  }
-  const started = await startCampaignRun(c.env, FINISH_SIGNUP);
-  if ("error" in started) return c.json({ error: started.error, message: started.message }, started.status);
-  // The count is for the reply only; the run has started either way.
-  let owed: number | null = null;
-  try {
-    const count = await runFinishSignup(c.env, { dryRun: true });
-    if (!("error" in count)) owed = count.owed;
-  } catch (err) {
-    console.error("[finish-signup] counting after the start failed:", err);
-  }
-  return c.json({ run: started.run, owed });
-});
+  admin.post(`/campaigns/${campaign}`, async (c) => {
+    const parsed: unknown = await c.req.json().catch(() => null);
+    const body = (parsed !== null && typeof parsed === "object" ? parsed : {}) as {
+      start?: unknown;
+      pause?: unknown;
+      test_to?: unknown;
+    };
+    const modes = [body.start === true, body.pause === true, typeof body.test_to === "string"].filter(Boolean).length;
+    if (modes !== 1) {
+      return c.json(
+        { error: "bad_request", message: "Send exactly one of: start: true, pause: true or test_to: <address>." },
+        400,
+      );
+    }
+    if (body.pause === true) return c.json(await pauseCampaignRun(c.env, campaign));
+    if (typeof body.test_to === "string") {
+      const test = await sendFinishSignupTest(c.env, body.test_to);
+      if ("error" in test) return c.json({ error: test.error, message: test.message }, test.status);
+      return c.json(test);
+    }
+    const started = await startCampaignRun(c.env, campaign);
+    if ("error" in started) return c.json({ error: started.error, message: started.message }, started.status);
+    // The count is for the reply only; the run has started either way.
+    let owed: number | null = null;
+    try {
+      const count = await runFinishSignup(c.env, { campaign, dryRun: true });
+      if (!("error" in count)) owed = count.owed;
+    } catch (err) {
+      console.error(`[${campaign}] counting after the start failed:`, err);
+    }
+    return c.json({ run: started.run, owed });
+  });
+}
 
 admin.post("/stripe/ensure-student-price", async (c) => {
   const secretKey = c.env.STRIPE_SECRET_KEY;

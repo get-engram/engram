@@ -24,6 +24,10 @@ import { BLACK_FRIDAY, blackFridayState } from "./black-friday.js";
  * The third send (engram#775) is the same email once more, to the same
  * kind of address: one the first email went to that has opened neither
  * email. It too has its own campaign value and is sent by the cron.
+ *
+ * The fourth send (engram#783) is the same again, to the addresses the
+ * first email went to that have opened none of the three. Its own
+ * campaign value, sent by the cron, like the second and the third.
  */
 
 const BATCH_DEFAULT = 20;
@@ -42,9 +46,13 @@ export const SEND_TIMEOUT_MS = 25_000;
 export const BLACK_FRIDAY_RESEND = "black-friday-resend";
 /** The third send's campaign value in campaign_sends and campaign_runs. */
 export const BLACK_FRIDAY_THIRD = "black-friday-third";
+/** The fourth send's campaign value in campaign_sends and campaign_runs. */
+export const BLACK_FRIDAY_FOURTH = "black-friday-fourth";
 /** The sends that go again to the first send's addresses, in order. */
-export const BLACK_FRIDAY_RESENDS = [BLACK_FRIDAY_RESEND, BLACK_FRIDAY_THIRD] as const;
+export const BLACK_FRIDAY_RESENDS = [BLACK_FRIDAY_RESEND, BLACK_FRIDAY_THIRD, BLACK_FRIDAY_FOURTH] as const;
 export type BlackFridayResend = (typeof BLACK_FRIDAY_RESENDS)[number];
+/** The only address a test copy goes to. */
+export const TEST_RECIPIENT = "hello@getengram.app";
 /**
  * The type engram-web logs the email under in email_log, for every send
  * (src/app/api/email/black-friday/route.ts there). The tracking pixel
@@ -80,7 +88,9 @@ const OWED = `
  * deleted, not internal, still subscribed, and still at that address. No
  * address that also belongs to a paid account, to an account that
  * unsubscribed, or to an account that bought a plan (a refund leaves the
- * row, and a buyer must not be asked to buy again). And no address that
+ * row, and a buyer must not be asked to buy again). No address that
+ * unsubscribed through the finish-sign-up email's link (email_opt_outs,
+ * engram#781), even if no org with it has opted out. And no address that
  * has opened a Black Friday email, by the tracking pixel's record; that is
  * read again for every batch, so an open during the send still counts.
  */
@@ -103,6 +113,7 @@ const RESEND_OWED = `
     AND s.email NOT IN (
       SELECT lower(trim(b.email)) FROM prepaid_plans p JOIN organizations b ON b.id = p.org_id
       WHERE b.email IS NOT NULL)
+    AND s.email NOT IN (SELECT email FROM email_opt_outs)
     AND s.email NOT IN (
       SELECT lower(trim(recipient)) FROM email_log INDEXED BY idx_email_log_type
       WHERE type = ?2 AND opened_at IS NOT NULL)
@@ -375,6 +386,56 @@ export async function runBlackFridayResend(
 
   const result = await sendBatch(env, mail, campaign, batch.results ?? [], opts.deadline);
   return { dry_run: false, owed, ...result, recorded: await recorded(env, campaign) };
+}
+
+/**
+ * A test copy of the email the resends send, to hello@getengram.app only
+ * (engram#783). That address has its own account on the Free plan, so the
+ * copy carries that account's name and signed links, as the real email
+ * would. engram-web files it in Sent. Nothing is claimed in
+ * campaign_sends, so it can be repeated and leaves no address out of a
+ * send. Refused, like the send, once the offer has ended.
+ */
+export async function sendBlackFridayResendTest(
+  env: Env,
+  to: string,
+  now?: number,
+): Promise<{ sent: true } | CampaignError> {
+  if (to.trim().toLowerCase() !== TEST_RECIPIENT) {
+    return { error: "bad_request", message: `A test copy goes to ${TEST_RECIPIENT} only.`, status: 400 };
+  }
+  const refusal = sendRefusal(env, now);
+  if (refusal) return refusal;
+  const mail = lifecycleMail(env) as LifecycleMail;
+  const org = await env.DB.prepare(
+    `SELECT id, name FROM organizations
+     WHERE lower(trim(email)) = ? AND deleted_at IS NULL
+     ORDER BY created_at, id
+     LIMIT 1`,
+  )
+    .bind(TEST_RECIPIENT)
+    .first<{ id: string; name: string | null }>();
+  if (!org) {
+    return {
+      error: "organization_not_found",
+      message: `${TEST_RECIPIENT} has no account to take the name and links from.`,
+      status: 404,
+    };
+  }
+  const link = await offerUrl(env, org.id);
+  if (link === null) return { error: "mail_not_configured", message: "No signing key.", status: 500 };
+  const outcome = await deliver(env, mail.bearer, {
+    to: TEST_RECIPIENT,
+    name: org.name,
+    org_id: org.id,
+    unsubscribe_url: await mail.unsubscribeUrl(org.id),
+    offer_url: link,
+    test: true,
+  });
+  if (outcome !== "sent") {
+    return { error: "test_send_failed", message: `engram-web did not send the test copy (${outcome}).`, status: 502 };
+  }
+  return { sent: true };
 }
 
 /**

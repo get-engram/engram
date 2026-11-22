@@ -4,9 +4,12 @@ import { readFileSync } from "node:fs";
 import { Miniflare } from "miniflare";
 import app from "../index.js";
 import {
+  BLACK_FRIDAY_FOURTH,
   BLACK_FRIDAY_RESEND,
+  BLACK_FRIDAY_RESENDS,
   BLACK_FRIDAY_THIRD,
   SEND_TIMEOUT_MS,
+  TEST_RECIPIENT,
   blackFridayOpens,
   runBlackFridayResend,
   type CampaignResult,
@@ -28,7 +31,8 @@ import type { Env } from "../types.js";
  * The Black Friday email again (engram#773), against real SQLite with the
  * real migrations: who it goes to, the send itself, the cron that sends it
  * a batch at a time once /admin starts it, and the /admin switch. Then the
- * third send (engram#775), which is the same send under its own campaign.
+ * third send (engram#775) and the fourth (engram#783), which are the same
+ * send under their own campaigns, and the fourth's test copy.
  */
 
 const KEY = "link-key-773-test";
@@ -101,7 +105,7 @@ describe("The Black Friday email again (engram#773), against real SQLite", () =>
 
   beforeEach(async () => {
     await db.batch(
-      ["campaign_runs", "campaign_sends", "email_log", "prepaid_plans", "organizations"].map((t) =>
+      ["campaign_runs", "campaign_sends", "email_log", "email_opt_outs", "prepaid_plans", "organizations"].map((t) =>
         db.prepare(`DELETE FROM ${t}`),
       ),
     );
@@ -649,10 +653,26 @@ describe("The Black Friday email again (engram#773), against real SQLite", () =>
       expect(mails).toEqual([]);
     });
 
-    it("POST refuses anything but exactly one of start or pause", async () => {
+    it("POST refuses anything but exactly one of start, pause or test_to", async () => {
       await got("org_1");
-      for (const body of [{}, "", "{", "null", "5", { start: "true" }, { start: 1 }, { start: true, pause: true }, { send: true }]) {
-        expect((await admin("POST", body)).status).toBe(400);
+      for (const body of [
+        {},
+        "",
+        "{",
+        "null",
+        "5",
+        { start: "true" },
+        { start: 1 },
+        { start: true, pause: true },
+        { start: true, test_to: TEST_RECIPIENT },
+        { pause: true, test_to: TEST_RECIPIENT },
+        { test_to: 5 },
+        { send: true },
+      ]) {
+        expect(await admin("POST", body)).toEqual({
+          status: 400,
+          body: { error: "bad_request", message: "Send exactly one of: start: true, pause: true or test_to: <address>." },
+        });
       }
       expect(await runRow()).toBeNull();
       expect(mails).toEqual([]);
@@ -828,6 +848,201 @@ describe("The Black Friday email again (engram#773), against real SQLite", () =>
   });
 
   // -------------------------------------------------------------------------
+  describe("the fourth send (engram#783)", () => {
+    const fourths = () => sendsOf(BLACK_FRIDAY_FOURTH);
+
+    async function admin(method: "GET" | "POST", body?: unknown, bearer = "admin-test") {
+      const res = await app.fetch(
+        new Request(`${WORKER}/admin/campaigns/${BLACK_FRIDAY_FOURTH}`, {
+          method,
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${bearer}` },
+          body: method === "GET" ? undefined : JSON.stringify(body),
+        }),
+        env(),
+        ctx,
+      );
+      return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+    }
+
+    /** hello@getengram.app's own account, as in production: Free, never sent the first email. */
+    const hello = (o: OrgOpts = {}) => org("org_hello", { email: "Hello@GetEngram.app", ...o });
+
+    it("goes to the first email's addresses that opened none of the three, and still could buy", async () => {
+      // Got all three, opened none.
+      await got("org_all");
+      await sendInsert(BLACK_FRIDAY_RESEND, "org_all@example.test", "org_all").run();
+      await sendInsert(BLACK_FRIDAY_THIRD, "org_all@example.test", "org_all").run();
+      // Got only the first, never opened it.
+      await got("org_first");
+      // Opened the third email.
+      await got("org_open_third");
+      await sendInsert(BLACK_FRIDAY_RESEND, "org_open_third@example.test", "org_open_third").run();
+      await sendInsert(BLACK_FRIDAY_THIRD, "org_open_third@example.test", "org_open_third").run();
+      await logged("org_open_third@example.test");
+      // Bought after the third email.
+      await got("org_bought");
+      await sendInsert(BLACK_FRIDAY_THIRD, "org_bought@example.test", "org_bought").run();
+      await db.prepare(
+        "INSERT INTO prepaid_plans (session_id, org_id, offer, tier, ends_at) VALUES ('cs_4', 'org_bought', 'black-friday', 'pro', '2027-11-21 00:00:00')",
+      ).run();
+      // Signed up after the first email went out.
+      await org("org_new");
+
+      expect(ok(await runBlackFridayResend(env(), { campaign: BLACK_FRIDAY_FOURTH, dryRun: true }))).toMatchObject({
+        owed: 2,
+        sent: 0,
+      });
+      expect(mails).toEqual([]);
+
+      expect(ok(await runBlackFridayResend(env(), { campaign: BLACK_FRIDAY_FOURTH, limit: 50 }))).toMatchObject({
+        owed: 2,
+        sent: 2,
+        failed: 0,
+        recorded: { sent: 2 },
+      });
+      expect(mails).toEqual(
+        ["org_all", "org_first"].map((id) => ({
+          to: `${id}@example.test`,
+          name: `Name ${id}`,
+          org_id: id,
+          unsubscribe_url: `https://mcp.getengram.app/email/unsubscribe?org=${id}&sig=${unsubscribeSig(id)}`,
+          offer_url: `${WEB}/black-friday?org=${id}&sig=${offerSig(id)}&utm_source=email&utm_campaign=blackfriday`,
+        })),
+      );
+      expect(await fourths()).toEqual([
+        { email: "org_all@example.test", org_id: "org_all", status: "sent" },
+        { email: "org_first@example.test", org_id: "org_first", status: "sent" },
+      ]);
+      // The third send's record is left as it was.
+      expect((await sendsOf(BLACK_FRIDAY_THIRD)).map((r) => r.org_id)).toEqual(["org_all", "org_bought", "org_open_third"]);
+
+      expect(ok(await runBlackFridayResend(env(), { campaign: BLACK_FRIDAY_FOURTH, limit: 50 }))).toMatchObject({
+        owed: 0,
+        sent: 0,
+      });
+      expect(mails).toHaveLength(2);
+    });
+
+    it("no resend goes to an address that unsubscribed through the finish-sign-up email", async () => {
+      await got("org_a");
+      await got("org_b");
+      // Its org was not opted out with it (the opt-out came from a link that names no org).
+      await db
+        .prepare("INSERT INTO email_opt_outs (email, user_id, source) VALUES (?, NULL, 'finish-signup')")
+        .bind("org_b@example.test")
+        .run();
+      // Each of the three resends.
+      for (const campaign of BLACK_FRIDAY_RESENDS) {
+        expect(ok(await runBlackFridayResend(env(), { campaign, dryRun: true })), campaign).toMatchObject({ owed: 1 });
+      }
+      ok(await runBlackFridayResend(env(), { campaign: BLACK_FRIDAY_FOURTH, limit: 50 }));
+      expect(mails.map((m) => m.org_id)).toEqual(["org_a"]);
+    });
+
+    it("the cron sends it once started, and the finished third send stays finished", async () => {
+      const ids = await gotMany(3);
+      await db
+        .prepare("INSERT INTO campaign_runs (campaign, state, finished_at) VALUES (?, 'done', datetime('now'))")
+        .bind(BLACK_FRIDAY_THIRD)
+        .run();
+      expect(await startCampaignRun(env(), BLACK_FRIDAY_FOURTH)).toMatchObject({
+        run: { campaign: BLACK_FRIDAY_FOURTH, state: "running", sending: false, note: null },
+      });
+      expect(mails).toEqual([]);
+
+      expect(await tick()).toMatchObject([
+        { campaign: BLACK_FRIDAY_FOURTH, outcome: "batch", state: "running", result: { owed: 3, sent: 3 } },
+      ]);
+      expect(await tick()).toMatchObject([
+        { campaign: BLACK_FRIDAY_FOURTH, outcome: "batch", state: "done", result: { owed: 0 } },
+      ]);
+      expect(await tick()).toEqual([]);
+
+      expect(mails.map((m) => m.org_id).sort()).toEqual(ids);
+      expect(await fourths()).toHaveLength(3);
+      expect(await sendsOf(BLACK_FRIDAY_THIRD)).toEqual([]);
+      expect(await runRow(BLACK_FRIDAY_THIRD)).toMatchObject({ state: "done" });
+    });
+
+    it("has its own /admin switch, which needs the admin secret", async () => {
+      await got("org_1");
+      await got("org_2");
+      await logged("org_2@example.test");
+      expect((await admin("GET", undefined, "wrong")).status).toBe(401);
+      expect((await admin("POST", { start: true }, "wrong")).status).toBe(401);
+      expect((await admin("POST", { test_to: TEST_RECIPIENT }, "wrong")).status).toBe(401);
+      expect(await admin("GET")).toEqual({
+        status: 200,
+        body: { campaign: BLACK_FRIDAY_FOURTH, owed: 1, first_send: 2, opened: 1, recorded: {}, run: null },
+      });
+      expect((await admin("POST", {})).status).toBe(400);
+      expect(await runRow(BLACK_FRIDAY_FOURTH)).toBeNull();
+
+      expect(await admin("POST", { start: true })).toMatchObject({
+        status: 200,
+        body: { owed: 1, run: { campaign: BLACK_FRIDAY_FOURTH, state: "running" } },
+      });
+      expect(await runRow(BLACK_FRIDAY_THIRD)).toBeNull();
+      expect((await admin("POST", { pause: true })).body).toMatchObject({ paused: true, run: { state: "paused" } });
+      expect(mails).toEqual([]);
+    });
+
+    it("test_to sends one copy to hello@ only, with that account's name and links, and records nothing", async () => {
+      await hello();
+      await got("org_1");
+      expect(await admin("POST", { test_to: " hello@GetEngram.app " })).toEqual({ status: 200, body: { sent: true } });
+      expect(mails).toEqual([
+        {
+          to: TEST_RECIPIENT,
+          name: "Name org_hello",
+          org_id: "org_hello",
+          unsubscribe_url: `https://mcp.getengram.app/email/unsubscribe?org=org_hello&sig=${unsubscribeSig("org_hello")}`,
+          offer_url: `${WEB}/black-friday?org=org_hello&sig=${offerSig("org_hello")}&utm_source=email&utm_campaign=blackfriday`,
+          test: true,
+        },
+      ]);
+      expect(await fourths()).toEqual([]);
+      expect(await runRow(BLACK_FRIDAY_FOURTH)).toBeNull();
+
+      // It can be sent again, and leaves nobody out of the send.
+      expect(await admin("POST", { test_to: TEST_RECIPIENT })).toEqual({ status: 200, body: { sent: true } });
+      expect(mails).toHaveLength(2);
+      expect((await admin("GET")).body).toMatchObject({ owed: 1, recorded: {}, run: null });
+    });
+
+    it.each(["org_1@example.test", "hello@getengram.app.evil.test", ""])("refuses a test copy to %j", async (to) => {
+      await hello();
+      await got("org_1");
+      expect(await admin("POST", { test_to: to })).toEqual({
+        status: 400,
+        body: { error: "bad_request", message: "A test copy goes to hello@getengram.app only." },
+      });
+      expect(mails).toEqual([]);
+    });
+
+    it("sends no test copy without a hello@ account, when engram-web does not send it, or once the offer has ended", async () => {
+      expect(await admin("POST", { test_to: TEST_RECIPIENT })).toMatchObject({
+        status: 404,
+        body: { error: "organization_not_found" },
+      });
+      await hello({ deleted: true });
+      expect((await admin("POST", { test_to: TEST_RECIPIENT })).status).toBe(404);
+
+      await db.prepare("UPDATE organizations SET deleted_at = NULL WHERE id = 'org_hello'").run();
+      webAnswer = () => 500;
+      expect(await admin("POST", { test_to: TEST_RECIPIENT })).toEqual({
+        status: 502,
+        body: { error: "test_send_failed", message: "engram-web did not send the test copy (unknown)." },
+      });
+
+      webAnswer = () => 200;
+      clock = BLACK_FRIDAY_ENDS_AT_MS;
+      expect(await admin("POST", { test_to: TEST_RECIPIENT })).toMatchObject({ status: 410, body: { error: "offer_ended" } });
+      expect(mails).toEqual([]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
   it("its statements read email_log by its type index and never walk campaign_sends or email_log", async () => {
     const sql: string[] = [];
     const recording = new Proxy(db, {
@@ -852,8 +1067,9 @@ describe("The Black Friday email again (engram#773), against real SQLite", () =>
     await runCampaignTick(e);
     expect(mails).toHaveLength(1);
 
-    const touching = [...new Set(sql)].filter((q) => /\b(campaign_sends|email_log)\b/.test(q));
+    const touching = [...new Set(sql)].filter((q) => /\b(campaign_sends|email_log|email_opt_outs)\b/.test(q));
     expect(touching.length).toBeGreaterThan(5);
+    expect(touching.some((q) => /\bemail_opt_outs\b/.test(q))).toBe(true);
     let readsEmailLog = 0;
     for (const q of touching) {
       const plan = (
@@ -862,7 +1078,7 @@ describe("The Black Friday email again (engram#773), against real SQLite", () =>
           .bind(...Array.from({ length: paramCount(q) }, () => "x"))
           .all<{ detail: string }>()
       ).results.map((r) => r.detail);
-      expect(plan.filter((line) => /^SCAN (campaign_sends|email_log|s)\b/.test(line)), q).toEqual([]);
+      expect(plan.filter((line) => /^SCAN (campaign_sends|email_log|email_opt_outs|s)\b/.test(line)), q).toEqual([]);
       if (/\bemail_log\b/.test(q)) {
         expect(plan.some((line) => /^SEARCH email_log USING (COVERING )?INDEX idx_email_log_type\b/.test(line)), q).toBe(true);
         readsEmailLog++;

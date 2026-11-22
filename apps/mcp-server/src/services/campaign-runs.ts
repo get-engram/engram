@@ -1,6 +1,7 @@
 import type { Env } from "../types.js";
 import {
   BATCH_MAX,
+  BLACK_FRIDAY_FOURTH,
   BLACK_FRIDAY_RESEND,
   BLACK_FRIDAY_THIRD,
   runBlackFridayResend,
@@ -8,7 +9,12 @@ import {
   type CampaignError,
   type CampaignResult,
 } from "./black-friday-campaign.js";
-import { FINISH_SIGNUP, finishSignupRefusal, runFinishSignup } from "./finish-signup-campaign.js";
+import {
+  FINISH_SIGNUP,
+  FINISH_SIGNUP_RESEND,
+  finishSignupRefusal,
+  runFinishSignup,
+} from "./finish-signup-campaign.js";
 
 /**
  * Campaign email the worker sends by itself (engram#773).
@@ -40,12 +46,13 @@ interface CampaignSender {
 
 /**
  * The campaigns the cron may send. Only a send whose audience is fixed in
- * advance belongs here: the second and third Black Friday emails go only
- * to addresses the first one went to. The first send must never be
- * listed: its audience is every Free account, so it would now include
+ * advance belongs here: the second, third and fourth Black Friday emails
+ * go only to addresses the first one went to. The first send must never
+ * be listed: its audience is every Free account, so it would now include
  * accounts created since it went out. The finish-sign-up email's audience
  * is fixed too (engram#781): accounts made before the sign-up fix that
- * never got in. Nobody can join it, and it only shrinks.
+ * never got in. Nobody can join it, and it only shrinks. Its second send
+ * (engram#783) goes only to people the first one reached.
  */
 const SENDERS: Readonly<Record<string, CampaignSender>> = {
   [BLACK_FRIDAY_RESEND]: {
@@ -56,8 +63,16 @@ const SENDERS: Readonly<Record<string, CampaignSender>> = {
     send: (env, opts) => runBlackFridayResend(env, { ...opts, campaign: BLACK_FRIDAY_THIRD }),
     refusal: sendRefusal,
   },
+  [BLACK_FRIDAY_FOURTH]: {
+    send: (env, opts) => runBlackFridayResend(env, { ...opts, campaign: BLACK_FRIDAY_FOURTH }),
+    refusal: sendRefusal,
+  },
   [FINISH_SIGNUP]: {
     send: (env, opts) => runFinishSignup(env, opts),
+    refusal: finishSignupRefusal,
+  },
+  [FINISH_SIGNUP_RESEND]: {
+    send: (env, opts) => runFinishSignup(env, { ...opts, campaign: FINISH_SIGNUP_RESEND }),
     refusal: finishSignupRefusal,
   },
 };

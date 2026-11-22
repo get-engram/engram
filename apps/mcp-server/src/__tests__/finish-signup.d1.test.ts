@@ -6,6 +6,7 @@ import app from "../index.js";
 import { BATCH_MAX } from "../services/black-friday-campaign.js";
 import {
   FINISH_SIGNUP,
+  FINISH_SIGNUP_RESEND,
   TEST_RECIPIENT,
   TEST_USER,
   runFinishSignup,
@@ -23,7 +24,8 @@ import type { Env } from "../types.js";
  * the cron that sends it a batch at a time once /admin starts it, the
  * /admin switch and its test copy, the unsubscribe link that names a
  * website account instead of an org, and the opt-out an org made later
- * inherits.
+ * inherits. Then the same email again (engram#783), to the people the
+ * first one went to who are still stuck and have not opened it.
  */
 
 const KEY = "link-key-781-test";
@@ -208,11 +210,11 @@ describe("The finish-sign-up email (engram#781), against real SQLite", () => {
       .run();
   }
 
-  const sends = async () =>
+  const sends = async (campaign = FINISH_SIGNUP) =>
     (
       await db
         .prepare("SELECT email, org_id, status FROM campaign_sends WHERE campaign = ? ORDER BY email")
-        .bind(FINISH_SIGNUP)
+        .bind(campaign)
         .all<{ email: string; org_id: string; status: string }>()
     ).results;
 
@@ -235,11 +237,61 @@ describe("The finish-sign-up email (engram#781), against real SQLite", () => {
       .bind(id)
       .first<{ out: number; at: string | null }>();
 
-  const runRow = () =>
+  const runRow = (campaign = FINISH_SIGNUP) =>
     db
       .prepare("SELECT state, note, lease_until, failed_ticks, finished_at FROM campaign_runs WHERE campaign = ?")
-      .bind(FINISH_SIGNUP)
+      .bind(campaign)
       .first<RunRow>();
+
+  /** Person `n`'s finish-sign-up email was opened. */
+  const opened = (n: number) =>
+    db.prepare("UPDATE email_log SET opened_at = '2026-11-21 09:00:00' WHERE id = ?").bind(`el_${n}`).run();
+
+  /** A D1 that records every statement prepared on it in `sql`. */
+  const recordingDb = (sql: string[]): D1Database =>
+    new Proxy(db, {
+      get(target, prop) {
+        if (prop === "prepare") {
+          return (query: string) => {
+            sql.push(query);
+            return target.prepare(query);
+          };
+        }
+        const value = Reflect.get(target, prop);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+  /**
+   * Checks that none of the statements touching the campaign tables walks
+   * one, and that each reading email_log reads it by its type index.
+   * Answers how many read email_log.
+   */
+  async function expectNoWalks(sql: string[]): Promise<number> {
+    const touching = [...new Set(sql)].filter((q) => /\b(campaign_sends|email_log|email_opt_outs)\b/.test(q));
+    // Not vacuous: each table was read or written along the way.
+    for (const table of ["campaign_sends", "email_log", "email_opt_outs"]) {
+      expect(
+        touching.some((q) => new RegExp(`\\b${table}\\b`).test(q)),
+        table,
+      ).toBe(true);
+    }
+    let readsEmailLog = 0;
+    for (const q of touching) {
+      const plan = (
+        await db
+          .prepare(`EXPLAIN QUERY PLAN ${q}`)
+          .bind(...Array.from({ length: paramCount(q) }, () => "[]"))
+          .all<{ detail: string }>()
+      ).results.map((r) => r.detail);
+      expect(plan.filter((line) => /^SCAN (campaign_sends|email_log|email_opt_outs)\b/.test(line)), q).toEqual([]);
+      if (/\bemail_log\b/.test(q)) {
+        expect(plan.some((line) => /^SEARCH email_log USING (COVERING )?INDEX idx_email_log_type\b/.test(line)), q).toBe(true);
+        readsEmailLog++;
+      }
+    }
+    return readsEmailLog;
+  }
 
   const ok = (r: Awaited<ReturnType<typeof runFinishSignup>>): FinishSignupResult => {
     if ("error" in r) throw new Error(`refused: ${r.error}`);
@@ -870,20 +922,229 @@ describe("The finish-sign-up email (engram#781), against real SQLite", () => {
   });
 
   // -------------------------------------------------------------------------
+  describe("the finish-sign-up email again (engram#783)", () => {
+    const resent = () => sends(FINISH_SIGNUP_RESEND);
+    const again = (o: { dryRun?: boolean } = {}) => runFinishSignup(env(), { campaign: FINISH_SIGNUP_RESEND, ...o });
+
+    async function resendAdmin(method: "GET" | "POST", body?: unknown, bearer = "admin-test") {
+      const res = await app.fetch(
+        new Request(`${WORKER}/admin/campaigns/${FINISH_SIGNUP_RESEND}`, {
+          method,
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${bearer}` },
+          body: method === "GET" ? undefined : typeof body === "string" ? body : JSON.stringify(body),
+        }),
+        env(),
+        ctx,
+      );
+      return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+    }
+
+    it("goes to the people the first one went to who are still stuck and have not opened it", async () => {
+      people = [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => person(n));
+      // Got the first, never opened it.
+      await gotIt(1);
+      // Opened it.
+      await gotIt(2);
+      await opened(2);
+      // Opened it; engram-web logged the address as it was typed.
+      await claim("person3@example.test", uid(3), "sent");
+      await db
+        .prepare(
+          "INSERT INTO email_log (id, org_id, recipient, type, sent_at, opened_at) VALUES ('el_3', NULL, ' Person3@Example.test ', ?, '2026-11-21 08:00:00', '2026-11-21 09:00:00')",
+        )
+        .bind(FINISH_SIGNUP)
+        .run();
+      // Person 4 is listed, but the first email never went to them.
+      // Got in since: an org with the address.
+      await gotIt(5);
+      await org("org_5", "person5@example.test");
+      // Unsubscribed.
+      await gotIt(6);
+      await optedOut("person6@example.test");
+      // The first send had no clear answer: it may not have gone.
+      await claim("person7@example.test", uid(7), "unknown");
+      // Already sent this one.
+      await gotIt(8);
+      await claim("person8@example.test", uid(8), "sent", FINISH_SIGNUP_RESEND);
+      // Opened only another kind of email.
+      await gotIt(9);
+      await db
+        .prepare(
+          "INSERT INTO email_log (id, org_id, recipient, type, sent_at, opened_at) VALUES ('el_9_welcome', NULL, 'person9@example.test', 'welcome', '2026-11-21 09:00:00', '2026-11-21 09:30:00')",
+        )
+        .run();
+      // Got the first, but engram-web no longer lists them.
+      await gotIt(10);
+      const first = await sends();
+
+      expect(ok(await again({ dryRun: true }))).toEqual({
+        dry_run: true,
+        listed: 9,
+        owed: 2,
+        sent: 0,
+        skipped: 0,
+        failed: 0,
+        stopped: false,
+        recorded: { sent: 1 },
+      });
+      expect(requests).toEqual(["GET"]);
+
+      expect(ok(await again())).toEqual({
+        dry_run: false,
+        listed: 9,
+        owed: 2,
+        sent: 2,
+        skipped: 0,
+        failed: 0,
+        stopped: false,
+        recorded: { sent: 3 },
+      });
+      // The same email as the first, with a link that names the account.
+      expect(posts).toEqual([1, 9].map((n) => ({ to: `person${n}@example.test`, user_id: uid(n), unsubscribe_url: userLink(uid(n)) })));
+      expect(await resent()).toEqual(
+        [1, 8, 9].map((n) => ({ email: `person${n}@example.test`, org_id: uid(n), status: "sent" })),
+      );
+      // The first send's record is left as it was.
+      expect(await sends()).toEqual(first);
+
+      expect(ok(await again())).toMatchObject({ owed: 0, sent: 0 });
+      expect(posts).toHaveLength(2);
+    });
+
+    it("an open recorded during the send counts at the next batch", async () => {
+      people = [person(1), person(2)];
+      await gotIt(1);
+      await gotIt(2);
+      expect(ok(await again({ dryRun: true }))).toMatchObject({ owed: 2 });
+      await opened(2);
+      ok(await again());
+      expect(posts.map((p) => p.user_id)).toEqual([uid(1)]);
+    });
+
+    it("the cron sends it once started, and the finished first send stays finished", async () => {
+      people = [1, 2, 3].map((n) => person(n));
+      for (const n of [1, 2, 3]) await gotIt(n);
+      await db
+        .prepare("INSERT INTO campaign_runs (campaign, state, finished_at) VALUES (?, 'done', datetime('now'))")
+        .bind(FINISH_SIGNUP)
+        .run();
+      expect(await startCampaignRun(env(), FINISH_SIGNUP_RESEND)).toMatchObject({
+        run: { campaign: FINISH_SIGNUP_RESEND, state: "running", sending: false, note: null },
+      });
+      expect(requests).toEqual([]);
+
+      const [first] = await tick();
+      expect(first).toMatchObject({ campaign: FINISH_SIGNUP_RESEND, outcome: "batch", state: "running" });
+      expect(first.result).toMatchObject({ owed: 3, sent: 3 });
+      const [second] = await tick();
+      expect(second).toMatchObject({ campaign: FINISH_SIGNUP_RESEND, state: "done", note: "Sent to everyone it was owed to." });
+      expect(await tick()).toEqual([]);
+
+      expect(mails.map((m) => m.user_id)).toEqual([uid(1), uid(2), uid(3)]);
+      expect(await resent()).toHaveLength(3);
+      expect(await runRow(FINISH_SIGNUP)).toMatchObject({ state: "done" });
+      expect(await runRow(FINISH_SIGNUP_RESEND)).toMatchObject({ state: "done" });
+    });
+
+    it("starts only while no other campaign is running", async () => {
+      await db.prepare("INSERT INTO campaign_runs (campaign, state) VALUES ('black-friday-fourth', 'running')").run();
+      expect(await resendAdmin("POST", { start: true })).toEqual({
+        status: 409,
+        body: {
+          error: "another_campaign_running",
+          message: "black-friday-fourth is still running; start this one after it is done or paused.",
+        },
+      });
+      expect(await runRow(FINISH_SIGNUP_RESEND)).toBeNull();
+    });
+
+    it("has its own /admin switch, which needs the admin secret and sends nothing", async () => {
+      people = [1, 2, 3].map((n) => person(n));
+      await gotIt(1);
+      await gotIt(2);
+      await opened(2);
+      expect((await resendAdmin("GET", undefined, "wrong")).status).toBe(401);
+      expect((await resendAdmin("POST", { start: true }, "wrong")).status).toBe(401);
+      expect((await resendAdmin("POST", { test_to: TEST_RECIPIENT }, "wrong")).status).toBe(401);
+      expect(requests).toEqual([]);
+
+      expect(await resendAdmin("GET")).toEqual({
+        status: 200,
+        body: { campaign: FINISH_SIGNUP_RESEND, listed: 3, owed: 1, recorded: {}, run: null },
+      });
+      for (const body of [{}, "", "{", "null", { start: true, pause: true }, { start: true, test_to: TEST_RECIPIENT }, { test_to: 5 }]) {
+        expect(await resendAdmin("POST", body)).toEqual({
+          status: 400,
+          body: { error: "bad_request", message: "Send exactly one of: start: true, pause: true or test_to: <address>." },
+        });
+      }
+      expect(await runRow(FINISH_SIGNUP_RESEND)).toBeNull();
+
+      expect(await resendAdmin("POST", { start: true })).toMatchObject({
+        status: 200,
+        body: { owed: 1, run: { campaign: FINISH_SIGNUP_RESEND, state: "running", sending: false, note: null } },
+      });
+      expect(await runRow(FINISH_SIGNUP)).toBeNull();
+      expect(await resendAdmin("POST", { pause: true })).toMatchObject({
+        status: 200,
+        body: { paused: true, run: { state: "paused", note: "Paused from /admin." } },
+      });
+      expect(await tick()).toEqual([]);
+      expect(posts).toEqual([]);
+    });
+
+    it("test_to sends one test copy to hello@ only, and records nothing", async () => {
+      people = [person(1)];
+      await gotIt(1);
+      expect(await resendAdmin("POST", { test_to: " Hello@GetEngram.app " })).toEqual({
+        status: 200,
+        body: { sent: true, offer: true },
+      });
+      expect(posts).toEqual([{ to: TEST_RECIPIENT, user_id: TEST_USER, unsubscribe_url: userLink(TEST_USER), test: true }]);
+      expect(requests).toEqual(["POST"]);
+      expect(await resent()).toEqual([]);
+      expect(await runRow(FINISH_SIGNUP_RESEND)).toBeNull();
+
+      expect(await resendAdmin("POST", { test_to: "person1@example.test" })).toEqual({
+        status: 400,
+        body: { error: "bad_request", message: "A test copy goes to hello@getengram.app only." },
+      });
+      expect(posts).toHaveLength(1);
+    });
+
+    it("its unsubscribe link works when it names a different account than the first one did", async () => {
+      // engram-web listed the address under a second account this time.
+      await gotIt(1);
+      await claim("person1@example.test", uid(11), "sent", FINISH_SIGNUP_RESEND);
+      await db
+        .prepare(
+          "INSERT INTO email_log (id, org_id, recipient, type, sent_at) VALUES ('el_again', NULL, 'person1@example.test', ?, '2026-11-22 05:00:00')",
+        )
+        .bind(FINISH_SIGNUP)
+        .run();
+      await org("org_a", " Person1@Example.test ");
+
+      const get = await send(userLink(uid(11)));
+      expect(get.status).toBe(200);
+      expect(get.body).toContain("Unsubscribe from Engram emails?");
+      expect(await optOuts()).toEqual([]);
+
+      const post = await send(userLink(uid(11)), { method: "POST" });
+      expect(post.status).toBe(200);
+      expect(post.body).toContain("You're unsubscribed");
+      expect(await optOuts()).toEqual([
+        { email: "person1@example.test", user_id: uid(11), source: FINISH_SIGNUP, opted_out_at: expect.any(String) },
+      ]);
+      expect(await digestOptOut("org_a")).toEqual({ out: 1, at: expect.any(String) });
+      // The newer of the two emails to the address.
+      expect(await credited()).toEqual(["el_again"]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
   it("its statements read email_log by its type index and never walk campaign_sends or email_log", async () => {
     const sql: string[] = [];
-    const recording = new Proxy(db, {
-      get(target, prop) {
-        if (prop === "prepare") {
-          return (query: string) => {
-            sql.push(query);
-            return target.prepare(query);
-          };
-        }
-        const value = Reflect.get(target, prop);
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
+    const recording = recordingDb(sql);
     const e = env({ DB: recording });
     people = [person(1), person(2)];
     await gotIt(3);
@@ -897,28 +1158,30 @@ describe("The finish-sign-up email (engram#781), against real SQLite", () => {
     await insertOrganizationWithEmail(recording, "org_new", "New", "person3@example.test");
     expect(await credited()).toEqual(["el_3"]);
 
-    const touching = [...new Set(sql)].filter((q) => /\b(campaign_sends|email_log|email_opt_outs)\b/.test(q));
-    // Not vacuous: each table was read or written along the way.
-    for (const table of ["campaign_sends", "email_log", "email_opt_outs"]) {
-      expect(
-        touching.some((q) => new RegExp(`\\b${table}\\b`).test(q)),
-        table,
-      ).toBe(true);
-    }
-    let readsEmailLog = 0;
-    for (const q of touching) {
-      const plan = (
-        await db
-          .prepare(`EXPLAIN QUERY PLAN ${q}`)
-          .bind(...Array.from({ length: paramCount(q) }, () => "[]"))
-          .all<{ detail: string }>()
-      ).results.map((r) => r.detail);
-      expect(plan.filter((line) => /^SCAN (campaign_sends|email_log|email_opt_outs)\b/.test(line)), q).toEqual([]);
-      if (/\bemail_log\b/.test(q)) {
-        expect(plan.some((line) => /^SEARCH email_log USING (COVERING )?INDEX idx_email_log_type\b/.test(line)), q).toBe(true);
-        readsEmailLog++;
-      }
-    }
-    expect(readsEmailLog).toBe(1);
+    // The unsubscribe's credit.
+    expect(await expectNoWalks(sql)).toBe(1);
+  });
+
+  it("the second send's statements read email_log by its type index and never walk campaign_sends or email_log", async () => {
+    const sql: string[] = [];
+    const e = env({ DB: recordingDb(sql) });
+    people = [1, 2, 3].map((n) => person(n));
+    for (const n of [1, 2, 3]) await gotIt(n);
+    await opened(3);
+    ok(await runFinishSignup(e, { campaign: FINISH_SIGNUP_RESEND, dryRun: true }));
+    await startCampaignRun(e, FINISH_SIGNUP_RESEND);
+    await runCampaignTick(e);
+    expect(mails.map((m) => m.user_id)).toEqual([uid(1), uid(2)]);
+    await app.fetch(
+      new Request(`${WORKER}/admin/campaigns/${FINISH_SIGNUP_RESEND}`, { headers: { Authorization: "Bearer admin-test" } }),
+      e,
+      ctx,
+    );
+    await send(userLink(uid(1)), undefined, e);
+    await send(userLink(uid(1)), { method: "POST" }, e);
+    expect(await credited()).toEqual(["el_1"]);
+
+    // Who is owed it, and the unsubscribe's credit.
+    expect(await expectNoWalks(sql)).toBe(2);
   });
 });

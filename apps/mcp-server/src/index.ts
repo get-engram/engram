@@ -43,7 +43,7 @@ export { DrainerDO } from "./services/drainer-do.js";
 export { ChunkMoverDO } from "./services/chunk-mover-do.js";
 import { sendWeeklyDigests } from "./cron/weekly-digest.js";
 import { UNSUBSCRIBE_LINK_EMAILS, unsubscribeSigValid, userUnsubscribeSigValid } from "./services/secrets.js";
-import { FINISH_SIGNUP } from "./services/finish-signup-campaign.js";
+import { FINISH_SIGNUP, FINISH_SIGNUP_RESEND } from "./services/finish-signup-campaign.js";
 import { sendShareNudge } from "./cron/share-nudge.js";
 import { sendDailyReport } from "./services/daily-report.js";
 import { runCampaignTick } from "./services/campaign-runs.js";
@@ -255,8 +255,12 @@ async function unsubscribeLinkUser(
   sig: string | undefined,
 ): Promise<{ user: string; address: string | null } | null> {
   if (!user || !sig || !(await userUnsubscribeSigValid(env, user, sig))) return null;
-  const row = await env.DB.prepare("SELECT email FROM campaign_sends WHERE campaign = ? AND org_id = ? LIMIT 1")
-    .bind(FINISH_SIGNUP, user)
+  // Either send's claim: the second (engram#783) went to people the first
+  // reached, and its link names the account engram-web listed then.
+  const row = await env.DB.prepare(
+    "SELECT email FROM campaign_sends WHERE campaign IN (?, ?) AND org_id = ? LIMIT 1",
+  )
+    .bind(FINISH_SIGNUP, FINISH_SIGNUP_RESEND, user)
     .first<{ email: string }>();
   return { user, address: row?.email ?? null };
 }

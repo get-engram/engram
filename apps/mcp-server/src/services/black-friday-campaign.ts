@@ -1,6 +1,6 @@
 import type { Env } from "../types.js";
 import { lifecycleMail, offerSig, type LifecycleMail } from "./secrets.js";
-import { BLACK_FRIDAY, blackFridayState } from "./black-friday.js";
+import { BLACK_FRIDAY, BLACK_FRIDAY_ENDS_AT_MS, blackFridayState } from "./black-friday.js";
 
 /**
  * The Black Friday 2026 email (engram#763): one email to every account
@@ -28,6 +28,13 @@ import { BLACK_FRIDAY, blackFridayState } from "./black-friday.js";
  * The fourth send (engram#783) is the same again, to the addresses the
  * first email went to that have opened none of the three. Its own
  * campaign value, sent by the cron, like the second and the third.
+ *
+ * The last-day send (engram#785) is a different email, which says the
+ * offer ends today, so it goes out on the offer's last day only. It goes
+ * to the other half of the first email's addresses: the ones that have
+ * opened a Black Friday email and could still buy. Its own campaign value
+ * and its own route on engram-web, sent by the cron, which can start it
+ * by itself at a time set in advance.
  */
 
 const BATCH_DEFAULT = 20;
@@ -51,14 +58,32 @@ export const BLACK_FRIDAY_FOURTH = "black-friday-fourth";
 /** The sends that go again to the first send's addresses, in order. */
 export const BLACK_FRIDAY_RESENDS = [BLACK_FRIDAY_RESEND, BLACK_FRIDAY_THIRD, BLACK_FRIDAY_FOURTH] as const;
 export type BlackFridayResend = (typeof BLACK_FRIDAY_RESENDS)[number];
+/** The last-day send's campaign value in campaign_sends and campaign_runs. */
+export const BLACK_FRIDAY_LAST_DAY = "black-friday-last-day";
+/**
+ * The first moment of the offer's last day: 24 hours before it ends, which
+ * is Friday, November 27 in US Eastern. The last-day email says "today is
+ * the last day", so it is never sent before this. Keep it equal to
+ * BLACK_FRIDAY_LAST_DAY_STARTS_AT_MS in engram-web's src/lib/black-friday.ts:
+ * its route refuses the email before then too.
+ */
+export const BLACK_FRIDAY_LAST_DAY_STARTS_AT_MS = BLACK_FRIDAY_ENDS_AT_MS - 24 * 60 * 60 * 1000;
 /** The only address a test copy goes to. */
 export const TEST_RECIPIENT = "hello@getengram.app";
 /**
- * The type engram-web logs the email under in email_log, for every send
- * (src/app/api/email/black-friday/route.ts there). The tracking pixel
- * stamps opened_at on that row.
+ * The type engram-web logs the email under in email_log, for every send,
+ * the last-day one included (src/app/api/email/black-friday/route.ts and
+ * black-friday-last-day/route.ts there). The tracking pixel stamps
+ * opened_at on that row.
  */
 const EMAIL_TYPE = "black-friday";
+/** engram-web's route for the email every send but the last-day one sends. */
+const EMAIL_ROUTE = "/api/email/black-friday";
+/**
+ * engram-web's route for the last-day email (engram-web#329). A route of
+ * its own, so a website without it answers 404 and sends nothing.
+ */
+const LAST_DAY_ROUTE = "/api/email/black-friday-last-day";
 
 /** FROM/WHERE for the accounts still owed the email. One bind: the campaign. */
 const OWED = `
@@ -79,9 +104,9 @@ const OWED = `
       SELECT email FROM campaign_sends WHERE campaign = ?1)`;
 
 /**
- * FROM/WHERE for the addresses owed the second or the third email. Binds:
- * ?1 the first send's campaign, ?2 the email's type in email_log, ?3 the
- * campaign being sent (one of BLACK_FRIDAY_RESENDS).
+ * FROM/WHERE for the addresses owed one of the emails that follow the
+ * first. Binds: ?1 the first send's campaign, ?2 the email's type in
+ * email_log, ?3 the campaign being sent.
  *
  * Only addresses the first email went to, so accounts created since are
  * never included. The account it went to must still be on Free, not
@@ -90,11 +115,15 @@ const OWED = `
  * unsubscribed, or to an account that bought a plan (a refund leaves the
  * row, and a buyer must not be asked to buy again). No address that
  * unsubscribed through the finish-sign-up email's link (email_opt_outs,
- * engram#781), even if no org with it has opted out. And no address that
- * has opened a Black Friday email, by the tracking pixel's record; that is
- * read again for every batch, so an open during the send still counts.
+ * engram#781), even if no org with it has opted out.
+ *
+ * `opened` picks which half of those addresses: false for the ones that
+ * have opened no Black Friday email (the resends), true for the ones that
+ * have opened one (the last-day send). An open is the tracking pixel's
+ * record. It is read again for every batch, so an open during a send
+ * still counts.
  */
-const RESEND_OWED = `
+const followUpOwed = (opened: boolean) => `
   FROM campaign_sends s
   JOIN organizations o ON o.id = s.org_id
   WHERE s.campaign = ?1
@@ -114,11 +143,16 @@ const RESEND_OWED = `
       SELECT lower(trim(b.email)) FROM prepaid_plans p JOIN organizations b ON b.id = p.org_id
       WHERE b.email IS NOT NULL)
     AND s.email NOT IN (SELECT email FROM email_opt_outs)
-    AND s.email NOT IN (
+    AND s.email ${opened ? "IN" : "NOT IN"} (
       SELECT lower(trim(recipient)) FROM email_log INDEXED BY idx_email_log_type
       WHERE type = ?2 AND opened_at IS NOT NULL)
     AND s.email NOT IN (
       SELECT email FROM campaign_sends WHERE campaign = ?3)`;
+
+/** Owed a resend (one of BLACK_FRIDAY_RESENDS): has opened no Black Friday email. */
+const RESEND_OWED = followUpOwed(false);
+/** Owed the last-day email: has opened a Black Friday email. */
+const LAST_DAY_OWED = followUpOwed(true);
 
 export interface CampaignResult {
   dry_run: boolean;
@@ -178,17 +212,41 @@ export function sendRefusal(env: Env, now?: number): CampaignError | null {
   return null;
 }
 
+/**
+ * Why the last-day email may not be sent at `now`, or null when it may.
+ * Everything that stops any Black Friday email stops it; and since it says
+ * "today is the last day", it is not sent before that day has begun.
+ */
+export function lastDayRefusal(env: Env, now = Date.now()): CampaignError | null {
+  const refusal = sendRefusal(env, now);
+  if (refusal) return refusal;
+  if (now < BLACK_FRIDAY_LAST_DAY_STARTS_AT_MS) {
+    const from = new Date(BLACK_FRIDAY_LAST_DAY_STARTS_AT_MS).toISOString();
+    return {
+      error: "too_early",
+      message: `The last-day email is sent only on the offer's last day, from ${from}; nothing was sent.`,
+      status: 409,
+    };
+  }
+  return null;
+}
+
 /** How many to send in one batch: `limit`, kept between 1 and BATCH_MAX. */
 export const batchLimit = (limit: number | undefined) => Math.max(1, Math.min(BATCH_MAX, Math.floor(limit ?? BATCH_DEFAULT)));
 
-/** Ask engram-web to send one email. "refused" = it answered 4xx, before sending. */
+/**
+ * Ask engram-web to send one email, through `route`: the first email's
+ * unless the caller names the last-day one. "refused" = it answered 4xx,
+ * before sending.
+ */
 async function deliver(
   env: Env,
   bearer: string,
   payload: { to: string; name: string | null; org_id: string; unsubscribe_url: string; offer_url: string; test?: boolean },
+  route = EMAIL_ROUTE,
 ): Promise<"sent" | "refused" | "unknown"> {
   try {
-    const res = await fetch(`${env.APP_URL}/api/email/black-friday`, {
+    const res = await fetch(`${env.APP_URL}${route}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${bearer}` },
       body: JSON.stringify(payload),
@@ -206,7 +264,8 @@ async function deliver(
 /**
  * Send to each recipient in turn, claiming its address under `campaign`
  * first. Stops after three failures in a row, and starts no send once
- * `deadline` (ms since the epoch) has passed.
+ * `deadline` (ms since the epoch) has passed. `route` is engram-web's
+ * route for the email being sent.
  */
 async function sendBatch(
   env: Env,
@@ -214,6 +273,7 @@ async function sendBatch(
   campaign: string,
   rows: Recipient[],
   deadline = Number.POSITIVE_INFINITY,
+  route = EMAIL_ROUTE,
 ): Promise<Pick<CampaignResult, "sent" | "skipped" | "failed" | "stopped">> {
   let sent = 0;
   let skipped = 0;
@@ -240,13 +300,18 @@ async function sendBatch(
       continue;
     }
 
-    const outcome = await deliver(env, mail.bearer, {
-      to: org.email.trim(),
-      name: org.name,
-      org_id: org.id,
-      unsubscribe_url: await mail.unsubscribeUrl(org.id),
-      offer_url: link,
-    });
+    const outcome = await deliver(
+      env,
+      mail.bearer,
+      {
+        to: org.email.trim(),
+        name: org.name,
+        org_id: org.id,
+        unsubscribe_url: await mail.unsubscribeUrl(org.id),
+        offer_url: link,
+      },
+      route,
+    );
 
     if (outcome === "sent") {
       await env.DB.prepare("UPDATE campaign_sends SET status = 'sent' WHERE campaign = ? AND email = ?")
@@ -342,20 +407,30 @@ export async function runBlackFridayCampaign(
   return { dry_run: false, owed, ...result, recorded: await recorded(env, BLACK_FRIDAY) };
 }
 
+/** One of the emails that follow the first, as runFollowUp sends it. */
+interface FollowUp {
+  /** Its value in campaign_sends and campaign_runs. */
+  campaign: string;
+  /** FROM/WHERE for the addresses owed it (followUpOwed). */
+  owed: string;
+  /** engram-web's route for the email. */
+  route: string;
+  /** Why it may not be sent at `now`, or null when it may. */
+  refusal(env: Env, now?: number): CampaignError | null;
+}
+
 /**
- * The Black Friday email again: the second send (engram#773) unless
- * `campaign` names the third (engram#775). Count who is owed it, or send
- * the next batch. `deadline` (ms since the epoch) stops a batch from
- * starting another send after it. Only the cron sends it, through
- * campaign-runs.ts; /admin can count it, start the run and pause it.
+ * Count who is owed one of the emails that follow the first, or send its
+ * next batch. `deadline` (ms since the epoch) stops a batch from starting
+ * another send after it.
  */
-export async function runBlackFridayResend(
+async function runFollowUp(
   env: Env,
-  opts: { campaign?: BlackFridayResend; dryRun?: boolean; limit?: number; now?: number; deadline?: number },
+  email: FollowUp,
+  opts: { dryRun?: boolean; limit?: number; now?: number; deadline?: number },
 ): Promise<CampaignResult | CampaignError> {
-  const campaign = opts.campaign ?? BLACK_FRIDAY_RESEND;
-  const binds = [BLACK_FRIDAY, EMAIL_TYPE, campaign] as const;
-  const owedRow = await env.DB.prepare(`SELECT COUNT(*) AS n ${RESEND_OWED}`)
+  const binds = [BLACK_FRIDAY, EMAIL_TYPE, email.campaign] as const;
+  const owedRow = await env.DB.prepare(`SELECT COUNT(*) AS n ${email.owed}`)
     .bind(...binds)
     .first<{ n: number }>();
   const owed = owedRow?.n ?? 0;
@@ -368,24 +443,59 @@ export async function runBlackFridayResend(
       skipped: 0,
       failed: 0,
       stopped: false,
-      recorded: await recorded(env, campaign),
+      recorded: await recorded(env, email.campaign),
     };
   }
 
-  const refusal = sendRefusal(env, opts.now);
+  const refusal = email.refusal(env, opts.now);
   if (refusal) return refusal;
   const mail = lifecycleMail(env) as LifecycleMail;
 
   const batch = await env.DB.prepare(
-    `SELECT s.org_id AS id, o.name, o.email, s.email AS address ${RESEND_OWED}
+    `SELECT s.org_id AS id, o.name, o.email, s.email AS address ${email.owed}
      ORDER BY s.email
      LIMIT ?4`,
   )
     .bind(...binds, batchLimit(opts.limit))
     .all<Recipient>();
 
-  const result = await sendBatch(env, mail, campaign, batch.results ?? [], opts.deadline);
-  return { dry_run: false, owed, ...result, recorded: await recorded(env, campaign) };
+  const result = await sendBatch(env, mail, email.campaign, batch.results ?? [], opts.deadline, email.route);
+  return { dry_run: false, owed, ...result, recorded: await recorded(env, email.campaign) };
+}
+
+/**
+ * The Black Friday email again: the second send (engram#773) unless
+ * `campaign` names the third (engram#775) or the fourth (engram#783).
+ * Count who is owed it, or send the next batch. Only the cron sends it,
+ * through campaign-runs.ts; /admin can count it, start the run and pause
+ * it.
+ */
+export async function runBlackFridayResend(
+  env: Env,
+  opts: { campaign?: BlackFridayResend; dryRun?: boolean; limit?: number; now?: number; deadline?: number },
+): Promise<CampaignResult | CampaignError> {
+  return runFollowUp(
+    env,
+    { campaign: opts.campaign ?? BLACK_FRIDAY_RESEND, owed: RESEND_OWED, route: EMAIL_ROUTE, refusal: sendRefusal },
+    opts,
+  );
+}
+
+/**
+ * The last-day email (engram#785): count who is owed it, or send the next
+ * batch. Refused before the offer's last day (lastDayRefusal); the count
+ * is not. Only the cron sends it, through campaign-runs.ts; /admin can
+ * count it, start the run, set a time for it to start, and pause it.
+ */
+export async function runBlackFridayLastDay(
+  env: Env,
+  opts: { dryRun?: boolean; limit?: number; now?: number; deadline?: number },
+): Promise<CampaignResult | CampaignError> {
+  return runFollowUp(
+    env,
+    { campaign: BLACK_FRIDAY_LAST_DAY, owed: LAST_DAY_OWED, route: LAST_DAY_ROUTE, refusal: lastDayRefusal },
+    opts,
+  );
 }
 
 /**
@@ -396,9 +506,33 @@ export async function runBlackFridayResend(
  * campaign_sends, so it can be repeated and leaves no address out of a
  * send. Refused, like the send, once the offer has ended.
  */
-export async function sendBlackFridayResendTest(
+export function sendBlackFridayResendTest(
   env: Env,
   to: string,
+  now?: number,
+): Promise<{ sent: true } | CampaignError> {
+  return sendTestCopy(env, to, EMAIL_ROUTE, now);
+}
+
+/**
+ * A test copy of the last-day email (engram#785), under the same rules.
+ * It may go before the offer's last day, which the send may not:
+ * engram-web sends a test copy to that one address on any day while the
+ * offer is open, so the email can be read before it goes out.
+ */
+export function sendBlackFridayLastDayTest(
+  env: Env,
+  to: string,
+  now?: number,
+): Promise<{ sent: true } | CampaignError> {
+  return sendTestCopy(env, to, LAST_DAY_ROUTE, now);
+}
+
+/** One test copy to hello@getengram.app, through engram-web's `route`. */
+async function sendTestCopy(
+  env: Env,
+  to: string,
+  route: string,
   now?: number,
 ): Promise<{ sent: true } | CampaignError> {
   if (to.trim().toLowerCase() !== TEST_RECIPIENT) {
@@ -424,14 +558,19 @@ export async function sendBlackFridayResendTest(
   }
   const link = await offerUrl(env, org.id);
   if (link === null) return { error: "mail_not_configured", message: "No signing key.", status: 500 };
-  const outcome = await deliver(env, mail.bearer, {
-    to: TEST_RECIPIENT,
-    name: org.name,
-    org_id: org.id,
-    unsubscribe_url: await mail.unsubscribeUrl(org.id),
-    offer_url: link,
-    test: true,
-  });
+  const outcome = await deliver(
+    env,
+    mail.bearer,
+    {
+      to: TEST_RECIPIENT,
+      name: org.name,
+      org_id: org.id,
+      unsubscribe_url: await mail.unsubscribeUrl(org.id),
+      offer_url: link,
+      test: true,
+    },
+    route,
+  );
   if (outcome !== "sent") {
     return { error: "test_send_failed", message: `engram-web did not send the test copy (${outcome}).`, status: 502 };
   }

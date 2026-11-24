@@ -40,13 +40,16 @@ import {
   BLACK_FRIDAY_UNIT_AMOUNT,
 } from "../services/black-friday.js";
 import {
+  BLACK_FRIDAY_LAST_DAY,
   BLACK_FRIDAY_RESENDS,
   blackFridayOpens,
   runBlackFridayCampaign,
+  runBlackFridayLastDay,
   runBlackFridayResend,
+  sendBlackFridayLastDayTest,
   sendBlackFridayResendTest,
 } from "../services/black-friday-campaign.js";
-import { campaignRun, pauseCampaignRun, startCampaignRun } from "../services/campaign-runs.js";
+import { campaignRun, pauseCampaignRun, scheduleCampaignRun, startCampaignRun } from "../services/campaign-runs.js";
 import { FINISH_SIGNUP_CAMPAIGNS, runFinishSignup, sendFinishSignupTest } from "../services/finish-signup-campaign.js";
 import {
   ADMIN_TZ_OFFSET,
@@ -847,6 +850,113 @@ for (const campaign of BLACK_FRIDAY_RESENDS) {
     return c.json({ run: started.run, owed: "error" in count ? null : count.owed });
   });
 }
+
+/**
+ * A UTC time written out with its Z, such as 2026-11-27T14:00:00Z, in ms
+ * since the epoch; null for anything else. The Z is required, so a time is
+ * never read in some other zone by mistake. A date that does not exist
+ * (November 31) is refused, not moved to the next month.
+ */
+function utcTime(value: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{3})?)?Z$/.test(value)) return null;
+  const ms = Date.parse(value);
+  if (Number.isNaN(ms)) return null;
+  return new Date(ms).toISOString().slice(0, 16) === value.slice(0, 16) ? ms : null;
+}
+
+// ---------------------------------------------------------------------------
+// /admin/campaigns/black-friday-last-day — the last-day email (engram#785):
+// a different email, which says the offer ends today, to the addresses the
+// first one went to that have opened a Black Friday email and could still
+// buy.
+//
+// It goes out on the offer's last day only, and only a test copy is sent
+// from here. The worker's two-minute cron sends it in batches until nobody
+// is left (campaign-runs.ts): from when the run is started, or by itself
+// from a time set in advance.
+//
+// GET: who is still owed it, what has been sent, and the run. The run's
+//   start_at is the time a scheduled run starts.
+// POST { schedule_at: "2026-11-27T14:00:00Z" }: have the run start by itself
+//   at that UTC time, or move the time it has. Refused for a time that has
+//   passed, is before the offer's last day or after its end, and while the
+//   run is running.
+// POST { start: true }: start the run now, or start it again after a pause.
+//   Refused before the offer's last day, once the offer has ended, while
+//   mail is not configured, or while another campaign is running.
+// POST { pause: true }: stop after the batch being sent, if any. Cancels a
+//   scheduled start.
+// POST { test_to: "hello@getengram.app" }: one test copy, to that address
+//   only, on any day while the offer is open. Recorded nowhere.
+// Any other body is refused. So is one that has two of these keys, whatever
+// the second one holds.
+// ---------------------------------------------------------------------------
+admin.get(`/campaigns/${BLACK_FRIDAY_LAST_DAY}`, async (c) => {
+  const count = await runBlackFridayLastDay(c.env, { dryRun: true });
+  if ("error" in count) return c.json({ error: count.error, message: count.message }, count.status);
+  const opens = await blackFridayOpens(c.env);
+  return c.json({
+    campaign: BLACK_FRIDAY_LAST_DAY,
+    owed: count.owed,
+    first_send: opens.first_send,
+    opened: opens.opened,
+    recorded: count.recorded,
+    run: await campaignRun(c.env, BLACK_FRIDAY_LAST_DAY),
+  });
+});
+
+admin.post(`/campaigns/${BLACK_FRIDAY_LAST_DAY}`, async (c) => {
+  const campaign = BLACK_FRIDAY_LAST_DAY;
+  const parsed: unknown = await c.req.json().catch(() => null);
+  const body = (parsed !== null && typeof parsed === "object" ? parsed : {}) as {
+    start?: unknown;
+    pause?: unknown;
+    test_to?: unknown;
+    schedule_at?: unknown;
+  };
+  // One of the four keys, and no other of them in any form: a body such as
+  // { start: true, schedule_at: 5 } must not start a send by mistake.
+  const given = [body.start, body.pause, body.test_to, body.schedule_at].filter((v) => v !== undefined).length;
+  const valid =
+    body.start === true ||
+    body.pause === true ||
+    typeof body.test_to === "string" ||
+    typeof body.schedule_at === "string";
+  if (given !== 1 || !valid) {
+    return c.json(
+      {
+        error: "bad_request",
+        message: "Send exactly one of: start: true, pause: true, test_to: <address> or schedule_at: <UTC time>.",
+      },
+      400,
+    );
+  }
+  if (body.pause === true) return c.json(await pauseCampaignRun(c.env, campaign));
+  if (typeof body.test_to === "string") {
+    const test = await sendBlackFridayLastDayTest(c.env, body.test_to);
+    if ("error" in test) return c.json({ error: test.error, message: test.message }, test.status);
+    return c.json(test);
+  }
+  let run: Awaited<ReturnType<typeof campaignRun>>;
+  if (typeof body.schedule_at === "string") {
+    const startAt = utcTime(body.schedule_at);
+    if (startAt === null) {
+      return c.json(
+        { error: "bad_request", message: "schedule_at must be a UTC time like 2026-11-27T14:00:00Z." },
+        400,
+      );
+    }
+    const scheduled = await scheduleCampaignRun(c.env, campaign, startAt);
+    if ("error" in scheduled) return c.json({ error: scheduled.error, message: scheduled.message }, scheduled.status);
+    run = scheduled.run;
+  } else {
+    const started = await startCampaignRun(c.env, campaign);
+    if ("error" in started) return c.json({ error: started.error, message: started.message }, started.status);
+    run = started.run;
+  }
+  const count = await runBlackFridayLastDay(c.env, { dryRun: true });
+  return c.json({ run, owed: "error" in count ? null : count.owed });
+});
 
 // ---------------------------------------------------------------------------
 // /admin/campaigns/finish-signup — the finish-sign-up email, to the people

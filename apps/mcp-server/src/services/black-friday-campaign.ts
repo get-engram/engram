@@ -35,6 +35,12 @@ import { BLACK_FRIDAY, BLACK_FRIDAY_ENDS_AT_MS, blackFridayState } from "./black
  * opened a Black Friday email and could still buy. Its own campaign value
  * and its own route on engram-web, sent by the cron, which can start it
  * by itself at a time set in advance.
+ *
+ * The reminders (engram#787) are three more emails, each to a small group
+ * that a Black Friday email has not reached as such: an unfinished
+ * checkout, a plan that ended for a failed payment, a new account with
+ * nothing saved. They are built in black-friday-reminders.ts from the
+ * pieces exported here.
  */
 
 const BATCH_DEFAULT = 20;
@@ -170,7 +176,7 @@ export interface CampaignResult {
 
 export type CampaignError = { error: string; message: string; status: 400 | 404 | 409 | 410 | 500 | 502 | 503 };
 
-interface Recipient {
+export interface Recipient {
   id: string;
   name: string | null;
   email: string;
@@ -179,7 +185,7 @@ interface Recipient {
 }
 
 /** The link in the email: the offer page, signed for this account. */
-async function offerUrl(env: Env, orgId: string): Promise<string | null> {
+export async function offerUrl(env: Env, orgId: string): Promise<string | null> {
   const sig = await offerSig(env, BLACK_FRIDAY, orgId);
   if (sig === null) return null;
   return `${env.APP_URL}/black-friday?org=${encodeURIComponent(orgId)}&sig=${sig}&utm_source=email&utm_campaign=blackfriday`;
@@ -239,7 +245,7 @@ export const batchLimit = (limit: number | undefined) => Math.max(1, Math.min(BA
  * unless the caller names the last-day one. "refused" = it answered 4xx,
  * before sending.
  */
-async function deliver(
+export async function deliver(
   env: Env,
   bearer: string,
   payload: { to: string; name: string | null; org_id: string; unsubscribe_url: string; offer_url: string; test?: boolean },
@@ -267,7 +273,7 @@ async function deliver(
  * `deadline` (ms since the epoch) has passed. `route` is engram-web's
  * route for the email being sent.
  */
-async function sendBatch(
+export async function sendBatch(
   env: Env,
   mail: LifecycleMail,
   campaign: string,
@@ -529,7 +535,7 @@ export function sendBlackFridayLastDayTest(
 }
 
 /** One test copy to hello@getengram.app, through engram-web's `route`. */
-async function sendTestCopy(
+export async function sendTestCopy(
   env: Env,
   to: string,
   route: string,

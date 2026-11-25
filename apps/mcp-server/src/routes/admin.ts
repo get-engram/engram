@@ -49,6 +49,12 @@ import {
   sendBlackFridayLastDayTest,
   sendBlackFridayResendTest,
 } from "../services/black-friday-campaign.js";
+import {
+  BLACK_FRIDAY_REMINDERS,
+  REMINDER_CUTOFF_MS,
+  runBlackFridayReminder,
+  sendBlackFridayReminderTest,
+} from "../services/black-friday-reminders.js";
 import { campaignRun, pauseCampaignRun, scheduleCampaignRun, startCampaignRun } from "../services/campaign-runs.js";
 import { FINISH_SIGNUP_CAMPAIGNS, runFinishSignup, sendFinishSignupTest } from "../services/finish-signup-campaign.js";
 import {
@@ -1026,6 +1032,117 @@ for (const campaign of FINISH_SIGNUP_CAMPAIGNS) {
       console.error(`[${campaign}] counting after the start failed:`, err);
     }
     return c.json({ run: started.run, owed });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// /admin/campaigns/black-friday-unpaid, /black-friday-checkout and
+// /black-friday-unused — the Black Friday reminders (engram#787): to a plan
+// that ended for a failed payment, an unfinished checkout, and a new
+// account with nothing saved (black-friday-reminders.ts says who gets each).
+//
+// They go out from their cutoff until the offer's last day begins, and only
+// a test copy is sent from here. Once started, the worker's two-minute cron
+// sends each in batches until nobody is left (campaign-runs.ts). Send them
+// one at a time, in that order, each once the one before is done, so that
+// nobody gets two: start each by hand, or give them start times in that
+// order. A run whose time comes while another is running waits for it. Two
+// runs due in the same tick start in name order, so keep the times at
+// least one tick (two minutes) apart.
+//
+// GET: who is still owed it, what has been sent, the cutoff, and the run.
+//   502 when Stripe or D1 cannot say who is owed it.
+// POST { schedule_at: "2026-11-25T14:00:00Z" }: have the run start by
+//   itself at that UTC time, or move the time it has. Refused for a time
+//   that has passed, is before the cutoff, or is on the offer's last day or
+//   after its end, and while the run is running.
+// POST { start: true }: start the run, or start it again after a pause.
+//   Refused before the cutoff, on the offer's last day or after its end,
+//   while mail or Stripe is not configured, or while another campaign is
+//   running.
+// POST { pause: true }: stop after the batch being sent, if any. Cancels a
+//   scheduled start.
+// POST { test_to: "hello@getengram.app" }: one test copy, to that address
+//   only, at any time while the offer is open. Recorded nowhere.
+// Any other body is refused. So is one that has two of these keys, whatever
+// the second one holds.
+// ---------------------------------------------------------------------------
+for (const campaign of BLACK_FRIDAY_REMINDERS) {
+  admin.get(`/campaigns/${campaign}`, async (c) => {
+    let count: Awaited<ReturnType<typeof runBlackFridayReminder>>;
+    try {
+      count = await runBlackFridayReminder(c.env, { campaign, dryRun: true });
+    } catch (err) {
+      console.error(`[${campaign}] counting failed:`, err);
+      return c.json({ error: "list_failed", message: err instanceof Error ? err.message : String(err) }, 502);
+    }
+    if ("error" in count) return c.json({ error: count.error, message: count.message }, count.status);
+    return c.json({
+      campaign,
+      owed: count.owed,
+      cutoff: new Date(REMINDER_CUTOFF_MS).toISOString(),
+      recorded: count.recorded,
+      run: await campaignRun(c.env, campaign),
+    });
+  });
+
+  admin.post(`/campaigns/${campaign}`, async (c) => {
+    const parsed: unknown = await c.req.json().catch(() => null);
+    const body = (parsed !== null && typeof parsed === "object" ? parsed : {}) as {
+      start?: unknown;
+      pause?: unknown;
+      test_to?: unknown;
+      schedule_at?: unknown;
+    };
+    // One of the four keys, and no other of them in any form: a body such
+    // as { test_to: "…", start: 1 } must not start a send by mistake.
+    const given = [body.start, body.pause, body.test_to, body.schedule_at].filter((v) => v !== undefined).length;
+    const valid =
+      body.start === true ||
+      body.pause === true ||
+      typeof body.test_to === "string" ||
+      typeof body.schedule_at === "string";
+    if (given !== 1 || !valid) {
+      return c.json(
+        {
+          error: "bad_request",
+          message: "Send exactly one of: start: true, pause: true, test_to: <address> or schedule_at: <UTC time>.",
+        },
+        400,
+      );
+    }
+    if (body.pause === true) return c.json(await pauseCampaignRun(c.env, campaign));
+    if (typeof body.test_to === "string") {
+      const test = await sendBlackFridayReminderTest(c.env, campaign, body.test_to);
+      if ("error" in test) return c.json({ error: test.error, message: test.message }, test.status);
+      return c.json(test);
+    }
+    let run: Awaited<ReturnType<typeof campaignRun>>;
+    if (typeof body.schedule_at === "string") {
+      const startAt = utcTime(body.schedule_at);
+      if (startAt === null) {
+        return c.json(
+          { error: "bad_request", message: "schedule_at must be a UTC time like 2026-11-25T14:00:00Z." },
+          400,
+        );
+      }
+      const scheduled = await scheduleCampaignRun(c.env, campaign, startAt);
+      if ("error" in scheduled) return c.json({ error: scheduled.error, message: scheduled.message }, scheduled.status);
+      run = scheduled.run;
+    } else {
+      const started = await startCampaignRun(c.env, campaign);
+      if ("error" in started) return c.json({ error: started.error, message: started.message }, started.status);
+      run = started.run;
+    }
+    // The count is for the reply only; the run is started or scheduled either way.
+    let owed: number | null = null;
+    try {
+      const count = await runBlackFridayReminder(c.env, { campaign, dryRun: true });
+      if (!("error" in count)) owed = count.owed;
+    } catch (err) {
+      console.error(`[${campaign}] counting after the start failed:`, err);
+    }
+    return c.json({ run, owed });
   });
 }
 

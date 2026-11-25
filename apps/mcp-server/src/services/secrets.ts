@@ -162,9 +162,12 @@ export function lifecycleMail(env: Env): LifecycleMail | null {
 
 /**
  * The emails that carry an unsubscribe link, by the type engram-web logs
- * each one under in email_log: the weekly digest, the nudges and the
- * plan-changed notice. An unsubscribe is credited only to one of these
- * (index.ts). A welcome email or a team invite has no link to click.
+ * each one under in email_log: the weekly digest, the nudges, the
+ * plan-changed notice and the Black Friday emails. Every Black Friday send
+ * so far, the last-day email included, is logged as black-friday; the
+ * three reminders (engram#787) each under its own type. An unsubscribe is
+ * credited only to one of these (index.ts). A welcome email or a team
+ * invite has no link to click.
  *
  * The finish-sign-up email (engram#781) has a link too, but one that names
  * a website account, not an org (userUnsubscribeUrl), and it is logged with
@@ -179,6 +182,9 @@ export const UNSUBSCRIBE_LINK_EMAILS: readonly string[] = [
   "recall-nudge",
   "plan-changed",
   "black-friday",
+  "black-friday-checkout",
+  "black-friday-unpaid",
+  "black-friday-unused",
 ];
 
 /**

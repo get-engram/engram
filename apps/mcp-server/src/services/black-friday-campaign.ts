@@ -31,10 +31,10 @@ import { BLACK_FRIDAY, BLACK_FRIDAY_ENDS_AT_MS, blackFridayState } from "./black
  *
  * The last-day send (engram#785) is a different email, which says the
  * offer ends today, so it goes out on the offer's last day only. It goes
- * to the other half of the first email's addresses: the ones that have
- * opened a Black Friday email and could still buy. Its own campaign value
- * and its own route on engram-web, sent by the cron, which can start it
- * by itself at a time set in advance.
+ * to every address the first email went to that could still buy, whether
+ * it has opened a Black Friday email or not (engram#791). Its own campaign
+ * value and its own route on engram-web, sent by the cron, which can
+ * start it by itself at a time set in advance.
  *
  * The reminders (engram#787) are three more emails, each to a small group
  * that a Black Friday email has not reached as such: an unfinished
@@ -109,6 +109,12 @@ const OWED = `
     AND lower(trim(o.email)) NOT IN (
       SELECT email FROM campaign_sends WHERE campaign = ?1)`;
 
+/** No address that has opened a Black Friday email. ?2 is that email's type in email_log. */
+const NONE_OPENED = `
+    AND s.email NOT IN (
+      SELECT lower(trim(recipient)) FROM email_log INDEXED BY idx_email_log_type
+      WHERE type = ?2 AND opened_at IS NOT NULL)`;
+
 /**
  * FROM/WHERE for the addresses owed one of the emails that follow the
  * first. Binds: ?1 the first send's campaign, ?2 the email's type in
@@ -123,13 +129,14 @@ const OWED = `
  * unsubscribed through the finish-sign-up email's link (email_opt_outs,
  * engram#781), even if no org with it has opted out.
  *
- * `opened` picks which half of those addresses: false for the ones that
- * have opened no Black Friday email (the resends), true for the ones that
- * have opened one (the last-day send). An open is the tracking pixel's
- * record. It is read again for every batch, so an open during a send
- * still counts.
+ * `unopenedOnly` keeps only the addresses that have opened no Black
+ * Friday email (NONE_OPENED): true for the resends. The last-day send
+ * passes false and goes to all of them, opened or not (engram#791). Its
+ * statements then leave ?2 unused; SQLite numbers parameters by ?N, so
+ * they take the same binds. An open is the tracking pixel's record. It is
+ * read again for every batch, so an open during a resend still counts.
  */
-const followUpOwed = (opened: boolean) => `
+const followUpOwed = (unopenedOnly: boolean) => `
   FROM campaign_sends s
   JOIN organizations o ON o.id = s.org_id
   WHERE s.campaign = ?1
@@ -148,17 +155,14 @@ const followUpOwed = (opened: boolean) => `
     AND s.email NOT IN (
       SELECT lower(trim(b.email)) FROM prepaid_plans p JOIN organizations b ON b.id = p.org_id
       WHERE b.email IS NOT NULL)
-    AND s.email NOT IN (SELECT email FROM email_opt_outs)
-    AND s.email ${opened ? "IN" : "NOT IN"} (
-      SELECT lower(trim(recipient)) FROM email_log INDEXED BY idx_email_log_type
-      WHERE type = ?2 AND opened_at IS NOT NULL)
+    AND s.email NOT IN (SELECT email FROM email_opt_outs)${unopenedOnly ? NONE_OPENED : ""}
     AND s.email NOT IN (
       SELECT email FROM campaign_sends WHERE campaign = ?3)`;
 
 /** Owed a resend (one of BLACK_FRIDAY_RESENDS): has opened no Black Friday email. */
-const RESEND_OWED = followUpOwed(false);
-/** Owed the last-day email: has opened a Black Friday email. */
-const LAST_DAY_OWED = followUpOwed(true);
+const RESEND_OWED = followUpOwed(true);
+/** Owed the last-day email: opened a Black Friday email or not (engram#791). */
+const LAST_DAY_OWED = followUpOwed(false);
 
 export interface CampaignResult {
   dry_run: boolean;

@@ -50,8 +50,8 @@ import {
   sendBlackFridayResendTest,
 } from "../services/black-friday-campaign.js";
 import {
-  BLACK_FRIDAY_REMINDERS,
-  REMINDER_CUTOFF_MS,
+  ALL_BLACK_FRIDAY_REMINDERS,
+  reminderCutoffMs,
   runBlackFridayReminder,
   sendBlackFridayReminderTest,
 } from "../services/black-friday-reminders.js";
@@ -1036,10 +1036,12 @@ for (const campaign of FINISH_SIGNUP_CAMPAIGNS) {
 }
 
 // ---------------------------------------------------------------------------
-// /admin/campaigns/black-friday-unpaid, /black-friday-checkout and
-// /black-friday-unused — the Black Friday reminders (engram#787): to a plan
-// that ended for a failed payment, an unfinished checkout, and a new
-// account with nothing saved (black-friday-reminders.ts says who gets each).
+// /admin/campaigns/black-friday-unpaid, /black-friday-checkout,
+// /black-friday-unused and /black-friday-unpaid-late — the Black Friday
+// reminders (engram#787, engram#789): to a plan that ended for a failed
+// payment, an unfinished checkout, a new account with nothing saved, and a
+// plan that ended for a failed payment after the first one's group was
+// fixed (black-friday-reminders.ts says who gets each).
 //
 // They go out from their cutoff until the offer's last day begins, and only
 // a test copy is sent from here. Once started, the worker's two-minute cron
@@ -1067,7 +1069,7 @@ for (const campaign of FINISH_SIGNUP_CAMPAIGNS) {
 // Any other body is refused. So is one that has two of these keys, whatever
 // the second one holds.
 // ---------------------------------------------------------------------------
-for (const campaign of BLACK_FRIDAY_REMINDERS) {
+for (const campaign of ALL_BLACK_FRIDAY_REMINDERS) {
   admin.get(`/campaigns/${campaign}`, async (c) => {
     let count: Awaited<ReturnType<typeof runBlackFridayReminder>>;
     try {
@@ -1080,7 +1082,7 @@ for (const campaign of BLACK_FRIDAY_REMINDERS) {
     return c.json({
       campaign,
       owed: count.owed,
-      cutoff: new Date(REMINDER_CUTOFF_MS).toISOString(),
+      cutoff: new Date(reminderCutoffMs(campaign)).toISOString(),
       recorded: count.recorded,
       run: await campaignRun(c.env, campaign),
     });

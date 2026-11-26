@@ -13,7 +13,7 @@ import {
   type CampaignResult,
 } from "./black-friday-campaign.js";
 import {
-  BLACK_FRIDAY_REMINDERS,
+  ALL_BLACK_FRIDAY_REMINDERS,
   blackFridayReminderRefusal,
   runBlackFridayReminder,
 } from "./black-friday-reminders.js";
@@ -69,9 +69,9 @@ interface CampaignSender {
  * (engram#781): accounts made before the sign-up fix that never got in.
  * Nobody can join it, and it only shrinks. Its second send (engram#783)
  * goes only to people the first one reached. The Black Friday reminders
- * (engram#787) count only checkouts, cancellations and accounts from
- * before their cutoff, and are refused until it has passed, so their
- * audiences are fixed by the time they can be sent.
+ * (engram#787, engram#789) count only checkouts, cancellations and
+ * accounts from before their cutoff, and are refused until it has passed,
+ * so their audiences are fixed by the time they can be sent.
  */
 const SENDERS: Readonly<Record<string, CampaignSender>> = {
   [BLACK_FRIDAY_RESEND]: {
@@ -99,7 +99,7 @@ const SENDERS: Readonly<Record<string, CampaignSender>> = {
     refusal: finishSignupRefusal,
   },
   ...Object.fromEntries(
-    BLACK_FRIDAY_REMINDERS.map((campaign): [string, CampaignSender] => [
+    ALL_BLACK_FRIDAY_REMINDERS.map((campaign): [string, CampaignSender] => [
       campaign,
       {
         send: (env, opts) => runBlackFridayReminder(env, { ...opts, campaign }),

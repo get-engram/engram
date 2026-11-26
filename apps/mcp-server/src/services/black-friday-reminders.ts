@@ -16,9 +16,9 @@ import { FINISH_SIGNUP, FINISH_SIGNUP_RESEND } from "./finish-signup-campaign.js
 import { listRows } from "./stripe-list.js";
 
 /**
- * The Black Friday reminders (engram#787): three emails about the offer,
- * each to a small group of free accounts and each through its own route on
- * engram-web (engram-web#339).
+ * The Black Friday reminders (engram#787): emails about the offer, each to
+ * a small group of free accounts and each through a route on engram-web
+ * (engram-web#339).
  *
  * - black-friday-unpaid: a paid plan that Stripe cancelled because a
  *   payment failed. The account is on the Free plan now.
@@ -30,11 +30,15 @@ import { listRows } from "./stripe-list.js";
  *   one message: the admin's "never used"), and whose address no Black
  *   Friday or finish-sign-up email has gone to. Counted by address: an
  *   address with any account that has been used is left out.
+ * - black-friday-unpaid-late (engram#789): the unpaid reminder's email,
+ *   through its route, for a plan Stripe cancelled for a failed payment
+ *   after the unpaid reminder's group was fixed, until LATE_CUTOFF_MS.
  *
- * Who is in each group is fixed at REMINDER_CUTOFF_MS: only a checkout, a
- * cancellation or an account from before then counts. After it a group can
- * only shrink (a purchase, an unsubscribe, a send), so the cron may send
- * them (campaign-runs.ts). They are not sent before it, and not on the
+ * Who is in the first three groups is fixed at REMINDER_CUTOFF_MS: only a
+ * checkout, a cancellation or an account from before then counts. The late
+ * one's is fixed at LATE_CUTOFF_MS. After its cutoff a group can only
+ * shrink (a purchase, an unsubscribe, a send), so the cron may send it
+ * (campaign-runs.ts). None is sent before its cutoff, and none on the
  * offer's last day, when the last-day email goes out instead.
  *
  * Every account must also be one any Black Friday email may go to: on the
@@ -42,10 +46,10 @@ import { listRows } from "./stripe-list.js";
  * belongs to a paid account or to one that unsubscribed, and not a buyer of
  * the offer.
  *
- * One email per person across the three: none goes to an address any of
+ * One email per person across the four: none goes to an address any of
  * them has already been sent to, and one campaign runs at a time. They are
- * started one after another, in BLACK_FRIDAY_REMINDERS order, so someone in
- * two of the groups gets the first one's email.
+ * started one after another, in ALL_BLACK_FRIDAY_REMINDERS order, so
+ * someone in two of the groups gets the first one's email.
  */
 
 /** The cancelled-for-non-payment reminder's campaign value, and engram-web's route name for it. */
@@ -54,19 +58,43 @@ export const BLACK_FRIDAY_UNPAID = "black-friday-unpaid";
 export const BLACK_FRIDAY_CHECKOUT = "black-friday-checkout";
 /** The new-and-unused reminder's campaign value, and engram-web's route name for it. */
 export const BLACK_FRIDAY_UNUSED = "black-friday-unused";
-/** The reminders, in the order they are sent. */
+/** The first three reminders, fixed at REMINDER_CUTOFF_MS, in the order they are sent. */
 export const BLACK_FRIDAY_REMINDERS = [BLACK_FRIDAY_UNPAID, BLACK_FRIDAY_CHECKOUT, BLACK_FRIDAY_UNUSED] as const;
-export type BlackFridayReminder = (typeof BLACK_FRIDAY_REMINDERS)[number];
+/**
+ * The late unpaid reminder's campaign value (engram#789). It sends the
+ * unpaid reminder's email, through engram-web's route for that one, so
+ * engram-web logs it, and credits its unsubscribes, as black-friday-unpaid.
+ */
+export const BLACK_FRIDAY_UNPAID_LATE = "black-friday-unpaid-late";
+/** Every reminder, in the order they are sent. */
+export const ALL_BLACK_FRIDAY_REMINDERS = [...BLACK_FRIDAY_REMINDERS, BLACK_FRIDAY_UNPAID_LATE] as const;
+export type BlackFridayReminder = (typeof ALL_BLACK_FRIDAY_REMINDERS)[number];
 
 /**
- * When the reminders' groups are fixed, and the first moment they may be
- * sent: 06:00 UTC on November 25, 2026.
+ * When the first three reminders' groups are fixed, and the first moment
+ * they may be sent: 06:00 UTC on November 25, 2026.
  */
 export const REMINDER_CUTOFF_MS = Date.UTC(2026, 10, 25, 6, 0, 0);
 /** REMINDER_CUTOFF_MS as D1 writes a time, for comparing with created_at. */
 const CUTOFF_SQL = new Date(REMINDER_CUTOFF_MS).toISOString().replace("T", " ").slice(0, 19);
 /** REMINDER_CUTOFF_MS in Stripe's seconds. */
 const CUTOFF_S = Math.floor(REMINDER_CUTOFF_MS / 1000);
+/**
+ * When the late unpaid reminder's group is fixed, and the first moment it
+ * may be sent: 01:00 UTC on November 26, 2026. It is for plans Stripe
+ * cancelled for a failed payment from REMINDER_CUTOFF_MS until then.
+ */
+export const LATE_CUTOFF_MS = Date.UTC(2026, 10, 26, 1, 0, 0);
+/** LATE_CUTOFF_MS in Stripe's seconds. */
+const LATE_CUTOFF_S = Math.floor(LATE_CUTOFF_MS / 1000);
+
+/** When `campaign`'s group is fixed, and the first moment it may be sent. */
+export const reminderCutoffMs = (campaign: BlackFridayReminder): number =>
+  campaign === BLACK_FRIDAY_UNPAID_LATE ? LATE_CUTOFF_MS : REMINDER_CUTOFF_MS;
+
+/** engram-web's route for `campaign`'s email. */
+const routeOf = (campaign: BlackFridayReminder): string =>
+  `/api/email/${campaign === BLACK_FRIDAY_UNPAID_LATE ? BLACK_FRIDAY_UNPAID : campaign}`;
 /** When the first Black Friday email started going out. The unused reminder is for accounts made since. */
 export const UNUSED_FROM = "2026-11-18 04:26:00";
 /** A checkout still open this long before the cutoff was left, not still being filled in. */
@@ -80,8 +108,8 @@ const iso = (ms: number) => new Date(ms).toISOString();
 
 /**
  * WHERE terms for an account (o) any of the reminders may go to.
- * ?2, ?3 and ?4: the three reminders' campaign values. No subquery yields
- * NULL, so NOT IN never leaves everyone out.
+ * ?2 to ?5: the four reminders' campaign values. No subquery yields NULL,
+ * so NOT IN never leaves everyone out.
  */
 const ELIGIBLE = `
     o.deleted_at IS NULL
@@ -102,7 +130,7 @@ const ELIGIBLE = `
       WHERE b.email IS NOT NULL)
     AND lower(trim(o.email)) NOT IN (SELECT email FROM email_opt_outs)
     AND lower(trim(o.email)) NOT IN (
-      SELECT email FROM campaign_sends WHERE campaign IN (?2, ?3, ?4))`;
+      SELECT email FROM campaign_sends WHERE campaign IN (?2, ?3, ?4, ?5))`;
 
 /** Which of a list of accounts (?1, a JSON array of ids) a reminder may go to. */
 const LISTED_OWED = `
@@ -113,7 +141,7 @@ const LISTED_OWED = `
 
 /**
  * The accounts owed the unused reminder. ?1 the first Black Friday email's
- * campaign, ?5 and ?6 the finish-sign-up emails', ?7 and ?8 the window the
+ * campaign, ?6 and ?7 the finish-sign-up emails', ?8 and ?9 the window the
  * account was made in.
  *
  * `used` holds every address with an account that has two conversations or
@@ -125,10 +153,10 @@ const UNUSED_OWED = `
     SELECT o.id, o.name, o.email, lower(trim(o.email)) AS address, julianday(o.created_at) AS jd
     FROM organizations o
     WHERE ${ELIGIBLE}
-      AND julianday(o.created_at) >= julianday(?7)
-      AND julianday(o.created_at) < julianday(?8)
+      AND julianday(o.created_at) >= julianday(?8)
+      AND julianday(o.created_at) < julianday(?9)
       AND lower(trim(o.email)) NOT IN (
-        SELECT email FROM campaign_sends WHERE campaign IN (?1, ?5, ?6))
+        SELECT email FROM campaign_sends WHERE campaign IN (?1, ?6, ?7))
   ),
   same_address AS MATERIALIZED (
     SELECT id, lower(trim(email)) AS address FROM organizations
@@ -192,17 +220,17 @@ async function checkoutOrgs(key: string): Promise<string[]> {
 }
 
 /**
- * The accounts with a subscription Stripe cancelled before the cutoff
- * because a payment failed. Whether the account is on the Free plan now is
- * D1's to say (LISTED_OWED).
+ * The accounts with a subscription Stripe cancelled because a payment
+ * failed, at `fromS` or later and before `untilS` (Stripe's seconds).
+ * Whether the account is on the Free plan now is D1's to say (LISTED_OWED).
  */
-async function unpaidOrgs(key: string): Promise<string[]> {
+async function unpaidOrgs(key: string, fromS: number, untilS: number): Promise<string[]> {
   const orgs = new Set<string>();
   for await (const s of listRows<StripeSubscription>(key, "/v1/subscriptions", { status: "canceled" }, MAX_PAGES)) {
     const org = s.metadata?.organization_id;
     if (!org) continue;
     if (s.cancellation_details?.reason !== "payment_failed") continue;
-    if (typeof s.canceled_at !== "number" || s.canceled_at >= CUTOFF_S) continue;
+    if (typeof s.canceled_at !== "number" || s.canceled_at < fromS || s.canceled_at >= untilS) continue;
     orgs.add(org);
   }
   return [...orgs];
@@ -213,7 +241,7 @@ async function eligibleOf(env: Env, ids: string[]): Promise<Candidate[]> {
   const rows: Candidate[] = [];
   for (let i = 0; i < ids.length; i += CHUNK) {
     const chunk = await env.DB.prepare(LISTED_OWED)
-      .bind(JSON.stringify(ids.slice(i, i + CHUNK)), ...BLACK_FRIDAY_REMINDERS)
+      .bind(JSON.stringify(ids.slice(i, i + CHUNK)), ...ALL_BLACK_FRIDAY_REMINDERS)
       .all<Candidate>();
     rows.push(...(chunk.results ?? []));
   }
@@ -243,12 +271,17 @@ function onePerAddress(rows: Candidate[]): Recipient[] {
 async function owedOf(env: Env, campaign: BlackFridayReminder): Promise<Recipient[]> {
   if (campaign === BLACK_FRIDAY_UNUSED) {
     const rows = await env.DB.prepare(UNUSED_OWED)
-      .bind(BLACK_FRIDAY, ...BLACK_FRIDAY_REMINDERS, FINISH_SIGNUP, FINISH_SIGNUP_RESEND, UNUSED_FROM, CUTOFF_SQL)
+      .bind(BLACK_FRIDAY, ...ALL_BLACK_FRIDAY_REMINDERS, FINISH_SIGNUP, FINISH_SIGNUP_RESEND, UNUSED_FROM, CUTOFF_SQL)
       .all<Candidate>();
     return onePerAddress(rows.results ?? []);
   }
+  const key = env.STRIPE_SECRET_KEY;
   const ids =
-    campaign === BLACK_FRIDAY_CHECKOUT ? await checkoutOrgs(env.STRIPE_SECRET_KEY) : await unpaidOrgs(env.STRIPE_SECRET_KEY);
+    campaign === BLACK_FRIDAY_CHECKOUT
+      ? await checkoutOrgs(key)
+      : campaign === BLACK_FRIDAY_UNPAID_LATE
+        ? await unpaidOrgs(key, CUTOFF_S, LATE_CUTOFF_S)
+        : await unpaidOrgs(key, Number.NEGATIVE_INFINITY, CUTOFF_S);
   return onePerAddress(await eligibleOf(env, ids));
 }
 
@@ -272,10 +305,11 @@ export function blackFridayReminderRefusal(
   const refusal = sendRefusal(env, now);
   if (refusal) return refusal;
   if (campaign !== BLACK_FRIDAY_UNUSED && !env.STRIPE_SECRET_KEY) return NO_STRIPE;
-  if (now < REMINDER_CUTOFF_MS) {
+  const cutoff = reminderCutoffMs(campaign);
+  if (now < cutoff) {
     return {
       error: "too_early",
-      message: `The reminders go out from ${iso(REMINDER_CUTOFF_MS)}, once who gets them is fixed; nothing was sent.`,
+      message: `The reminders go out from ${iso(cutoff)}, once who gets them is fixed; nothing was sent.`,
       status: 409,
     };
   }
@@ -329,7 +363,7 @@ export async function runBlackFridayReminder(
     campaign,
     owed.slice(0, batchLimit(opts.limit)),
     opts.deadline,
-    `/api/email/${campaign}`,
+    routeOf(campaign),
   );
   return { dry_run: false, owed: owed.length, ...result, recorded: await recorded(env, campaign) };
 }
@@ -347,5 +381,5 @@ export function sendBlackFridayReminderTest(
   to: string,
   now?: number,
 ): Promise<{ sent: true } | CampaignError> {
-  return sendTestCopy(env, to, `/api/email/${campaign}`, now);
+  return sendTestCopy(env, to, routeOf(campaign), now);
 }

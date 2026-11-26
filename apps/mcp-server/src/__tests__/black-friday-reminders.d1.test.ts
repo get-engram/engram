@@ -12,7 +12,9 @@ import {
   BLACK_FRIDAY_CHECKOUT,
   BLACK_FRIDAY_REMINDERS,
   BLACK_FRIDAY_UNPAID,
+  BLACK_FRIDAY_UNPAID_LATE,
   BLACK_FRIDAY_UNUSED,
+  LATE_CUTOFF_MS,
   REMINDER_CUTOFF_MS,
   UNUSED_FROM,
   blackFridayReminderRefusal,
@@ -26,9 +28,9 @@ import { createMockEnv } from "./helpers.js";
 import type { Env } from "../types.js";
 
 /**
- * The three Black Friday reminders (engram#787), against real SQLite with
- * the real migrations and a fake Stripe: who each one goes to, one email
- * per person across the three, when they may be sent, the cron that sends
+ * The Black Friday reminders (engram#787, engram#789), against real SQLite
+ * with the real migrations and a fake Stripe: who each one goes to, one
+ * email per person across them, when they may be sent, the cron that sends
  * them, the /admin switch for each (a start time included), the test copy,
  * crediting an unsubscribe, and how their statements read D1.
  */
@@ -51,8 +53,14 @@ const LAST_DAY = BLACK_FRIDAY_LAST_DAY_STARTS_AT_MS;
 /** When an account in the unused reminder's window was made, as D1 writes a time. */
 const NEW = "2026-11-20 12:00:00";
 const MINUTE = 60_000;
+/** The late unpaid reminder's cutoff, and the same in Stripe's seconds. */
+const LATE_CUTOFF = LATE_CUTOFF_MS;
+const LATE_CUTOFF_S = LATE_CUTOFF / 1000;
+/** 14:00 UTC on November 26. */
+const LATE_SEND_AT = Date.UTC(2026, 10, 26, 14, 0, 0);
 
 const TOO_EARLY = "The reminders go out from 2026-11-25T06:00:00.000Z, once who gets them is fixed; nothing was sent.";
+const LATE_TOO_EARLY = "The reminders go out from 2026-11-26T01:00:00.000Z, once who gets them is fixed; nothing was sent.";
 const TOO_LATE = "The reminders are not sent on the offer's last day, from 2026-11-27T05:00:00.000Z; nothing was sent.";
 const BAD_BODY = "Send exactly one of: start: true, pause: true, test_to: <address> or schedule_at: <UTC time>.";
 const BAD_TIME = "schedule_at must be a UTC time like 2026-11-25T14:00:00Z.";
@@ -882,6 +890,132 @@ describe("The Black Friday reminders (engram#787), against real SQLite", () => {
       { id: "el_first", credited: 0 },
       { id: "el_reminder", credited: 1 },
     ]);
+  });
+
+  // -------------------------------------------------------------------------
+  describe("the late unpaid reminder (engram#789)", () => {
+    const campaign = BLACK_FRIDAY_UNPAID_LATE;
+
+    /**
+     * Who it goes to, in the order it is sent: counted, then sent in one
+     * batch at LATE_SEND_AT, through the unpaid reminder's route.
+     */
+    async function lateGets(): Promise<string[]> {
+      clock = LATE_SEND_AT;
+      const count = ok(await runBlackFridayReminder(env(), { campaign, dryRun: true }));
+      const before = mails.length;
+      const sent = ok(await runBlackFridayReminder(env(), { campaign, limit: 50 }));
+      expect(sent).toMatchObject({ owed: count.owed, sent: count.owed, skipped: 0, failed: 0, stopped: false });
+      const got = mails.slice(before);
+      expect(got.every((m) => m.route === BLACK_FRIDAY_UNPAID)).toBe(true);
+      return got.map((m) => m.org_id);
+    }
+
+    /** An account whose plan Stripe cancelled for a failed payment a minute after the first cutoff. */
+    async function lateUnpaid(id: string, o: OrgOpts = {}) {
+      await org(id, o);
+      cancelled(id, CUTOFF_S + 60);
+    }
+
+    it("goes to a plan Stripe cancelled for a failed payment from the first cutoff until its own, on the Free plan now", async () => {
+      for (const id of ["org_at_cutoff", "org_last_second", "org_early", "org_after", "org_asked"]) await org(id);
+      await org("org_back", { tier: "pro" });
+      cancelled("org_at_cutoff", CUTOFF_S);
+      cancelled("org_last_second", LATE_CUTOFF_S - 1);
+      // The unpaid reminder's.
+      cancelled("org_early", CUTOFF_S - 1);
+      // Once its group was fixed.
+      cancelled("org_after", LATE_CUTOFF_S);
+      cancelled("org_asked", CUTOFF_S + 60, "cancellation_requested");
+      // On a paid plan again since.
+      cancelled("org_back", CUTOFF_S + 60);
+
+      expect(await whoGets(BLACK_FRIDAY_UNPAID)).toEqual(["org_early"]);
+      expect(await lateGets()).toEqual(["org_at_cutoff", "org_last_second"]);
+    });
+
+    it.each(BLACK_FRIDAY_REMINDERS)("leaves out an address %s has gone to", async (other) => {
+      await lateUnpaid("org_1");
+      await lateUnpaid("org_2");
+      await sendInsert(other, "org_1@example.test", "org_1").run();
+      expect(await lateGets()).toEqual(["org_2"]);
+    });
+
+    it("the other reminders leave out an address it has gone to", async () => {
+      // In the checkout and unused groups too.
+      await lateUnpaid("org_1", { created: NEW });
+      checkout("org_1", CUTOFF_S - DAY_S, "expired");
+      expect(await owedCounts()).toEqual({ [BLACK_FRIDAY_UNPAID]: 0, [BLACK_FRIDAY_CHECKOUT]: 1, [BLACK_FRIDAY_UNUSED]: 1 });
+      expect(await lateGets()).toEqual(["org_1"]);
+      expect(await owedCounts()).toEqual({ [BLACK_FRIDAY_UNPAID]: 0, [BLACK_FRIDAY_CHECKOUT]: 0, [BLACK_FRIDAY_UNUSED]: 0 });
+    });
+
+    it("is sent from its own cutoff until the offer's last day begins, with mail and Stripe set up; counted at any time", async () => {
+      await lateUnpaid("org_1");
+      const send = (e = env()) => runBlackFridayReminder(e, { campaign, limit: 50 });
+
+      clock = CUTOFF;
+      expect(ok(await runBlackFridayReminder(env(), { campaign, dryRun: true })).owed).toBe(1);
+      vi.mocked(fetch).mockClear();
+      // The first three may go from here; this one may not.
+      expect(await send()).toEqual({ error: "too_early", message: LATE_TOO_EARLY, status: 409 });
+      clock = LATE_CUTOFF - 1;
+      expect(await send()).toEqual({ error: "too_early", message: LATE_TOO_EARLY, status: 409 });
+      clock = LAST_DAY;
+      expect(await send()).toEqual({ error: "too_late", message: TOO_LATE, status: 409 });
+      clock = BLACK_FRIDAY_ENDS_AT_MS;
+      expect(await send()).toMatchObject({ error: "offer_ended", status: 410 });
+      clock = LATE_CUTOFF;
+      expect(await send(env({ INTERNAL_CRON_SECRET: "", ADMIN_SECRET: "" }))).toMatchObject({
+        error: "mail_not_configured",
+      });
+      expect(await send(env({ STRIPE_SECRET_KEY: "" }))).toMatchObject({ error: "stripe_not_configured", status: 500 });
+      expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+      expect(mails).toEqual([]);
+
+      expect(blackFridayReminderRefusal(env(), campaign, LAST_DAY - 1)).toBeNull();
+      expect(ok(await send())).toMatchObject({ owed: 1, sent: 1 });
+      expect(mails.map((m) => [m.route, m.org_id])).toEqual([[BLACK_FRIDAY_UNPAID, "org_1"]]);
+    });
+
+    it("/admin: for the admin only; GET shows its cutoff; the test copy goes through the unpaid route; a start time before its cutoff is refused; the cron sends it once at its time", async () => {
+      await org("org_hello", { email: "Hello@GetEngram.app" });
+      await lateUnpaid("org_1");
+      clock = CUTOFF + HOUR;
+
+      expect((await admin("GET", campaign, undefined, "wrong")).status).toBe(401);
+      expect((await admin("POST", campaign, { start: true }, "wrong")).status).toBe(401);
+      expect(await admin("GET", campaign)).toEqual({
+        status: 200,
+        body: { campaign, owed: 1, cutoff: "2026-11-26T01:00:00.000Z", recorded: {}, run: null },
+      });
+      expect(await admin("POST", campaign, { test_to: "hello@getengram.app" })).toEqual({
+        status: 200,
+        body: { sent: true },
+      });
+      expect(mails.map((m) => [m.route, m.to, m.org_id, m.test])).toEqual([
+        [BLACK_FRIDAY_UNPAID, TEST_RECIPIENT, "org_hello", true],
+      ]);
+      expect(await admin("POST", campaign, { start: true })).toEqual({
+        status: 409,
+        body: { error: "too_early", message: LATE_TOO_EARLY },
+      });
+      expect(await admin("POST", campaign, { schedule_at: "2026-11-26T00:58:00Z" })).toEqual({
+        status: 409,
+        body: { error: "too_early", message: LATE_TOO_EARLY },
+      });
+      expect(await admin("POST", campaign, { schedule_at: "2026-11-26T14:00:00Z" })).toMatchObject({
+        status: 200,
+        body: { owed: 1, run: { campaign, state: "scheduled", start_at: "2026-11-26T14:00:00.000Z" } },
+      });
+
+      for (let at = LATE_SEND_AT - 2 * TICK; at <= LATE_SEND_AT + 10 * MINUTE; at += TICK) await cron(at);
+      expect(mails.slice(1).map((m) => [m.route, m.org_id, iso(m.at)])).toEqual([
+        [BLACK_FRIDAY_UNPAID, "org_1", "2026-11-26T14:00:00.000Z"],
+      ]);
+      expect(await runRow(campaign)).toMatchObject({ state: "done", note: "Sent to everyone it was owed to." });
+      expect(await admin("GET", campaign)).toMatchObject({ status: 200, body: { owed: 0 } });
+    });
   });
 
   // -------------------------------------------------------------------------

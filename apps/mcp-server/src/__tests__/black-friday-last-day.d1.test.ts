@@ -373,8 +373,9 @@ describe("The last-day Black Friday email and its scheduled start (engram#785), 
     });
 
     /**
-     * Five people who should get it, and one of every kind that should not.
-     * Everyone below has opened a Black Friday email unless it says not.
+     * Eight people who should get it, opened or not (engram#791), and one
+     * of every kind that should not. Everyone below has opened a Black
+     * Friday email unless it says not.
      */
     async function everyone() {
       await opened("org_open");
@@ -388,7 +389,6 @@ describe("The last-day Black Friday email and its scheduled start (engram#785), 
       await logged("org_two_logs@example.test", { opened: false });
       // The first send never heard back; a later one was opened.
       await opened("org_unknown", { status: "unknown" });
-
       // Got the first email; no open of any email is on record.
       await got("org_never");
       // Logged by engram-web, never opened.
@@ -397,6 +397,7 @@ describe("The last-day Black Friday email and its scheduled start (engram#785), 
       // Opened a weekly digest, not a Black Friday email.
       await got("org_digest");
       await logged("org_digest@example.test", { type: "weekly-digest" });
+
       // A customer now.
       await opened("org_paid", { tier: "pro" });
       // Still on Free, but the same person has a paid account.
@@ -423,7 +424,7 @@ describe("The last-day Black Friday email and its scheduled start (engram#785), 
       await opened("org_deleted", { deleted: true });
       // Internal.
       await opened("org_internal", { source: "internal" });
-      // Changed address since; the open was at the old one.
+      // Changed address since; the first email went to the old one.
       await opened("org_moved");
       await db.prepare("UPDATE organizations SET email = 'new-address@example.test' WHERE id = 'org_moved'").run();
       // Signed up after the first email, so it never went to this address.
@@ -437,7 +438,16 @@ describe("The last-day Black Friday email and its scheduled start (engram#785), 
     }
 
     /** In the order it is sent: by address. */
-    const OWED_TO = ["org_mixed", "org_open_typed", "org_open", "org_two_logs", "org_unknown"];
+    const OWED_TO = [
+      "org_mixed",
+      "org_open_typed",
+      "org_digest",
+      "org_never",
+      "org_open",
+      "org_two_logs",
+      "org_unknown",
+      "org_unopened",
+    ];
 
     it("a dry run counts the addresses owed it and sends nothing, on any day", async () => {
       await everyone();
@@ -457,18 +467,18 @@ describe("The last-day Black Friday email and its scheduled start (engram#785), 
       expect((await lastDaySends()).map((s) => s.org_id)).toEqual(["org_has_it", "org_may_have_it"]);
     });
 
-    it("goes only to people the first email went to who opened a Black Friday email and could still buy", async () => {
+    it("goes to everyone the first email went to who could still buy, opened or not", async () => {
       await everyone();
       const before = await sendsOf("black-friday");
       const r = ok(await runBlackFridayLastDay(env(), { limit: 50 }));
       expect(r).toMatchObject({
         dry_run: false,
-        owed: 5,
-        sent: 5,
+        owed: 8,
+        sent: 8,
         skipped: 0,
         failed: 0,
         stopped: false,
-        recorded: { sent: 6, unknown: 1 },
+        recorded: { sent: 9, unknown: 1 },
       });
       expect(mails.map((m) => m.org_id)).toEqual(OWED_TO);
       expect((await lastDaySends()).map((s) => [s.org_id, s.status])).toEqual(
@@ -476,11 +486,14 @@ describe("The last-day Black Friday email and its scheduled start (engram#785), 
         [
           ["org_mixed", "sent"],
           ["org_open_typed", "sent"],
+          ["org_digest", "sent"],
           ["org_has_it", "sent"],
           ["org_may_have_it", "unknown"],
+          ["org_never", "sent"],
           ["org_open", "sent"],
           ["org_two_logs", "sent"],
           ["org_unknown", "sent"],
+          ["org_unopened", "sent"],
         ],
       );
       // The first send's record is left as it was, and nothing went through its route.
@@ -529,15 +542,14 @@ describe("The last-day Black Friday email and its scheduled start (engram#785), 
       expect(await lastDaySends()).toEqual([]);
     });
 
-    it("an open, a purchase or an unsubscribe during the send counts at the next batch", async () => {
+    it("a purchase or an unsubscribe during the send counts at the next batch", async () => {
       await opened("org_1");
       await opened("org_2");
       await opened("org_3");
       await got("org_4");
-      expect(ok(await runBlackFridayLastDay(env(), { limit: 1 }))).toMatchObject({ owed: 3, sent: 1 });
+      expect(ok(await runBlackFridayLastDay(env(), { limit: 1 }))).toMatchObject({ owed: 4, sent: 1 });
       await bought("org_2", "cs_1");
       await db.prepare("UPDATE organizations SET digest_opt_out = 1 WHERE id = 'org_3'").run();
-      await logged("org_4@example.test");
       expect(ok(await runBlackFridayLastDay(env(), { limit: 50 }))).toMatchObject({ owed: 1, sent: 1 });
       expect(mails.map((m) => m.org_id)).toEqual(["org_1", "org_4"]);
     });
@@ -851,8 +863,8 @@ describe("The last-day Black Friday email and its scheduled start (engram#785), 
     });
 
     it("waits for a campaign that is running at its time, and starts in the tick that finds that one done", async () => {
-      // 51 people who have opened nothing are owed the fourth email; two who opened one are owed this.
-      await gotMany(51);
+      // 51 people who have opened nothing are owed the fourth email and this one; two who opened one are owed only this.
+      const ids = await gotMany(51);
       await opened("org_a");
       await opened("org_b");
       await schedule();
@@ -900,9 +912,10 @@ describe("The last-day Black Friday email and its scheduled start (engram#785), 
         outcome: "batch",
         state: "running",
         note: null,
-        result: { owed: 2, sent: 2 },
+        result: { owed: 53, sent: 50 },
       });
-      expect(mails.map((m) => m.org_id)).toEqual(["org_a", "org_b"]);
+      // A batch of 50, by address: org_000 to org_049.
+      expect(mails.map((m) => m.org_id)).toEqual(ids.slice(0, 50));
       expect(firstRouteMails).toHaveLength(51);
       expect(await runRow()).toMatchObject({ state: "running", start_at: null, note: null });
     });
@@ -1088,7 +1101,7 @@ describe("The last-day Black Friday email and its scheduled start (engram#785), 
       await got("org_3");
       expect(await admin("GET")).toEqual({
         status: 200,
-        body: { campaign: BLACK_FRIDAY_LAST_DAY, owed: 2, first_send: 3, opened: 2, recorded: {}, run: null },
+        body: { campaign: BLACK_FRIDAY_LAST_DAY, owed: 3, first_send: 3, opened: 2, recorded: {}, run: null },
       });
       expect(vi.mocked(fetch)).not.toHaveBeenCalled();
     });
@@ -1254,11 +1267,11 @@ describe("The last-day Black Friday email and its scheduled start (engram#785), 
       await cron(SEND_AT - TICK);
       expect(mails).toEqual([]);
       await cron(SEND_AT);
-      expect(mails.map((m) => m.org_id)).toEqual(ids);
+      expect(mails.map((m) => m.org_id)).toEqual([...ids, "org_unopened"]);
       await cron(SEND_AT + TICK);
       expect((await admin("GET")).body).toMatchObject({
         owed: 0,
-        recorded: { sent: 3 },
+        recorded: { sent: 4 },
         run: { state: "done", note: "Sent to everyone it was owed to.", start_at: null },
       });
       expect(firstRouteMails).toEqual([]);
@@ -1432,7 +1445,7 @@ describe("The last-day Black Friday email and its scheduled start (engram#785), 
     await schedule(SEND_AT, e);
     clock = SEND_AT;
     await runCampaignTick(e);
-    expect(mails).toHaveLength(2);
+    expect(mails).toHaveLength(3);
 
     const touching = [...new Set(sql)].filter((q) => /\b(campaign_sends|email_log|email_opt_outs)\b/.test(q));
     expect(touching.length).toBeGreaterThan(5);
@@ -1451,6 +1464,7 @@ describe("The last-day Black Friday email and its scheduled start (engram#785), 
         readsEmailLog++;
       }
     }
-    expect(readsEmailLog).toBeGreaterThanOrEqual(3);
+    // Only the open count reads email_log: the email no longer depends on an open (engram#791).
+    expect(readsEmailLog).toBeGreaterThanOrEqual(1);
   });
 });

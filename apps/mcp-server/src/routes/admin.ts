@@ -873,8 +873,7 @@ function utcTime(value: string): number | null {
 // ---------------------------------------------------------------------------
 // /admin/campaigns/black-friday-last-day — the last-day email (engram#785):
 // a different email, which says the offer ends today, to the addresses the
-// first one went to that have opened a Black Friday email and could still
-// buy.
+// first one went to that could still buy, opened or not (engram#791).
 //
 // It goes out on the offer's last day only, and only a test copy is sent
 // from here. The worker's two-minute cron sends it in batches until nobody

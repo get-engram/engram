@@ -36,6 +36,13 @@ import { BLACK_FRIDAY, BLACK_FRIDAY_ENDS_AT_MS, blackFridayState } from "./black
  * value and its own route on engram-web, sent by the cron, which can
  * start it by itself at a time set in advance.
  *
+ * The "ends tomorrow" send (engram#793) is a different email again, which
+ * opens with the "Save your AI chats" image and says the offer ends
+ * tomorrow, so it is never sent once the last day has begun. It goes to the
+ * same addresses as the resends: the first email went to them and they have
+ * opened none of the Black Friday emails. Its own campaign value and its
+ * own route on engram-web, sent by the cron.
+ *
  * The reminders (engram#787) are three more emails, each to a small group
  * that a Black Friday email has not reached as such: an unfinished
  * checkout, a plan that ended for a failed payment, a new account with
@@ -66,6 +73,8 @@ export const BLACK_FRIDAY_RESENDS = [BLACK_FRIDAY_RESEND, BLACK_FRIDAY_THIRD, BL
 export type BlackFridayResend = (typeof BLACK_FRIDAY_RESENDS)[number];
 /** The last-day send's campaign value in campaign_sends and campaign_runs. */
 export const BLACK_FRIDAY_LAST_DAY = "black-friday-last-day";
+/** The "ends tomorrow" send's campaign value in campaign_sends and campaign_runs. */
+export const BLACK_FRIDAY_ENDS_TOMORROW = "black-friday-ends-tomorrow";
 /**
  * The first moment of the offer's last day: 24 hours before it ends, which
  * is Friday, November 27 in US Eastern. The last-day email says "today is
@@ -90,6 +99,8 @@ const EMAIL_ROUTE = "/api/email/black-friday";
  * its own, so a website without it answers 404 and sends nothing.
  */
 const LAST_DAY_ROUTE = "/api/email/black-friday-last-day";
+/** engram-web's route for the "ends tomorrow" email (engram#793). */
+const ENDS_TOMORROW_ROUTE = "/api/email/black-friday-ends-tomorrow";
 
 /** FROM/WHERE for the accounts still owed the email. One bind: the campaign. */
 const OWED = `
@@ -235,6 +246,25 @@ export function lastDayRefusal(env: Env, now = Date.now()): CampaignError | null
     return {
       error: "too_early",
       message: `The last-day email is sent only on the offer's last day, from ${from}; nothing was sent.`,
+      status: 409,
+    };
+  }
+  return null;
+}
+
+/**
+ * Why the "ends tomorrow" email may not be sent at `now`, or null when it
+ * may. Everything that stops any Black Friday email stops it; and since it
+ * says the offer ends tomorrow, it is not sent once the last day has begun.
+ */
+export function endsTomorrowRefusal(env: Env, now = Date.now()): CampaignError | null {
+  const refusal = sendRefusal(env, now);
+  if (refusal) return refusal;
+  if (now >= BLACK_FRIDAY_LAST_DAY_STARTS_AT_MS) {
+    const until = new Date(BLACK_FRIDAY_LAST_DAY_STARTS_AT_MS).toISOString();
+    return {
+      error: "too_late",
+      message: `The "ends tomorrow" email is sent only before ${until}, when the last day begins; nothing was sent.`,
       status: 409,
     };
   }
@@ -506,6 +536,42 @@ export async function runBlackFridayLastDay(
     { campaign: BLACK_FRIDAY_LAST_DAY, owed: LAST_DAY_OWED, route: LAST_DAY_ROUTE, refusal: lastDayRefusal },
     opts,
   );
+}
+
+/**
+ * The "ends tomorrow" email (engram#793): count who is owed it, or send the
+ * next batch. Owed by the same addresses as a resend, under its own
+ * campaign value. Refused once the last day has begun (endsTomorrowRefusal);
+ * the count is not. Only the cron sends it, through campaign-runs.ts.
+ */
+export async function runBlackFridayEndsTomorrow(
+  env: Env,
+  opts: { dryRun?: boolean; limit?: number; now?: number; deadline?: number },
+): Promise<CampaignResult | CampaignError> {
+  return runFollowUp(
+    env,
+    {
+      campaign: BLACK_FRIDAY_ENDS_TOMORROW,
+      owed: RESEND_OWED,
+      route: ENDS_TOMORROW_ROUTE,
+      refusal: endsTomorrowRefusal,
+    },
+    opts,
+  );
+}
+
+/**
+ * A test copy of the "ends tomorrow" email, to hello@getengram.app only,
+ * recorded nowhere. Refused, like the send, once the last day has begun.
+ */
+export function sendBlackFridayEndsTomorrowTest(
+  env: Env,
+  to: string,
+  now = Date.now(),
+): Promise<{ sent: true } | CampaignError> {
+  const refusal = endsTomorrowRefusal(env, now);
+  if (refusal) return Promise.resolve(refusal);
+  return sendTestCopy(env, to, ENDS_TOMORROW_ROUTE, now);
 }
 
 /**

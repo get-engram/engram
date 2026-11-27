@@ -1,11 +1,14 @@
 import type { Env } from "../types.js";
 import {
   BATCH_MAX,
+  BLACK_FRIDAY_ENDS_TOMORROW,
   BLACK_FRIDAY_FOURTH,
   BLACK_FRIDAY_LAST_DAY,
   BLACK_FRIDAY_RESEND,
   BLACK_FRIDAY_THIRD,
+  endsTomorrowRefusal,
   lastDayRefusal,
+  runBlackFridayEndsTomorrow,
   runBlackFridayLastDay,
   runBlackFridayResend,
   sendRefusal,
@@ -85,6 +88,11 @@ const SENDERS: Readonly<Record<string, CampaignSender>> = {
   [BLACK_FRIDAY_FOURTH]: {
     send: (env, opts) => runBlackFridayResend(env, { ...opts, campaign: BLACK_FRIDAY_FOURTH }),
     refusal: sendRefusal,
+  },
+  // Same audience as the resends, a different email (engram#793).
+  [BLACK_FRIDAY_ENDS_TOMORROW]: {
+    send: (env, opts) => runBlackFridayEndsTomorrow(env, opts),
+    refusal: endsTomorrowRefusal,
   },
   [BLACK_FRIDAY_LAST_DAY]: {
     send: (env, opts) => runBlackFridayLastDay(env, opts),

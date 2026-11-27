@@ -40,12 +40,15 @@ import {
   BLACK_FRIDAY_UNIT_AMOUNT,
 } from "../services/black-friday.js";
 import {
+  BLACK_FRIDAY_ENDS_TOMORROW,
   BLACK_FRIDAY_LAST_DAY,
   BLACK_FRIDAY_RESENDS,
   blackFridayOpens,
   runBlackFridayCampaign,
+  runBlackFridayEndsTomorrow,
   runBlackFridayLastDay,
   runBlackFridayResend,
+  sendBlackFridayEndsTomorrowTest,
   sendBlackFridayLastDayTest,
   sendBlackFridayResendTest,
 } from "../services/black-friday-campaign.js";
@@ -895,73 +898,86 @@ function utcTime(value: string): number | null {
 //   only, on any day while the offer is open. Recorded nowhere.
 // Any other body is refused. So is one that has two of these keys, whatever
 // the second one holds.
+//
+// /admin/campaigns/black-friday-ends-tomorrow — the "ends tomorrow" email
+// (engram#793), with the same routes: a different email again, to the
+// addresses the resends go to (opened no Black Friday email). It is sent
+// only BEFORE the last day, so start, schedule and test are refused from
+// then on.
 // ---------------------------------------------------------------------------
-admin.get(`/campaigns/${BLACK_FRIDAY_LAST_DAY}`, async (c) => {
-  const count = await runBlackFridayLastDay(c.env, { dryRun: true });
-  if ("error" in count) return c.json({ error: count.error, message: count.message }, count.status);
-  const opens = await blackFridayOpens(c.env);
-  return c.json({
-    campaign: BLACK_FRIDAY_LAST_DAY,
-    owed: count.owed,
-    first_send: opens.first_send,
-    opened: opens.opened,
-    recorded: count.recorded,
-    run: await campaignRun(c.env, BLACK_FRIDAY_LAST_DAY),
-  });
-});
+const SCHEDULED_FOLLOW_UPS = [
+  { campaign: BLACK_FRIDAY_LAST_DAY, run: runBlackFridayLastDay, test: sendBlackFridayLastDayTest },
+  { campaign: BLACK_FRIDAY_ENDS_TOMORROW, run: runBlackFridayEndsTomorrow, test: sendBlackFridayEndsTomorrowTest },
+] as const;
 
-admin.post(`/campaigns/${BLACK_FRIDAY_LAST_DAY}`, async (c) => {
-  const campaign = BLACK_FRIDAY_LAST_DAY;
-  const parsed: unknown = await c.req.json().catch(() => null);
-  const body = (parsed !== null && typeof parsed === "object" ? parsed : {}) as {
-    start?: unknown;
-    pause?: unknown;
-    test_to?: unknown;
-    schedule_at?: unknown;
-  };
-  // One of the four keys, and no other of them in any form: a body such as
-  // { start: true, schedule_at: 5 } must not start a send by mistake.
-  const given = [body.start, body.pause, body.test_to, body.schedule_at].filter((v) => v !== undefined).length;
-  const valid =
-    body.start === true ||
-    body.pause === true ||
-    typeof body.test_to === "string" ||
-    typeof body.schedule_at === "string";
-  if (given !== 1 || !valid) {
-    return c.json(
-      {
-        error: "bad_request",
-        message: "Send exactly one of: start: true, pause: true, test_to: <address> or schedule_at: <UTC time>.",
-      },
-      400,
-    );
-  }
-  if (body.pause === true) return c.json(await pauseCampaignRun(c.env, campaign));
-  if (typeof body.test_to === "string") {
-    const test = await sendBlackFridayLastDayTest(c.env, body.test_to);
-    if ("error" in test) return c.json({ error: test.error, message: test.message }, test.status);
-    return c.json(test);
-  }
-  let run: Awaited<ReturnType<typeof campaignRun>>;
-  if (typeof body.schedule_at === "string") {
-    const startAt = utcTime(body.schedule_at);
-    if (startAt === null) {
+for (const followUp of SCHEDULED_FOLLOW_UPS) {
+  admin.get(`/campaigns/${followUp.campaign}`, async (c) => {
+    const count = await followUp.run(c.env, { dryRun: true });
+    if ("error" in count) return c.json({ error: count.error, message: count.message }, count.status);
+    const opens = await blackFridayOpens(c.env);
+    return c.json({
+      campaign: followUp.campaign,
+      owed: count.owed,
+      first_send: opens.first_send,
+      opened: opens.opened,
+      recorded: count.recorded,
+      run: await campaignRun(c.env, followUp.campaign),
+    });
+  });
+
+  admin.post(`/campaigns/${followUp.campaign}`, async (c) => {
+    const campaign = followUp.campaign;
+    const parsed: unknown = await c.req.json().catch(() => null);
+    const body = (parsed !== null && typeof parsed === "object" ? parsed : {}) as {
+      start?: unknown;
+      pause?: unknown;
+      test_to?: unknown;
+      schedule_at?: unknown;
+    };
+    // One of the four keys, and no other of them in any form: a body such as
+    // { start: true, schedule_at: 5 } must not start a send by mistake.
+    const given = [body.start, body.pause, body.test_to, body.schedule_at].filter((v) => v !== undefined).length;
+    const valid =
+      body.start === true ||
+      body.pause === true ||
+      typeof body.test_to === "string" ||
+      typeof body.schedule_at === "string";
+    if (given !== 1 || !valid) {
       return c.json(
-        { error: "bad_request", message: "schedule_at must be a UTC time like 2026-11-27T14:00:00Z." },
+        {
+          error: "bad_request",
+          message: "Send exactly one of: start: true, pause: true, test_to: <address> or schedule_at: <UTC time>.",
+        },
         400,
       );
     }
-    const scheduled = await scheduleCampaignRun(c.env, campaign, startAt);
-    if ("error" in scheduled) return c.json({ error: scheduled.error, message: scheduled.message }, scheduled.status);
-    run = scheduled.run;
-  } else {
-    const started = await startCampaignRun(c.env, campaign);
-    if ("error" in started) return c.json({ error: started.error, message: started.message }, started.status);
-    run = started.run;
-  }
-  const count = await runBlackFridayLastDay(c.env, { dryRun: true });
-  return c.json({ run, owed: "error" in count ? null : count.owed });
-});
+    if (body.pause === true) return c.json(await pauseCampaignRun(c.env, campaign));
+    if (typeof body.test_to === "string") {
+      const test = await followUp.test(c.env, body.test_to);
+      if ("error" in test) return c.json({ error: test.error, message: test.message }, test.status);
+      return c.json(test);
+    }
+    let run: Awaited<ReturnType<typeof campaignRun>>;
+    if (typeof body.schedule_at === "string") {
+      const startAt = utcTime(body.schedule_at);
+      if (startAt === null) {
+        return c.json(
+          { error: "bad_request", message: "schedule_at must be a UTC time like 2026-11-27T14:00:00Z." },
+          400,
+        );
+      }
+      const scheduled = await scheduleCampaignRun(c.env, campaign, startAt);
+      if ("error" in scheduled) return c.json({ error: scheduled.error, message: scheduled.message }, scheduled.status);
+      run = scheduled.run;
+    } else {
+      const started = await startCampaignRun(c.env, campaign);
+      if ("error" in started) return c.json({ error: started.error, message: started.message }, started.status);
+      run = started.run;
+    }
+    const count = await followUp.run(c.env, { dryRun: true });
+    return c.json({ run, owed: "error" in count ? null : count.owed });
+  });
+}
 
 // ---------------------------------------------------------------------------
 // /admin/campaigns/finish-signup — the finish-sign-up email, to the people

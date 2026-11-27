@@ -13,6 +13,7 @@ import { engramCommand } from "../daemon/package-runner.js";
 import { green, red, dim, bold } from "../output.js";
 import { Engram } from "@getengram/sdk";
 import { autoEnableCapture } from "../daemon/commands.js";
+import { savedKeyUnusedLine, warnIfEnvKeyWins } from "../env-key.js";
 
 /**
  * The server these commands talk to: see resolveBaseUrl (engram#625). Read
@@ -153,6 +154,7 @@ export async function signup(): Promise<void> {
   console.log(green("✓ Account created"));
   console.log(`  Organization: ${data.organization_id}`);
   console.log(`  API key saved to ~/.engram/config.json`);
+  warnIfEnvKeyWins(data.api_key);
   await autoEnableCapture({ after: "login" });
   console.log(
     dim(`  Tip: run '${engramCommand("link <email>")}' to claim your account for upgrades`),
@@ -290,6 +292,8 @@ export async function whoami(): Promise<void> {
   }
   console.log(`  Org:   ${acct.org_id}`);
   console.log(`  Key:   ${apiKey.slice(0, 20)}... ${dim(`(${source})`)}`);
+  const unused = savedKeyUnusedLine(config.apiKey);
+  if (unused) console.log(red(`  ${unused}`));
 }
 
 /**
@@ -389,6 +393,7 @@ export async function login(args: string[] = [], flags: Record<string, string> =
       await confirmSavedKeyIsFor(email.trim(), orgId, config.apiKey);
       console.log(green(`✓ Signed in as ${email.trim()}`));
       console.log(`  Using existing API key from ~/.engram/config.json`);
+      warnIfEnvKeyWins(config.apiKey);
       await autoEnableCapture({ after: "login" });
       return;
     }
@@ -417,5 +422,6 @@ export async function login(args: string[] = [], flags: Record<string, string> =
 
   console.log(green(`✓ Signed in as ${email.trim()}`));
   console.log(`  API key saved to ~/.engram/config.json`);
+  warnIfEnvKeyWins(data.api_key);
   await autoEnableCapture({ after: "login" });
 }

@@ -4,6 +4,7 @@ import { green, red } from "../output.js";
 import { Engram } from "@getengram/sdk";
 import { autoEnableCapture } from "../daemon/commands.js";
 import { engramCommand } from "../daemon/package-runner.js";
+import { savedKeyUnusedLine, warnIfEnvKeyWins } from "../env-key.js";
 
 export async function authLogin(args: string[]): Promise<void> {
   const key = args[0];
@@ -45,6 +46,7 @@ export async function authLogin(args: string[]): Promise<void> {
   console.log(green("✓ Authenticated successfully"));
   console.log(`  Key saved to ~/.engram/config.json`);
   console.log(`  Prefix: ${key.slice(0, 20)}...`);
+  warnIfEnvKeyWins(key);
   await autoEnableCapture({ after: "login" });
 }
 
@@ -91,4 +93,6 @@ export async function authStatus(): Promise<void> {
   const source = process.env.ENGRAM_API_KEY ? "ENGRAM_API_KEY env var" : "~/.engram/config.json";
   console.log(`Authenticated via ${source}`);
   console.log(`  Key prefix: ${key.slice(0, 20)}...`);
+  const unused = savedKeyUnusedLine(config.apiKey);
+  if (unused) console.log(red(`  ${unused}`));
 }

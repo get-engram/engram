@@ -31,6 +31,8 @@ interface Rows {
 
 function stubDb(rows: Rows) {
   const writes: Array<{ sql: string; args: unknown[] }> = [];
+  /** The SQL of each batch() call, one array per call, so a test can tell what was written together. */
+  const batches: string[][] = [];
   const db = {
     prepare: (sql: string) => {
       let args: unknown[] = [];
@@ -67,11 +69,12 @@ function stubDb(rows: Rows) {
     },
     // clearOAuthTokensByOrg goes through batch(); record those too.
     batch: async (stmts: Array<{ __sql: string; __args: () => unknown[] }>) => {
+      batches.push(stmts.map((st) => st.__sql));
       for (const st of stmts) writes.push({ sql: st.__sql, args: st.__args() });
       return [];
     },
   } as unknown as D1Database;
-  return { db, writes };
+  return { db, writes, batches };
 }
 
 const SECRET = "test-jwt-secret-claim";
@@ -212,12 +215,17 @@ describe("POST /signup with an existing org that holds data", () => {
     expect(has(writes, /INSERT INTO audit_log/i)).toBe(false);
   });
 
-  it("does not gate an unknown sub on an EMPTY org (nothing to take over)", async () => {
+  it("gates an unknown sub on an org whose message counter is 0 the same way", async () => {
+    // The counter is live (deletes lower it, it floors at 0): it says nothing
+    // about which keys, tokens or identities the org already has.
     const { db, writes } = stubDb({ identity: null, orgByEmail: { ...ORG, messages_stored_total: 0 } });
     const res = await post("/signup", db, "sub_new_surface");
-    expect(res.status).toBe(200);
-    expect(has(writes, /INSERT INTO org_identities/i)).toBe(true);
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe("claim_required");
+    expect(has(writes, /INSERT INTO api_keys/i)).toBe(false);
+    expect(has(writes, /INSERT INTO org_identities/i)).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe(`${APP_URL}/api/email/claim-link`);
   });
 
   it("honours the resend cooldown: no new row, no new email", async () => {
@@ -263,6 +271,24 @@ describe("POST /signup with an existing org that holds data", () => {
   });
 });
 
+// ── /signup for an address with no org ───────────────────────────────────
+
+describe("POST /signup for an address with no org", () => {
+  it("creates the org and its creator's identity in ONE batch, written nowhere else", async () => {
+    const { db, writes, batches } = stubDb({ identity: null, orgByEmail: null });
+    const res = await post("/signup", db, "sub_first");
+    expect(res.status).toBe(201);
+    const create = batches.find((b) => b.some((sql) => /INSERT INTO organizations\b/i.test(sql)));
+    expect(create).toBeTruthy();
+    expect(create!.some((sql) => /INSERT INTO org_identities/i.test(sql))).toBe(true);
+    expect(writes.filter((w) => /INSERT INTO organizations\b/i.test(w.sql))).toHaveLength(1);
+    const idents = writes.filter((w) => /INSERT INTO org_identities/i.test(w.sql));
+    expect(idents).toHaveLength(1);
+    expect(idents[0].args.slice(1)).toEqual(["sub_first", EMAIL, "signup"]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
 // ── the claim-link email's bearer (engram#456) ───────────────────────────
 
 describe("the claim-link email's bearer (engram#456)", () => {
@@ -300,14 +326,25 @@ describe("POST /signup/login", () => {
   }
   const loginEnv = (db: D1Database) =>
     ({ ...envWith(db), SUPABASE_ANON_KEY: "anon" }) as unknown as Env;
-  async function login(db: D1Database) {
+  // Every call spends one of its address's 5 attempts per 15 minutes (and,
+  // with an ip, one of that IP's 10 a minute). The throttle buckets live for
+  // the whole file, so the throttle tests below use addresses and IPs of
+  // their own; keep the EMAIL calls in this block under 5.
+  async function login(db: D1Database, opts: { email?: string; ip?: string } = {}) {
     const { app: a } = app(db);
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (opts.ip) headers["CF-Connecting-IP"] = opts.ip;
     return a.request(
       "/signup/login",
-      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: EMAIL, password: "pw" }) },
+      { method: "POST", headers, body: JSON.stringify({ email: opts.email ?? EMAIL, password: "pw" }) },
       loginEnv(db),
     );
   }
+  const passwordRejected = () =>
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ error_description: "Invalid login credentials" }), { status: 400 }),
+    );
+  const grantCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes("/auth/v1/token")).length;
 
   it("gates an unknown sub on an org with data instead of minting a key", async () => {
     supabaseAnswers({ id: "sub_stranger" });
@@ -339,6 +376,61 @@ describe("POST /signup/login", () => {
     const res = await login(db);
     expect(res.status).toBe(502);
     expect(has(writes, /INSERT INTO api_keys/i)).toBe(false);
+  });
+
+  it("gates an unknown sub on an org whose message counter is 0 the same way", async () => {
+    supabaseAnswers({ id: "sub_stranger" });
+    const { db, writes } = stubDb({ identity: null, orgByEmail: { ...ORG, messages_stored_total: 0 } });
+    const res = await login(db);
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe("claim_required");
+    expect(has(writes, /INSERT INTO api_keys/i)).toBe(false);
+    expect(has(writes, /INSERT INTO org_identities/i)).toBe(false);
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === `${APP_URL}/api/email/claim-link`)).toBe(true);
+  });
+
+  it("stops one IP after 10 attempts a minute, before the password reaches Supabase", async () => {
+    passwordRejected();
+    const { db } = stubDb({ orgByEmail: ORG });
+    const ip = "198.51.100.10";
+    // A different address each time, so only the IP's bucket can run out.
+    for (let i = 0; i < 10; i++) {
+      expect((await login(db, { email: `per-ip-${i}@example.com`, ip })).status).toBe(401);
+    }
+    const res = await login(db, { email: "per-ip-10@example.com", ip });
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBe("6");
+    expect(((await res.json()) as { error: string }).error).toBe("rate_limited");
+    expect(grantCalls()).toBe(10);
+  });
+
+  it("stops one address after 5 attempts in 15 minutes, whatever IP they come from", async () => {
+    passwordRejected();
+    const { db } = stubDb({ orgByEmail: ORG });
+    for (let i = 0; i < 5; i++) {
+      expect((await login(db, { email: "guessed@example.com", ip: `203.0.113.${i + 1}` })).status).toBe(401);
+    }
+    // Same address in another spelling, from a fresh IP: still the same bucket.
+    const res = await login(db, { email: "  Guessed@Example.COM ", ip: "203.0.113.99" });
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBe("180");
+    expect(await res.json()).toMatchObject({
+      error: "rate_limited",
+      message: expect.stringMatching(/Too many sign-in attempts for this address/),
+    });
+    expect(grantCalls()).toBe(5);
+  });
+
+  it("keeps the address buckets apart from the IP buckets", async () => {
+    passwordRejected();
+    const { db } = stubDb({ orgByEmail: ORG });
+    // Five attempts whose "address" is the IP of the next caller...
+    for (let i = 0; i < 5; i++) {
+      await login(db, { email: "192.0.2.50", ip: `192.0.2.${i + 1}` });
+    }
+    // ...have not spent any of that IP's own attempts.
+    const res = await login(db, { email: "owner-of-192@example.com", ip: "192.0.2.50" });
+    expect(res.status).toBe(401);
   });
 });
 

@@ -9,21 +9,19 @@ import {
   getOrganizationByEmail,
   getOrganizationById,
   insertOrganization,
-  insertOrganizationWithEmail,
+  insertOrganizationWithOwner,
   insertApiKey,
   getApiKeyCount,
   setOrganizationEmail,
   getApiKeyWithOrg,
   upsertOrgIdentity,
-  hasOrgIdentity,
   clearOAuthTokensByOrg,
 } from "@getengram/db";
-import { requiresClaim, startClaim, claimMessage } from "../services/claim.js";
-export { requiresClaim };
+import { mustProveInbox, startClaim, claimMessage } from "../services/claim.js";
 import { TIER_LIMITS, type Tier } from "@getengram/shared";
 import type { Env, AuthContext } from "../types.js";
 import { verifySupabaseJwt } from "../utils/jwt.js";
-import { ipThrottle } from "../middleware/ip-throttle.js";
+import { ipThrottle, takeToken } from "../middleware/ip-throttle.js";
 import { hasScope, parseScopes } from "../mcp/scopes.js";
 import { audit } from "../services/audit.js";
 
@@ -61,11 +59,11 @@ async function authenticateApiKey(
  * No. The Supabase project auto-confirms every address
  * (mailer_autoconfirm), so a JWT's email proves nothing about inbox control
  * — anyone can sign up as anyone. Binding by email let an attacker claim any
- * unbound org with memories in it (716 at the time of the audit). An org
- * with nothing in it has nothing to steal, so a fresh identity may bind it;
- * an org with data requires proof of inbox control first. Until the
- * self-service claim flow ships, that proof is a support request — the same
- * path the one real case (Oct 2026) already took.
+ * unbound org with memories in it (716 at the time of the audit). Now a sub
+ * the org has never seen proves inbox control through the claim link before
+ * it binds, whatever the org holds: an empty org can still carry API keys,
+ * connector tokens and a plan. The rule is mustProveInbox in
+ * services/claim.ts, and every binding surface calls it.
  */
 
 const WELCOME_MESSAGE = `Welcome to Engram — your AI's long-term memory.
@@ -185,9 +183,9 @@ signup.post("/", async (c) => {
     // The Supabase user that created this org — through ChatGPT/Claude
     // connect, the CLI, or an earlier web signup — is on org_identities.
     // That user arriving through a new surface is not a takeover and is not
-    // gated. Only a sub this org has never seen has to prove the inbox.
-    const known = await hasOrgIdentity(c.env.DB, existing.id, claims.sub);
-    if (!known && requiresClaim(existing)) {
+    // gated. Any sub this org has never seen has to prove the inbox, whatever
+    // the org holds (see services/claim.ts).
+    if (await mustProveInbox(c.env.DB, existing.id, claims.sub)) {
       const claim = await startClaim(c.env, existing, claims.sub, email, "web");
       return c.json({ error: "claim_required", message: claimMessage(claim, "web"), claim }, 403);
     }
@@ -199,11 +197,17 @@ signup.post("/", async (c) => {
     await upsertOrgIdentity(c.env.DB, orgId, claims.sub, email, "signup");
   } else {
     orgId = generateId("org");
-    const orgName = email.split("@")[0];
-    await insertOrganizationWithEmail(c.env.DB, orgId, orgName, email, ref, requestCountry(c.req.raw));
-    // Before the welcome seed: that seed sets messages_stored_total = 1, which
-    // would make a retry of a half-finished signup gate its own creator.
-    await upsertOrgIdentity(c.env.DB, orgId, claims.sub, email, "signup");
+    // The org and its creator's identity are written in one batch: an org
+    // that existed without it would gate its own creator on a retry.
+    await insertOrganizationWithOwner(c.env.DB, {
+      id: orgId,
+      name: email.split("@")[0],
+      email,
+      sub: claims.sub,
+      source: "signup",
+      referralSource: ref,
+      country: requestCountry(c.req.raw),
+    });
     await seedWelcomeConversation(c.env.DB, orgId);
     created = true;
   }
@@ -402,13 +406,30 @@ signup.post("/set-password", async (c) => {
 
 // POST /signup/login — authenticate with email + password, return API key.
 // Handles Supabase auth server-side so the CLI doesn't need credentials.
-signup.post("/login", async (c) => {
+//
+// Two throttles sit in front of the password grant: 10 attempts a minute per
+// client IP (the middleware) and 5 per 15 minutes per address (below), so one
+// address cannot be tried from many IPs either. Both are in-memory floors
+// that hold within one Worker isolate, not durable limits (see ip-throttle.ts).
+const LOGIN_ATTEMPTS_PER_ADDRESS = 5;
+const LOGIN_ADDRESS_WINDOW_MS = 15 * 60_000;
+signup.post("/login", ipThrottle({ limit: 10, windowMs: 60_000, bucket: "signup-login" }), async (c) => {
   const body = await c.req.json<{ email?: string; password?: string }>().catch(() => ({} as Record<string, string>));
   const email = body.email?.trim();
   const password = body.password;
 
   if (!email || !password) {
     return c.json({ error: "invalid_request", message: "Email and password are required" }, 400);
+  }
+
+  // Its own key prefix: the middleware's buckets are `signup-login:<ip>`, and
+  // an "address" that is really an IP must not spend that IP's attempts.
+  if (!takeToken(`signup-login-address:${email.toLowerCase()}`, LOGIN_ATTEMPTS_PER_ADDRESS, LOGIN_ADDRESS_WINDOW_MS)) {
+    c.header("Retry-After", String(Math.ceil(LOGIN_ADDRESS_WINDOW_MS / LOGIN_ATTEMPTS_PER_ADDRESS / 1000)));
+    return c.json(
+      { error: "rate_limited", message: "Too many sign-in attempts for this address. Wait a few minutes and try again." },
+      429,
+    );
   }
 
   const supabaseUrl = c.env.SUPABASE_URL;
@@ -459,7 +480,7 @@ signup.post("/login", async (c) => {
   // Same rule as /signup: a password proves the Supabase account, not the
   // inbox. The org's own user (recorded at connect/signup) logs in freely; a
   // sub the org has never seen gets the claim link and must come back.
-  if (!(await hasOrgIdentity(c.env.DB, org.id, sub)) && requiresClaim(org)) {
+  if (await mustProveInbox(c.env.DB, org.id, sub)) {
     const claim = await startClaim(c.env, org, sub, email, "cli");
     return c.json({ error: "claim_required", message: claimMessage(claim, "cli"), claim }, 403);
   }

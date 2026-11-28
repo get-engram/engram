@@ -24,13 +24,12 @@ import {
   claimRefreshGrace,
   revokeOAuthConnection,
   getOrganizationByEmail,
-  insertOrganizationWithEmail,
+  insertOrganizationWithOwner,
   upsertOrgIdentity,
-  hasOrgIdentity,
 } from "@getengram/db";
 import { verifySupabaseJwt } from "../utils/jwt.js";
 import { ipThrottle } from "../middleware/ip-throttle.js";
-import { requiresClaim, startClaim, claimMessage } from "../services/claim.js";
+import { mustProveInbox, startClaim, claimMessage } from "../services/claim.js";
 import { websiteBearer } from "../services/secrets.js";
 import { seedWelcomeConversation } from "../routes/signup.js";
 import { DEFAULT_SCOPE, originOf } from "./metadata.js";
@@ -386,8 +385,7 @@ oauth.post("/authorize/approve", async (c) => {
     | { id: string; messages_stored_total?: number | null }
     | null;
   if (existing) {
-    const known = await hasOrgIdentity(c.env.DB, existing.id, claims.sub);
-    if (!known && requiresClaim(existing)) {
+    if (await mustProveInbox(c.env.DB, existing.id, claims.sub)) {
       const claim = await startClaim(c.env, existing, claims.sub, email, "oauth");
       return c.json(
         { error: "claim_required", error_description: claimMessage(claim, "oauth"), claim },
@@ -399,10 +397,18 @@ oauth.post("/authorize/approve", async (c) => {
   } else {
     orgId = generateId("org");
     const ref = oauthReferralSource(client.client_name, allowedUris);
-    await insertOrganizationWithEmail(c.env.DB, orgId, email.split("@")[0], email, ref, requestCountry(c.req.raw));
-    // Before the welcome seed, which sets messages_stored_total = 1 and would
-    // otherwise gate this very user on a retry of a half-finished connect.
-    await recordIdentity(c.env.DB, orgId, claims.sub, email);
+    // The org and its creator's identity are written in one batch, so a retry
+    // of a half-finished connect never finds an org that gates its creator.
+    // Unlike recordIdentity this is not best-effort: no identity, no org.
+    await insertOrganizationWithOwner(c.env.DB, {
+      id: orgId,
+      name: email.split("@")[0],
+      email,
+      sub: claims.sub,
+      source: "oauth",
+      referralSource: ref,
+      country: requestCountry(c.req.raw),
+    });
     // Activation parity with /signup (engram#onboarding): connector-directory
     // users never see the dashboard, so this is their only welcome. Seed the
     // getting-started note (their first search hits something real) and fire

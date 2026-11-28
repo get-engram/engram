@@ -1,4 +1,5 @@
 import { generateId, hashApiKey } from "@getengram/shared";
+import { hasOrgIdentity } from "@getengram/db";
 import { audit } from "./audit.js";
 import { websiteBearer } from "./secrets.js";
 import type { Env } from "../types.js";
@@ -9,23 +10,28 @@ import type { Env } from "../types.js";
  *
  * Supabase auto-confirms addresses, so a JWT's email proves a string was
  * typed, not that an inbox was read. Every surface that binds a Supabase user
- * to an org (web /signup, CLI login, ChatGPT/Claude connect) therefore asks
- * two questions, in order:
+ * to an existing org (web /signup, CLI login, ChatGPT/Claude connect)
+ * therefore asks one question: is this sub already on org_identities for the
+ * org?
  *
- *   1. Is this sub already on org_identities for the org? Then it is the
- *      org's own user coming back through a new surface — connect, no gate.
- *   2. Otherwise, does the org hold memories? Then the sub must prove the
- *      inbox: we mail a one-time link to the org's address and POST
- *      /signup/claim redeems it. An empty org has nothing to take over and
- *      binds freely.
+ *   - Yes: it is the org's own user coming back through a new surface —
+ *     connect, no gate.
+ *   - No: the sub must prove the inbox. We mail a one-time link to the org's
+ *     address and POST /signup/claim redeems it.
+ *
+ * What the org holds does not change the answer. messages_stored_total is a
+ * live counter: deletes lower it and it floors at 0, so an org at 0 can still
+ * have API keys, connector tokens, other identities and a paid plan on it.
+ * New orgs are created together with their creator's identity in one batch
+ * (insertOrganizationWithOwner), so a creator is never asked by their own org.
  *
  * Only the token HASH is stored. One row per send is the trail; the daily cap
  * counts rows; a row whose email never left is deleted so the cooldown and
  * the cap stay truthful. A (org, sub, 2-minute window) unique index turns a
  * parallel burst — the dashboard rendering twice — into one email, not N.
  */
-export function requiresClaim(org: { messages_stored_total?: number | null }): boolean {
-  return (org.messages_stored_total ?? 0) > 0;
+export async function mustProveInbox(db: D1Database, orgId: string, sub: string): Promise<boolean> {
+  return !(await hasOrgIdentity(db, orgId, sub));
 }
 
 export const CLAIM_TTL_MINUTES = 30;
@@ -154,7 +160,7 @@ export async function startClaim(
 
 /** User-facing sentence for a claim_required response, per surface and outcome. */
 export function claimMessage(claim: ClaimState, via: ClaimSurface): string {
-  const lead = `An Engram account with saved memories already exists for ${claim.email}.`;
+  const lead = `An Engram account already exists for ${claim.email}.`;
   const again =
     via === "cli" ? " Then run 'engram login' again." : via === "oauth" ? " Then connect again." : "";
   const support = ` Email hello@getengram.app from ${claim.email} and we'll connect it by hand.`;

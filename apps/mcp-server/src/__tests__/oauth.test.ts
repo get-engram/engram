@@ -437,6 +437,10 @@ describe("Connected apps management (/api/oauth/connections)", () => {
 
     await db.prepare("INSERT INTO organizations (id, name, email, tier) VALUES (?, ?, ?, ?)")
       .bind("org_ca", "Apps Org", email, "free").run();
+    // The owner's own sign-in (signSupabaseJwt signs sub "user-1"), so the
+    // connect below binds instead of asking for a claim.
+    await db.prepare("INSERT INTO org_identities (organization_id, sub, email, source) VALUES (?, ?, ?, ?)")
+      .bind("org_ca", "user-1", email, "signup").run();
     await db.prepare("INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, name, expires_at) VALUES (?, ?, ?, ?, ?, ?)")
       .bind("key_ca", "org_ca", await hashApiKey(apiKey), prefix, "Default", "2999-01-01 00:00:00").run();
 

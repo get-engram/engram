@@ -1,3 +1,5 @@
+import { orgIdentityStatement, type IdentitySource } from "./identities.js";
+
 export function insertOrganization(
   db: D1Database,
   id: string,
@@ -34,6 +36,37 @@ export async function insertOrganizationWithEmail(
     .run();
   await carryEmailOptOut(db, id, email);
   return result;
+}
+
+/**
+ * Create an org and record the Supabase user creating it, in one batch.
+ *
+ * D1 runs a batch as one transaction, so both rows exist or neither does.
+ * Every sub an existing org has not seen must prove the inbox before it may
+ * sign in, so an org left without its creator's identity (a failure between
+ * two separate writes) would ask its own creator for that proof on the retry.
+ */
+export async function insertOrganizationWithOwner(
+  db: D1Database,
+  org: {
+    id: string;
+    name: string;
+    email: string;
+    sub: string;
+    source: IdentitySource;
+    referralSource?: string | null;
+    country?: string | null;
+  },
+): Promise<void> {
+  await db.batch([
+    db
+      .prepare(
+        "INSERT INTO organizations (id, name, email, referral_source, country) VALUES (?, ?, ?, ?, ?)",
+      )
+      .bind(org.id, org.name, org.email, org.referralSource ?? null, org.country ?? null),
+    orgIdentityStatement(db, org.id, org.sub, org.email, org.source),
+  ]);
+  await carryEmailOptOut(db, org.id, org.email);
 }
 
 /**

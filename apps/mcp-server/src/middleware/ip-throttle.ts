@@ -22,20 +22,24 @@ import type { Env } from "../types.js";
 interface Bucket {
   tokens: number;
   updated: number;
+  /** The window this bucket refills over. Buckets do not share one. */
+  windowMs: number;
 }
 
 const buckets = new Map<string, Bucket>();
 
 // Bounded sweep: only runs when the Map is large, and only removes buckets
-// that have been idle for at least a full window (their tokens have fully
-// refilled by the time-based refill, so dropping them loses no throttle state
-// — a returning IP just gets a fresh full bucket, which is the same thing).
+// that have been idle for at least their OWN full window (their tokens have
+// fully refilled by the time-based refill, so dropping them loses no throttle
+// state — a returning IP just gets a fresh full bucket, which is the same
+// thing). Judging every bucket by the caller's window would drop a 15-minute
+// bucket after a minute of quiet and hand it a fresh allowance early.
 // This keeps memory proportional to ACTIVE IPs without evicting IPs mid-abuse.
 const SWEEP_THRESHOLD = 20_000;
-function maybeSweep(now: number, windowMs: number) {
+function maybeSweep(now: number) {
   if (buckets.size < SWEEP_THRESHOLD) return;
   for (const [k, b] of buckets) {
-    if (now - b.updated >= windowMs) buckets.delete(k);
+    if (now - b.updated >= b.windowMs) buckets.delete(k);
   }
 }
 
@@ -47,10 +51,10 @@ function maybeSweep(now: number, windowMs: number) {
  * website makes that call and every buyer would share its address).
  */
 export function takeToken(key: string, limit: number, windowMs: number, now = Date.now()): boolean {
-  maybeSweep(now, windowMs);
+  maybeSweep(now);
   let b = buckets.get(key);
   if (!b) {
-    b = { tokens: limit, updated: now };
+    b = { tokens: limit, updated: now, windowMs };
     buckets.set(key, b);
   }
   // Refill proportionally to elapsed time. Never negative: a clock that

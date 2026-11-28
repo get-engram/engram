@@ -15,6 +15,23 @@ export type IdentitySource =
   | "profile"
   | "backfill";
 
+/** The statement upsertOrgIdentity runs, for callers that need it inside a batch. */
+export function orgIdentityStatement(
+  db: D1Database,
+  organizationId: string,
+  sub: string,
+  email: string | null,
+  source: IdentitySource,
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `INSERT INTO org_identities (organization_id, sub, email, source)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(organization_id, sub) DO UPDATE SET last_seen_at = datetime('now')`,
+    )
+    .bind(organizationId, sub, email, source);
+}
+
 export function upsertOrgIdentity(
   db: D1Database,
   organizationId: string,
@@ -22,14 +39,7 @@ export function upsertOrgIdentity(
   email: string | null,
   source: IdentitySource,
 ) {
-  return db
-    .prepare(
-      `INSERT INTO org_identities (organization_id, sub, email, source)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(organization_id, sub) DO UPDATE SET last_seen_at = datetime('now')`,
-    )
-    .bind(organizationId, sub, email, source)
-    .run();
+  return orgIdentityStatement(db, organizationId, sub, email, source).run();
 }
 
 export async function hasOrgIdentity(

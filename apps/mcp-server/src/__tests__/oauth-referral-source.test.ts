@@ -110,6 +110,11 @@ describe("signup through OAuth approval records the source (engram#761)", () => 
       .prepare("INSERT INTO organizations (id, name, email, referral_source, country) VALUES (?, ?, ?, ?, ?)")
       .bind("org_old", "old", "old@example.com", "chatgpt", null)
       .run();
+    // Its owner, signing in again: an unknown sub would be sent to claim it.
+    await db
+      .prepare("INSERT INTO org_identities (organization_id, sub, email, source) VALUES (?, ?, ?, ?)")
+      .bind("org_old", "user-1", "old@example.com", "oauth")
+      .run();
     const reg = await app.fetch(
       new Request("http://mcp.test/oauth/register", {
         method: "POST",

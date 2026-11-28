@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
 import { Hono } from "hono";
 import { mintableScopes, type Scope } from "../mcp/scopes.js";
-import { requiresClaim, signup } from "../routes/signup.js";
+import { signup } from "../routes/signup.js";
+import { mustProveInbox } from "../services/claim.js";
 import { keys } from "../routes/keys.js";
 import { verifySupabaseJwt } from "../utils/jwt.js";
 import type { Env, AuthContext } from "../types.js";
@@ -227,11 +228,14 @@ describe("/signup/set-password", () => {
 
 // ── #1: a new identity may not claim an org that holds data ──────────────
 
-describe("requiresClaim", () => {
-  it("is true only when the org holds memories", () => {
-    expect(requiresClaim({ messages_stored_total: 383 })).toBe(true);
-    expect(requiresClaim({ messages_stored_total: 0 })).toBe(false);
-    expect(requiresClaim({})).toBe(false);
+describe("mustProveInbox", () => {
+  const identityDb = (present: boolean) =>
+    ({
+      prepare: () => ({ bind: () => ({ first: async () => (present ? { present: 1 } : null) }) }),
+    }) as unknown as D1Database;
+  it("asks every sub the org has never seen, and only those", async () => {
+    expect(await mustProveInbox(identityDb(false), "org_x", "sub_new")).toBe(true);
+    expect(await mustProveInbox(identityDb(true), "org_x", "sub_owner")).toBe(false);
   });
 });
 
@@ -251,12 +255,28 @@ describe("POST /signup bind-by-email", () => {
     expect(writes.some((w) => /INSERT INTO audit_log/i.test(w))).toBe(true);
   });
 
-  it("still binds an existing EMPTY org — nothing to steal, no friction", async () => {
-    const { db, writes } = stubDb({ orgByEmail: { id: "org_empty", messages_stored_total: 0 } });
-    const res = await post(db, "new@example.com");
-    expect(res.status).toBe(200);
-    expect((await res.json()) as object).toMatchObject({ organization_id: "org_empty", created: false });
-    expect(writes.some((w) => /INSERT INTO api_keys/i.test(w))).toBe(true);
+  it("refuses a fresh identity on an existing org whose message counter is 0 too", async () => {
+    const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const { db, writes } = stubDb({ orgByEmail: { id: "org_empty", messages_stored_total: 0 } });
+      const { app } = signupApp(db);
+      const env = { ...envWith(db), ADMIN_SECRET: "admin-secret-test" } as unknown as Env;
+      const token = await signJwt({ sub: "user_new", email: "new@example.com", role: "authenticated", exp: nowSec() + 600 });
+      const res = await app.request(
+        "/signup",
+        { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: "{}" },
+        env,
+      );
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({ error: "claim_required" });
+      expect(writes.some((w) => /INSERT INTO api_keys/i.test(w))).toBe(false);
+      expect(writes.some((w) => /INSERT INTO org_identities/i.test(w))).toBe(false);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String((fetchMock.mock.calls[0] as unknown[])[0])).toBe("https://getengram.app/api/email/claim-link");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("creates a fresh org for a brand-new email — zero friction unchanged", async () => {

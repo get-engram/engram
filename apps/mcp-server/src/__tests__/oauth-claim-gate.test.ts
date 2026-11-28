@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import app from "../index.js";
 import { createOAuthD1, createOAuthEnv, signSupabaseJwt, pkcePair } from "./oauth-helpers.js";
 
@@ -104,13 +104,19 @@ describe("/oauth/authorize/approve on an existing org that holds data", () => {
     expect(rows(db, "oauth_authorization_codes")).toHaveLength(1);
   });
 
-  it("binds an unknown sub to an EMPTY org and records the identity (nothing to take over)", async () => {
+  it("refuses an unknown sub on an org whose message counter is 0 the same way", async () => {
     const { db, env, client_id, challenge } = await setup({ messages: 0 });
+    const prepare = vi.spyOn(db as unknown as { prepare: (sql: string) => unknown }, "prepare");
     const res = await approveAs(env, client_id, challenge, EMAIL);
-    expect(res.status).toBe(200);
-    const ids = rows(db, "org_identities");
-    expect(ids).toHaveLength(1);
-    expect(ids[0]).toMatchObject({ organization_id: "org_victim", sub: "user-1", source: "oauth" });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string; claim: unknown };
+    expect(body.error).toBe("claim_required");
+    expect(body.claim).toBeTruthy();
+    expect(rows(db, "oauth_authorization_codes")).toHaveLength(0);
+    expect(rows(db, "org_identities")).toHaveLength(0);
+    // It went for a claim link. This fake cannot parse INSERT OR IGNORE, so
+    // the send reads as a cooldown here; claim.test.ts covers the email.
+    expect(prepare.mock.calls.some(([sql]) => /INSERT OR IGNORE INTO org_claims/i.test(String(sql)))).toBe(true);
   });
 
   it("records the identity for a brand-new org before anything else can fail", async () => {
@@ -133,5 +139,30 @@ describe("/oauth/authorize/approve on an existing org that holds data", () => {
     expect(ids).toHaveLength(1);
     expect(ids[0]).toMatchObject({ sub: "user-1", source: "oauth" });
     expect(rows(db, "organizations")).toHaveLength(1);
+  });
+
+  it("writes a brand-new org and its identity in one batch: if that batch fails, neither exists", async () => {
+    const db = createOAuthD1();
+    const env = createOAuthEnv(db);
+    const reg = await app.fetch(
+      new Request("http://mcp.test/oauth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ client_name: "ChatGPT", redirect_uris: [REDIRECT] }),
+      }),
+      env,
+      MOCK_CTX,
+    );
+    const { client_id } = (await reg.json()) as { client_id: string };
+    const { challenge } = await pkcePair();
+    // D1 runs a batch as one transaction; a failed one writes nothing.
+    (db as unknown as { batch: unknown }).batch = vi.fn(async () => {
+      throw new Error("D1_ERROR: simulated batch failure");
+    });
+    const res = await approveAs(env, client_id, challenge, "fresh@example.com");
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    expect(rows(db, "organizations")).toHaveLength(0);
+    expect(rows(db, "org_identities")).toHaveLength(0);
+    expect(rows(db, "oauth_authorization_codes")).toHaveLength(0);
   });
 });
